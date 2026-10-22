@@ -481,11 +481,7 @@ func plannerNoticeTallyKey(conv string, n plannerNotice, action ...string) strin
 // executesMessages reports whether the host is running and latched message
 // in [ops] authoritative, so planner notices go to its lane.
 func (h *conversationLaneHost) executesMessages() bool {
-	if !slices.Contains(h.kinds, string(opjournal.KindMessage)) {
-		return false
-	}
-	state, _ := h.stateReason()
-	return state == laneHostStateRunning
+	return slices.Contains(h.runningKinds(), string(opjournal.KindMessage))
 }
 
 // noticeStore is the host's op store, opened over its sessions store.
@@ -504,14 +500,7 @@ func (h *conversationLaneHost) noticeNow() time.Time { return h.clk.Now() }
 // lane then delivers it. A protocol-mode session is nudged directly, as
 // before, even where this host's executor serves it from its turns.
 func (h *conversationLaneHost) servesNotice(st *opjournal.Store, sessName string, view opjournal.ConversationView) (bool, error) {
-	if laneTypesLive(h.env.SessionProvider(), sessName) {
-		return true, nil
-	}
-	row, _, found, err := st.Runtime(view.ID)
-	if err != nil {
-		return false, fmt.Errorf("reading conversation %s's runtime row: %w", view.ID, err)
-	}
-	return found && hostedElsewhere(row.Host, view.Generation), nil
+	return laneServesSession(h.env.SessionProvider(), st, sessName, view)
 }
 
 // noticeFailed implements plannerNoticeLane.

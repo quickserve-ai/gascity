@@ -141,7 +141,7 @@ func TestDrainAckStopPendingPoolSeatWithOpenTriggerIsReplaced(t *testing.T) {
 			}
 			store := beads.NewMemStore()
 			sp := runtime.NewFake()
-			trigger := createRoutedReadyBeadForReplacement(t, store, "repo/worker", "trigger work still open")
+			trigger := createRoutedReadyBeadForReplacement(t, store, "trigger work still open")
 
 			seat := createCanonicalPoolSession(t, store, &cfg.Agents[0], now, 1)
 			setPoolSessionActive(t, store, seat.ID)

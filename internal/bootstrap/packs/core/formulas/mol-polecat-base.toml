@@ -116,10 +116,20 @@ gc mail inbox
 - What exactly needs to be done?
 - What files are likely involved?
 - Are there dependencies or blockers?
-- What does "done" look like?
+- What does "done" look like? Read `Done means:` and `Stop and ask only if:`
+  from the bead (description and acceptance field). If either is absent,
+  derive it and record both in a comment before implementing, unless an
+  earlier attempt already recorded them (`gc bd comments "$WORK_BEAD_ID"`
+  shows them; write with `gc bd comment "$WORK_BEAD_ID" "..."`), then work
+  to them.
+- If the bead carries a `Level:` line of L or XL, read its fan-out plan (the
+  parallel tracks and what each returns); if none is on the bead, write one
+  as a comment before implementing. The plan is how you split the work across
+  your own subagents; you still own and deliver the whole bead. No `Level:`
+  line means no plan is required.
 - If rejected: what specifically needs fixing?
 
-If blocked or unclear, mail `{{escalation_target}}`:
+If still unclear after deriving the done and stop lines, mail `{{escalation_target}}`:
 ```bash
 gc mail send {{escalation_target}} -s "HELP: Unclear requirements" -m "Issue: $WORK_BEAD_ID
 Question: <what you need clarified>"
@@ -338,15 +348,15 @@ BODY
 Commit types: feat, fix, refactor, perf, test, docs, chore
 
 **Examples of strong subjects + bodies:**
-- `fix(session): preserve lifecycle metadata during crash adoption (ga-xxxx)`
+- `fix(session): preserve lifecycle metadata during crash adoption (<bead-id>)`
   body: explains the stale session projection, the resume path that
   lost metadata, the projection update, and the focused adoption test
-- `perf(events): batch typed payload registration lookups (ga-xxxx)`
+- `perf(events): batch typed payload registration lookups (<bead-id>)`
   body: cites the event fan-out profile, names the registry call site
   that drove the regression, and notes why the cache stays read-only
 
 **Weak commits to avoid** (refinery/reviewer can't tell what's going on):
-- `fix: stuff (ga-xxxx)`
+- `fix: stuff (<bead-id>)`
 - `perf: speed up the slow loop`
 - `refactor` with no body
 
@@ -356,7 +366,10 @@ gc bd create --title "Found: <description>" --type bug --priority 2
 ```
 Do NOT fix unrelated issues in this branch.
 
-**If stuck (>15 minutes):**
+**If stuck on a blocker you cannot clear yourself, or cannot explain after a
+real attempt** (a time box of ~15 minutes is a prompt to re-check, not a
+stop; a blocker you can name, such as a missing credential or an unreachable
+dependency, is escalated at once):
 ```bash
 gc mail send {{escalation_target}} -s "HELP: Stuck on implementation" -m "Issue: $WORK_BEAD_ID
 Problem: <what's blocking you>

@@ -135,6 +135,9 @@ type fakeClaudePane struct {
 	// ignoreCtrlU makes Ctrl-U and Ctrl-K no-ops (an input box that will
 	// not clear).
 	ignoreCtrlU bool
+	// swallowEnter makes Enter a no-op: the draft stays in the input box,
+	// the way a submit raced against the paste is dropped (ga-bwm).
+	swallowEnter bool
 	// placeholder is drawn dim in an empty input box, as Claude draws
 	// "Try \"write a test for <filepath>\"" at startup.
 	placeholder string
@@ -425,7 +428,7 @@ func (f *fakeClaudePane) sendKeys(args []string) error {
 			f.draft = ""
 			f.cursor = draftEnd
 		case "Enter":
-			if f.draft != "" {
+			if f.draft != "" && !f.swallowEnter {
 				f.submitted = append(f.submitted, f.draft)
 				f.draft = ""
 				f.cursor = draftEnd
@@ -546,10 +549,12 @@ func TestNudgeSessionLeavesAttachedClaudeDraftAlone(t *testing.T) {
 // draft: the human now at the pane may be typing (#5192).
 func TestNudgeSessionStopsClearingWhenClientAttachesMidClear(t *testing.T) {
 	pane := newFakeClaudePane(claudeRestoredDraft)
-	// Capture 4 is the redraw read after the first Ctrl-U Ctrl-K: the nudge
-	// looks for a permission prompt (1) and a dialog (2), then the clear reads
-	// the input box (3) and presses.
-	pane.attachOnCapture = 4
+	// Capture 5 is the redraw read after the first Ctrl-U Ctrl-K: the nudge
+	// runs the carry's human-prompt guard (1, ga-ubfc7j: it must precede every
+	// key, so it is the first read under the lock), looks for a permission
+	// prompt (2) and a dialog (3), then the clear reads the input box (4) and
+	// presses.
+	pane.attachOnCapture = 5
 	tm := newFakeClaudeTmux(pane)
 
 	err := tm.NudgeSession(pane.sessionName, "nudge")

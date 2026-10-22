@@ -365,6 +365,24 @@
               "null"
             ]
           },
+          "OptInSkills": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "OptInSkillsAppend": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "OptionDefaults": {
             "additionalProperties": {
               "type": "string"
@@ -533,6 +551,12 @@
               "null"
             ]
           },
+          "WakeTransport": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "WorkDir": {
             "type": [
               "string",
@@ -552,6 +576,7 @@
           "PreStart",
           "PromptTemplate",
           "Session",
+          "WakeTransport",
           "Provider",
           "Upstream",
           "Args",
@@ -588,6 +613,8 @@
           "SessionLiveAppend",
           "InstallAgentHooksAppend",
           "InjectFragmentsAppend",
+          "OptInSkills",
+          "OptInSkillsAppend",
           "MaxActiveSessions",
           "MinActiveSessions",
           "ScaleCheck"
@@ -611,6 +638,23 @@
           "name": {
             "description": "Agent name.",
             "type": "string"
+          },
+          "opt_in_skills": {
+            "description": "Replace the agent's opt-in skill selection (binding-qualified names of skills a pack ships under skills/opt-in/). An empty list clears it; omit the field to inherit the underlying agent's list.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "opt_in_skills_append": {
+            "description": "Opt-in skills to add to the agent's selection.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
           },
           "provider": {
             "description": "Override the agent's provider.",
@@ -846,7 +890,7 @@
         "additionalProperties": false,
         "properties": {
           "event_cursor": {
-            "description": "City event-stream sequence captured before the async request was accepted. Pass this value as after_seq to /v0/city/{cityName}/events/stream to receive the request result without replaying unrelated historical backlog. A value of 0 can also mean no event provider is configured or the event log is empty.",
+            "description": "City event-stream sequence captured before the async request was accepted. Pass this value as after_seq to /v0/city/{cityName}/events/stream to receive the request result without replaying unrelated historical backlog, and to /v0/city/{cityName}/request/{requestId} to read its outcome. A value of 0 means the event log was empty.",
             "type": "string"
           },
           "idempotency_key": {
@@ -938,6 +982,9 @@
         "additionalProperties": false,
         "properties": {
           "assignee": {
+            "type": "string"
+          },
+          "await_type": {
             "type": "string"
           },
           "close_reason": {
@@ -1043,6 +1090,55 @@
             "type": "string"
           }
         },
+        "type": "object"
+      },
+      "BeadClaimFailedPayload": {
+        "additionalProperties": false,
+        "properties": {
+          "error": {
+            "type": "string"
+          },
+          "runtime_epoch": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "template": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "template",
+          "error"
+        ],
+        "type": "object"
+      },
+      "BeadClaimLoopHeldPayload": {
+        "additionalProperties": false,
+        "properties": {
+          "error": {
+            "type": "string"
+          },
+          "failures": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "held_until": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "template": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "template",
+          "error",
+          "failures",
+          "held_until"
+        ],
         "type": "object"
       },
       "BeadClaimRejectedPayload": {
@@ -2041,6 +2137,79 @@
         ],
         "type": "object"
       },
+      "ConversationFact": {
+        "additionalProperties": false,
+        "properties": {
+          "at": {
+            "description": "When it happened: the source's time, or the observer's clock when the source gives none.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "basis": {
+            "description": "How the fact is known: runtime (the provider recorded it), observed (gc inferred it) or lane. Open: a newer build may add values.",
+            "type": "string"
+          },
+          "cause_ops": {
+            "description": "Operations that caused the fact.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "conversation": {
+            "description": "Session (conversation) id the fact belongs to.",
+            "type": "string"
+          },
+          "detail": {
+            "description": "The source's own word for the occurrence, e.g. a provider stop reason.",
+            "type": "string"
+          },
+          "generation": {
+            "description": "Session generation the fact happened in.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "id": {
+            "description": "Fact id, keyed by the occurrence.",
+            "type": "string"
+          },
+          "interaction": {
+            "description": "The occurrence of an interaction.* fact.",
+            "type": "string"
+          },
+          "kind": {
+            "description": "Fact kind.",
+            "enum": [
+              "session.started",
+              "session.ended",
+              "turn.started",
+              "turn.ended",
+              "interaction.raised",
+              "interaction.resolved"
+            ],
+            "type": "string"
+          },
+          "reason": {
+            "description": "Open reason token, e.g. a turn.ended reason (completed, interrupted, superseded).",
+            "type": "string"
+          },
+          "turn": {
+            "description": "The turn of a turn.* fact, as its runtime names it.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "conversation",
+          "generation",
+          "at"
+        ],
+        "type": "object"
+      },
       "ConversationGroupParticipant": {
         "additionalProperties": false,
         "properties": {
@@ -2124,6 +2293,20 @@
         ],
         "type": "object"
       },
+      "ConversationInterruptPolicyBody": {
+        "additionalProperties": false,
+        "properties": {
+          "on_failure": {
+            "description": "What the interrupt does when no boundary is observed: fail or restart.",
+            "enum": [
+              "fail",
+              "restart"
+            ],
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
       "ConversationKind": {
         "description": "Shape of a conversation.",
         "enum": [
@@ -2133,16 +2316,115 @@
         ],
         "type": "string"
       },
+      "ConversationMessagePolicyBody": {
+        "additionalProperties": false,
+        "properties": {
+          "now_generation": {
+            "description": "With when now: the session generation the requester saw.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "now_turn": {
+            "description": "With when now: the turn the requester saw.",
+            "maxLength": 128,
+            "type": "string"
+          },
+          "on_unsupported": {
+            "description": "What a steer does on a runtime that cannot steer: boundary or fail.",
+            "enum": [
+              "boundary",
+              "fail"
+            ],
+            "type": "string"
+          },
+          "role": {
+            "description": "How the agent sees it: prompt (a turn of its own) or notice (a reminder).",
+            "enum": [
+              "prompt",
+              "notice"
+            ],
+            "type": "string"
+          },
+          "wake": {
+            "description": "Whether the message may wake its session: if_needed or live_only.",
+            "enum": [
+              "if_needed",
+              "live_only"
+            ],
+            "type": "string"
+          },
+          "when": {
+            "description": "When to deliver: boundary (the next turn boundary), after_turn (ride the next turn, never start one), interrupt, if_idle (skipped when the session is mid-turn), now (deliver now) or steer (into the running turn, where the runtime can steer).",
+            "enum": [
+              "boundary",
+              "after_turn",
+              "interrupt",
+              "if_idle",
+              "now",
+              "steer"
+            ],
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
       "ConversationOp": {
         "additionalProperties": false,
         "properties": {
+          "actor": {
+            "description": "The producer's actor class, an open token. Set on the op routes and op.changed only.",
+            "type": "string"
+          },
+          "at": {
+            "description": "When the operation last changed status. Set on the op routes and op.changed only.",
+            "format": "date-time",
+            "type": "string"
+          },
           "attempt": {
-            "description": "Executions after the first (an adopted orphan).",
+            "description": "How many times the operation was executed, counted by its executor. A legacy-executed operation counts executions after the first (an adopted orphan), so its first run reads 0. A lane operation counts the lane's takes, its first included, so one delivered once reads 1 and a redelivery 2; maybe_delivered says whether an earlier take may have reached the agent.",
             "format": "int64",
+            "type": "integer"
+          },
+          "cancel_requested": {
+            "description": "True once a cancel is recorded on an operation that was already executing; its outcome says whether the cancel won. Set on the op routes and op.changed only.",
+            "type": "boolean"
+          },
+          "causation": {
+            "description": "What caused the operation, as the producer named it. Set on the op routes and op.changed only.",
+            "type": "string"
+          },
+          "client_key": {
+            "description": "The producer's client key: the Idempotency-Key, or the key the server minted. Set on the op routes and op.changed only.",
+            "type": "string"
+          },
+          "client_seq": {
+            "description": "The producer's own sequence number, which orders its operations of equal precedence. Set on the op routes and op.changed only.",
+            "format": "int64",
+            "minimum": 0,
             "type": "integer"
           },
           "conversation": {
             "description": "Session (conversation) id the operation targets.",
+            "type": "string"
+          },
+          "correlation": {
+            "description": "The producer's correlation id. Set on the op routes and op.changed only.",
+            "type": "string"
+          },
+          "created_at": {
+            "description": "When the operation was proposed. Set on the op routes and op.changed only.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "executor": {
+            "description": "Who executes the operation: lane (the conversation lane) or a legacy path. Set on the op routes and op.changed only.",
+            "enum": [
+              "lane",
+              "legacy",
+              "legacy:api",
+              "legacy:cli"
+            ],
             "type": "string"
           },
           "id": {
@@ -2165,9 +2447,24 @@
             ],
             "type": "string"
           },
+          "lane_seq": {
+            "description": "The conversation lane's sequence number of the operation's last take. Set on the op routes and op.changed only.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "maybe_delivered": {
+            "description": "The last attempt that may have reached the agent (a redelivery after an ambiguous attempt), 0 when none may have. Set on the op routes and op.changed only.",
+            "format": "int64",
+            "type": "integer"
+          },
           "outcome": {
             "$ref": "#/components/schemas/ConversationOpOutcome",
             "description": "Present when status is closed."
+          },
+          "principal": {
+            "description": "The producer's principal: operator, conversation:\u003cid\u003e, t3:\u003cenvironment id\u003e, or gc:\u003cproducer\u003e for gc's own producers. Asserted, not authenticated. Set on the op routes and op.changed only.",
+            "type": "string"
           },
           "status": {
             "description": "Operation status. A legacy-executed operation stays submitted until it closes.",
@@ -2187,6 +2484,76 @@
           "kind",
           "status"
         ],
+        "type": "object"
+      },
+      "ConversationOpCancelBody": {
+        "additionalProperties": false,
+        "properties": {
+          "principal": {
+            "description": "The asserted principal recorded as the canceler: operator (the default) or t3:\u003cenvironment id\u003e.",
+            "pattern": "^(operator|t3:[A-Za-z0-9][A-Za-z0-9._-]{0,127})$",
+            "type": "string"
+          },
+          "reason": {
+            "description": "Why the producer cancels.",
+            "maxLength": 256,
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "ConversationOpCancelResult": {
+        "additionalProperties": false,
+        "properties": {
+          "op": {
+            "$ref": "#/components/schemas/ConversationOp",
+            "description": "The operation after the cancel."
+          },
+          "result": {
+            "description": "What the cancel did: closed (the operation had not started and is now closed canceled), requested (it is executing; the cancel is recorded and its outcome says who won), already_decided (it is settling; nothing was written) or already_terminal (it was closed).",
+            "enum": [
+              "closed",
+              "requested",
+              "already_decided",
+              "already_terminal"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "result",
+          "op"
+        ],
+        "type": "object"
+      },
+      "ConversationOpDelivery": {
+        "additionalProperties": false,
+        "properties": {
+          "ack": {
+            "description": "The runtime's answer (open vocabulary, e.g. delivered, delivered_unobserved, in_band).",
+            "type": "string"
+          },
+          "at": {
+            "description": "The lane's clock just before the delivery's first input.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "message_at": {
+            "description": "The runtime's creation time for the delivered message, when it reports one.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "message_id": {
+            "description": "The runtime's id for the delivered message, when it reports one.",
+            "type": "string"
+          },
+          "seq": {
+            "description": "lane_seq of the delivery's head operation.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
         "type": "object"
       },
       "ConversationOpOutcome": {
@@ -2210,6 +2577,10 @@
             "description": "Why a failed or skipped operation ended (open vocabulary; refused:\u003cwhy\u003e names a refusal).",
             "type": "string"
           },
+          "result": {
+            "$ref": "#/components/schemas/ConversationOpResult",
+            "description": "What a succeeded or coalesced operation produced. Set on the op routes and op.changed only."
+          },
           "via": {
             "description": "How it was carried out; legacy.* in this release (legacy.delivered, legacy.queued).",
             "type": "string"
@@ -2217,6 +2588,240 @@
         },
         "required": [
           "arm"
+        ],
+        "type": "object"
+      },
+      "ConversationOpPolicyBody": {
+        "additionalProperties": false,
+        "properties": {
+          "guarantee": {
+            "description": "Execution guarantee: at_least_once (the default; a delivery is repeated only after an ambiguous attempt) or at_most_once (never repeated).",
+            "enum": [
+              "at_least_once",
+              "at_most_once"
+            ],
+            "type": "string"
+          },
+          "interrupt": {
+            "$ref": "#/components/schemas/ConversationInterruptPolicyBody",
+            "description": "The interrupt policy."
+          },
+          "message": {
+            "$ref": "#/components/schemas/ConversationMessagePolicyBody",
+            "description": "The message policy."
+          }
+        },
+        "type": "object"
+      },
+      "ConversationOpProposeBody": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "description": "The actor class within the principal, e.g. user, system or mcp. Defaults to operator for the operator principal; required with a t3 principal.",
+            "maxLength": 64,
+            "pattern": "^[a-z0-9._:/-]+$",
+            "type": "string"
+          },
+          "after": {
+            "description": "An operation id of the same session this one runs after.",
+            "type": "string"
+          },
+          "causation": {
+            "description": "What caused the operation.",
+            "type": "string"
+          },
+          "client_key": {
+            "description": "The producer's idempotency key (e.g. T3's message id). The Idempotency-Key header may carry it instead; when both are set they must be equal. Minted and returned when both are absent.",
+            "type": "string"
+          },
+          "client_seq": {
+            "description": "The producer's own sequence number: it keeps two quick proposals in their order even when relayed concurrently.",
+            "format": "int64",
+            "maximum": 9223372036854776000,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "correlation": {
+            "description": "The producer's correlation id.",
+            "type": "string"
+          },
+          "finish_by": {
+            "description": "The deadline for the operation to finish.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "kind": {
+            "description": "Operation kind. Only kinds listed in [ops] authoritative are accepted (409 kind-not-enabled otherwise).",
+            "enum": [
+              "message",
+              "interrupt",
+              "respond",
+              "create",
+              "wake",
+              "suspend",
+              "resume",
+              "restart",
+              "kill",
+              "close"
+            ],
+            "type": "string"
+          },
+          "not_before": {
+            "description": "Do not start before this time.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "payload": {
+            "description": "The operation's payload: a message's text.",
+            "type": "string"
+          },
+          "policy": {
+            "$ref": "#/components/schemas/ConversationOpPolicyBody",
+            "description": "The operation's policy; omitted fields take the kind's defaults."
+          },
+          "principal": {
+            "description": "The asserted principal: operator (the default) or t3:\u003cenvironment id\u003e for a T3 Code environment. Until the front door exists it is asserted, not authenticated, like the operator identity of every API mutation; conversation:\u003cid\u003e and gc:\u003cproducer\u003e stay reserved to gc's own producers. It keys the operation with the client key, so a retry must send the same one.",
+            "pattern": "^(operator|t3:[A-Za-z0-9][A-Za-z0-9._-]{0,127})$",
+            "type": "string"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/ConversationOpScopeBody",
+            "description": "The operation's validity scope; omitted takes the kind's default."
+          },
+          "start_by": {
+            "description": "Close the operation failed if it has not started by this time.",
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "type": "object"
+      },
+      "ConversationOpProposeResult": {
+        "additionalProperties": false,
+        "properties": {
+          "client_key": {
+            "description": "The client key the operation is recorded under: the producer's, or the one the server minted. Retry with it to get this operation back.",
+            "type": "string"
+          },
+          "created": {
+            "description": "True when this request wrote the operation (201), false when it already existed (200).",
+            "type": "boolean"
+          },
+          "cursor": {
+            "description": "City event-stream sequence captured before the proposal. Pass it as after_seq to /v0/city/{cityName}/events/stream to receive this operation's op.changed events.",
+            "type": "string"
+          },
+          "op": {
+            "$ref": "#/components/schemas/ConversationOp",
+            "description": "The operation."
+          },
+          "op_id": {
+            "description": "The operation id, derived from the session, the principal and the client key.",
+            "type": "string"
+          },
+          "status": {
+            "description": "The operation's status now.",
+            "enum": [
+              "submitted",
+              "accepted",
+              "executing",
+              "settling",
+              "closed"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "op_id",
+          "status",
+          "created",
+          "client_key",
+          "cursor",
+          "op"
+        ],
+        "type": "object"
+      },
+      "ConversationOpResult": {
+        "additionalProperties": false,
+        "properties": {
+          "coalesced_into": {
+            "description": "The operation this one was delivered with, when coalesced.",
+            "type": "string"
+          },
+          "context_epoch": {
+            "description": "Context epoch the operation ran in.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "delivery": {
+            "$ref": "#/components/schemas/ConversationOpDelivery",
+            "description": "The conversation lane's delivery record."
+          },
+          "generation": {
+            "description": "Session generation the operation ran in.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "turn": {
+            "description": "The turn the operation ran in or was linked to; empty when the link is none.",
+            "type": "string"
+          },
+          "turn_basis": {
+            "description": "The rule that decided the turn link (open vocabulary, e.g. runtime_turn, history_diff, no_source).",
+            "type": "string"
+          },
+          "turn_link": {
+            "description": "Confidence of the turn link: exact when the runtime named the turn, correlated or ambiguous from observed turns, none when no turn could be linked.",
+            "enum": [
+              "exact",
+              "correlated",
+              "ambiguous",
+              "none"
+            ],
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "ConversationOpScopeBody": {
+        "additionalProperties": false,
+        "properties": {
+          "epoch": {
+            "description": "The context epoch of a context scope.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "generation": {
+            "description": "The session generation of a session scope.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "interaction": {
+            "description": "The interaction occurrence a respond answers.",
+            "type": "string"
+          },
+          "kind": {
+            "description": "conversation (any session), context (one context epoch) or session (one session generation).",
+            "enum": [
+              "conversation",
+              "context",
+              "session"
+            ],
+            "type": "string"
+          },
+          "turn": {
+            "description": "The turn an interrupt targets.",
+            "maxLength": 128,
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind"
         ],
         "type": "object"
       },
@@ -2551,6 +3156,16 @@
         ],
         "type": "object"
       },
+      "DoctorStruct": {
+        "additionalProperties": false,
+        "properties": {
+          "census_owner_namespace": {
+            "description": "Override the doctor census owner namespace; empty string clears it.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
       "ErrorDetail": {
         "additionalProperties": false,
         "properties": {
@@ -2640,10 +3255,15 @@
               "urn:gascity:error:invalid-cursor",
               "urn:gascity:error:invalid-idempotency-key",
               "urn:gascity:error:invalid-request",
+              "urn:gascity:error:key-reuse",
+              "urn:gascity:error:kind-not-enabled",
               "urn:gascity:error:mail-not-found",
+              "urn:gascity:error:mail-not-persisted",
               "urn:gascity:error:method-not-allowed",
               "urn:gascity:error:not-implemented",
+              "urn:gascity:error:op-already-failed",
               "urn:gascity:error:op-journal-unavailable",
+              "urn:gascity:error:op-not-found",
               "urn:gascity:error:operation-in-progress",
               "urn:gascity:error:order-not-found",
               "urn:gascity:error:pack-credential-required",
@@ -2651,6 +3271,7 @@
               "urn:gascity:error:patch-not-found",
               "urn:gascity:error:payload-too-large",
               "urn:gascity:error:provider-not-found",
+              "urn:gascity:error:request-not-found",
               "urn:gascity:error:rig-not-found",
               "urn:gascity:error:run-not-found",
               "urn:gascity:error:scope-not-found",
@@ -2668,6 +3289,7 @@
               "urn:gascity:error:wait-not-found",
               "urn:gascity:error:wake-will-not-start",
               "urn:gascity:error:webhook-rejected",
+              "urn:gascity:error:when-not-supported",
               "urn:gascity:error:workflow-not-found"
             ],
             "format": "uri",
@@ -2693,10 +3315,15 @@
               "urn:gascity:error:invalid-cursor",
               "urn:gascity:error:invalid-idempotency-key",
               "urn:gascity:error:invalid-request",
+              "urn:gascity:error:key-reuse",
+              "urn:gascity:error:kind-not-enabled",
               "urn:gascity:error:mail-not-found",
+              "urn:gascity:error:mail-not-persisted",
               "urn:gascity:error:method-not-allowed",
               "urn:gascity:error:not-implemented",
+              "urn:gascity:error:op-already-failed",
               "urn:gascity:error:op-journal-unavailable",
+              "urn:gascity:error:op-not-found",
               "urn:gascity:error:operation-in-progress",
               "urn:gascity:error:order-not-found",
               "urn:gascity:error:pack-credential-required",
@@ -2704,6 +3331,7 @@
               "urn:gascity:error:patch-not-found",
               "urn:gascity:error:payload-too-large",
               "urn:gascity:error:provider-not-found",
+              "urn:gascity:error:request-not-found",
               "urn:gascity:error:rig-not-found",
               "urn:gascity:error:run-not-found",
               "urn:gascity:error:scope-not-found",
@@ -2721,6 +3349,7 @@
               "urn:gascity:error:wait-not-found",
               "urn:gascity:error:wake-will-not-start",
               "urn:gascity:error:webhook-rejected",
+              "urn:gascity:error:when-not-supported",
               "urn:gascity:error:workflow-not-found"
             ]
           }
@@ -2780,6 +3409,12 @@
             "$ref": "#/components/schemas/BackendCredentialResolvedPayload"
           },
           {
+            "$ref": "#/components/schemas/BeadClaimFailedPayload"
+          },
+          {
+            "$ref": "#/components/schemas/BeadClaimLoopHeldPayload"
+          },
+          {
             "$ref": "#/components/schemas/BeadClaimRejectedPayload"
           },
           {
@@ -2831,10 +3466,16 @@
             "$ref": "#/components/schemas/ExecutionStepStalledPayload"
           },
           {
+            "$ref": "#/components/schemas/FactRecordedPayload"
+          },
+          {
             "$ref": "#/components/schemas/GroupCreatedEventPayload"
           },
           {
             "$ref": "#/components/schemas/HookClaimReclaimedStalePayload"
+          },
+          {
+            "$ref": "#/components/schemas/HookClaimRefusedPayload"
           },
           {
             "$ref": "#/components/schemas/InboundEventPayload"
@@ -2847,6 +3488,9 @@
           },
           {
             "$ref": "#/components/schemas/NoPayload"
+          },
+          {
+            "$ref": "#/components/schemas/OpChangedPayload"
           },
           {
             "$ref": "#/components/schemas/OpsRecordingDegradedPayload"
@@ -2871,6 +3515,9 @@
           },
           {
             "$ref": "#/components/schemas/Record"
+          },
+          {
+            "$ref": "#/components/schemas/RequestAcceptedPayload"
           },
           {
             "$ref": "#/components/schemas/RequestFailedPayload"
@@ -2907,6 +3554,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionPoolSlotRetiredAtDrainDeadlinePayload"
+          },
+          {
+            "$ref": "#/components/schemas/SessionReleaseDeferredPayload"
           },
           {
             "$ref": "#/components/schemas/SessionResetStalledPayload"
@@ -3576,6 +4226,19 @@
         ],
         "type": "object"
       },
+      "FactRecordedPayload": {
+        "additionalProperties": false,
+        "properties": {
+          "fact": {
+            "$ref": "#/components/schemas/ConversationFact",
+            "description": "The recorded fact."
+          }
+        },
+        "required": [
+          "fact"
+        ],
+        "type": "object"
+      },
       "FanoutPolicy": {
         "additionalProperties": false,
         "properties": {
@@ -4172,6 +4835,64 @@
         ],
         "type": "object"
       },
+      "HookClaimRefusedPayload": {
+        "additionalProperties": false,
+        "properties": {
+          "agent": {
+            "description": "The runtime's GC_ALIAS, else GC_AGENT.",
+            "type": "string"
+          },
+          "bead_epoch": {
+            "description": "The session bead's generation now, normalized as a start normalizes it (empty, zero or unparseable becomes 1), so it compares directly with runtime_epoch. A lower runtime_epoch means the generation moved on after this runtime started. Equal epochs do NOT prove the same incarnation: a start that finds no instance token mints one without bumping the generation.",
+            "type": "string"
+          },
+          "bead_token_fingerprint": {
+            "description": "First 8 hex chars of SHA-256 of the session bead's instance token. Never the token.",
+            "type": "string"
+          },
+          "detail": {
+            "description": "Which identity check refused: session_closed, token_superseded, bead_token_missing, state_not_claim_eligible, session_bead_not_found, not_a_session_bead, or session_id_unset.",
+            "type": "string"
+          },
+          "reason": {
+            "description": "Drain reason the refusal reported: stale_session or missing_session_registration.",
+            "type": "string"
+          },
+          "runtime_epoch": {
+            "description": "The runtime's GC_RUNTIME_EPOCH: the session bead's generation when this runtime was started, with an empty, zero or unparseable generation started as 1.",
+            "type": "string"
+          },
+          "runtime_token_fingerprint": {
+            "description": "First 8 hex chars of SHA-256 of the runtime's instance token. Never the token.",
+            "type": "string"
+          },
+          "session_id": {
+            "description": "The runtime's GC_SESSION_ID (its session bead id); empty for session_id_unset.",
+            "type": "string"
+          },
+          "session_name": {
+            "description": "The runtime's GC_SESSION_NAME.",
+            "type": "string"
+          },
+          "state": {
+            "description": "The session bead's state when it was read.",
+            "type": "string"
+          },
+          "template": {
+            "description": "The runtime's GC_TEMPLATE (pool membership).",
+            "type": "string"
+          },
+          "token_matched": {
+            "description": "Whether the runtime's instance token equals the session bead's; absent when no bead was read.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "reason",
+          "detail"
+        ],
+        "type": "object"
+      },
       "InboundEventPayload": {
         "additionalProperties": false,
         "properties": {
@@ -4364,6 +5085,49 @@
             "description": "The list of items.",
             "items": {
               "$ref": "#/components/schemas/CityPendingEntry"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "next_cursor": {
+            "description": "Cursor for the next page of results.",
+            "type": "string"
+          },
+          "partial": {
+            "description": "True when one or more backends failed and the list is incomplete.",
+            "type": "boolean"
+          },
+          "partial_errors": {
+            "description": "Human-readable errors from backends that failed during aggregation.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "total": {
+            "description": "Total number of items matching the query.",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total"
+        ],
+        "type": "object"
+      },
+      "ListBodyConversationOp": {
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "description": "The list of items.",
+            "items": {
+              "$ref": "#/components/schemas/ConversationOp"
             },
             "type": [
               "array",
@@ -5300,6 +6064,18 @@
             "description": "Resource ID.",
             "type": "string"
           },
+          "idempotency_key": {
+            "description": "The key the request was recorded under: the client's Idempotency-Key, one the server minted when the request carried none, or, for a stop of a known turn, stop:\u003cgeneration\u003e:\u003cturn\u003e, so two stops of one turn are one operation. Retry with the Idempotency-Key to get this request's outcome instead of acting again.",
+            "type": "string"
+          },
+          "op": {
+            "$ref": "#/components/schemas/ConversationOp",
+            "description": "The operation the request was recorded as."
+          },
+          "replayed": {
+            "description": "True when this answers a retry of a request that already finished: nothing was executed again, and op carries the stored outcome. A replayed stop never interrupts a later turn.",
+            "type": "boolean"
+          },
           "status": {
             "description": "Operation result.",
             "examples": [
@@ -5310,6 +6086,19 @@
         },
         "required": [
           "status"
+        ],
+        "type": "object"
+      },
+      "OpChangedPayload": {
+        "additionalProperties": false,
+        "properties": {
+          "op": {
+            "$ref": "#/components/schemas/ConversationOp",
+            "description": "The operation as its row reads after the change."
+          }
+        },
+        "required": [
+          "op"
         ],
         "type": "object"
       },
@@ -6987,6 +7776,9 @@
           "assignee": {
             "type": "string"
           },
+          "await_type": {
+            "type": "string"
+          },
           "blocked_by": {
             "items": {
               "$ref": "#/components/schemas/ReadyBeadBlocker"
@@ -7175,6 +7967,29 @@
         ],
         "type": "object"
       },
+      "RequestAcceptedPayload": {
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "description": "Which operation was accepted.",
+            "enum": [
+              "session.create",
+              "session.message",
+              "session.submit"
+            ],
+            "type": "string"
+          },
+          "request_id": {
+            "description": "Correlation ID from the 202 response.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "request_id",
+          "operation"
+        ],
+        "type": "object"
+      },
       "RequestFailedPayload": {
         "additionalProperties": false,
         "properties": {
@@ -7216,6 +8031,44 @@
           "operation",
           "error_code",
           "error_message"
+        ],
+        "type": "object"
+      },
+      "RequestOutcome": {
+        "additionalProperties": false,
+        "properties": {
+          "event": {
+            "$ref": "#/components/schemas/TypedEventStreamEnvelope",
+            "description": "The terminal event exactly as /v0/city/{cityName}/events and the event stream deliver it: request.result.session.* for succeeded, request.failed for failed. Absent while pending and for outcome_unknown."
+          },
+          "operation": {
+            "description": "The operation that was accepted.",
+            "enum": [
+              "session.create",
+              "session.message",
+              "session.submit"
+            ],
+            "type": "string"
+          },
+          "request_id": {
+            "description": "The request_id from the 202 response.",
+            "type": "string"
+          },
+          "state": {
+            "description": "pending: the request is still running, or its terminal event is held until the city event log takes it. succeeded: its request.result.* event was recorded; event carries it. failed: its request.failed event was recorded; event carries it. outcome_unknown: the server that accepted the request stopped (or lost the terminal event) before recording an outcome, so the operation may or may not have taken effect; inspect the target resource before retrying.",
+            "enum": [
+              "pending",
+              "succeeded",
+              "failed",
+              "outcome_unknown"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "request_id",
+          "operation",
+          "state"
         ],
         "type": "object"
       },
@@ -7365,6 +8218,21 @@
         ],
         "type": "object"
       },
+      "RigDoctorPatch": {
+        "additionalProperties": false,
+        "properties": {
+          "CensusOwnerNamespace": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "CensusOwnerNamespace"
+        ],
+        "type": "object"
+      },
       "RigPatch": {
         "additionalProperties": false,
         "properties": {
@@ -7385,6 +8253,9 @@
               "string",
               "null"
             ]
+          },
+          "Doctor": {
+            "$ref": "#/components/schemas/RigDoctorPatch"
           },
           "FormulaVars": {
             "additionalProperties": {
@@ -7435,9 +8306,28 @@
       "RigPatchSetInputBody": {
         "additionalProperties": false,
         "properties": {
+          "beads_proxied_idle_timeout": {
+            "description": "Override the rig's beads_proxied_idle_timeout.",
+            "type": "string"
+          },
           "default_branch": {
             "description": "Override mainline branch.",
             "type": "string"
+          },
+          "default_merge_strategy": {
+            "description": "Override the merge strategy gc sling stamps on beads routed into this rig; empty string clears it.",
+            "type": "string"
+          },
+          "doctor": {
+            "$ref": "#/components/schemas/DoctorStruct",
+            "description": "Override rig doctor settings."
+          },
+          "formula_vars": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Rig-scoped formula variable defaults.",
+            "type": "object"
           },
           "name": {
             "description": "Rig name.",
@@ -7452,7 +8342,11 @@
             "type": "string"
           },
           "suspended": {
-            "description": "Override suspended state.",
+            "description": "Deprecated suspension override.",
+            "type": "boolean"
+          },
+          "suspended_on_start": {
+            "description": "Override desired suspension state at city start.",
             "type": "boolean"
           }
         },
@@ -7641,13 +8535,51 @@
         ],
         "type": "object"
       },
+      "RunCancelInterruptFailure": {
+        "additionalProperties": false,
+        "properties": {
+          "error": {
+            "description": "Why the interrupt failed.",
+            "type": "string"
+          },
+          "session": {
+            "description": "Session ID, or the step assignee when it could not be resolved to a session.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session",
+          "error"
+        ],
+        "type": "object"
+      },
       "RunCancelOutputBody": {
         "additionalProperties": false,
         "properties": {
           "closed": {
-            "description": "Count of the run's beads closed by the cancel.",
+            "description": "Count of the run's beads closed by the cancel. Closing is the durable part of a cancel: no closed bead is claimed again.",
             "format": "int64",
             "type": "integer"
+          },
+          "interrupt_failures": {
+            "description": "Holders of an in-progress step the cancel closed whose current turn could not be interrupted. The cancel is durable regardless; stop or suspend these sessions directly.",
+            "items": {
+              "$ref": "#/components/schemas/RunCancelInterruptFailure"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "interrupted": {
+            "description": "IDs of the sessions whose current turn was interrupted because they held an in-progress step the cancel closed. Interrupting ends the agent's turn, the same as POST /session/{id}/stop; for Codex it also closes the session's background terminals. It does not verify that every process the step started has exited, and it cannot undo effects the step already made, such as a push or a call to a remote service. The sessions are not killed; they stay up to serve other work.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
           },
           "run_id": {
             "description": "The canceled run.",
@@ -7810,7 +8742,7 @@
           },
           "status": {
             "$ref": "#/components/schemas/RunStepStatus",
-            "description": "Closed step lifecycle status."
+            "description": "Closed step lifecycle status. Under a terminal run an unfinished step reads the status the run's wind-down closes it with (canceled for a canceled run, skipped otherwise), so it never changes from one terminal status to another; a step that executes after the run settles (the workflow finalizer, the teardown tail) reads its own status until it closes."
           },
           "title": {
             "description": "Step title.",
@@ -8071,6 +9003,34 @@
           "ExpiresAt",
           "BindingGeneration",
           "Metadata"
+        ],
+        "type": "object"
+      },
+      "SessionCommandStatusBody": {
+        "additionalProperties": false,
+        "properties": {
+          "idempotency_key": {
+            "description": "The key the request was recorded under: the client's Idempotency-Key, or one the server minted when the request carried none. Retry with it to get this request's outcome instead of acting again.",
+            "type": "string"
+          },
+          "op": {
+            "$ref": "#/components/schemas/ConversationOp",
+            "description": "The operation the request was recorded as."
+          },
+          "replayed": {
+            "description": "True when this answers a retry of a request that already finished: nothing was executed again, and op carries the stored outcome.",
+            "type": "boolean"
+          },
+          "status": {
+            "description": "Operation result.",
+            "examples": [
+              "ok"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
         ],
         "type": "object"
       },
@@ -8484,6 +9444,63 @@
         "description": "Provider-native transcript frame. Gas City forwards the exact JSON the provider wrote to its session log, so the shape is provider-specific and can be any JSON value. The producing provider is identified by the Provider field on the enclosing envelope; consumers dispatch per-provider frame parsing keyed by that identifier.",
         "title": "Session raw transcript frame"
       },
+      "SessionReleaseDeferredPayload": {
+        "additionalProperties": false,
+        "properties": {
+          "capture": {
+            "description": "\"full\" when the pre-close session bead was read, \"id_only\" when it could not be and only the resolved session ID is known.",
+            "type": "string"
+          },
+          "conditional_write": {
+            "description": "True when the obligation was published through the store's compare-and-set metadata primitive, which makes the write-once guarantee hold across concurrent close processes. False means the store lacked that capability and a read-then-write fallback was used, which two simultaneous closes could race.",
+            "type": "boolean"
+          },
+          "generation": {
+            "description": "Obligation generation. 1 for a first publish; higher only when a degraded ID-only obligation was later replaced by a full capture. A drain acknowledges one generation, never the key as a whole.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "identities": {
+            "description": "Every identifier under which work could be assigned to this session, captured BEFORE the close mutated them. Untruncated.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "marker_error": {
+            "description": "Why the obligation write failed, when MarkerPersisted is false.",
+            "type": "string"
+          },
+          "marker_persisted": {
+            "description": "Whether the obligation was durably written to the session bead. False means the deferred release is unrecoverable by any automated path.",
+            "type": "boolean"
+          },
+          "reason": {
+            "description": "Why the city config was unavailable, as reported at close time.",
+            "type": "string"
+          },
+          "rig_stores_known": {
+            "description": "False when rig stores could not be enumerated (the usual case here, since enumerating them needs the config that failed to load). A drain must treat false as \"scope unknown\", never as \"no rig stores\".",
+            "type": "boolean"
+          },
+          "session_id": {
+            "description": "Canonical session bead ID whose close withheld the release (also the envelope Subject).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "generation",
+          "capture",
+          "rig_stores_known",
+          "marker_persisted",
+          "conditional_write"
+        ],
+        "type": "object"
+      },
       "SessionRenameInputBody": {
         "additionalProperties": false,
         "properties": {
@@ -8559,6 +9576,18 @@
             "description": "Session ID.",
             "type": "string"
           },
+          "idempotency_key": {
+            "description": "The key the request was recorded under: the client's Idempotency-Key, or one the server minted when the request carried none. Retry with it to get this request's outcome instead of a second response.",
+            "type": "string"
+          },
+          "op": {
+            "$ref": "#/components/schemas/ConversationOp",
+            "description": "The operation the request was recorded as."
+          },
+          "replayed": {
+            "description": "True when this answers a retry of a request that already finished: nothing was executed again, and op carries the stored outcome.",
+            "type": "boolean"
+          },
           "status": {
             "description": "Operation result.",
             "examples": [
@@ -8591,6 +9620,9 @@
           "attached": {
             "type": "boolean"
           },
+          "base_state": {
+            "type": "string"
+          },
           "configured_named_session": {
             "type": "boolean"
           },
@@ -8601,6 +9633,9 @@
           "context_window": {
             "format": "int64",
             "type": "integer"
+          },
+          "control_plane": {
+            "type": "boolean"
           },
           "created_at": {
             "type": "string"
@@ -8632,6 +9667,9 @@
           "model": {
             "type": "string"
           },
+          "navigator_schema_version": {
+            "type": "string"
+          },
           "options": {
             "additionalProperties": {
               "type": "string"
@@ -8640,6 +9678,9 @@
           },
           "pool": {
             "type": "string"
+          },
+          "pool_managed": {
+            "type": "boolean"
           },
           "provider": {
             "type": "string"
@@ -8651,9 +9692,13 @@
             "type": "string"
           },
           "running": {
+            "description": "Whether the session's runtime was live when this response was built, in any open state. It observes the runtime, not the agent: on tmux it is true while the session has a pane whose process has not exited, so a pane still running a launch wrapper or shell before the agent starts reads true, and a pane kept by remain-on-exit after its process exited reads false. GET /session/{id} and GET /sessions read the same probe, which tmux serves from a fleet snapshot refreshed at most every 2 s. Point-in-time: a session in a transitional state (creating, start-pending, draining) can start or stop its process right after; a client confirming quiescence should re-read after its last transition settles.",
             "type": "boolean"
           },
           "session_name": {
+            "type": "string"
+          },
+          "session_origin": {
             "type": "string"
           },
           "state": {
@@ -8668,6 +9713,10 @@
           "title": {
             "type": "string"
           },
+          "turn": {
+            "$ref": "#/components/schemas/SessionTurn",
+            "description": "The turn the session's conversation lane last observed, with the runtime's turn capabilities. Set on a single-session read while the city's conversation lane host runs with a kind of [ops] authoritative, once its observer has recorded the session's runtime row."
+          },
           "work_dir": {
             "type": "string"
           }
@@ -8681,8 +9730,24 @@
           "session_name",
           "created_at",
           "attached",
+          "configured_named_session",
+          "pool_managed",
+          "control_plane",
+          "base_state",
+          "navigator_schema_version",
           "running"
         ],
+        "type": "object"
+      },
+      "SessionStopBody": {
+        "additionalProperties": true,
+        "properties": {
+          "turn": {
+            "description": "The turn to stop, as the client saw it (a turn id the session's runtime reported). Only that turn is interrupted: when another turn, or none, is running by then, nothing is sent and the request is refused with 409 turn_not_current. A runtime that does not record turn identity refuses a named turn with 501 turn_identity_unsupported. Omit it to stop whatever turn is running.",
+            "maxLength": 128,
+            "type": "string"
+          }
+        },
         "type": "object"
       },
       "SessionStrandedClaimsPayload": {
@@ -11824,6 +12889,255 @@
         "title": "Structured session transcript response",
         "type": "object"
       },
+      "SessionTurn": {
+        "additionalProperties": false,
+        "properties": {
+          "at": {
+            "description": "When the observer saw the current state begin.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "caps": {
+            "description": "The runtime's turn capabilities (gc.rt.turn.caps): the turn axes, then source, interrupt and replace.",
+            "items": {
+              "$ref": "#/components/schemas/SessionTurnCapPair"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "generation": {
+            "description": "The session generation the turn cells describe.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "id": {
+            "description": "The running turn's id, as the runtime names it.",
+            "type": "string"
+          },
+          "last_at": {
+            "description": "When the observer saw the last turn end.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "last_end": {
+            "description": "Why the last turn ended (completed, interrupted, superseded, ...).",
+            "type": "string"
+          },
+          "last_id": {
+            "description": "The last turn seen to end.",
+            "type": "string"
+          },
+          "observed_at": {
+            "description": "The observer's clock at the observation that last changed the cells.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "state": {
+            "description": "running, ended, or unknown (never observed, or the cells describe another generation). Open: a newer build may add values.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "generation",
+          "state"
+        ],
+        "type": "object"
+      },
+      "SessionTurnCapPair": {
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "description": "Capability name, e.g. start, end, fence, link, source, interrupt, replace.",
+            "type": "string"
+          },
+          "value": {
+            "description": "Capability value.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "value"
+        ],
+        "type": "object"
+      },
+      "SessionTurnCapabilities": {
+        "additionalProperties": false,
+        "properties": {
+          "end": {
+            "description": "How turn ends are known: recorded means every end carries its id and how it ended; inferred means some ends are inferred from the session going idle.",
+            "enum": [
+              "none",
+              "boundary",
+              "inferred",
+              "recorded"
+            ],
+            "type": "string"
+          },
+          "fence": {
+            "description": "How an interrupt could be confined to a named turn: atomic means the runtime refuses to interrupt a turn that is not current; checked means the turn is re-read just before an untargeted interrupt, so a turn starting in between can still be hit; none means an interrupt cannot be aimed at a turn.",
+            "enum": [
+              "none",
+              "checked",
+              "atomic"
+            ],
+            "type": "string"
+          },
+          "interrupt": {
+            "description": "How the runtime interrupts the session's turn. unsupported forces fence none.",
+            "enum": [
+              "keystroke",
+              "protocol",
+              "unsupported"
+            ],
+            "type": "string"
+          },
+          "link": {
+            "description": "How a delivery is tied to the turn it started: exact means the runtime names it; correlated means it is matched by observation.",
+            "enum": [
+              "none",
+              "correlated",
+              "exact"
+            ],
+            "type": "string"
+          },
+          "lossless": {
+            "description": "Every turn since the last read can be recovered from the next one.",
+            "type": "boolean"
+          },
+          "start": {
+            "description": "How turn starts are known: recorded means every start carries its turn id.",
+            "enum": [
+              "none",
+              "boundary",
+              "recorded"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "start",
+          "end",
+          "fence",
+          "link",
+          "lossless",
+          "interrupt"
+        ],
+        "type": "object"
+      },
+      "SessionTurnCurrent": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "description": "The turn's id, as the source records it. Opaque; compare for equality only.",
+            "type": "string"
+          },
+          "started_at": {
+            "description": "When the turn started, at the source's precision; absent when unknown.",
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "SessionTurnEnded": {
+        "additionalProperties": false,
+        "properties": {
+          "ended_at": {
+            "description": "When the turn ended: the source's time, or, for an inferred end, the server's when the read inferred it; absent when unknown. Each read infers an end anew, so an inferred end's time can differ between reads, and a read that cannot confirm the session idle reports that turn current again.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "description": "The turn's id, as the source records it. Opaque; compare for equality only.",
+            "type": "string"
+          },
+          "inferred": {
+            "description": "The end was inferred from the session going idle, not recorded.",
+            "type": "boolean"
+          },
+          "started_at": {
+            "description": "When the turn started, at the source's precision; absent when unknown.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "status": {
+            "description": "How the turn ended: completed, cancelled or failed (the runtime's spelling); absent when the source closed it only because a newer turn started.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "inferred"
+        ],
+        "type": "object"
+      },
+      "SessionTurnResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "capabilities": {
+            "$ref": "#/components/schemas/SessionTurnCapabilities",
+            "description": "How far the source's answer can be trusted."
+          },
+          "current": {
+            "$ref": "#/components/schemas/SessionTurnCurrent",
+            "description": "The turn in progress. Absent when no turn is running, or when the observation is not observed."
+          },
+          "detail": {
+            "description": "Why the observation is not observed.",
+            "type": "string"
+          },
+          "observation": {
+            "description": "What this read saw. observed: current and recent are this read's answer, and an absent current means no turn is running. unavailable: the source exists but could not be read now (a transcript not written yet, no conversation key yet, a runtime that did not answer); the session's turns are unknown, not idle, so retry. unsupported: the session's turns cannot be identified (no source, or a transcript that records turns without ids).",
+            "enum": [
+              "observed",
+              "unavailable",
+              "unsupported"
+            ],
+            "type": "string"
+          },
+          "observed_at": {
+            "description": "When the read was made, on the server's clock. Present only when observed.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "recent": {
+            "description": "Turns that ended, newest first. A transcript source reports at most 8 from a bounded window, so a turn that ends between two reads can fall out of it unless capabilities.lossless is true.",
+            "items": {
+              "$ref": "#/components/schemas/SessionTurnEnded"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "session_id": {
+            "description": "The resolved session id.",
+            "type": "string"
+          },
+          "source": {
+            "description": "Where the session's turns are read from: protocol (the runtime observes turns itself), transcript (the provider's transcript of the session's own conversation, on this host), or none (the session's turns cannot be identified here). Fixed for the session's generation.",
+            "enum": [
+              "protocol",
+              "transcript",
+              "none"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "source",
+          "capabilities",
+          "observation"
+        ],
+        "type": "object"
+      },
       "SessionUnknownStatePayload": {
         "additionalProperties": false,
         "properties": {
@@ -13336,6 +14650,8 @@
         "discriminator": {
           "mapping": {
             "backend.credential_resolved": "#/components/schemas/TypedEventStreamEnvelopeBackendCredentialResolved",
+            "bead.claim_failed": "#/components/schemas/TypedEventStreamEnvelopeBeadClaimFailed",
+            "bead.claim_loop_held": "#/components/schemas/TypedEventStreamEnvelopeBeadClaimLoopHeld",
             "bead.claim_rejected": "#/components/schemas/TypedEventStreamEnvelopeBeadClaimRejected",
             "bead.claim_released": "#/components/schemas/TypedEventStreamEnvelopeBeadClaimReleased",
             "bead.closed": "#/components/schemas/TypedEventStreamEnvelopeBeadClosed",
@@ -13376,11 +14692,13 @@
             "extmsg.outbound": "#/components/schemas/TypedEventStreamEnvelopeExtmsgOutbound",
             "extmsg.outbound_channel_mismatch": "#/components/schemas/TypedEventStreamEnvelopeExtmsgOutboundChannelMismatch",
             "extmsg.unbound": "#/components/schemas/TypedEventStreamEnvelopeExtmsgUnbound",
+            "fact.recorded": "#/components/schemas/TypedEventStreamEnvelopeFactRecorded",
             "gc.store.disk_critical": "#/components/schemas/TypedEventStreamEnvelopeGcStoreDiskCritical",
             "gc.store.disk_warn": "#/components/schemas/TypedEventStreamEnvelopeGcStoreDiskWarn",
             "gc.store.maintenance.done": "#/components/schemas/TypedEventStreamEnvelopeGcStoreMaintenanceDone",
             "gc.store.maintenance.failed": "#/components/schemas/TypedEventStreamEnvelopeGcStoreMaintenanceFailed",
             "hook.claim.reclaimed_stale": "#/components/schemas/TypedEventStreamEnvelopeHookClaimReclaimedStale",
+            "hook.claim.refused": "#/components/schemas/TypedEventStreamEnvelopeHookClaimRefused",
             "mail.archived": "#/components/schemas/TypedEventStreamEnvelopeMailArchived",
             "mail.deleted": "#/components/schemas/TypedEventStreamEnvelopeMailDeleted",
             "mail.marked_read": "#/components/schemas/TypedEventStreamEnvelopeMailMarkedRead",
@@ -13389,6 +14707,7 @@
             "mail.replied": "#/components/schemas/TypedEventStreamEnvelopeMailReplied",
             "mail.sent": "#/components/schemas/TypedEventStreamEnvelopeMailSent",
             "molecule.resolved": "#/components/schemas/TypedEventStreamEnvelopeMoleculeResolved",
+            "op.changed": "#/components/schemas/TypedEventStreamEnvelopeOpChanged",
             "ops.recording_degraded": "#/components/schemas/TypedEventStreamEnvelopeOpsRecordingDegraded",
             "order.completed": "#/components/schemas/TypedEventStreamEnvelopeOrderCompleted",
             "order.failed": "#/components/schemas/TypedEventStreamEnvelopeOrderFailed",
@@ -13398,6 +14717,7 @@
             "order.suppressed": "#/components/schemas/TypedEventStreamEnvelopeOrderSuppressed",
             "project.identity.stamped": "#/components/schemas/TypedEventStreamEnvelopeProjectIdentityStamped",
             "provider.swapped": "#/components/schemas/TypedEventStreamEnvelopeProviderSwapped",
+            "request.accepted": "#/components/schemas/TypedEventStreamEnvelopeRequestAccepted",
             "request.failed": "#/components/schemas/TypedEventStreamEnvelopeRequestFailed",
             "request.result.city.create": "#/components/schemas/TypedEventStreamEnvelopeRequestResultCityCreate",
             "request.result.city.unregister": "#/components/schemas/TypedEventStreamEnvelopeRequestResultCityUnregister",
@@ -13407,6 +14727,7 @@
             "request.result.session.submit": "#/components/schemas/TypedEventStreamEnvelopeRequestResultSessionSubmit",
             "rig.provision.progress": "#/components/schemas/TypedEventStreamEnvelopeRigProvisionProgress",
             "session.cold_start_timeout": "#/components/schemas/TypedEventStreamEnvelopeSessionColdStartTimeout",
+            "session.config_drift_wave": "#/components/schemas/TypedEventStreamEnvelopeSessionConfigDriftWave",
             "session.conversation_reset": "#/components/schemas/TypedEventStreamEnvelopeSessionConversationReset",
             "session.crashed": "#/components/schemas/TypedEventStreamEnvelopeSessionCrashed",
             "session.demand_claim_divergence": "#/components/schemas/TypedEventStreamEnvelopeSessionDemandClaimDivergence",
@@ -13420,6 +14741,7 @@
             "session.pending_cleared": "#/components/schemas/TypedEventStreamEnvelopeSessionPendingCleared",
             "session.pool_slot_retired_at_drain_deadline": "#/components/schemas/TypedEventStreamEnvelopeSessionPoolSlotRetiredAtDrainDeadline",
             "session.quarantined": "#/components/schemas/TypedEventStreamEnvelopeSessionQuarantined",
+            "session.release_deferred": "#/components/schemas/TypedEventStreamEnvelopeSessionReleaseDeferred",
             "session.reset_stalled": "#/components/schemas/TypedEventStreamEnvelopeSessionResetStalled",
             "session.stopped": "#/components/schemas/TypedEventStreamEnvelopeSessionStopped",
             "session.stranded": "#/components/schemas/TypedEventStreamEnvelopeSessionStranded",
@@ -13456,6 +14778,12 @@
         "oneOf": [
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeBackendCredentialResolved"
+          },
+          {
+            "$ref": "#/components/schemas/TypedEventStreamEnvelopeBeadClaimFailed"
+          },
+          {
+            "$ref": "#/components/schemas/TypedEventStreamEnvelopeBeadClaimLoopHeld"
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeBeadClaimRejected"
@@ -13578,6 +14906,9 @@
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeExtmsgUnbound"
           },
           {
+            "$ref": "#/components/schemas/TypedEventStreamEnvelopeFactRecorded"
+          },
+          {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeGcStoreDiskCritical"
           },
           {
@@ -13591,6 +14922,9 @@
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeHookClaimReclaimedStale"
+          },
+          {
+            "$ref": "#/components/schemas/TypedEventStreamEnvelopeHookClaimRefused"
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeMailArchived"
@@ -13615,6 +14949,9 @@
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeMoleculeResolved"
+          },
+          {
+            "$ref": "#/components/schemas/TypedEventStreamEnvelopeOpChanged"
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeOpsRecordingDegraded"
@@ -13644,6 +14981,9 @@
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeProviderSwapped"
           },
           {
+            "$ref": "#/components/schemas/TypedEventStreamEnvelopeRequestAccepted"
+          },
+          {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeRequestFailed"
           },
           {
@@ -13669,6 +15009,9 @@
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeSessionColdStartTimeout"
+          },
+          {
+            "$ref": "#/components/schemas/TypedEventStreamEnvelopeSessionConfigDriftWave"
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeSessionConversationReset"
@@ -13708,6 +15051,9 @@
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeSessionQuarantined"
+          },
+          {
+            "$ref": "#/components/schemas/TypedEventStreamEnvelopeSessionReleaseDeferred"
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeSessionResetStalled"
@@ -13860,6 +15206,120 @@
           "payload"
         ],
         "title": "TypedEventStreamEnvelope backend.credential_resolved",
+        "type": "object"
+      },
+      "TypedEventStreamEnvelopeBeadClaimFailed": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "depends_on_step_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/BeadClaimFailedPayload"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "step_id": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "bead.claim_failed",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload"
+        ],
+        "title": "TypedEventStreamEnvelope bead.claim_failed",
+        "type": "object"
+      },
+      "TypedEventStreamEnvelopeBeadClaimLoopHeld": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "depends_on_step_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/BeadClaimLoopHeldPayload"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "step_id": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "bead.claim_loop_held",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload"
+        ],
+        "title": "TypedEventStreamEnvelope bead.claim_loop_held",
         "type": "object"
       },
       "TypedEventStreamEnvelopeBeadClaimRejected": {
@@ -15171,9 +16631,11 @@
                 "session.stranded",
                 "session.pool_slot_retired_at_drain_deadline",
                 "session.stranded_claims",
+                "session.release_deferred",
                 "session.unknown_state",
                 "session.wake_refused",
                 "session.reset_stalled",
+                "session.config_drift_wave",
                 "session.work_query_failed",
                 "session.drain_fence_unavailable",
                 "work.started_unrecorded",
@@ -15190,7 +16652,10 @@
                 "bead.worktree.reap_skipped",
                 "bead.claim_rejected",
                 "bead.claim_released",
+                "bead.claim_failed",
+                "bead.claim_loop_held",
                 "hook.claim.reclaimed_stale",
+                "hook.claim.refused",
                 "bead.dead_assignee_reopened",
                 "execution.work_associated",
                 "execution.run_anchored",
@@ -15228,6 +16693,7 @@
                 "request.result.session.submit",
                 "request.result.rig.create",
                 "request.failed",
+                "request.accepted",
                 "rig.provision.progress",
                 "city.created",
                 "city.unregister_requested",
@@ -15266,6 +16732,8 @@
                 "beads.conditional_writes.degraded",
                 "beads.blocked.recomputed",
                 "ops.recording_degraded",
+                "op.changed",
+                "fact.recorded",
                 "storage.binding.converged",
                 "storage.binding.genesis",
                 "storage.binding.unconverged",
@@ -16315,6 +17783,63 @@
         "title": "TypedEventStreamEnvelope extmsg.unbound",
         "type": "object"
       },
+      "TypedEventStreamEnvelopeFactRecorded": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "depends_on_step_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/FactRecordedPayload"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "step_id": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "fact.recorded",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload"
+        ],
+        "title": "TypedEventStreamEnvelope fact.recorded",
+        "type": "object"
+      },
       "TypedEventStreamEnvelopeGcStoreDiskCritical": {
         "additionalProperties": false,
         "properties": {
@@ -16598,6 +18123,63 @@
           "payload"
         ],
         "title": "TypedEventStreamEnvelope hook.claim.reclaimed_stale",
+        "type": "object"
+      },
+      "TypedEventStreamEnvelopeHookClaimRefused": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "depends_on_step_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/HookClaimRefusedPayload"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "step_id": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "hook.claim.refused",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload"
+        ],
+        "title": "TypedEventStreamEnvelope hook.claim.refused",
         "type": "object"
       },
       "TypedEventStreamEnvelopeMailArchived": {
@@ -17054,6 +18636,63 @@
           "payload"
         ],
         "title": "TypedEventStreamEnvelope molecule.resolved",
+        "type": "object"
+      },
+      "TypedEventStreamEnvelopeOpChanged": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "depends_on_step_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/OpChangedPayload"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "step_id": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "op.changed",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload"
+        ],
+        "title": "TypedEventStreamEnvelope op.changed",
         "type": "object"
       },
       "TypedEventStreamEnvelopeOpsRecordingDegraded": {
@@ -17569,6 +19208,63 @@
         "title": "TypedEventStreamEnvelope provider.swapped",
         "type": "object"
       },
+      "TypedEventStreamEnvelopeRequestAccepted": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "depends_on_step_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/RequestAcceptedPayload"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "step_id": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "request.accepted",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload"
+        ],
+        "title": "TypedEventStreamEnvelope request.accepted",
+        "type": "object"
+      },
       "TypedEventStreamEnvelopeRequestFailed": {
         "additionalProperties": false,
         "properties": {
@@ -18080,6 +19776,63 @@
           "payload"
         ],
         "title": "TypedEventStreamEnvelope session.cold_start_timeout",
+        "type": "object"
+      },
+      "TypedEventStreamEnvelopeSessionConfigDriftWave": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "depends_on_step_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/NoPayload"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "step_id": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "session.config_drift_wave",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload"
+        ],
+        "title": "TypedEventStreamEnvelope session.config_drift_wave",
         "type": "object"
       },
       "TypedEventStreamEnvelopeSessionConversationReset": {
@@ -18821,6 +20574,63 @@
           "payload"
         ],
         "title": "TypedEventStreamEnvelope session.quarantined",
+        "type": "object"
+      },
+      "TypedEventStreamEnvelopeSessionReleaseDeferred": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "depends_on_step_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/SessionReleaseDeferredPayload"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "step_id": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "session.release_deferred",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload"
+        ],
+        "title": "TypedEventStreamEnvelope session.release_deferred",
         "type": "object"
       },
       "TypedEventStreamEnvelopeSessionResetStalled": {
@@ -20538,6 +22348,8 @@
         "discriminator": {
           "mapping": {
             "backend.credential_resolved": "#/components/schemas/TypedTaggedEventStreamEnvelopeBackendCredentialResolved",
+            "bead.claim_failed": "#/components/schemas/TypedTaggedEventStreamEnvelopeBeadClaimFailed",
+            "bead.claim_loop_held": "#/components/schemas/TypedTaggedEventStreamEnvelopeBeadClaimLoopHeld",
             "bead.claim_rejected": "#/components/schemas/TypedTaggedEventStreamEnvelopeBeadClaimRejected",
             "bead.claim_released": "#/components/schemas/TypedTaggedEventStreamEnvelopeBeadClaimReleased",
             "bead.closed": "#/components/schemas/TypedTaggedEventStreamEnvelopeBeadClosed",
@@ -20578,11 +22390,13 @@
             "extmsg.outbound": "#/components/schemas/TypedTaggedEventStreamEnvelopeExtmsgOutbound",
             "extmsg.outbound_channel_mismatch": "#/components/schemas/TypedTaggedEventStreamEnvelopeExtmsgOutboundChannelMismatch",
             "extmsg.unbound": "#/components/schemas/TypedTaggedEventStreamEnvelopeExtmsgUnbound",
+            "fact.recorded": "#/components/schemas/TypedTaggedEventStreamEnvelopeFactRecorded",
             "gc.store.disk_critical": "#/components/schemas/TypedTaggedEventStreamEnvelopeGcStoreDiskCritical",
             "gc.store.disk_warn": "#/components/schemas/TypedTaggedEventStreamEnvelopeGcStoreDiskWarn",
             "gc.store.maintenance.done": "#/components/schemas/TypedTaggedEventStreamEnvelopeGcStoreMaintenanceDone",
             "gc.store.maintenance.failed": "#/components/schemas/TypedTaggedEventStreamEnvelopeGcStoreMaintenanceFailed",
             "hook.claim.reclaimed_stale": "#/components/schemas/TypedTaggedEventStreamEnvelopeHookClaimReclaimedStale",
+            "hook.claim.refused": "#/components/schemas/TypedTaggedEventStreamEnvelopeHookClaimRefused",
             "mail.archived": "#/components/schemas/TypedTaggedEventStreamEnvelopeMailArchived",
             "mail.deleted": "#/components/schemas/TypedTaggedEventStreamEnvelopeMailDeleted",
             "mail.marked_read": "#/components/schemas/TypedTaggedEventStreamEnvelopeMailMarkedRead",
@@ -20591,6 +22405,7 @@
             "mail.replied": "#/components/schemas/TypedTaggedEventStreamEnvelopeMailReplied",
             "mail.sent": "#/components/schemas/TypedTaggedEventStreamEnvelopeMailSent",
             "molecule.resolved": "#/components/schemas/TypedTaggedEventStreamEnvelopeMoleculeResolved",
+            "op.changed": "#/components/schemas/TypedTaggedEventStreamEnvelopeOpChanged",
             "ops.recording_degraded": "#/components/schemas/TypedTaggedEventStreamEnvelopeOpsRecordingDegraded",
             "order.completed": "#/components/schemas/TypedTaggedEventStreamEnvelopeOrderCompleted",
             "order.failed": "#/components/schemas/TypedTaggedEventStreamEnvelopeOrderFailed",
@@ -20600,6 +22415,7 @@
             "order.suppressed": "#/components/schemas/TypedTaggedEventStreamEnvelopeOrderSuppressed",
             "project.identity.stamped": "#/components/schemas/TypedTaggedEventStreamEnvelopeProjectIdentityStamped",
             "provider.swapped": "#/components/schemas/TypedTaggedEventStreamEnvelopeProviderSwapped",
+            "request.accepted": "#/components/schemas/TypedTaggedEventStreamEnvelopeRequestAccepted",
             "request.failed": "#/components/schemas/TypedTaggedEventStreamEnvelopeRequestFailed",
             "request.result.city.create": "#/components/schemas/TypedTaggedEventStreamEnvelopeRequestResultCityCreate",
             "request.result.city.unregister": "#/components/schemas/TypedTaggedEventStreamEnvelopeRequestResultCityUnregister",
@@ -20609,6 +22425,7 @@
             "request.result.session.submit": "#/components/schemas/TypedTaggedEventStreamEnvelopeRequestResultSessionSubmit",
             "rig.provision.progress": "#/components/schemas/TypedTaggedEventStreamEnvelopeRigProvisionProgress",
             "session.cold_start_timeout": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionColdStartTimeout",
+            "session.config_drift_wave": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionConfigDriftWave",
             "session.conversation_reset": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionConversationReset",
             "session.crashed": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionCrashed",
             "session.demand_claim_divergence": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionDemandClaimDivergence",
@@ -20622,6 +22439,7 @@
             "session.pending_cleared": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionPendingCleared",
             "session.pool_slot_retired_at_drain_deadline": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionPoolSlotRetiredAtDrainDeadline",
             "session.quarantined": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionQuarantined",
+            "session.release_deferred": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionReleaseDeferred",
             "session.reset_stalled": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionResetStalled",
             "session.stopped": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionStopped",
             "session.stranded": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionStranded",
@@ -20658,6 +22476,12 @@
         "oneOf": [
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeBackendCredentialResolved"
+          },
+          {
+            "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeBeadClaimFailed"
+          },
+          {
+            "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeBeadClaimLoopHeld"
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeBeadClaimRejected"
@@ -20780,6 +22604,9 @@
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeExtmsgUnbound"
           },
           {
+            "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeFactRecorded"
+          },
+          {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeGcStoreDiskCritical"
           },
           {
@@ -20793,6 +22620,9 @@
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeHookClaimReclaimedStale"
+          },
+          {
+            "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeHookClaimRefused"
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeMailArchived"
@@ -20817,6 +22647,9 @@
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeMoleculeResolved"
+          },
+          {
+            "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeOpChanged"
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeOpsRecordingDegraded"
@@ -20846,6 +22679,9 @@
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeProviderSwapped"
           },
           {
+            "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeRequestAccepted"
+          },
+          {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeRequestFailed"
           },
           {
@@ -20871,6 +22707,9 @@
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionColdStartTimeout"
+          },
+          {
+            "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionConfigDriftWave"
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionConversationReset"
@@ -20910,6 +22749,9 @@
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionQuarantined"
+          },
+          {
+            "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionReleaseDeferred"
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionResetStalled"
@@ -21066,6 +22908,128 @@
           "city"
         ],
         "title": "TypedTaggedEventStreamEnvelope backend.credential_resolved",
+        "type": "object"
+      },
+      "TypedTaggedEventStreamEnvelopeBeadClaimFailed": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "city": {
+            "type": "string"
+          },
+          "depends_on_step_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/BeadClaimFailedPayload"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "step_id": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "bead.claim_failed",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload",
+          "city"
+        ],
+        "title": "TypedTaggedEventStreamEnvelope bead.claim_failed",
+        "type": "object"
+      },
+      "TypedTaggedEventStreamEnvelopeBeadClaimLoopHeld": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "city": {
+            "type": "string"
+          },
+          "depends_on_step_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/BeadClaimLoopHeldPayload"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "step_id": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "bead.claim_loop_held",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload",
+          "city"
+        ],
+        "title": "TypedTaggedEventStreamEnvelope bead.claim_loop_held",
         "type": "object"
       },
       "TypedTaggedEventStreamEnvelopeBeadClaimRejected": {
@@ -22468,9 +24432,11 @@
                 "session.stranded",
                 "session.pool_slot_retired_at_drain_deadline",
                 "session.stranded_claims",
+                "session.release_deferred",
                 "session.unknown_state",
                 "session.wake_refused",
                 "session.reset_stalled",
+                "session.config_drift_wave",
                 "session.work_query_failed",
                 "session.drain_fence_unavailable",
                 "work.started_unrecorded",
@@ -22487,7 +24453,10 @@
                 "bead.worktree.reap_skipped",
                 "bead.claim_rejected",
                 "bead.claim_released",
+                "bead.claim_failed",
+                "bead.claim_loop_held",
                 "hook.claim.reclaimed_stale",
+                "hook.claim.refused",
                 "bead.dead_assignee_reopened",
                 "execution.work_associated",
                 "execution.run_anchored",
@@ -22525,6 +24494,7 @@
                 "request.result.session.submit",
                 "request.result.rig.create",
                 "request.failed",
+                "request.accepted",
                 "rig.provision.progress",
                 "city.created",
                 "city.unregister_requested",
@@ -22563,6 +24533,8 @@
                 "beads.conditional_writes.degraded",
                 "beads.blocked.recomputed",
                 "ops.recording_degraded",
+                "op.changed",
+                "fact.recorded",
                 "storage.binding.converged",
                 "storage.binding.genesis",
                 "storage.binding.unconverged",
@@ -23685,6 +25657,67 @@
         "title": "TypedTaggedEventStreamEnvelope extmsg.unbound",
         "type": "object"
       },
+      "TypedTaggedEventStreamEnvelopeFactRecorded": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "city": {
+            "type": "string"
+          },
+          "depends_on_step_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/FactRecordedPayload"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "step_id": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "fact.recorded",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload",
+          "city"
+        ],
+        "title": "TypedTaggedEventStreamEnvelope fact.recorded",
+        "type": "object"
+      },
       "TypedTaggedEventStreamEnvelopeGcStoreDiskCritical": {
         "additionalProperties": false,
         "properties": {
@@ -23988,6 +26021,67 @@
           "city"
         ],
         "title": "TypedTaggedEventStreamEnvelope hook.claim.reclaimed_stale",
+        "type": "object"
+      },
+      "TypedTaggedEventStreamEnvelopeHookClaimRefused": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "city": {
+            "type": "string"
+          },
+          "depends_on_step_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/HookClaimRefusedPayload"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "step_id": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "hook.claim.refused",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload",
+          "city"
+        ],
+        "title": "TypedTaggedEventStreamEnvelope hook.claim.refused",
         "type": "object"
       },
       "TypedTaggedEventStreamEnvelopeMailArchived": {
@@ -24476,6 +26570,67 @@
           "city"
         ],
         "title": "TypedTaggedEventStreamEnvelope molecule.resolved",
+        "type": "object"
+      },
+      "TypedTaggedEventStreamEnvelopeOpChanged": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "city": {
+            "type": "string"
+          },
+          "depends_on_step_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/OpChangedPayload"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "step_id": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "op.changed",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload",
+          "city"
+        ],
+        "title": "TypedTaggedEventStreamEnvelope op.changed",
         "type": "object"
       },
       "TypedTaggedEventStreamEnvelopeOpsRecordingDegraded": {
@@ -25027,6 +27182,67 @@
         "title": "TypedTaggedEventStreamEnvelope provider.swapped",
         "type": "object"
       },
+      "TypedTaggedEventStreamEnvelopeRequestAccepted": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "city": {
+            "type": "string"
+          },
+          "depends_on_step_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/RequestAcceptedPayload"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "step_id": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "request.accepted",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload",
+          "city"
+        ],
+        "title": "TypedTaggedEventStreamEnvelope request.accepted",
+        "type": "object"
+      },
       "TypedTaggedEventStreamEnvelopeRequestFailed": {
         "additionalProperties": false,
         "properties": {
@@ -25574,6 +27790,67 @@
           "city"
         ],
         "title": "TypedTaggedEventStreamEnvelope session.cold_start_timeout",
+        "type": "object"
+      },
+      "TypedTaggedEventStreamEnvelopeSessionConfigDriftWave": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "city": {
+            "type": "string"
+          },
+          "depends_on_step_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/NoPayload"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "step_id": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "session.config_drift_wave",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload",
+          "city"
+        ],
+        "title": "TypedTaggedEventStreamEnvelope session.config_drift_wave",
         "type": "object"
       },
       "TypedTaggedEventStreamEnvelopeSessionConversationReset": {
@@ -26367,6 +28644,67 @@
           "city"
         ],
         "title": "TypedTaggedEventStreamEnvelope session.quarantined",
+        "type": "object"
+      },
+      "TypedTaggedEventStreamEnvelopeSessionReleaseDeferred": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "city": {
+            "type": "string"
+          },
+          "depends_on_step_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/SessionReleaseDeferredPayload"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "step_id": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "session.release_deferred",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload",
+          "city"
+        ],
+        "title": "TypedTaggedEventStreamEnvelope session.release_deferred",
         "type": "object"
       },
       "TypedTaggedEventStreamEnvelopeSessionResetStalled": {
@@ -35615,6 +37953,7 @@
         "summary": "Get v0 city by city name events"
       },
       "post": {
+        "description": "Appends a caller-authored event to the city's event log. op.changed and fact.recorded, which the controller derives from operation-journal rows, are refused 422.",
         "operationId": "emit-event",
         "parameters": [
           {
@@ -40057,6 +42396,7 @@
         "summary": "Get v0 city by city name mail"
       },
       "post": {
+        "description": "Send a mail message. Returns 201 with the stored message, or 202 when the write is unconfirmed (see the 202 response). A message verified NOT stored is a 500; re-send it.",
         "operationId": "send-mail",
         "parameters": [
           {
@@ -40122,7 +42462,37 @@
               },
               "X-GC-Index": {
                 "schema": {
-                  "description": "City event sequence captured before this response's state was read. Resume or block after it to observe every change made through this server that the body does not reflect; a change another process writes directly to the city's stores is reflected once this server applies its event.",
+                  "description": "Latest event sequence number.",
+                  "format": "int64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Message"
+                }
+              }
+            },
+            "description": "Delivery unconfirmed: the store reported the message created but it could not be read back, so it may or may not have landed. The body carries its id; check storage for that id before re-sending (a blind re-send may duplicate it). A retry with the same Idempotency-Key replays this 202 without writing again.",
+            "headers": {
+              "X-GC-Cache-Age-S": {
+                "schema": {
+                  "description": "Age in seconds of the CachingStore snapshot that served this response (0 if not applicable).",
+                  "format": "double",
+                  "type": "number"
+                }
+              },
+              "X-GC-Index": {
+                "schema": {
+                  "description": "Latest event sequence number.",
                   "format": "int64",
                   "minimum": 0,
                   "type": "integer"
@@ -41202,6 +43572,7 @@
     },
     "/v0/city/{cityName}/mail/{id}/reply": {
       "post": {
+        "description": "Reply to a mail message. Returns 201 with the stored reply, or 202 when the write is unconfirmed (see the 202 response). A reply verified NOT stored is a 500; re-send it.",
         "operationId": "reply-mail",
         "parameters": [
           {
@@ -41287,7 +43658,37 @@
               },
               "X-GC-Index": {
                 "schema": {
-                  "description": "City event sequence captured before this response's state was read. Resume or block after it to observe every change made through this server that the body does not reflect; a change another process writes directly to the city's stores is reflected once this server applies its event.",
+                  "description": "Latest event sequence number.",
+                  "format": "int64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Message"
+                }
+              }
+            },
+            "description": "Delivery unconfirmed: the store reported the reply created but it could not be read back, so it may or may not have landed. The body carries its id; check storage for that id before re-sending (a blind re-send may duplicate it). A retry with the same Idempotency-Key replays this 202 without writing again.",
+            "headers": {
+              "X-GC-Cache-Age-S": {
+                "schema": {
+                  "description": "Age in seconds of the CachingStore snapshot that served this response (0 if not applicable).",
+                  "format": "double",
+                  "type": "number"
+                }
+              },
+              "X-GC-Index": {
+                "schema": {
+                  "description": "Latest event sequence number.",
                   "format": "int64",
                   "minimum": 0,
                   "type": "integer"
@@ -46343,6 +48744,126 @@
         "summary": "Get v0 city by city name readiness"
       }
     },
+    "/v0/city/{cityName}/request/{requestId}": {
+      "get": {
+        "description": "Reads the outcome of a session create, message or submit request by the request_id its 202 returned, so a client that missed the request.result.* or request.failed event (a dropped stream, a supervisor restart) can still learn it. after_seq is the event_cursor of the same 202: the outcome is derived from the persisted city event log after it, so it survives a supervisor restart and lasts as long as the log retains the request's events. pending means the request is still running, or its terminal event is held until the log takes it; succeeded and failed carry the terminal event exactly as the event stream delivered it; outcome_unknown means the server that accepted the request stopped before recording an outcome, so the operation may or may not have taken effect. An id this city did not accept after after_seq, or whose events have aged out of the log, is a 404 request-not-found.",
+        "operationId": "get-request-outcome",
+        "parameters": [
+          {
+            "description": "City name.",
+            "in": "path",
+            "name": "cityName",
+            "required": true,
+            "schema": {
+              "description": "City name.",
+              "minLength": 1,
+              "pattern": "\\S",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The request_id from an async session request's 202 response.",
+            "in": "path",
+            "name": "requestId",
+            "required": true,
+            "schema": {
+              "description": "The request_id from an async session request's 202 response.",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The event_cursor from the same 202 response. The request's request.accepted marker and terminal event both follow it, so the lookup reads only the events after it.",
+            "explode": false,
+            "in": "query",
+            "name": "after_seq",
+            "required": true,
+            "schema": {
+              "description": "The event_cursor from the same 202 response. The request's request.accepted marker and terminal event both follow it, so the lookup reads only the events after it.",
+              "pattern": "^[0-9]+$",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RequestOutcome"
+                }
+              }
+            },
+            "description": "OK",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Not Found",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Unprocessable Entity",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Internal Server Error",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Service Unavailable",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          }
+        },
+        "summary": "Get the outcome of an async session request"
+      }
+    },
     "/v0/city/{cityName}/rig/{name}": {
       "delete": {
         "operationId": "delete-v0-city-by-city-name-rig-by-name",
@@ -47210,6 +49731,7 @@
     },
     "/v0/city/{cityName}/runs": {
       "get": {
+        "description": "Run reads are a projection of the city event log, not a direct store read. A change the supervisor makes (sling, cancel, its own step writes) is in the log when the write returns and reaches these reads on the projection's next poll, normally within about a second; a successful POST /runs/{run_id}/cancel is reflected before its response. A worker's `gc hook --claim` (the claim and the hook's own follow-up writes) and `gc bd close` record their changes in the log before the command returns, and these reads pick them up on the next poll. No fixed bound is promised: on a slow store the recording itself takes store reads, and claims were measured visible 1 to 8 seconds after they landed. Any other change another process writes straight to the bead store (such as a `bd close` or `bd update` run without gc), or one of those changes the worker could not record, reaches the log, and these reads, when the supervisor first reads it back from the store: a live read of the run's steps, or its periodic store reconcile (normally every 30 to 120 seconds, by store size and latency). From then on these reads agree with GET /bead/{id}, which serves the same supervisor view.",
         "operationId": "get-v0-city-by-city-name-runs",
         "parameters": [
           {
@@ -47304,6 +49826,7 @@
     },
     "/v0/city/{cityName}/runs/census": {
       "get": {
+        "description": "Run reads are a projection of the city event log, not a direct store read. A change the supervisor makes (sling, cancel, its own step writes) is in the log when the write returns and reaches these reads on the projection's next poll, normally within about a second; a successful POST /runs/{run_id}/cancel is reflected before its response. A worker's `gc hook --claim` (the claim and the hook's own follow-up writes) and `gc bd close` record their changes in the log before the command returns, and these reads pick them up on the next poll. No fixed bound is promised: on a slow store the recording itself takes store reads, and claims were measured visible 1 to 8 seconds after they landed. Any other change another process writes straight to the bead store (such as a `bd close` or `bd update` run without gc), or one of those changes the worker could not record, reaches the log, and these reads, when the supervisor first reads it back from the store: a live read of the run's steps, or its periodic store reconcile (normally every 30 to 120 seconds, by store size and latency). From then on these reads agree with GET /bead/{id}, which serves the same supervisor view.",
         "operationId": "get-v0-city-by-city-name-runs-census",
         "parameters": [
           {
@@ -47386,6 +49909,7 @@
     },
     "/v0/city/{cityName}/runs/{run_id}": {
       "get": {
+        "description": "Run reads are a projection of the city event log, not a direct store read. A change the supervisor makes (sling, cancel, its own step writes) is in the log when the write returns and reaches these reads on the projection's next poll, normally within about a second; a successful POST /runs/{run_id}/cancel is reflected before its response. A worker's `gc hook --claim` (the claim and the hook's own follow-up writes) and `gc bd close` record their changes in the log before the command returns, and these reads pick them up on the next poll. No fixed bound is promised: on a slow store the recording itself takes store reads, and claims were measured visible 1 to 8 seconds after they landed. Any other change another process writes straight to the bead store (such as a `bd close` or `bd update` run without gc), or one of those changes the worker could not record, reaches the log, and these reads, when the supervisor first reads it back from the store: a live read of the run's steps, or its periodic store reconcile (normally every 30 to 120 seconds, by store size and latency). From then on these reads agree with GET /bead/{id}, which serves the same supervisor view.",
         "operationId": "get-v0-city-by-city-name-runs-by-run-id",
         "parameters": [
           {
@@ -47495,6 +50019,7 @@
     },
     "/v0/city/{cityName}/runs/{run_id}/cancel": {
       "post": {
+        "description": "A successful cancel folds its own writes into the run projection before it responds, so a GET /runs/{run_id} or /runs/{run_id}/steps issued after the 202 reports the run and its open steps canceled.",
         "operationId": "post-v0-city-by-city-name-runs-by-run-id-cancel",
         "parameters": [
           {
@@ -47630,6 +50155,7 @@
     },
     "/v0/city/{cityName}/runs/{run_id}/steps": {
       "get": {
+        "description": "Run reads are a projection of the city event log, not a direct store read. A change the supervisor makes (sling, cancel, its own step writes) is in the log when the write returns and reaches these reads on the projection's next poll, normally within about a second; a successful POST /runs/{run_id}/cancel is reflected before its response. A worker's `gc hook --claim` (the claim and the hook's own follow-up writes) and `gc bd close` record their changes in the log before the command returns, and these reads pick them up on the next poll. No fixed bound is promised: on a slow store the recording itself takes store reads, and claims were measured visible 1 to 8 seconds after they landed. Any other change another process writes straight to the bead store (such as a `bd close` or `bd update` run without gc), or one of those changes the worker could not record, reaches the log, and these reads, when the supervisor first reads it back from the store: a live read of the run's steps, or its periodic store reconcile (normally every 30 to 120 seconds, by store size and latency). From then on these reads agree with GET /bead/{id}, which serves the same supervisor view.",
         "operationId": "get-v0-city-by-city-name-runs-by-run-id-steps",
         "parameters": [
           {
@@ -48746,6 +51272,7 @@
     },
     "/v0/city/{cityName}/session/{id}/close": {
       "post": {
+        "description": "Ends the session permanently: stops its runtime and closes its session bead. Closing a session that is already closed answers 200, so a retry is safe; address it by session ID, because a closed session no longer resolves by its alias or name. A close the store committed but could not read back in time is settled by re-reading the session: when it reads closed the answer is 200, not an error. When it does not, the answer is 503 with detail prefix write_unconfirmed: the close may still land, so re-read the session or retry the close.",
         "operationId": "post-v0-city-by-city-name-session-by-id-close",
         "parameters": [
           {
@@ -48782,13 +51309,22 @@
             }
           },
           {
-            "description": "Permanently delete bead after closing.",
+            "description": "Permanently delete bead after closing. Part of the request an Idempotency-Key names: a same-key retry that changes it is 422, after an API restart too while the close is recorded as an operation, and a replay never deletes. After a restart a same-key retry finds the recorded close by the session ID only: by an alias or session_name, or after a completed delete, it is 404.",
             "explode": false,
             "in": "query",
             "name": "delete",
             "schema": {
-              "description": "Permanently delete bead after closing.",
+              "description": "Permanently delete bead after closing. Part of the request an Idempotency-Key names: a same-key retry that changes it is 422, after an API restart too while the close is recorded as an operation, and a replay never deletes. After a restart a same-key retry finds the recorded close by the session ID only: by an alias or session_name, or after a completed delete, it is 404.",
               "type": "boolean"
+            }
+          },
+          {
+            "description": "Idempotency key for safe retries.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "schema": {
+              "description": "Idempotency key for safe retries.",
+              "type": "string"
             }
           }
         ],
@@ -48797,7 +51333,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/OKResponseBody"
+                  "$ref": "#/components/schemas/SessionCommandStatusBody"
                 }
               }
             },
@@ -48919,6 +51455,7 @@
     },
     "/v0/city/{cityName}/session/{id}/kill": {
       "post": {
+        "description": "Force-kills the session's runtime without discarding its work, as `gc session kill` does: the session is left asleep with sleep_reason killed, a configured named session's respawn circuit breaker is cleared, the controller is asked to reconcile the session, and session.stopped and worker.operation are recorded. A closed session, or one whose runtime is already gone, reports ok. 409 live_subagents refuses a kill that would destroy live background subagents and names them; force overrides it. 409 session_starting is retryable: another holder has the runtime lease.",
         "operationId": "post-v0-city-by-city-name-session-by-id-kill",
         "parameters": [
           {
@@ -48952,6 +51489,25 @@
             "schema": {
               "description": "Session ID, alias, or runtime session_name.",
               "type": "string"
+            }
+          },
+          {
+            "description": "Idempotency key for safe retries.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "schema": {
+              "description": "Idempotency key for safe retries.",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Kill even when the session has live background subagents, or past a hung holder of its runtime lease whose record expired, as gc session kill --force does.",
+            "explode": false,
+            "in": "query",
+            "name": "force",
+            "schema": {
+              "description": "Kill even when the session has live background subagents, or past a hung holder of its runtime lease whose record expired, as gc session kill --force does.",
+              "type": "boolean"
             }
           }
         ],
@@ -49260,6 +51816,672 @@
           }
         },
         "summary": "Send a message to a session"
+      }
+    },
+    "/v0/city/{cityName}/session/{id}/ops": {
+      "get": {
+        "description": "Lists the session's open operations, legacy and lane, in the conversation lane's order. A row this server cannot read is left out and named in partial_errors.",
+        "operationId": "list-session-ops",
+        "parameters": [
+          {
+            "description": "City name.",
+            "in": "path",
+            "name": "cityName",
+            "required": true,
+            "schema": {
+              "description": "City name.",
+              "minLength": 1,
+              "pattern": "\\S",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Session ID, alias, or runtime session_name.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "description": "Session ID, alias, or runtime session_name.",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListBodyConversationOp"
+                }
+              }
+            },
+            "description": "OK",
+            "headers": {
+              "X-GC-Cache-Age-S": {
+                "schema": {
+                  "description": "Age in seconds of the CachingStore snapshot that served this response (0 if not applicable).",
+                  "format": "double",
+                  "type": "number"
+                }
+              },
+              "X-GC-Index": {
+                "schema": {
+                  "description": "City event sequence captured before this response's state was read. Resume or block after it to observe every change made through this server that the body does not reflect; a change another process writes directly to the city's stores is reflected once this server applies its event.",
+                  "format": "int64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Not Found",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Conflict",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Unprocessable Entity",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Internal Server Error",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Service Unavailable",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          }
+        },
+        "summary": "List a session's open operations"
+      },
+      "post": {
+        "description": "Writes a conversation-lane operation, create-if-absent under its id, which derives from the session, the principal and the client key. 201 when this request wrote it, 200 with the stored operation when the same request was proposed before. Only kinds the city's running conversation lane host executes are accepted: those [ops] authoritative listed when the controller started. Any other, or any kind while no lane host runs, is refused 409 kind-not-enabled. A message whose policy.message.when this build's lane does not deliver (now, interrupt) is refused 409 when-not-supported. A client key that already names a different request from the same principal is refused 409 key-reuse, naming the existing op_id. A refused request writes nothing and materializes no named session. Watch op.changed and fact.recorded on the city event stream from the returned cursor; after reconnecting, read a non-terminal operation again with GET .../ops/{op}, whose row is authoritative.",
+        "operationId": "propose-session-op",
+        "parameters": [
+          {
+            "description": "Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.",
+            "in": "header",
+            "name": "X-GC-Request",
+            "required": true,
+            "schema": {
+              "description": "Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "City name.",
+            "in": "path",
+            "name": "cityName",
+            "required": true,
+            "schema": {
+              "description": "City name.",
+              "minLength": 1,
+              "pattern": "\\S",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Session ID, alias, or runtime session_name.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "description": "Session ID, alias, or runtime session_name.",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The client key, when the body does not carry one.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "schema": {
+              "description": "The client key, when the body does not carry one.",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConversationOpProposeBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConversationOpProposeResult"
+                }
+              }
+            },
+            "description": "The same request was proposed before: the stored operation, with created false.",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConversationOpProposeResult"
+                }
+              }
+            },
+            "description": "Created",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Forbidden",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Not Found",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Conflict",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Unprocessable Entity",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Internal Server Error",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Service Unavailable",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          }
+        },
+        "summary": "Propose an operation to a session's conversation lane"
+      }
+    },
+    "/v0/city/{cityName}/session/{id}/ops/{op}": {
+      "get": {
+        "operationId": "get-session-op",
+        "parameters": [
+          {
+            "description": "City name.",
+            "in": "path",
+            "name": "cityName",
+            "required": true,
+            "schema": {
+              "description": "City name.",
+              "minLength": 1,
+              "pattern": "\\S",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Session ID, alias, or runtime session_name.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "description": "Session ID, alias, or runtime session_name.",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Operation id.",
+            "in": "path",
+            "name": "op",
+            "required": true,
+            "schema": {
+              "description": "Operation id.",
+              "pattern": "^[^\\s,\"@#]+-op-[a-z2-7]{26}$",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConversationOp"
+                }
+              }
+            },
+            "description": "OK",
+            "headers": {
+              "X-GC-Cache-Age-S": {
+                "schema": {
+                  "description": "Age in seconds of the CachingStore snapshot that served this response (0 if not applicable).",
+                  "format": "double",
+                  "type": "number"
+                }
+              },
+              "X-GC-Index": {
+                "schema": {
+                  "description": "City event sequence captured before this response's state was read. Resume or block after it to observe every change made through this server that the body does not reflect; a change another process writes directly to the city's stores is reflected once this server applies its event.",
+                  "format": "int64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Not Found",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Conflict",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Unprocessable Entity",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Internal Server Error",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Service Unavailable",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          }
+        },
+        "summary": "Get one of a session's operations"
+      }
+    },
+    "/v0/city/{cityName}/session/{id}/ops/{op}/cancel": {
+      "post": {
+        "description": "Cancels a lane operation. One that has not started closes canceled; one executing records the cancel, and its outcome says who won. A legacy operation is closed only by its legacy path and is refused 409.",
+        "operationId": "cancel-session-op",
+        "parameters": [
+          {
+            "description": "Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.",
+            "in": "header",
+            "name": "X-GC-Request",
+            "required": true,
+            "schema": {
+              "description": "Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "City name.",
+            "in": "path",
+            "name": "cityName",
+            "required": true,
+            "schema": {
+              "description": "City name.",
+              "minLength": 1,
+              "pattern": "\\S",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Session ID, alias, or runtime session_name.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "description": "Session ID, alias, or runtime session_name.",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Operation id.",
+            "in": "path",
+            "name": "op",
+            "required": true,
+            "schema": {
+              "description": "Operation id.",
+              "pattern": "^[^\\s,\"@#]+-op-[a-z2-7]{26}$",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConversationOpCancelBody"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConversationOpCancelResult"
+                }
+              }
+            },
+            "description": "OK",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Forbidden",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Not Found",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Conflict",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Unprocessable Entity",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Internal Server Error",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Service Unavailable",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          }
+        },
+        "summary": "Cancel one of a session's operations"
       }
     },
     "/v0/city/{cityName}/session/{id}/pending": {
@@ -50051,6 +53273,15 @@
               "description": "Session ID, alias, or runtime session_name.",
               "type": "string"
             }
+          },
+          {
+            "description": "Idempotency key for safe retries.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "schema": {
+              "description": "Idempotency key for safe retries.",
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -50377,6 +53608,7 @@
     },
     "/v0/city/{cityName}/session/{id}/stop": {
       "post": {
+        "description": "Stops the session's current turn with a provider-appropriate interrupt. The session stays running and keeps its conversation. For a Codex session it also closes the session's background terminals, the processes Codex keeps running a turn's commands in after the turn is interrupted. That closes all of them, including ones started by earlier turns, such as a dev server. An interrupt_now submit interrupts the turn the same way but leaves background terminals running. A runtime that can interrupt the turn neither by keys nor by protocol gets nothing sent and answers 501 turn_interrupt_unsupported.",
         "operationId": "post-v0-city-by-city-name-session-by-id-stop",
         "parameters": [
           {
@@ -50422,6 +53654,15 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionStopBody"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "content": {
@@ -51090,6 +54331,15 @@
               "description": "Session ID, alias, or runtime session_name.",
               "type": "string"
             }
+          },
+          {
+            "description": "Idempotency key for safe retries.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "schema": {
+              "description": "Idempotency key for safe retries.",
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -51097,7 +54347,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/OKResponseBody"
+                  "$ref": "#/components/schemas/SessionCommandStatusBody"
                 }
               }
             },
@@ -51407,6 +54657,144 @@
           }
         },
         "summary": "Get v0 city by city name session by ID transcript"
+      }
+    },
+    "/v0/city/{cityName}/session/{id}/turn": {
+      "get": {
+        "description": "Reads the session's turn identity, read-only: where its turns are read from (source), how far that answer can be trusted (capabilities), and what one read saw now (observation, current, recent). A session whose turns cannot be identified answers 200 with source none and observation unsupported, never a 5xx; a source that cannot be read now answers 200 with observation unavailable, meaning its turns are unknown, not idle. An open session that no runtime is bound to runs no turn: it answers observed with no current turn, as POST /session/{id}/stop reads it. A closed or unknown session is 404. The read aims nothing at a turn: POST /session/{id}/stop interrupts the turn its turn field names, or whatever turn is current when it names none.",
+        "operationId": "get-v0-city-by-city-name-session-by-id-turn",
+        "parameters": [
+          {
+            "description": "City name.",
+            "in": "path",
+            "name": "cityName",
+            "required": true,
+            "schema": {
+              "description": "City name.",
+              "minLength": 1,
+              "pattern": "\\S",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Session ID, alias, or runtime session_name.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "description": "Session ID, alias, or runtime session_name.",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionTurnResponse"
+                }
+              }
+            },
+            "description": "OK",
+            "headers": {
+              "X-GC-Cache-Age-S": {
+                "schema": {
+                  "description": "Age in seconds of the CachingStore snapshot that served this response (0 if not applicable).",
+                  "format": "double",
+                  "type": "number"
+                }
+              },
+              "X-GC-Index": {
+                "schema": {
+                  "description": "City event sequence captured before this response's state was read. Resume or block after it to observe every change made through this server that the body does not reflect; a change another process writes directly to the city's stores is reflected once this server applies its event.",
+                  "format": "int64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Not Found",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Conflict",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Unprocessable Entity",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Internal Server Error",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Service Unavailable",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          }
+        },
+        "summary": "Get v0 city by city name session by ID turn"
       }
     },
     "/v0/city/{cityName}/session/{id}/unpin": {
@@ -51997,6 +55385,15 @@
               "pattern": "\\S",
               "type": "string"
             }
+          },
+          {
+            "description": "Idempotency key for safe retries.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "schema": {
+              "description": "Idempotency key for safe retries.",
+              "type": "string"
+            }
           }
         ],
         "requestBody": {
@@ -52079,6 +55476,21 @@
               }
             },
             "description": "Not Found",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Conflict",
             "headers": {
               "X-GC-Request-Id": {
                 "$ref": "#/components/headers/X-GC-Request-Id"

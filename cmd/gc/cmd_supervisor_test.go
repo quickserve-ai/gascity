@@ -426,6 +426,74 @@ func TestRenderSupervisorLaunchdTemplateUsesPreserveEnvFromData(t *testing.T) {
 	}
 }
 
+// Without ExitTimeOut, launchd SIGKILLs a booted-out supervisor 5s after its
+// SIGTERM — the same length as a city's default stop grace, so any stop that
+// needs its grace is killed before it can write the clean-exit token
+// (ga-2jjk51: 28 of 107 signal stops on one machine). The plist must give the
+// supervisor one default city's whole worst-case DESTRUCTIVE stop (grace,
+// forced phase, then the bead provider's stop), and launchd must still drop
+// the job before install's unload wait gives up on it.
+func TestRenderSupervisorLaunchdTemplateCoversCityStopBudget(t *testing.T) {
+	content, err := renderSupervisorTemplate(supervisorLaunchdTemplate, &supervisorServiceData{
+		GCPath:       "/usr/local/bin/gc",
+		LogPath:      "/home/user/.gc/supervisor.log",
+		GCHome:       "/home/user/.gc",
+		LaunchdLabel: defaultSupervisorLaunchdLabel,
+		Path:         "/usr/local/bin:/usr/bin:/bin",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const key = "<key>ExitTimeOut</key>"
+	_, rest, found := strings.Cut(content, key)
+	if !found {
+		t.Fatalf("launchd template has no %s; launchd would kill a stopping supervisor after 5s:\n%s", key, content)
+	}
+	rest = strings.TrimSpace(rest)
+	value, _, found := strings.Cut(strings.TrimPrefix(rest, "<integer>"), "</integer>")
+	if !strings.HasPrefix(rest, "<integer>") || !found {
+		t.Fatalf("%s is not followed by an <integer>:\n%s", key, content)
+	}
+	seconds, err := strconv.Atoi(value)
+	if err != nil {
+		t.Fatalf("%s value %q: %v", key, value, err)
+	}
+	exitTimeout := time.Duration(seconds) * time.Second
+	// The 2s is the provider command's WaitDelay in runProviderOpWithEnv.
+	providerStop := providerOpTimeout("stop") + 2*time.Second
+	stopBudget := managedCityStopTimeout(nil) + managedCityForcedStopTimeout(nil) + providerStop
+	if exitTimeout <= stopBudget {
+		t.Errorf("ExitTimeOut = %s, want more than a default city's worst-case destructive stop of %s", exitTimeout, stopBudget)
+	}
+	if exitTimeout >= launchdRefreshWaitTimeout {
+		t.Errorf("ExitTimeOut = %s, want less than launchdRefreshWaitTimeout (%s) so a refresh sees the job unload", exitTimeout, launchdRefreshWaitTimeout)
+	}
+}
+
+// Every wait on a stopping launchd supervisor must outlast the plist's
+// ExitTimeOut. Before ga-2jjk51 launchd killed the job after 5s, which hid
+// waits that were shorter than a real stop: a longer grace turned them into
+// false "stop failed" reports while the stop was still going.
+func TestSupervisorStopWaitsOutlastLaunchdExitTimeout(t *testing.T) {
+	if supervisorStopWaitTimeout <= supervisorLaunchdExitTimeout {
+		t.Errorf("supervisorStopWaitTimeout = %s, want more than ExitTimeOut %s", supervisorStopWaitTimeout, supervisorLaunchdExitTimeout)
+	}
+	if got := supervisorLaunchctlTimeoutFor([]string{"unload", "/tmp/x.plist"}); got <= supervisorLaunchdExitTimeout {
+		t.Errorf("launchctl unload timeout = %s, want more than ExitTimeOut %s: unload blocks until the job exits", got, supervisorLaunchdExitTimeout)
+	}
+	if got := supervisorLaunchctlTimeoutFor([]string{"bootout", "gui/501/com.gascity.supervisor"}); got != supervisorLaunchctlTimeout {
+		t.Errorf("launchctl bootout timeout = %s, want the general %s: bootout signals and returns", got, supervisorLaunchctlTimeout)
+	}
+	cmd := newSupervisorStopCmd(io.Discard, io.Discard)
+	flag := cmd.Flags().Lookup("wait-timeout")
+	if flag == nil {
+		t.Fatal("gc supervisor stop has no --wait-timeout flag")
+	}
+	if flag.DefValue != supervisorStopWaitTimeout.String() {
+		t.Errorf("--wait-timeout default = %s, want %s", flag.DefValue, supervisorStopWaitTimeout)
+	}
+}
+
 func TestRenderSupervisorSystemdTemplate(t *testing.T) {
 	data := &supervisorServiceData{
 		GCPath:        "/usr/local/bin/gc",
@@ -738,6 +806,30 @@ UNRELATED_SECRET=do-not-persist
 	}
 	if _, ok := got["UNRELATED_SECRET"]; ok {
 		t.Fatalf("ExtraEnv should not include non-allowlisted UNRELATED_SECRET: %#v", got)
+	}
+}
+
+// TestBuildSupervisorServiceDataPersistsSchemaSkewEscapeHatch asserts the
+// ga-v2yrs4 guarantee: BD_IGNORE_SCHEMA_SKEW set only in ${GC_HOME}/secrets.env
+// survives plist regeneration from a shell that does not export it. During a
+// fleet schema-skew window the controller's bd calls live or die on this key.
+func TestBuildSupervisorServiceDataPersistsSchemaSkewEscapeHatch(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	t.Setenv("GC_HOME", filepath.Join(homeDir, ".gc"))
+	t.Setenv("PATH", "/usr/local/bin:/usr/bin:/bin")
+	t.Setenv("BD_IGNORE_SCHEMA_SKEW", "")
+
+	writeSupervisorSecretsEnvFile(t, "BD_IGNORE_SCHEMA_SKEW=1\n")
+
+	data, err := buildSupervisorServiceData()
+	if err != nil {
+		t.Fatalf("buildSupervisorServiceData: %v", err)
+	}
+
+	if got := supervisorServiceEnvMap(data.ExtraEnv); got["BD_IGNORE_SCHEMA_SKEW"] != "1" {
+		t.Fatalf("ExtraEnv[BD_IGNORE_SCHEMA_SKEW] = %q, want %q (all env: %#v)",
+			got["BD_IGNORE_SCHEMA_SKEW"], "1", got)
 	}
 }
 
@@ -1473,6 +1565,7 @@ func TestSupervisorInstallUnsupportedOS(t *testing.T) {
 		t.Skip("unsupported-os test only applies outside darwin/linux")
 	}
 	t.Setenv("GC_HOME", t.TempDir())
+	t.Setenv("HOME", t.TempDir()) // the deploy-freeze guard reads $HOME/.gc (ga-bztbqf)
 
 	var stdout, stderr bytes.Buffer
 	code := doSupervisorInstall(&stdout, &stderr)
@@ -3532,7 +3625,34 @@ func TestUninstallSupervisorSystemdUsesControlSocketWhenServiceActive(t *testing
 	}
 }
 
+func writeSupervisorLaunchdTestGC(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "gc")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nprintf 'gc version test\\n'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func stubSupervisorLaunchdUnloaded(t *testing.T) {
+	t.Helper()
+	oldLoaded := supervisorLaunchdLoaded
+	supervisorLaunchdLoaded = func(string) (bool, bool, string) { return false, true, "" }
+	t.Cleanup(func() { supervisorLaunchdLoaded = oldLoaded })
+}
+
+// skipUnlessDarwinLaunchd is the mirror of the inline systemd guards: the
+// launchd install path shells out to plutil, so it only applies on darwin.
+func skipUnlessDarwinLaunchd(t *testing.T) {
+	t.Helper()
+	if goruntime.GOOS != "darwin" {
+		t.Skip("launchd path only applies on darwin")
+	}
+}
+
 func TestInstallSupervisorLaunchdRemovesMatchingLegacyDefaultPlistForIsolatedGCHome(t *testing.T) {
+	skipUnlessDarwinLaunchd(t)
+
 	homeDir := t.TempDir()
 	gcHome := filepath.Join(t.TempDir(), "isolated-home")
 	t.Setenv("HOME", homeDir)
@@ -3557,7 +3677,7 @@ func TestInstallSupervisorLaunchdRemovesMatchingLegacyDefaultPlistForIsolatedGCH
 	}
 
 	data := &supervisorServiceData{
-		GCPath:        "/tmp/gc-new",
+		GCPath:        writeSupervisorLaunchdTestGC(t),
 		LogPath:       filepath.Join(gcHome, "supervisor.log"),
 		GCHome:        gcHome,
 		XDGRuntimeDir: "",
@@ -3585,9 +3705,9 @@ func TestInstallSupervisorLaunchdRemovesMatchingLegacyDefaultPlistForIsolatedGCH
 	joined := strings.Join(calls, "\n")
 	currentPath := filepath.Join(homeDir, "Library", "LaunchAgents", supervisorLaunchdLabel()+".plist")
 	for _, want := range []string{
-		"unload " + legacyPath,
-		"unload " + currentPath,
-		"load " + currentPath,
+		"bootout " + supervisorLaunchdServiceTarget(defaultSupervisorLaunchdLabel),
+		"bootout " + supervisorLaunchdServiceTarget(supervisorLaunchdLabel()),
+		"bootstrap " + supervisorLaunchdDomain() + " " + currentPath,
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("launchctl calls = %v, want %q", calls, want)
@@ -3596,13 +3716,15 @@ func TestInstallSupervisorLaunchdRemovesMatchingLegacyDefaultPlistForIsolatedGCH
 }
 
 func TestInstallSupervisorLaunchdWritesPrivatePlist(t *testing.T) {
+	skipUnlessDarwinLaunchd(t)
+
 	homeDir := t.TempDir()
 	gcHome := filepath.Join(t.TempDir(), "isolated-home")
 	t.Setenv("HOME", homeDir)
 	t.Setenv("GC_HOME", gcHome)
 
 	data := &supervisorServiceData{
-		GCPath:       "/tmp/gc-new",
+		GCPath:       writeSupervisorLaunchdTestGC(t),
 		LogPath:      filepath.Join(gcHome, "supervisor.log"),
 		GCHome:       gcHome,
 		LaunchdLabel: supervisorLaunchdLabel(),
@@ -3634,15 +3756,30 @@ func TestInstallSupervisorLaunchdWritesPrivatePlist(t *testing.T) {
 	}
 }
 
-func TestInstallSupervisorLaunchdEnablesAndKickstartsLoadedService(t *testing.T) {
+func TestInstallSupervisorLaunchdBootsOutGastownDaemonBeforeBootstrap(t *testing.T) {
+	skipUnlessDarwinLaunchd(t)
+
 	homeDir := t.TempDir()
 	gcHome := filepath.Join(t.TempDir(), "isolated-home")
 	t.Setenv("HOME", homeDir)
 	t.Setenv("GC_HOME", gcHome)
+	// The legacy gastown agent is booted out only when it was ever installed
+	// (gc-pk1x): this test is the installed case, so its plist exists.
+	legacyPlist := filepath.Join(homeDir, "Library", "LaunchAgents", legacyGastownLaunchdLabel+".plist")
+	if err := os.MkdirAll(filepath.Dir(legacyPlist), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacyPlist, []byte("<plist/>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
+	gcPath := filepath.Join(t.TempDir(), "gc")
+	if err := os.WriteFile(gcPath, []byte("#!/bin/sh\nprintf 'gc version test\\n'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	label := supervisorLaunchdLabel()
 	data := &supervisorServiceData{
-		GCPath:       "/tmp/gc-new",
+		GCPath:       gcPath,
 		LogPath:      filepath.Join(gcHome, "supervisor.log"),
 		GCHome:       gcHome,
 		LaunchdLabel: label,
@@ -3650,13 +3787,16 @@ func TestInstallSupervisorLaunchdEnablesAndKickstartsLoadedService(t *testing.T)
 	}
 
 	oldRun := supervisorLaunchctlRun
+	oldAlive := supervisorAliveHook
 	var calls []string
 	supervisorLaunchctlRun = func(args ...string) error {
 		calls = append(calls, strings.Join(args, " "))
 		return nil
 	}
+	supervisorAliveHook = func() int { return 0 }
 	t.Cleanup(func() {
 		supervisorLaunchctlRun = oldRun
+		supervisorAliveHook = oldAlive
 	})
 
 	var stdout, stderr bytes.Buffer
@@ -3665,11 +3805,13 @@ func TestInstallSupervisorLaunchdEnablesAndKickstartsLoadedService(t *testing.T)
 	}
 
 	path := supervisorLaunchdPlistPath()
-	target := "gui/" + strconv.Itoa(os.Getuid()) + "/" + label
+	target := supervisorLaunchdServiceTarget(label)
 	wantSequence := []string{
-		"unload " + path,
+		"bootout " + supervisorLaunchdServiceTarget("com.gastown.daemon"),
+		// enable precedes bootstrap: `gc supervisor stop` disables the job
+		// (#5334) and launchd refuses to bootstrap a disabled service.
 		"enable " + target,
-		"load " + path,
+		"bootstrap " + supervisorLaunchdDomain() + " " + path,
 		"kickstart -p " + target,
 	}
 	last := -1
@@ -3682,7 +3824,9 @@ func TestInstallSupervisorLaunchdEnablesAndKickstartsLoadedService(t *testing.T)
 	}
 }
 
-func TestInstallSupervisorLaunchdIgnoresLegacyUnloadFailures(t *testing.T) {
+func TestInstallSupervisorLaunchdIgnoresLegacyBootoutFailures(t *testing.T) {
+	skipUnlessDarwinLaunchd(t)
+
 	homeDir := t.TempDir()
 	gcHome := filepath.Join(t.TempDir(), "isolated-home")
 	t.Setenv("HOME", homeDir)
@@ -3707,7 +3851,7 @@ func TestInstallSupervisorLaunchdIgnoresLegacyUnloadFailures(t *testing.T) {
 	}
 
 	data := &supervisorServiceData{
-		GCPath:        "/tmp/gc-new",
+		GCPath:        writeSupervisorLaunchdTestGC(t),
 		LogPath:       filepath.Join(gcHome, "supervisor.log"),
 		GCHome:        gcHome,
 		XDGRuntimeDir: "",
@@ -3717,8 +3861,8 @@ func TestInstallSupervisorLaunchdIgnoresLegacyUnloadFailures(t *testing.T) {
 
 	oldRun := supervisorLaunchctlRun
 	supervisorLaunchctlRun = func(args ...string) error {
-		if len(args) == 2 && args[0] == "unload" && args[1] == legacyPath {
-			return errors.New("legacy unload failed")
+		if len(args) == 2 && args[0] == "bootout" && args[1] == supervisorLaunchdServiceTarget(defaultSupervisorLaunchdLabel) {
+			return errors.New("legacy bootout failed")
 		}
 		return nil
 	}
@@ -3736,6 +3880,9 @@ func TestInstallSupervisorLaunchdIgnoresLegacyUnloadFailures(t *testing.T) {
 }
 
 func TestInstallSupervisorLaunchdKeepsLegacyPlistWhenNewServiceFails(t *testing.T) {
+	skipUnlessDarwinLaunchd(t)
+
+	stubSupervisorLaunchdUnloaded(t)
 	homeDir := t.TempDir()
 	gcHome := filepath.Join(t.TempDir(), "isolated-home")
 	t.Setenv("HOME", homeDir)
@@ -3760,7 +3907,7 @@ func TestInstallSupervisorLaunchdKeepsLegacyPlistWhenNewServiceFails(t *testing.
 	}
 
 	data := &supervisorServiceData{
-		GCPath:        "/tmp/gc-new",
+		GCPath:        writeSupervisorLaunchdTestGC(t),
 		LogPath:       filepath.Join(gcHome, "supervisor.log"),
 		GCHome:        gcHome,
 		XDGRuntimeDir: "",
@@ -3773,8 +3920,8 @@ func TestInstallSupervisorLaunchdKeepsLegacyPlistWhenNewServiceFails(t *testing.
 	var calls []string
 	supervisorLaunchctlRun = func(args ...string) error {
 		calls = append(calls, strings.Join(args, " "))
-		if len(args) == 2 && args[0] == "load" && args[1] == currentPath {
-			return errors.New("new plist failed to load")
+		if len(args) == 3 && args[0] == "bootstrap" && args[2] == currentPath {
+			return errors.New("new plist failed to bootstrap")
 		}
 		return nil
 	}
@@ -3794,9 +3941,9 @@ func TestInstallSupervisorLaunchdKeepsLegacyPlistWhenNewServiceFails(t *testing.
 	}
 	joined := strings.Join(calls, "\n")
 	for _, want := range []string{
-		"unload " + legacyPath,
-		"load " + currentPath,
-		"load " + legacyPath,
+		"bootout " + supervisorLaunchdServiceTarget(defaultSupervisorLaunchdLabel),
+		"bootstrap " + supervisorLaunchdDomain() + " " + currentPath,
+		"bootstrap " + supervisorLaunchdDomain() + " " + legacyPath,
 		"enable gui/" + strconv.Itoa(os.Getuid()) + "/" + defaultSupervisorLaunchdLabel,
 		"kickstart -p gui/" + strconv.Itoa(os.Getuid()) + "/" + defaultSupervisorLaunchdLabel,
 	} {
@@ -3807,6 +3954,9 @@ func TestInstallSupervisorLaunchdKeepsLegacyPlistWhenNewServiceFails(t *testing.
 }
 
 func TestInstallSupervisorLaunchdRestoresLegacyPlistWhenEnableFails(t *testing.T) {
+	skipUnlessDarwinLaunchd(t)
+
+	stubSupervisorLaunchdUnloaded(t)
 	homeDir := t.TempDir()
 	gcHome := filepath.Join(t.TempDir(), "isolated-home")
 	t.Setenv("HOME", homeDir)
@@ -3832,7 +3982,7 @@ func TestInstallSupervisorLaunchdRestoresLegacyPlistWhenEnableFails(t *testing.T
 
 	label := supervisorLaunchdLabel()
 	data := &supervisorServiceData{
-		GCPath:        "/tmp/gc-new",
+		GCPath:        writeSupervisorLaunchdTestGC(t),
 		LogPath:       filepath.Join(gcHome, "supervisor.log"),
 		GCHome:        gcHome,
 		XDGRuntimeDir: "",
@@ -3869,16 +4019,15 @@ func TestInstallSupervisorLaunchdRestoresLegacyPlistWhenEnableFails(t *testing.T
 	if _, err := os.Stat(legacyPath); err != nil {
 		t.Fatalf("legacy launchd plist %q should remain after failed install; err=%v", legacyPath, err)
 	}
-	if strings.Contains(stderr.String(), "rollback after launchctl failure") {
-		t.Fatalf("stderr = %q, want rollback restart failure to be warning-only", stderr.String())
-	}
-	if !strings.Contains(stderr.String(), "warning: restoring launchd service: kickstart -p "+legacyTarget) {
-		t.Fatalf("stderr = %q, want warning for best-effort legacy restart", stderr.String())
+	for _, want := range []string{"rollback after launchctl failure", "kickstart -p " + legacyTarget} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr = %q, want propagated rollback failure %q", stderr.String(), want)
+		}
 	}
 	joined := strings.Join(calls, "\n")
 	for _, want := range []string{
 		"enable " + currentTarget,
-		"load " + legacyPath,
+		"bootstrap " + supervisorLaunchdDomain() + " " + legacyPath,
 		"enable " + legacyTarget,
 		"kickstart -p " + legacyTarget,
 	} {
@@ -3889,6 +4038,9 @@ func TestInstallSupervisorLaunchdRestoresLegacyPlistWhenEnableFails(t *testing.T
 }
 
 func TestInstallSupervisorLaunchdRestoresLegacyPlistWhenKickstartFails(t *testing.T) {
+	skipUnlessDarwinLaunchd(t)
+
+	stubSupervisorLaunchdUnloaded(t)
 	homeDir := t.TempDir()
 	gcHome := filepath.Join(t.TempDir(), "isolated-home")
 	t.Setenv("HOME", homeDir)
@@ -3914,7 +4066,7 @@ func TestInstallSupervisorLaunchdRestoresLegacyPlistWhenKickstartFails(t *testin
 
 	label := supervisorLaunchdLabel()
 	data := &supervisorServiceData{
-		GCPath:        "/tmp/gc-new",
+		GCPath:        writeSupervisorLaunchdTestGC(t),
 		LogPath:       filepath.Join(gcHome, "supervisor.log"),
 		GCHome:        gcHome,
 		XDGRuntimeDir: "",
@@ -3950,7 +4102,7 @@ func TestInstallSupervisorLaunchdRestoresLegacyPlistWhenKickstartFails(t *testin
 	joined := strings.Join(calls, "\n")
 	for _, want := range []string{
 		"kickstart -p " + currentTarget,
-		"load " + legacyPath,
+		"bootstrap " + supervisorLaunchdDomain() + " " + legacyPath,
 		"enable gui/" + strconv.Itoa(os.Getuid()) + "/" + defaultSupervisorLaunchdLabel,
 		"kickstart -p gui/" + strconv.Itoa(os.Getuid()) + "/" + defaultSupervisorLaunchdLabel,
 	} {
@@ -3961,6 +4113,8 @@ func TestInstallSupervisorLaunchdRestoresLegacyPlistWhenKickstartFails(t *testin
 }
 
 func TestInstallSupervisorLaunchdRestoresPreviousCurrentPlistWhenUpdateFails(t *testing.T) {
+	skipUnlessDarwinLaunchd(t)
+
 	homeDir := t.TempDir()
 	gcHome := filepath.Join(t.TempDir(), "isolated-home")
 	t.Setenv("HOME", homeDir)
@@ -3976,7 +4130,7 @@ func TestInstallSupervisorLaunchdRestoresPreviousCurrentPlistWhenUpdateFails(t *
 	}
 
 	data := &supervisorServiceData{
-		GCPath:        "/tmp/gc-new",
+		GCPath:        writeSupervisorLaunchdTestGC(t),
 		LogPath:       filepath.Join(gcHome, "supervisor.log"),
 		GCHome:        gcHome,
 		XDGRuntimeDir: "",
@@ -3988,13 +4142,13 @@ func TestInstallSupervisorLaunchdRestoresPreviousCurrentPlistWhenUpdateFails(t *
 	target := "gui/" + strconv.Itoa(os.Getuid()) + "/" + label
 	oldRun := supervisorLaunchctlRun
 	var calls []string
-	loadCalls := 0
+	bootstrapCalls := 0
 	supervisorLaunchctlRun = func(args ...string) error {
 		calls = append(calls, strings.Join(args, " "))
-		if len(args) == 2 && args[0] == "load" && args[1] == currentPath {
-			loadCalls++
-			if loadCalls == 1 {
-				return errors.New("new plist failed to load")
+		if len(args) == 3 && args[0] == "bootstrap" && args[2] == currentPath {
+			bootstrapCalls++
+			if bootstrapCalls == 1 {
+				return errors.New("new plist failed to bootstrap")
 			}
 		}
 		return nil
@@ -4021,13 +4175,13 @@ func TestInstallSupervisorLaunchdRestoresPreviousCurrentPlistWhenUpdateFails(t *
 	if got := info.Mode().Perm(); got != 0o600 {
 		t.Fatalf("restored launchd plist mode = %03o, want 600", got)
 	}
-	if loadCalls != 2 {
-		t.Fatalf("launchctl load call count = %d, want 2 (failed install + rollback restore); calls=%v", loadCalls, calls)
+	if bootstrapCalls != 2 {
+		t.Fatalf("launchctl bootstrap call count = %d, want 2 (failed install + rollback restore); calls=%v", bootstrapCalls, calls)
 	}
 	joined := strings.Join(calls, "\n")
 	for _, want := range []string{
-		"unload " + currentPath,
-		"load " + currentPath,
+		"bootout " + target,
+		"bootstrap " + supervisorLaunchdDomain() + " " + currentPath,
 		"enable " + target,
 		"kickstart -p " + target,
 	} {
@@ -4037,14 +4191,20 @@ func TestInstallSupervisorLaunchdRestoresPreviousCurrentPlistWhenUpdateFails(t *
 	}
 }
 
-func TestInstallSupervisorLaunchdSkipsReloadWhenUnchangedAndSupervisorAlive(t *testing.T) {
+func TestInstallSupervisorLaunchdRefreshesWhenUnchangedAndLaunchdManaged(t *testing.T) {
+	skipUnlessDarwinLaunchd(t)
+
 	homeDir := t.TempDir()
 	gcHome := filepath.Join(t.TempDir(), "isolated-home")
 	t.Setenv("HOME", homeDir)
 	t.Setenv("GC_HOME", gcHome)
 
+	gcPath := filepath.Join(t.TempDir(), "gc")
+	if err := os.WriteFile(gcPath, []byte("#!/bin/sh\nprintf 'gc version test\\n'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	data := &supervisorServiceData{
-		GCPath:        "/tmp/gc-same",
+		GCPath:        gcPath,
 		LogPath:       filepath.Join(gcHome, "supervisor.log"),
 		GCHome:        gcHome,
 		XDGRuntimeDir: "",
@@ -4065,37 +4225,313 @@ func TestInstallSupervisorLaunchdSkipsReloadWhenUnchangedAndSupervisorAlive(t *t
 
 	oldRun := supervisorLaunchctlRun
 	oldAlive := supervisorAliveHook
+	oldPID := supervisorLaunchdPID
+	oldBaseURL := supervisorAPIBaseURLHook
+	oldVerify := pollLaunchdRestartVerifiedHook
 	var calls []string
 	supervisorLaunchctlRun = func(args ...string) error {
 		calls = append(calls, strings.Join(args, " "))
 		return nil
 	}
 	supervisorAliveHook = func() int { return 4242 }
+	pidCalls := 0
+	supervisorLaunchdPID = func(label string) (int, bool, error) {
+		if label != supervisorLaunchdLabel() {
+			return 0, false, nil
+		}
+		pidCalls++
+		if pidCalls == 1 {
+			return 4242, true, nil
+		}
+		return 0, false, nil
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"status":"ok","build_id":"old-build-id"}`)
+	}))
+	t.Cleanup(server.Close)
+	supervisorAPIBaseURLHook = func() (string, error) { return server.URL, nil }
+	pollLaunchdRestartVerifiedHook = func(string, int, string, string, time.Duration) string {
+		return "injected post-refresh verification failure"
+	}
 	t.Cleanup(func() {
 		supervisorLaunchctlRun = oldRun
 		supervisorAliveHook = oldAlive
+		supervisorLaunchdPID = oldPID
+		supervisorAPIBaseURLHook = oldBaseURL
+		pollLaunchdRestartVerifiedHook = oldVerify
+	})
+
+	var stdout, stderr bytes.Buffer
+	if code := installSupervisorLaunchd(data, &stdout, &stderr); code != 1 {
+		t.Fatalf("installSupervisorLaunchd code = %d, want 1 after verification failure; stderr=%q", code, stderr.String())
+	}
+	restored, err := os.ReadFile(currentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(restored) != content {
+		t.Fatalf("restored plist differs from previous content")
+	}
+	if !strings.Contains(stderr.String(), "injected post-refresh verification failure") {
+		t.Fatalf("stderr = %q, want verification failure", stderr.String())
+	}
+	joined := strings.Join(calls, "\n")
+	for _, want := range []string{"bootout ", "bootstrap ", "enable ", "kickstart -p "} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("launchctl calls = %v, want %q for explicit refresh", calls, want)
+		}
+	}
+	if strings.Contains(stdout.String(), "Installed launchd service: "+currentPath) {
+		t.Fatalf("stdout = %q, should not report install success after failed verification", stdout.String())
+	}
+}
+
+func TestInstallSupervisorLaunchdMigratesLegacyOwnedLivePID(t *testing.T) {
+	skipUnlessDarwinLaunchd(t)
+
+	homeDir := t.TempDir()
+	gcHome := filepath.Join(t.TempDir(), "isolated-home")
+	t.Setenv("HOME", homeDir)
+	t.Setenv("GC_HOME", gcHome)
+
+	gcPath := filepath.Join(t.TempDir(), "gc")
+	if err := os.WriteFile(gcPath, []byte("#!/bin/sh\nprintf 'gc version test\\n'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	data := &supervisorServiceData{
+		GCPath:       gcPath,
+		LogPath:      filepath.Join(gcHome, "supervisor.log"),
+		GCHome:       gcHome,
+		LaunchdLabel: supervisorLaunchdLabel(),
+		Path:         "/usr/local/bin:/usr/bin:/bin",
+	}
+	legacyPath := legacySupervisorLaunchdPlistPath()
+	legacyContent, err := renderSupervisorTemplate(supervisorLaunchdTemplate, &supervisorServiceData{
+		GCPath:       gcPath,
+		LogPath:      data.LogPath,
+		GCHome:       gcHome,
+		LaunchdLabel: defaultSupervisorLaunchdLabel,
+		Path:         data.Path,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(legacyPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacyPath, []byte(legacyContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	oldRun, oldAlive, oldPID := supervisorLaunchctlRun, supervisorAliveHook, supervisorLaunchdPID
+	oldBaseURL, oldVerify := supervisorAPIBaseURLHook, pollLaunchdRestartVerifiedHook
+	var calls []string
+	failCurrentBootstrap := false
+	legacyLoaded := true
+	supervisorLaunchctlRun = func(args ...string) error {
+		calls = append(calls, strings.Join(args, " "))
+		if len(args) == 2 && args[0] == "bootout" && args[1] == supervisorLaunchdServiceTarget(defaultSupervisorLaunchdLabel) {
+			legacyLoaded = false
+		}
+		if len(args) == 3 && args[0] == "bootstrap" && args[2] == legacyPath {
+			legacyLoaded = true
+		}
+		if failCurrentBootstrap && len(args) == 3 && args[0] == "bootstrap" && args[2] == supervisorLaunchdPlistPath() {
+			return errors.New("injected current bootstrap failure")
+		}
+		return nil
+	}
+	supervisorAliveHook = func() int { return 4242 }
+	supervisorLaunchdPID = func(label string) (int, bool, error) {
+		if label == defaultSupervisorLaunchdLabel {
+			if legacyLoaded {
+				return 4242, true, nil
+			}
+			return 0, false, nil
+		}
+		return 0, false, nil
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"status":"ok","build_id":"old-build-id"}`)
+	}))
+	t.Cleanup(server.Close)
+	supervisorAPIBaseURLHook = func() (string, error) { return server.URL, nil }
+	pollLaunchdRestartVerifiedHook = func(string, int, string, string, time.Duration) string { return "" }
+	t.Cleanup(func() {
+		supervisorLaunchctlRun, supervisorAliveHook, supervisorLaunchdPID = oldRun, oldAlive, oldPID
+		supervisorAPIBaseURLHook, pollLaunchdRestartVerifiedHook = oldBaseURL, oldVerify
 	})
 
 	var stdout, stderr bytes.Buffer
 	if code := installSupervisorLaunchd(data, &stdout, &stderr); code != 0 {
 		t.Fatalf("installSupervisorLaunchd code = %d, want 0; stderr=%q", code, stderr.String())
 	}
-	if len(calls) != 0 {
-		t.Fatalf("launchctl calls = %v, want none for unchanged running service", calls)
+	joined := strings.Join(calls, "\n")
+	for _, want := range []string{
+		"bootout " + supervisorLaunchdServiceTarget(defaultSupervisorLaunchdLabel),
+		"bootstrap " + supervisorLaunchdDomain() + " " + supervisorLaunchdPlistPath(),
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("launchctl calls = %v, want %q", calls, want)
+		}
 	}
-	if !strings.Contains(stdout.String(), "Installed launchd service: "+currentPath) {
-		t.Fatalf("stdout = %q, want install confirmation for %s", stdout.String(), currentPath)
+
+	if err := os.Remove(supervisorLaunchdPlistPath()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacyPath, []byte(legacyContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	calls = nil
+	legacyLoaded = true
+	failCurrentBootstrap = true
+	stdout.Reset()
+	stderr.Reset()
+	if code := installSupervisorLaunchd(data, &stdout, &stderr); code != 1 {
+		t.Fatalf("failed migration code = %d, want 1; stderr=%q", code, stderr.String())
+	}
+	if _, err := os.Stat(supervisorLaunchdPlistPath()); !os.IsNotExist(err) {
+		t.Fatalf("failed current plist should be removed; err=%v", err)
+	}
+	if _, err := os.Stat(legacyPath); err != nil {
+		t.Fatalf("legacy plist should remain after rollback: %v", err)
+	}
+	if !slices.Contains(calls, "bootstrap "+supervisorLaunchdDomain()+" "+legacyPath) {
+		t.Fatalf("launchctl calls = %v, want legacy bootstrap rollback", calls)
+	}
+}
+
+func TestInstallSupervisorLaunchdMigratesGastownOwnedLivePID(t *testing.T) {
+	skipUnlessDarwinLaunchd(t)
+
+	homeDir := t.TempDir()
+	gcHome := filepath.Join(homeDir, ".gc")
+	t.Setenv("HOME", homeDir)
+	t.Setenv("GC_HOME", gcHome)
+	gcPath := writeSupervisorLaunchdTestGC(t)
+	data := &supervisorServiceData{
+		GCPath:       gcPath,
+		LogPath:      filepath.Join(gcHome, "supervisor.log"),
+		GCHome:       gcHome,
+		LaunchdLabel: supervisorLaunchdLabel(),
+		Path:         "/usr/local/bin:/usr/bin:/bin",
+	}
+	gastownPath := filepath.Join(homeDir, "Library", "LaunchAgents", legacyGastownLaunchdLabel+".plist")
+	if err := os.MkdirAll(filepath.Dir(gastownPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(gastownPath, []byte("legacy gastown plist\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	oldRun, oldAlive, oldPID := supervisorLaunchctlRun, supervisorAliveHook, supervisorLaunchdPID
+	oldBaseURL, oldVerify := supervisorAPIBaseURLHook, pollLaunchdRestartVerifiedHook
+	legacyLoaded := true
+	var calls []string
+	supervisorLaunchctlRun = func(args ...string) error {
+		calls = append(calls, strings.Join(args, " "))
+		if len(args) == 2 && args[0] == "bootout" && args[1] == supervisorLaunchdServiceTarget(legacyGastownLaunchdLabel) {
+			legacyLoaded = false
+		}
+		return nil
+	}
+	supervisorAliveHook = func() int { return 4242 }
+	supervisorLaunchdPID = func(label string) (int, bool, error) {
+		if label == legacyGastownLaunchdLabel && legacyLoaded {
+			return 4242, true, nil
+		}
+		return 0, false, nil
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"status":"ok","build_id":"old-build-id"}`)
+	}))
+	t.Cleanup(server.Close)
+	supervisorAPIBaseURLHook = func() (string, error) { return server.URL, nil }
+	pollLaunchdRestartVerifiedHook = func(string, int, string, string, time.Duration) string { return "" }
+	t.Cleanup(func() {
+		supervisorLaunchctlRun, supervisorAliveHook, supervisorLaunchdPID = oldRun, oldAlive, oldPID
+		supervisorAPIBaseURLHook, pollLaunchdRestartVerifiedHook = oldBaseURL, oldVerify
+	})
+
+	var stdout, stderr bytes.Buffer
+	if code := installSupervisorLaunchd(data, &stdout, &stderr); code != 0 {
+		t.Fatalf("installSupervisorLaunchd code = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	want := "bootout " + supervisorLaunchdServiceTarget(legacyGastownLaunchdLabel)
+	if !slices.Contains(calls, want) {
+		t.Fatalf("launchctl calls = %v, want %q", calls, want)
+	}
+}
+
+func TestInstallSupervisorLaunchdDoesNotStartSecondSupervisorWhenDirectProcessAlive(t *testing.T) {
+	skipUnlessDarwinLaunchd(t)
+
+	homeDir := t.TempDir()
+	gcHome := filepath.Join(t.TempDir(), "isolated-home")
+	t.Setenv("HOME", homeDir)
+	t.Setenv("GC_HOME", gcHome)
+	data := &supervisorServiceData{
+		GCPath:       "/tmp/gc-same",
+		LogPath:      filepath.Join(gcHome, "supervisor.log"),
+		GCHome:       gcHome,
+		LaunchdLabel: supervisorLaunchdLabel(),
+		Path:         "/usr/local/bin:/usr/bin:/bin",
+	}
+	content, err := renderSupervisorTemplate(supervisorLaunchdTemplate, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentPath := supervisorLaunchdPlistPath()
+	if err := os.MkdirAll(filepath.Dir(currentPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(currentPath, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldRun, oldAlive, oldPID := supervisorLaunchctlRun, supervisorAliveHook, supervisorLaunchdPID
+	var calls []string
+	supervisorLaunchctlRun = func(args ...string) error {
+		calls = append(calls, strings.Join(args, " "))
+		return nil
+	}
+	supervisorAliveHook = func() int { return 4242 }
+	supervisorLaunchdPID = func(string) (int, bool, error) { return 0, false, nil }
+	t.Cleanup(func() {
+		supervisorLaunchctlRun, supervisorAliveHook, supervisorLaunchdPID = oldRun, oldAlive, oldPID
+	})
+	var stdout, stderr bytes.Buffer
+	if code := installSupervisorLaunchd(data, &stdout, &stderr); code != 1 {
+		t.Fatalf("installSupervisorLaunchd code = %d, want 1; stderr=%q", code, stderr.String())
+	}
+	if len(calls) != 0 {
+		t.Fatalf("launchctl calls = %v, want none while direct supervisor owns the socket", calls)
+	}
+	if !strings.Contains(stderr.String(), "is not owned by launchd job") {
+		t.Fatalf("stderr = %q, want launchd-ownership recovery guidance", stderr.String())
+	}
+	calls = nil
+	supervisorLaunchdPID = func(string) (int, bool, error) { return 9999, true, nil }
+	stdout.Reset()
+	stderr.Reset()
+	if code := installSupervisorLaunchd(data, &stdout, &stderr); code != 1 {
+		t.Fatalf("mismatched launchd pid code = %d, want 1; stderr=%q", code, stderr.String())
+	}
+	if len(calls) != 0 || !strings.Contains(stderr.String(), "launchd pid=9999") {
+		t.Fatalf("mismatched launchd pid calls=%v stderr=%q", calls, stderr.String())
 	}
 }
 
 func TestInstallSupervisorLaunchdReloadsWhenUnchangedButSupervisorStopped(t *testing.T) {
+	skipUnlessDarwinLaunchd(t)
+
 	homeDir := t.TempDir()
 	gcHome := filepath.Join(t.TempDir(), "isolated-home")
 	t.Setenv("HOME", homeDir)
 	t.Setenv("GC_HOME", gcHome)
 
+	gcPath := writeSupervisorLaunchdTestGC(t)
 	data := &supervisorServiceData{
-		GCPath:        "/tmp/gc-same",
+		GCPath:        gcPath,
 		LogPath:       filepath.Join(gcHome, "supervisor.log"),
 		GCHome:        gcHome,
 		XDGRuntimeDir: "",
@@ -4133,8 +4569,8 @@ func TestInstallSupervisorLaunchdReloadsWhenUnchangedButSupervisorStopped(t *tes
 	}
 	joined := strings.Join(calls, "\n")
 	for _, want := range []string{
-		"unload " + currentPath,
-		"load " + currentPath,
+		"bootout " + supervisorLaunchdServiceTarget(supervisorLaunchdLabel()),
+		"bootstrap " + supervisorLaunchdDomain() + " " + currentPath,
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("launchctl calls = %v, want %q", calls, want)
@@ -4196,7 +4632,7 @@ func TestUninstallSupervisorLaunchdRemovesMatchingLegacyDefaultPlistForIsolatedG
 	for _, want := range []string{
 		"unload " + currentPath,
 		"disable gui/" + strconv.Itoa(os.Getuid()) + "/" + supervisorLaunchdLabel(),
-		"unload " + legacyPath,
+		"bootout " + supervisorLaunchdServiceTarget(defaultSupervisorLaunchdLabel),
 		"disable gui/" + strconv.Itoa(os.Getuid()) + "/" + defaultSupervisorLaunchdLabel,
 	} {
 		if !strings.Contains(joined, want) {
@@ -4338,7 +4774,7 @@ func TestUninstallSupervisorLaunchdRefusesActiveServiceWithoutControlSocket(t *t
 	}
 }
 
-func TestUninstallSupervisorLaunchdIgnoresLegacyUnloadFailures(t *testing.T) {
+func TestUninstallSupervisorLaunchdIgnoresLegacyBootoutFailures(t *testing.T) {
 	homeDir := t.TempDir()
 	gcHome := filepath.Join(t.TempDir(), "isolated-home")
 	t.Setenv("HOME", homeDir)
@@ -4371,8 +4807,8 @@ func TestUninstallSupervisorLaunchdIgnoresLegacyUnloadFailures(t *testing.T) {
 
 	oldRun := supervisorLaunchctlRun
 	supervisorLaunchctlRun = func(args ...string) error {
-		if len(args) == 2 && args[0] == "unload" && args[1] == legacyPath {
-			return errors.New("legacy unload failed")
+		if len(args) == 2 && args[0] == "bootout" && args[1] == supervisorLaunchdServiceTarget(defaultSupervisorLaunchdLabel) {
+			return errors.New("legacy bootout failed")
 		}
 		return nil
 	}
@@ -4791,6 +5227,8 @@ func TestRunSupervisorSIGTERMPreservesSessionsEndToEnd(t *testing.T) {
 		"Preserving city '" + cityPath + "' sessions for re-adoption...",
 		"Preserving agent sessions for supervisor re-adoption.",
 		"City '" + cityPath + "' preserved.",
+		"gc supervisor: city '" + cityPath + "' stop took ",
+		"gc supervisor: stopping took ",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("stdout = %q, want %q; stderr=%q", got, want, stderr.String())
@@ -5152,6 +5590,8 @@ func TestStopManagedCityForcesCleanupAfterTimeout(t *testing.T) {
 		},
 	}
 
+	warmSpyScript(t, script)
+
 	var stderr bytes.Buffer
 	start := time.Now()
 	err := stopManagedCity(mc, cityPath, &stderr)
@@ -5257,6 +5697,8 @@ func TestStopManagedCityDoesNotUseStartupOrDriftTimeouts(t *testing.T) {
 		},
 	}
 
+	warmSpyScript(t, script)
+
 	var stderr bytes.Buffer
 	start := time.Now()
 	err := stopManagedCity(mc, cityPath, &stderr)
@@ -5357,6 +5799,8 @@ func TestStopManagedCityBoundsForcedShutdownWhenRuntimeHangs(t *testing.T) {
 			forceStopShutdown: forceStop,
 		},
 	}
+
+	warmSpyScript(t, script)
 
 	// A sibling 100ms timer, armed as the forced phase begins (the grace's
 	// warning), fires as late as the forced wait's own timer on a loaded
@@ -7118,6 +7562,8 @@ func TestInstallSupervisorSystemdCreatesLogDirBeforeStartingService(t *testing.T
 }
 
 func TestInstallSupervisorLaunchdCreatesLogDirBeforeLoadingService(t *testing.T) {
+	skipUnlessDarwinLaunchd(t)
+
 	homeDir := t.TempDir()
 	gcHome := filepath.Join(t.TempDir(), "fresh-gc-home")
 	t.Setenv("HOME", homeDir)
@@ -7128,9 +7574,9 @@ func TestInstallSupervisorLaunchdCreatesLogDirBeforeLoadingService(t *testing.T)
 	var calls []string
 	supervisorLaunchctlRun = func(args ...string) error {
 		calls = append(calls, strings.Join(args, " "))
-		if args[0] == "load" {
+		if args[0] == "bootstrap" {
 			if _, err := os.Stat(filepath.Dir(supervisorLogPath())); err != nil {
-				t.Fatalf("log dir missing before launchctl load: %v", err)
+				t.Fatalf("log dir missing before launchctl bootstrap: %v", err)
 			}
 		}
 		return nil
@@ -7138,7 +7584,7 @@ func TestInstallSupervisorLaunchdCreatesLogDirBeforeLoadingService(t *testing.T)
 	t.Cleanup(func() { supervisorLaunchctlRun = oldRun })
 
 	data := &supervisorServiceData{
-		GCPath:       "/tmp/gc-new",
+		GCPath:       writeSupervisorLaunchdTestGC(t),
 		LogPath:      filepath.Join(gcHome, "supervisor.log"),
 		GCHome:       gcHome,
 		LaunchdLabel: label,
@@ -7152,8 +7598,8 @@ func TestInstallSupervisorLaunchdCreatesLogDirBeforeLoadingService(t *testing.T)
 	if _, err := os.Stat(filepath.Dir(data.LogPath)); err != nil {
 		t.Fatalf("log dir was not created: %v", err)
 	}
-	if !slices.Contains(calls, "load "+supervisorLaunchdPlistPath()) {
-		t.Fatalf("launchctl calls = %v, want plist load", calls)
+	if !slices.Contains(calls, "bootstrap "+supervisorLaunchdDomain()+" "+supervisorLaunchdPlistPath()) {
+		t.Fatalf("launchctl calls = %v, want plist bootstrap", calls)
 	}
 }
 

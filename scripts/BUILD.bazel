@@ -58,6 +58,14 @@ sh_test(
 # it is larger than the CGO_ENABLED=0 release-shaped build the script's
 # default cap is measured against: 207,034,352 bytes at 9fdc52d82c versus
 # 180,287,491 for the release shape. The cap keeps the same ~5.4% headroom.
+#
+# The fork's carry: the cap is 231000000, not upstream's 218000000, the same
+# ~5.4% headroom over 219,091,984 bytes measured at the re-sync #8 cert head
+# on the CI runner (Go 1.26.10, cgo, RBE worker env held at 0c6c05c2 for that
+# run). Re-measured at every re-sync with the certification build
+# configuration; dropped once upstream's own cap admits that fresh
+# measurement and the unchanged upstream guard passes, not on a comparison
+# with the number above.
 sh_test(
     name = "check_native_dependency_surface_test",
     srcs = ["check-native-dependency-surface.sh"],
@@ -69,7 +77,7 @@ sh_test(
         "//:go.sum",
         "//cmd/gc",
     ],
-    env = {"GC_NATIVE_DEP_MAX_BINARY_BYTES": "218000000"},
+    env = {"GC_NATIVE_DEP_MAX_BINARY_BYTES": "231000000"},
 )
 
 go_test(
@@ -82,6 +90,7 @@ go_test(
         "bazel_bep_summary_workflow_test.go",
         "bazel_callers_permissions_test.go",
         "bazel_fork_cache_test.go",
+        "bazel_fork_runner_rule_test.go",
         "bazel_fresh_merge_test.go",
         "bazel_go_repository_tools_test.go",
         "bazel_hermetic_cc_test.go",
@@ -100,6 +109,7 @@ go_test(
         "bazel_test_tmp_bt_test.go",
         "bd_contract_pins_test.go",
         "bd_version_pin_test.go",
+        "beads_fleet_replace_test.go",
         "build_provenance_test.go",
         "check_core_boundary_test.go",
         "check_embedded_pins_test.go",
@@ -127,6 +137,7 @@ go_test(
         "githooks_pre_push_suite_test.go",
         "githooks_pre_push_worker_env_test.go",
         "githooks_precommit_local_runtime_test.go",
+        "githooks_push_suite_policy_test.go",
         "go_module_fetch_test.go",
         "go_test_observable_test.go",
         "go_test_run_script_test.go",
@@ -134,10 +145,12 @@ go_test(
         "harness_reap_test.go",
         "integration_packages_shards_test.go",
         "integration_shards_test.go",
+        "lean_local_test.go",
         "lint_readonly_contract_test.go",
         "makefile_bazel_primary_test.go",
         "makefile_cgo_test.go",
         "makefile_install_test.go",
+        "mol_scoped_work_teardown_test.go",
         "native_doltlite_target_test.go",
         "oasdiff_pin_test.go",
         "openapi_breaking_gate_test.go",
@@ -196,6 +209,7 @@ go_test(
         "//scripts/testdata/test-go-test-shard/no_extra_env:pkg_files",
         "//test:BUILD.bazel",
         "//test/acceptance:BUILD.bazel",
+        "//test/conversationlane:BUILD.bazel",
         "//test/integration:BUILD.bazel",
         "//tools/bazel/rules:go_repository_tools.bzl",
         "//tools/bazel/rules:go_test_run.sh",
@@ -213,6 +227,7 @@ go_test(
         "//internal/testpolicy/timingsummary",
         "//internal/testutil",
         "@in_gopkg_yaml_v3//:yaml_v3",
+        "@org_golang_x_mod//modfile",
     ],
 )
 

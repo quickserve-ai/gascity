@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"reflect"
 	"strings"
 	"testing"
@@ -16,10 +17,10 @@ import (
 func TestWorkReleaseConditionalWritesPreservesNewIncarnation(t *testing.T) {
 	for name, release := range map[string]func(beads.Store, beads.Bead) error{
 		"retired session": func(store beads.Store, snapshot beads.Bead) error {
-			return workAssignmentForStore(beads.WorkStore{Store: store}).ReleaseWorkBead(snapshot, "")
+			return workAssignmentForStore(beads.WorkStore{Store: store}).ReleaseWorkBead(snapshot, "", poolReleaseGuardForTest(), io.Discard, "test")
 		},
 		"orphaned pool": func(store beads.Store, snapshot beads.Bead) error {
-			if releaseOrphanedPoolAssignment(store, snapshot, true) {
+			if releaseOrphanedPoolAssignment(store, snapshot, true, poolReleaseGuardForTest()) {
 				return errors.New("released a newer claim")
 			}
 			return nil
@@ -143,10 +144,10 @@ func TestWorkReleaseConditionalWritesAtomicCleanup(t *testing.T) {
 				}
 				store.legacyCalls = 0
 				if orphan {
-					if !releaseOrphanedPoolAssignment(store, snapshot, true) {
+					if !releaseOrphanedPoolAssignment(store, snapshot, true, poolReleaseGuardForTest()) {
 						t.Fatal("orphan release failed")
 					}
-				} else if err := workAssignmentForStore(beads.WorkStore{Store: store}).ReleaseWorkBead(snapshot, "worker"); err != nil {
+				} else if err := workAssignmentForStore(beads.WorkStore{Store: store}).ReleaseWorkBead(snapshot, "worker", poolReleaseGuardForTest(), io.Discard, "test"); err != nil {
 					t.Fatal(err)
 				}
 				if store.conditionalCalls != 1 || store.legacyCalls != 0 {
@@ -185,11 +186,11 @@ func TestWorkReleaseConditionalWritesNeverFallsBackAfterFailure(t *testing.T) {
 			snapshot := seedClaimedBead(t, store, "retired-session")
 			store.legacyCalls = 0
 			store.writeErr = writeErr
-			err := workAssignmentForStore(beads.WorkStore{Store: store}).ReleaseWorkBead(snapshot, "")
+			err := workAssignmentForStore(beads.WorkStore{Store: store}).ReleaseWorkBead(snapshot, "", poolReleaseGuardForTest(), io.Discard, "test")
 			if !errors.Is(err, writeErr) {
 				t.Fatalf("error=%v, want %v", err, writeErr)
 			}
-			if releaseOrphanedPoolAssignment(store, snapshot, true) {
+			if releaseOrphanedPoolAssignment(store, snapshot, true, poolReleaseGuardForTest()) {
 				t.Fatal("reported a failed orphan release as successful")
 			}
 			if store.legacyCalls != 0 || store.conditionalCalls != 2 {
@@ -219,7 +220,7 @@ func TestWorkReleaseConditionalWritesConflictDoesNotAcknowledgeRelease(t *testin
 		t.Fatal(err)
 	}
 	store.legacyCalls = 0
-	err = workAssignmentForStore(beads.WorkStore{Store: store}).ReleaseWorkBead(snapshot, "")
+	err = workAssignmentForStore(beads.WorkStore{Store: store}).ReleaseWorkBead(snapshot, "", poolReleaseGuardForTest(), io.Discard, "test")
 	if !beads.IsPreconditionFailed(err) {
 		t.Fatalf("error=%v, want a conflict so the caller cannot count this as a released assignment", err)
 	}
@@ -245,11 +246,11 @@ func TestWorkReleaseConditionalWritesRequireRefusesWithoutCapability(t *testing.
 		snapshot := seedClaimedBead(t, store, "retired-session")
 		store.DisableConditionalWrites = true
 		store.legacyCalls = 0
-		err := workAssignmentForStore(beads.WorkStore{Store: store}).ReleaseWorkBead(snapshot, "")
+		err := workAssignmentForStore(beads.WorkStore{Store: store}).ReleaseWorkBead(snapshot, "", poolReleaseGuardForTest(), io.Discard, "test")
 		if !beads.IsConditionalWritesRequired(err) {
 			t.Fatalf("want required-capability refusal, got %v", err)
 		}
-		if releaseOrphanedPoolAssignment(store, snapshot, true) {
+		if releaseOrphanedPoolAssignment(store, snapshot, true, poolReleaseGuardForTest()) {
 			t.Fatal("orphan release reported success without the required capability")
 		}
 		if store.conditionalCalls != 0 || store.legacyCalls != 0 {
@@ -276,10 +277,10 @@ func TestWorkReleaseConditionalWritesRequireRefusesWithoutCapability(t *testing.
 		if len(snapshots) != 1 || snapshots[0].Revision != 0 {
 			t.Fatalf("listed %+v, want one revision-less list row", snapshots)
 		}
-		if err := work.ReleaseWorkBead(snapshots[0], ""); !beads.IsConditionalWritesRequired(err) {
+		if err := work.ReleaseWorkBead(snapshots[0], "", poolReleaseGuardForTest(), io.Discard, "test"); !beads.IsConditionalWritesRequired(err) {
 			t.Fatalf("ReleaseWorkBead err=%v, want required-capability refusal", err)
 		}
-		if releaseOrphanedPoolAssignment(store, snapshots[0], true) {
+		if releaseOrphanedPoolAssignment(store, snapshots[0], true, poolReleaseGuardForTest()) {
 			t.Fatal("orphan release reported success without the required capability")
 		}
 		got, err := store.Get(claimed.ID)
@@ -367,10 +368,10 @@ func TestWorkReleaseConditionalWritesReleasesRevisionlessSnapshots(t *testing.T)
 						s := shapes[snapshot.ID]
 						label := fmt.Sprintf("group=%t/reclaimed=%t", s.group, s.reclaimed)
 						if orphan {
-							if released := releaseOrphanedPoolAssignment(target, snapshot, true); released == s.reclaimed {
+							if released := releaseOrphanedPoolAssignment(target, snapshot, true, poolReleaseGuardForTest()); released == s.reclaimed {
 								t.Errorf("%s: orphan release reported released=%t", label, released)
 							}
-						} else if err := work.ReleaseWorkBead(snapshot, ""); err != nil {
+						} else if err := work.ReleaseWorkBead(snapshot, "", poolReleaseGuardForTest(), io.Discard, "test"); err != nil {
 							t.Errorf("%s: release: %v", label, err)
 						}
 						got, err := store.Get(snapshot.ID)
@@ -466,7 +467,7 @@ func TestReleaseWorkBead_PropagatesBackendFailures(t *testing.T) {
 		claimed := seedClaimedBead(t, mem, "retired-session")
 
 		wa := workAssignmentForStore(beads.WorkStore{Store: store})
-		err := wa.ReleaseWorkBead(claimed, "")
+		err := wa.ReleaseWorkBead(claimed, "", poolReleaseGuardForTest(), io.Discard, "test")
 		if err == nil {
 			t.Fatal("ReleaseWorkBead returned nil after a backend failure; the caller will count this as a completed unassign")
 		}
@@ -489,7 +490,7 @@ func TestReleaseWorkBead_PropagatesBackendFailures(t *testing.T) {
 		store.fail = true
 
 		wa := workAssignmentForStore(beads.WorkStore{Store: store})
-		err := wa.ReleaseWorkBead(claimed, "")
+		err := wa.ReleaseWorkBead(claimed, "", poolReleaseGuardForTest(), io.Discard, "test")
 		if err == nil {
 			t.Fatal("ReleaseWorkBead returned nil after the pre-release read failed; the caller will count this as a completed unassign")
 		}
@@ -514,7 +515,7 @@ func TestReleaseWorkBead_FallbackRouteNeverRidesASecondWrite(t *testing.T) {
 		store.updateCalls = 0
 
 		wa := workAssignmentForStore(beads.WorkStore{Store: store})
-		if err := wa.ReleaseWorkBead(claimed, "worker"); err != nil {
+		if err := wa.ReleaseWorkBead(claimed, "worker", poolReleaseGuardForTest(), io.Discard, "test"); err != nil {
 			t.Fatalf("ReleaseWorkBead: %v", err)
 		}
 
@@ -542,7 +543,7 @@ func TestReleaseWorkBead_FallbackRouteNeverRidesASecondWrite(t *testing.T) {
 		store.updateCalls = 0
 
 		wa := workAssignmentForStore(beads.WorkStore{Store: store})
-		if err := wa.ReleaseWorkBead(stale, "worker"); err != nil {
+		if err := wa.ReleaseWorkBead(stale, "worker", poolReleaseGuardForTest(), io.Discard, "test"); err != nil {
 			t.Fatalf("ReleaseWorkBead: %v", err)
 		}
 
@@ -601,7 +602,7 @@ func TestReleaseWorkBead_Tier2DoesNotTrustACachedRead(t *testing.T) {
 	}
 
 	wa := workAssignmentForStore(beads.WorkStore{Store: store})
-	if err := wa.ReleaseWorkBead(stale, ""); err == nil {
+	if err := wa.ReleaseWorkBead(stale, "", poolReleaseGuardForTest(), io.Discard, "test"); err == nil {
 		t.Fatal("ReleaseWorkBead = nil after losing its fence; a caller gating a close on it would close over the bead")
 	}
 
@@ -716,7 +717,7 @@ func TestReleaseWorkBead_DoesNotClobberReclaimedAssignee(t *testing.T) {
 			stale := seedReclaimedBead(t, store)
 
 			wa := workAssignmentForStore(beads.WorkStore{Store: store})
-			if err := wa.ReleaseWorkBead(stale, ""); err != nil {
+			if err := wa.ReleaseWorkBead(stale, "", poolReleaseGuardForTest(), io.Discard, "test"); err != nil {
 				t.Fatalf("ReleaseWorkBead: %v", err)
 			}
 
@@ -750,7 +751,7 @@ func TestReleaseWorkBead_ReleasesWhenSnapshotStillCurrent(t *testing.T) {
 			created := seedClaimedBead(t, store, "retired-session")
 
 			wa := workAssignmentForStore(beads.WorkStore{Store: store})
-			if err := wa.ReleaseWorkBead(created, ""); err != nil {
+			if err := wa.ReleaseWorkBead(created, "", poolReleaseGuardForTest(), io.Discard, "test"); err != nil {
 				t.Fatalf("ReleaseWorkBead: %v", err)
 			}
 
@@ -1043,7 +1044,7 @@ func TestReleaseWorkBead_ContinuationGroupNeverRidesASecondWrite(t *testing.T) {
 		wa := workAssignmentForStore(beads.WorkStore{Store: store})
 		// runTargetFallback is empty, so stampFallbackRoute is false and the group is
 		// the only thing that can force the single-write path.
-		if err := wa.ReleaseWorkBead(claimed, ""); err != nil {
+		if err := wa.ReleaseWorkBead(claimed, "", poolReleaseGuardForTest(), io.Discard, "test"); err != nil {
 			t.Fatalf("ReleaseWorkBead: %v", err)
 		}
 
@@ -1074,7 +1075,7 @@ func TestReleaseWorkBead_ContinuationGroupNeverRidesASecondWrite(t *testing.T) {
 		store.updateCalls = 0
 
 		wa := workAssignmentForStore(beads.WorkStore{Store: store})
-		if err := wa.ReleaseWorkBead(stale, ""); err != nil {
+		if err := wa.ReleaseWorkBead(stale, "", poolReleaseGuardForTest(), io.Discard, "test"); err != nil {
 			t.Fatalf("ReleaseWorkBead: %v", err)
 		}
 

@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // ErrPatchTargetNotFound reports a [patches] entry whose target is absent from
@@ -61,6 +62,9 @@ type AgentPatch struct {
 	PromptTemplate *string `toml:"prompt_template,omitempty"`
 	// Session overrides the session transport ("acp" or "tmux").
 	Session *string `toml:"session,omitempty"`
+	// WakeTransport overrides the seat's notification-plane wake transport
+	// ("session" or "claude-cloud"; see Agent.WakeTransport).
+	WakeTransport *string `toml:"wake_transport,omitempty"`
 	// Provider overrides the provider name.
 	Provider *string `toml:"provider,omitempty"`
 	// ContextAdvisory overrides context-pressure guidance for this agent.
@@ -164,6 +168,13 @@ type AgentPatch struct {
 	InstallAgentHooksAppend []string `toml:"install_agent_hooks_append,omitempty"`
 	// InjectFragmentsAppend appends to the agent's inject_fragments list.
 	InjectFragmentsAppend []string `toml:"inject_fragments_append,omitempty"`
+	// OptInSkills replaces the agent's opt_in_skills list (see
+	// Agent.OptInSkills). Leave it unset to keep the agent's list; set an
+	// empty list to clear it.
+	OptInSkills *[]string `toml:"opt_in_skills,omitempty"`
+	// OptInSkillsAppend appends to the agent's opt_in_skills list, the way
+	// inject_fragments_append adds a prompt fragment.
+	OptInSkillsAppend []string `toml:"opt_in_skills_append,omitempty"`
 	// MaxActiveSessions overrides the agent-level cap on concurrent sessions.
 	MaxActiveSessions *int `toml:"max_active_sessions,omitempty"`
 	// MinActiveSessions overrides the minimum number of sessions to keep alive.
@@ -240,6 +251,16 @@ type RigPatch struct {
 	FormulaVars map[string]string `toml:"formula_vars,omitempty" json:"FormulaVars,omitempty"`
 	// BeadsProxiedIdleTimeout overrides the rig's beads_proxied_idle_timeout.
 	BeadsProxiedIdleTimeout *string `toml:"beads_proxied_idle_timeout,omitempty"`
+	// Doctor overrides fields of the rig's [rigs.doctor] table.
+	Doctor *RigDoctorPatch `toml:"doctor,omitempty" json:"Doctor,omitempty"`
+}
+
+// RigDoctorPatch overrides fields of a rig's [rigs.doctor] table. Nil
+// fields leave the rig's value unchanged.
+type RigDoctorPatch struct {
+	// CensusOwnerNamespace overrides Rig.Doctor.CensusOwnerNamespace; an
+	// empty string clears the declaration.
+	CensusOwnerNamespace *string `toml:"census_owner_namespace,omitempty"`
 }
 
 // ProviderPatch modifies an existing provider identified by Name.
@@ -350,34 +371,73 @@ func Fragments(items ...string) *[]string {
 	return &out
 }
 
+// unappliedPatchMarker is a stable substring on the warning emitted when a
+// patch cannot be applied. CLI warning classification keys off this marker, so
+// keep it in sync with IsUnappliedPatchWarning.
+const unappliedPatchMarker = "was NOT APPLIED"
+
+// IsUnappliedPatchWarning reports whether a load warning records a patch that
+// could not be applied. Keep in sync with unappliedPatchMarker.
+func IsUnappliedPatchWarning(warning string) bool {
+	return strings.Contains(warning, unappliedPatchMarker)
+}
+
 // ApplyPatches applies all patches to the config. Patches target existing
-// resources by identity key. If a patch targets a nonexistent resource,
-// an error is returned. Patches are intentional — they never generate
-// collision warnings.
+// resources by identity key.
+//
+// A PATCH THAT CANNOT BE APPLIED IS SKIPPED AND RECORDED, NOT FATAL
+// (ga-djvbvp). It used to abort the whole load, and because every gc command
+// loads config that meant one dangling reference stopped the entire city: on
+// 2026-08-25 a `gc bd update` on an unrelated bead died with
+// `patches.agent[12]: agent "cherub-law.conway" not found in merged config`
+// while a new seat was mid-stand-up. Standing up a seat touches the pack and
+// city.toml, and a local-path pack is live the instant it is written, so ANY
+// two-file edit opens a window where a reference exists and its target does
+// not. Halting every agent for the duration of someone else's edit is a worse
+// outcome than leaving one patch unapplied.
+//
+// Skipping is safe in a way that failing is not: a patch that matched nothing
+// changed nothing, so the config here is exactly the config without that
+// patch. The risk is the opposite one — that a real typo becomes invisible —
+// which is why every skip is recorded on LoadWarnings, why the CLI prints
+// those on EVERY command rather than only on configuration surfaces, and why
+// `gc config --validate` still exits non-zero on them.
+//
+// Every patch is attempted, so one bad patch no longer hides the next: the old
+// code returned on the first failure and reported one defect at a time.
+//
+// Patches are intentional — they never generate collision warnings.
+//
+// The error return is retained for systemic failures; unappliable targets do
+// not produce one.
 func ApplyPatches(cfg *City, patches Patches) error {
+	record := func(kind string, i int, err error) {
+		cfg.LoadWarnings = appendUnique(cfg.LoadWarnings,
+			fmt.Sprintf("patches.%s[%d] %s: %v", kind, i, unappliedPatchMarker, err))
+	}
 	for i, p := range patches.Agents {
 		if err := applyAgentPatch(cfg, &p); err != nil {
-			return fmt.Errorf("patches.agent[%d]: %w", i, err)
+			record("agent", i, err)
 		}
 	}
 	for i, p := range patches.NamedSessions {
 		if err := applyNamedSessionPatch(cfg, &p); err != nil {
-			return fmt.Errorf("patches.named_session[%d]: %w", i, err)
+			record("named_session", i, err)
 		}
 	}
 	for i, p := range patches.Rigs {
 		if err := applyRigPatch(cfg, &p); err != nil {
-			return fmt.Errorf("patches.rigs[%d]: %w", i, err)
+			record("rigs", i, err)
 		}
 	}
 	for i, p := range patches.Providers {
 		if err := applyProviderPatch(cfg, &p); err != nil {
-			return fmt.Errorf("patches.providers[%d]: %w", i, err)
+			record("providers", i, err)
 		}
 	}
 	for i, p := range patches.GitHubPRMonitors {
 		if err := applyGitHubPRMonitorPatch(cfg, &p); err != nil {
-			return fmt.Errorf("patches.github_pr_monitor[%d]: %w", i, err)
+			record("github_pr_monitor", i, err)
 		}
 	}
 	return nil
@@ -556,6 +616,9 @@ func applyAgentMutation(a *Agent, p *AgentPatch, sleepSource string) {
 	if p.PromptTemplate != nil {
 		a.PromptTemplate = *p.PromptTemplate
 	}
+	if p.WakeTransport != nil {
+		a.WakeTransport = *p.WakeTransport
+	}
 	if p.Session != nil {
 		a.Session = *p.Session
 	}
@@ -673,6 +736,14 @@ func applyAgentMutation(a *Agent, p *AgentPatch, sleepSource string) {
 	if len(p.InjectFragmentsAppend) > 0 {
 		a.InjectFragments = append(a.InjectFragments, p.InjectFragmentsAppend...)
 	}
+	// OptInSkills is presence-aware like InjectFragments, so a city can
+	// clear the opt-ins a pack's agent declares with `opt_in_skills = []`.
+	if p.OptInSkills != nil {
+		a.OptInSkills = append([]string(nil), (*p.OptInSkills)...)
+	}
+	if len(p.OptInSkillsAppend) > 0 {
+		a.OptInSkills = append(a.OptInSkills, p.OptInSkillsAppend...)
+	}
 	// Env: additive merge.
 	if len(p.Env) > 0 {
 		if a.Env == nil {
@@ -769,6 +840,9 @@ func applyRigPatch(cfg *City, patch *RigPatch) error {
 				for k, v := range patch.FormulaVars {
 					r.FormulaVars[k] = v
 				}
+			}
+			if patch.Doctor != nil && patch.Doctor.CensusOwnerNamespace != nil {
+				r.Doctor.CensusOwnerNamespace = *patch.Doctor.CensusOwnerNamespace
 			}
 			return nil
 		}

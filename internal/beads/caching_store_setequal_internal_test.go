@@ -101,3 +101,27 @@ func TestDepSetEqual(t *testing.T) {
 		t.Error("depSetEqual = true for different multisets; want false")
 	}
 }
+
+// ga-knhu61: a bead.updated event that changes await_type must both flag the
+// stale cache row (conflict) and land on the merged copy — the re-typing
+// operation (`bd update --await-type`) is exactly this event.
+func TestCacheEventCarriesAwaitType(t *testing.T) {
+	current := Bead{ID: "gc-gate", Title: "g", Status: "open", Type: "gate", AwaitType: AwaitHuman}
+	patch := current
+	patch.AwaitType = AwaitBead
+	fields := map[string]json.RawMessage{"await_type": json.RawMessage(`"bead"`)}
+
+	if !cacheEventConflictsCurrent(current, patch, fields) {
+		t.Fatal("cacheEventConflictsCurrent = false for an await_type change; want true")
+	}
+	merged := mergeCacheEventPatch(current, patch, fields)
+	if merged.AwaitType != AwaitBead {
+		t.Fatalf("merged AwaitType = %q, want %q", merged.AwaitType, AwaitBead)
+	}
+	if merged := mergeCacheEventPatch(current, patch, map[string]json.RawMessage{"title": json.RawMessage(`"g"`)}); merged.AwaitType != AwaitHuman {
+		t.Fatalf("merge without await_type field mutated AwaitType to %q; want untouched %q", merged.AwaitType, AwaitHuman)
+	}
+	if !beadChanged(current, patch, false) {
+		t.Fatal("beadChanged = false for an await_type-only change; applyEvent would drop the update")
+	}
+}

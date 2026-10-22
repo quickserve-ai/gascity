@@ -39,9 +39,11 @@ import (
 //
 // TWO THINGS THIS GATE DELIBERATELY DOES NOT DO.
 //
-// It does not test the RIG PREFIX. qcore is precisely the SHARED rig, so a
-// prefix test protects nothing — the discriminator has to be the agent
-// identity against the local roster.
+// It does not test the RIG PREFIX of the work bead. qcore is precisely the
+// SHARED rig, so a prefix test protects nothing — the discriminator has to be
+// the agent identity against the local roster. (The store prefix of a bare
+// session bead ID named AS the assignee is a different question, and is
+// tested: see poolRosterReasonForeignStorePrefix.)
 //
 // It does not test pool CAPACITY. "<local agent>-<slot>" is an instance
 // identity of a local agent family whatever the current max_active_sessions
@@ -63,12 +65,16 @@ import (
 // this gate to every identity shape without the shape exemption, because the
 // order has no route filter (claimIdentityProvenance, #5955).
 //
-// The orphan-close release (releaseConfirmedOrphanSessionWork) has no gate of
-// its own, deliberately. It releases only under identifiers read off this
-// city's own orphaned session bead or derived from its roster, so every claim
-// it touches already carries the provenance this gate looks for. A roster test
-// there would refuse exactly the seats that site exists for (an orphaned seat
-// is one whose config is gone) and re-wedge them (ga-jrnou).
+// The orphan close (releaseConfirmedOrphanSessionWork, and the v2 close
+// effect's orphan release) does not use this gate. It releases only under the
+// orphaned seat's own identifiers, and a plain roster test there would refuse
+// exactly the seats that site exists for (an orphaned seat is one whose config
+// is gone) and re-wedge them (ga-jrnou). It has a narrower gate of its own
+// (orphanCloseHold, kept by the fork): an identifier off the roster passes
+// when the seat's own record answers to it under alias, configured named
+// identity or alias history, the same provenance this gate accepts, and is
+// protected when it reached the seat only as a raw stored bead ID or
+// session_name, which never legitimately hold "<rig>/<name>".
 //
 // KNOWN RESIDUAL (ga-dk24ao): two cities importing the same agent pack share an
 // identity space, so a foreign POOL instance ("qcore/gastown.furiosa") is
@@ -210,28 +216,167 @@ func (g *foreignClaimGate) log() {
 // adds the session-record half, and it is the gate a release must consult.
 //
 // Anything that is not a well-formed <rig>/<name> identity returns true: bare
-// aliases, session bead IDs and runtime session names ("gastown__dog-ga-up143",
-// "claude-mc-xyz") are this city's own naming and were never the cross-city
-// hazard. Keeping them on the existing path is what preserves current
-// behavior for every local assignee shape.
+// aliases, runtime session names ("gastown__dog-ga-up143", "claude-mc-xyz")
+// and session bead IDs minted by THIS city's own stores are this city's own
+// naming and were never the cross-city hazard. Keeping them on the existing
+// path is what preserves current behavior for every local assignee shape. The
+// one bare shape that returns false is a session bead ID minted by a store
+// this city does not own ("we-wisp-126vyfx", ga-x1f77i): it names another
+// city's session.
 func poolAssigneeIsLocallyObservable(cfg *config.City, cityName, assignee string) bool {
+	return poolAssigneeObservability(cfg, cityName, assignee).Local
+}
+
+// poolRosterReason names the narrowing that decided a roster verdict. It exists
+// so a PROTECTED claim can say WHY, per identity, rather than only that it was
+// skipped: an invisible gate is a fresh instance of the class this file fixes,
+// and "foreign_binding" versus "absent_from_roster" is the difference between
+// another city's live agent and one of ours that was decommissioned.
+type poolRosterReason string
+
+// Roster verdict reasons. The matched ones name which resolver answered; the
+// unmatched ones name why none could.
+const (
+	// poolRosterReasonNotQualified: not a <rig>/<name> identity at all — a bare
+	// alias, a runtime session name, a session bead ID under one of this city's
+	// own store prefixes. This city's own naming, never the cross-city hazard,
+	// so it stays on the existing liveness path.
+	poolRosterReasonNotQualified poolRosterReason = "not_qualified"
+
+	// poolRosterReasonForeignStorePrefix: a bare session bead ID
+	// ("<prefix>-wisp-<id>") whose store prefix is neither this city's HQ
+	// prefix nor any rig's (ga-x1f77i). Before it existed every bare string
+	// read not_qualified/local, so on 2026-09-24 `gc agent is-foreign
+	// we-wisp-126vyfx` answered local for a westeros hub session holding claims
+	// on qcore beads in the shared store — six such sessions were live, and only
+	// an unrelated later fail-safe kept the sweeper from reaping their claims.
+	// A session bead lives in the store that minted it, so a prefix this city
+	// does not own names a session whose liveness this city cannot observe.
+	// Detail carries the prefix.
+	poolRosterReasonForeignStorePrefix poolRosterReason = "foreign_store_prefix"
+
+	poolRosterReasonNamedSession     poolRosterReason = "named_session"
+	poolRosterReasonAgentTemplate    poolRosterReason = "agent_template"
+	poolRosterReasonConfiguredAgent  poolRosterReason = "configured_agent"
+	poolRosterReasonNamepoolInstance poolRosterReason = "namepool_instance"
+	poolRosterReasonAgentInstance    poolRosterReason = "agent_instance"
+
+	// poolRosterReasonForeignBinding: every candidate carried a binding prefix
+	// this city does not mint, so no resolver was allowed to run (ga-8yi7ne).
+	// This is the reason that distinguishes another city's canonical naming
+	// ("qcore/pool.omp-1") from one of our own stale identities.
+	poolRosterReasonForeignBinding poolRosterReason = "foreign_binding"
+
+	// poolRosterReasonAbsentFromRoster: well-formed, binding acceptable, and no
+	// resolver matched. Another city's unbound identity, or one of ours that
+	// config no longer carries.
+	poolRosterReasonAbsentFromRoster poolRosterReason = "absent_from_roster"
+
+	// poolRosterReasonNoConfig: no resolved city config to answer from. Not a
+	// statement about the identity — a statement that this city cannot answer.
+	poolRosterReasonNoConfig poolRosterReason = "no_config"
+)
+
+// poolRosterVerdict is one roster decision with the narrowing that produced it.
+type poolRosterVerdict struct {
+	// Local is the sweeper's existing boolean: true means this city is in a
+	// position to answer the identity's liveness, false means PROTECT.
+	Local bool
+	// Reason names the narrowing that fired.
+	Reason poolRosterReason
+	// Detail carries the narrowing's subject when there is one — the matched
+	// candidate, the foreign binding that blocked every candidate, or the
+	// foreign store prefix of a bare session bead ID.
+	Detail string
+}
+
+// poolAssigneeObservability is the explained form of
+// poolAssigneeIsLocallyObservable. The boolean predicate delegates here so
+// there is exactly ONE implementation of this decision: a second copy that
+// drifts from the in-process sweeper would make the two disagree about which
+// city owns a claim, which is the failure this file exists to prevent.
+func poolAssigneeObservability(cfg *config.City, cityName, assignee string) poolRosterVerdict {
 	assignee = strings.TrimSpace(assignee)
-	if cfg == nil || assignee == "" {
-		return true
+	if assignee == "" {
+		return poolRosterVerdict{Local: true, Reason: poolRosterReasonNotQualified}
+	}
+	if cfg == nil {
+		// Unchanged for the sweeper (it passes a loaded cfg), and honest for a
+		// caller that could not load one: no roster, no answer.
+		return poolRosterVerdict{Local: true, Reason: poolRosterReasonNoConfig}
 	}
 	rig, local := config.ParseQualifiedName(assignee)
 	if strings.TrimSpace(rig) == "" || strings.TrimSpace(local) == "" {
-		return true
+		if prefix, ok := sessionBeadIDStorePrefix(assignee); ok && !cityOwnsStorePrefix(cfg, prefix) {
+			return poolRosterVerdict{Reason: poolRosterReasonForeignStorePrefix, Detail: prefix}
+		}
+		return poolRosterVerdict{Local: true, Reason: poolRosterReasonNotQualified}
 	}
-	return poolIdentityInLocalRoster(cfg, cityName, assignee)
+	return poolIdentityLocalRosterVerdict(cfg, cityName, assignee)
 }
 
-// poolIdentityInLocalRoster resolves a <rig>/<name> identity against local
+// sessionBeadIDWispInfix separates a session bead's store prefix from its id.
+// Session beads are wisps, and a wisp id reads "<store prefix>-wisp-<id>".
+const sessionBeadIDWispInfix = "-wisp-"
+
+// sessionBeadIDStorePrefix returns the lowercased store prefix of an assignee
+// shaped exactly like a session bead ID — "<prefix>-wisp-<id>", both parts
+// ASCII letters and digits only — and false for anything else.
+//
+// The shape is matched strictly because a false match PROTECTS a claim this
+// city could have reaped. Bare aliases ("platform-lead") and runtime session
+// names ("qcore--refinery") carry no "-wisp-" infix; a runtime name that EMBEDS
+// a wisp id ("polecat-we-wisp-3nvj3yx") has a dash in what would be its prefix.
+// Neither is a store prefix, so both stay on the not_qualified path.
+func sessionBeadIDStorePrefix(assignee string) (string, bool) {
+	id := strings.ToLower(strings.TrimSpace(assignee))
+	prefix, tail, ok := strings.Cut(id, sessionBeadIDWispInfix)
+	if !ok || !isLowerAlnum(prefix) || !isLowerAlnum(tail) {
+		return "", false
+	}
+	return prefix, true
+}
+
+func isLowerAlnum(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if (s[i] < 'a' || s[i] > 'z') && (s[i] < '0' || s[i] > '9') {
+			return false
+		}
+	}
+	return true
+}
+
+// cityOwnsStorePrefix reports whether prefix names one of this city's own bead
+// stores: the HQ store or any configured rig's, including the prefix a rig
+// DERIVES from its name when it declares none. Compared case-insensitively,
+// matching rig prefix validation.
+func cityOwnsStorePrefix(cfg *config.City, prefix string) bool {
+	prefix = strings.ToLower(strings.TrimSpace(prefix))
+	if cfg == nil || prefix == "" {
+		return false
+	}
+	if strings.ToLower(strings.TrimSpace(config.EffectiveHQPrefix(cfg))) == prefix {
+		return true
+	}
+	for i := range cfg.Rigs {
+		if strings.ToLower(strings.TrimSpace(cfg.Rigs[i].EffectivePrefix())) == prefix {
+			return true
+		}
+	}
+	return false
+}
+
+// poolIdentityLocalRosterVerdict resolves a <rig>/<name> identity against local
 // config: configured named sessions, configured agent templates (including the
 // legacy bound form that persisted assignees still carry), namepool-themed pool
 // instances, and the instance identities gc mints for a local agent (numeric
-// slots and adhoc tokens).
-func poolIdentityInLocalRoster(cfg *config.City, cityName, identity string) bool {
+// slots and adhoc tokens). The verdict carries the reason the identity was
+// judged local or foreign, not just the boolean.
+func poolIdentityLocalRosterVerdict(cfg *config.City, cityName, identity string) poolRosterVerdict {
+	foreignBinding := ""
 	for _, candidate := range poolIdentityLocalCandidates(cfg, identity) {
 		// A candidate still carrying a binding this city does not mint cannot
 		// name a local agent, whatever the resolvers say (ga-8yi7ne). This is
@@ -250,25 +395,52 @@ func poolIdentityInLocalRoster(cfg *config.City, cityName, identity string) bool
 		// five resolvers below inherit it, so a sixth added later cannot
 		// silently reopen the hole.
 		if !poolCandidateBindingIsLocal(cfg, candidate) {
+			if foreignBinding == "" {
+				foreignBinding = poolCandidateBinding(candidate)
+			}
 			continue
 		}
 		if _, ok := findNamedSessionSpec(cfg, cityName, candidate); ok {
-			return true
+			return poolRosterVerdict{Local: true, Reason: poolRosterReasonNamedSession, Detail: candidate}
 		}
 		if findAgentByTemplate(cfg, candidate) != nil {
-			return true
+			return poolRosterVerdict{Local: true, Reason: poolRosterReasonAgentTemplate, Detail: candidate}
 		}
 		if config.FindAgent(cfg, candidate) != nil {
-			return true
+			return poolRosterVerdict{Local: true, Reason: poolRosterReasonConfiguredAgent, Detail: candidate}
 		}
 		if poolIdentityIsThemedInstance(cfg, candidate) {
-			return true
+			return poolRosterVerdict{Local: true, Reason: poolRosterReasonNamepoolInstance, Detail: candidate}
 		}
 		if poolIdentityIsInstanceOfLocalAgent(cfg, candidate) {
-			return true
+			return poolRosterVerdict{Local: true, Reason: poolRosterReasonAgentInstance, Detail: candidate}
 		}
 	}
-	return false
+	// A foreign binding is reported ahead of a plain roster miss because it is
+	// the stronger statement: the identity names an import this city does not
+	// bind, so it cannot be ours however config changes.
+	if foreignBinding != "" {
+		return poolRosterVerdict{Reason: poolRosterReasonForeignBinding, Detail: foreignBinding}
+	}
+	return poolRosterVerdict{Reason: poolRosterReasonAbsentFromRoster, Detail: identity}
+}
+
+// poolIdentityInLocalRoster is the boolean form of poolIdentityLocalRosterVerdict:
+// the roster half claimIdentityProvenance (the `gc agent is-foreign` gate) asks
+// for every identity shape.
+func poolIdentityInLocalRoster(cfg *config.City, cityName, identity string) bool {
+	return poolIdentityLocalRosterVerdict(cfg, cityName, identity).Local
+}
+
+// poolCandidateBinding returns a candidate's binding prefix, or "" when it
+// carries none.
+func poolCandidateBinding(candidate string) string {
+	_, local := config.ParseQualifiedName(strings.TrimSpace(candidate))
+	binding, unbound, ok := strings.Cut(local, ".")
+	if !ok || strings.TrimSpace(binding) == "" || strings.TrimSpace(unbound) == "" {
+		return ""
+	}
+	return binding
 }
 
 // poolIdentityLocalCandidates returns the identity itself plus, when its local

@@ -173,6 +173,33 @@ orders and pack scripts run, is the binary under test, and whenever an order
 they run fails. `test/acceptance/BUILD.bazel` sets both variables
 (`SOLO_ENV`); its `REALTIME_TESTS` run the same rows with neither, nightly.
 
+### Lane failpoints
+
+`GC_LANE_FAILPOINT=<host>:<stage>[:<n>]` makes a gc process kill itself with
+SIGKILL at one crash point of one of its conversation lanes, so the X2 kill
+matrix can show what a crash there leaves behind and that the next lane host
+recovers it. Only `//test/conversationlane` uses it.
+
+- `host` is `ctl`, the controller's lane host, or `cli`, the inline pass of
+  `gc session nudge`. A gc that hosts no such lane never fires.
+- `stage` is `propose` (`cli` only: the op is durable and nothing is taken),
+  `take` (the Take's guarded batch landed and the effect has not started),
+  `effect` (the effect returned and its Done is not written) or `done` (a
+  pass's Done landed accepted).
+- `n` fires on the n-th hit of that host and stage in the process; it
+  defaults to 1.
+
+Like `GC_TEST_BACKSTOP_SPEEDUP`, it is honored only by the
+`//cmd/gc:gc_testhooks` link. Any other gc ignores it and prints one
+`gc: WARNING: GC_LANE_FAILPOINT=...: ignored: ...` line. An armed failpoint
+prints one `gc: WARNING: GC_LANE_FAILPOINT=...: TEST HOOK ACTIVE: ...` line
+when the lane first consults it, and the evidence tests check for that line,
+so a gc that ignored the variable fails them instead of passing vacuously. A
+malformed value is ignored with a notice naming why. The variable is in the
+GC_* env-read inventory and in `internal/testenv.LeakVectorVars`, so a shell
+value never reaches a test's gc child; a test sets it on the child it means
+to kill.
+
 ### Git auto-maintenance in test repos
 
 Git 2.55 starts `git maintenance run --auto` detached, in the background, after
@@ -1319,6 +1346,7 @@ all-source audit while staying outside untagged and Small debt.
 | Audit baseline | all tracked test source | fixed_sleep | ga-cp3hwi | tracked test source totals remain visible as audit evidence; ga-cp3hwi owns this point-in-time source census | P0.4a | 2026-10-31 |
 | Audit baseline | all tracked test source | listener_helper | ga-cp3hwi | all-source listener-helper call/file totals cannot drift without an explicit checked policy update; ga-cp3hwi owns this all-source audit; tagged calls stay Large and receive no Medium exemption | P0.4c-listener-helper | 2026-10-31 |
 | Audit baseline | all tracked test source | subprocess | ga-cp3hwi | tracked test source totals remain visible as audit evidence; ga-cp3hwi owns this point-in-time source census | P0.4a | 2026-10-31 |
+| Medium owner | `cmd/gc` package `main` | TestGcBeadsBdInitConsentsToMigrateOnlyADatabaseItCreated: subprocess | ga-zyvj2k | the created-database migrate-consent proof is a checked Medium subprocess owner; the test executes the shipped provider script once per case with a test-owned bd, dolt and sleep on PATH and a scope built from files alone, so no Dolt, no bd and no host service are involved | P0.4b | 2026-10-31 |
 | Medium owner | `cmd/gc` package `main` | TestGcBeadsBdProviderOwnedLifecycleUsesBdBoundary: subprocess | ga-p9iuv.30 | the provider-owned script boundary proof is a checked Medium subprocess owner; the test executes the copied provider script only with a test-owned BD executable and verifies its lifecycle delegation without a host service | GC6011 | 2026-10-31 |
 | Medium owner | `cmd/gc` package `main` | TestGcBeadsBdProviderOwnedRealLifecycleStopsOwnedProcesses: slow_process_gate, subprocess | ga-p9iuv.30 | the provider-owned BD lifecycle proof is a checked Medium process owner; the test runs the pinned real bd direct and proxied lifecycles under deadlines, records only provider-published identities, and stops its own scope before asserting those children are absent | GC6011 | 2026-10-31 |
 | Medium owner | `cmd/gc` package `main` | TestGcBeadsBdReadyScopeLifecycleReadsItsPersistedTopology: subprocess | ga-p9iuv.30 | the ready-scope topology boundary proof is a checked Medium subprocess owner; the test executes the shipped provider script once per init shape with a test-owned BD executable and a scope built from files alone, so no Dolt, no bd and no host service are involved | GC6011 | 2026-10-31 |
@@ -1344,6 +1372,7 @@ all-source audit while staying outside untagged and Small debt.
 | Medium owner | `scripts` package `scripts_test` | TestFreshMergeActionBehaviour: subprocess | ga-cp3hwi | the fresh-merge composite action's behavior proof is a checked Medium subprocess owner; the git and bash subprocesses are confined to TestFreshMergeActionBehaviour, which exists to run .github/actions/fresh-merge's own bash script against a scratch git origin (clean merge, workflow skew, conflict, head already containing the tip, unfetchable base): the script is git plumbing, so only real git can prove what it merges and when it fails | P0.4b | 2026-10-31 |
 | Medium owner | `scripts` package `scripts_test` | TestGoModDownloadRetryScriptRetriesTransientFailures: subprocess | ga-cp3hwi | the CI go mod download retry proof is a checked Medium subprocess owner; the one bash subprocess per case is confined to TestGoModDownloadRetryScriptRetriesTransientFailures, which exists to run .github/scripts/go-mod-download-retry.sh against a PATH-injected fake go: the retry loop and GOPROXY selection are shell, so only a real shell run can prove a transient proxy error is retried and a persistent one fails | P0.4b | 2026-10-31 |
 | Medium owner | `scripts` package `scripts_test` | TestGoModVerifyCacheDetectsTamperedModules: subprocess | ga-cp3hwi | the CI Go module cache verification proof is a checked Medium subprocess owner; the go and bash subprocesses are confined to TestGoModVerifyCacheDetectsTamperedModules, which exists to run .github/scripts/go-mod-download-retry.sh and .github/scripts/go-mod-verify-cache.sh with the real go command against a file:// module proxy and an isolated module cache, then tamper with the cached zip: the claim under test is the go command's own trust of a cached .ziphash, so only the real go command can prove the verify step catches what it accepts | P0.4b | 2026-10-31 |
+| Medium owner | `scripts` package `scripts_test` | TestMolScopedWorkTeardownScript: subprocess | pl-4k0 | the mol-scoped-work cleanup-worktree behavior proof is a checked Medium subprocess owner; the one bash subprocess is confined to TestMolScopedWorkTeardownScript, which runs scripts/test-mol-scoped-work-teardown.sh: the step under test is agent-executed shell rendered from formula TOML, so only running that shell against a stub gc can prove what it does | P0.4b | 2026-10-31 |
 | Medium owner | `scripts` package `scripts_test` | TestProviderOverridesAndSuiteContractsCrossMakeIsolation: subprocess | ga-cp3hwi | Make/provider and suite-contract proof is a checked Medium owner; the six isolated Make invocations are confined to TestProviderOverridesAndSuiteContractsCrossMakeIsolation | P0.1 | 2026-10-31 |
 | Small debt ratchet | `cmd/gc` untagged test source | cwd | ga-cp3hwi | untagged Small cmd/gc cwd call/file totals cannot grow; reductions are banked by regenerating test/test-resource-counts.toml; non-Medium lexical owners restore or eliminate every cwd mutation | D5/D6 | 2026-10-31 |
 | Small debt ratchet | `cmd/gc` untagged test source | environment | ga-cp3hwi | untagged Small cmd/gc environment call/file totals cannot grow; reductions are banked by regenerating test/test-resource-counts.toml; non-Medium lexical owners restore or eliminate every process-environment mutation | D5/D6/E6 | 2026-10-31 |
@@ -1474,6 +1503,28 @@ coverage sweep locally, use `make test-integration-packages-cover` or
 fast unit-only baseline; the integration contribution comes from the
 shard-specific `coverage.integration-*.txt` profiles and their matching
 Codecov flags.
+
+For a lean local check against a fetched integration base, use:
+
+```bash
+make check-lean-local LINT_CHANGED_REF=origin/carry/operational
+```
+
+This runs `go vet` and `go build` across the repository, then fast-unit tests
+for changed Go/native/embedded inputs and their transitive importers, including
+test-only importers. It reuses `ci-static-select` and the Makefile's isolated
+test environment and ICU configuration; `CGO_CPPFLAGS` reaches both C and C++,
+and this target also preserves explicit `CGO_CFLAGS` and `CGO_CXXFLAGS`.
+Package parallelism and `GOMAXPROCS` are capped at two.
+
+`LINT_CHANGED_REF` defaults to `HEAD` for local edits; refinery callers must
+pass their fetched integration base, not rely on that default. The existing
+`LINT_CHANGED_SCOPE` modes apply. Unknown selection and module/workspace
+changes refuse with a diagnostic instead of quietly selecting no tests or
+expanding into a full suite on the shared host. Required server CI remains
+authoritative; this target neither authorizes a merge nor replaces its checks.
+An empty diff also refuses, so a clean committed checkout cannot accidentally
+report a tested change when the caller forgot to select the integration base.
 
 ### Cross-category runners, timing, and resource isolation
 

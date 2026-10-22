@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/gastownhall/gascity/internal/processenv"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
+	workdirutil "github.com/gastownhall/gascity/internal/workdir"
 	"github.com/gastownhall/gascity/internal/worker"
 )
 
@@ -36,12 +38,30 @@ func workerFactoryWithConfig(cityPath string, store beads.Store, sp runtime.Prov
 	return workerFactoryWithStaleKeyDetectionWaiter(cityPath, store, sp, cfg, nil)
 }
 
+// workerFactoryWithStaleKeyDetectionWaiter builds a factory whose usage
+// attribution reads work beads from store only: city-resident beads. A caller
+// that serves rig-resident work uses workerFactoryWithAttribution.
 func workerFactoryWithStaleKeyDetectionWaiter(
 	cityPath string,
 	store beads.Store,
 	sp runtime.Provider,
 	cfg *config.City,
 	waiter session.StaleKeyDetectionWaiter,
+) (*worker.Factory, error) {
+	return workerFactoryWithAttribution(cityPath, store, sp, cfg, waiter, nil, nil)
+}
+
+// workerFactoryWithAttribution is the factory constructor with formula
+// attribution injected: resolveBead reads a work bead wherever it lives (nil
+// falls back to store) and memo outlives the factory (nil derives every time).
+func workerFactoryWithAttribution(
+	cityPath string,
+	store beads.Store,
+	sp runtime.Provider,
+	cfg *config.City,
+	waiter session.StaleKeyDetectionWaiter,
+	resolveBead func(id string) (beads.Bead, error),
+	memo *worker.FormulaNameMemo,
 ) (*worker.Factory, error) {
 	var (
 		resolveTransport func(template, provider string) string
@@ -95,6 +115,8 @@ func workerFactoryWithStaleKeyDetectionWaiter(
 		StaleKeyDetectionWaiter: waiter,
 		Pricing:                 cfg.PricingRegistry(),
 		RuntimeLeaseTTL:         session.RuntimeLeaseTTLFor(cfg),
+		ResolveBead:             resolveBead,
+		FormulaMemo:             memo,
 		// The zero store resolves no class store: a deferred submit writes
 		// no shadow, so it opens nothing.
 		DeferredSubmits: openNudgeQueue(cityPath, beads.NudgesStore{}).Queue,
@@ -112,6 +134,14 @@ func workerSessionRuntimeResolverWithConfig(cityPath string, cfg *config.City) w
 		}
 		if runtimeCfg == nil {
 			return nil, nil
+		}
+		if strings.TrimSpace(runtimeCfg.Command) == "" {
+			// Env-only reset override (unresolved provider, ga-xd3bjx item 1):
+			// the stored command/provider stay in force, so the strict
+			// normalization — which requires both — must not reject it.
+			// applyResolvedRuntimeToSessionSpec applies partial overrides
+			// field-by-field.
+			return runtimeCfg, nil
 		}
 		normalized, err := worker.NormalizeResolvedRuntime(*runtimeCfg)
 		if err != nil {
@@ -307,6 +337,14 @@ func newWorkerSessionHandleForResolvedRuntimeWithConfig(
 	// worker factory. In particular, workspace.env BD_BIN must follow the same
 	// schema-compatible executable as the controller and resumed sessions.
 	sessionEnv := resolvedWorkerSessionEnvWithConfig(cityPath, cfg, resolved)
+	// Account guard (ga-ai7gz2), hard on this create path because it launches a
+	// new process: refuse a claude-family session that would inherit the
+	// controller's ambient CLAUDE_CONFIG_DIR with none declared. It checks the
+	// env the session actually launches with, so an account declared only in
+	// [workspace.env] satisfies it.
+	if err := processenv.RequireDeclaredClaudeAccount(sessionCfg.Runtime.Provider, resolved.AccountFamily(), sessionEnv); err != nil {
+		return nil, err
+	}
 	sessionCfg.Runtime.SessionEnv = sessionEnv
 	sessionCfg.Runtime.Hints.Env = sessionEnv
 	// Stage provider-overlay hooks on the CLI create path the same way the
@@ -679,9 +717,32 @@ func resolvedWorkerRuntimeWithConfigAndMetadata(cityPath string, cfg *config.Cit
 	if cfg == nil {
 		return nil, nil
 	}
-	resolved, configuredTransport := resolveWorkerRuntimeProviderWithConfigAndMetadata(cfg, info, sessionKind, metadata)
+	resolved, configuredTransport, resolvedAgent := resolveWorkerRuntimeProviderAndAgent(cfg, info, sessionKind, metadata)
+	// Render a templated start_command for this session before anything
+	// compares against it, so a stored (already rendered) command is
+	// recognized as current and the raw template is never launched
+	// (ga-b1u4yg).
+	resolved = renderResolvedCommandForSession(cityPath, cfg, resolvedAgent, info, info.WorkDir, resolved)
 	if resolved == nil {
-		return nil, nil
+		// The provider can no longer be resolved (removed or renamed since the
+		// session was stored). Returning nil here used to mean "no override",
+		// and the stored command was then relaunched with the controller's
+		// inherited process env — bypassing both the passthrough reset and the
+		// account guard, so a session whose provider declaration was REMOVED
+		// could silently resume under the controller's ambient Claude account
+		// (ga-xd3bjx item 1, codex lens finding). A hard error is not an option
+		// either: this resolver services every session-handle lookup (stop,
+		// kill, observe), and failing it would make such a session impossible
+		// to stop. So return an ENV-ONLY override carrying the reset baseline:
+		// Command/Provider/WorkDir stay empty (the stored values apply), and
+		// the session env is the passthrough reset (which empties
+		// CLAUDE_CONFIG_DIR and friends) plus the city identity anchors.
+		sessionEnv := mergeEnv(providerProcessPassthroughEnv(), cityIdentityAnchorsForCity(cityPath))
+		hints := runtime.Config{Env: sessionEnv}
+		return &worker.ResolvedRuntime{
+			SessionEnv: sessionEnv,
+			Hints:      hints,
+		}, nil
 	}
 	transport := resolvedWorkerRuntimeTransport(info, resolved, configuredTransport, metadata)
 	if transport == "" && startedConfigHashProvesWorkerACPTransport(cityPath, cfg, info, sessionKind, resolved, metadata, configuredTransport) {
@@ -721,6 +782,19 @@ func resolvedWorkerRuntimeWithConfigAndMetadata(cityPath string, cfg *config.Cit
 	// overwritten with the city-uniform default here. template_resolve.go
 	// owns the qualified override for the CLI create path.
 	sessionEnv := resolvedWorkerSessionEnvWithConfig(cityPath, cfg, resolved)
+	if model := config.LaunchModelFromCommand(command); model != "" {
+		sessionEnv["GC_CONTEXT_LAUNCH_MODEL"] = model
+	}
+	// Account guard, warn-only (ga-ai7gz2): this resolver services EVERY
+	// session-handle lookup through worker.Factory (stop, kill, observe —
+	// not just relaunch), so a hard error here would make an undeclared
+	// claude session impossible to stop while the controller carries an
+	// ambient CLAUDE_CONFIG_DIR (codex lens finding). The passthrough reset
+	// still guarantees the env never carries the ambient account; the hard
+	// refusal lives on the create paths, which launch new processes.
+	if err := processenv.RequireDeclaredClaudeAccount(resolved.Name, resolved.AccountFamily(), sessionEnv); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: resumed session %q runs without a declared Claude account: %v\n", info.SessionName, err)
+	}
 	// Resolve session_live so resumed sessions get re-themed (status bar,
 	// keybindings) the same way reconciler-started sessions do. Without this,
 	// `gc session attach` recreates the tmux runtime with an empty
@@ -978,14 +1052,23 @@ func resolveWorkerRuntimeProviderWithConfig(cfg *config.City, info session.Info,
 }
 
 func resolveWorkerRuntimeProviderWithConfigAndMetadata(cfg *config.City, info session.Info, sessionKind string, metadata map[string]string) (*config.ResolvedProvider, string) {
+	resolved, transport, _ := resolveWorkerRuntimeProviderAndAgent(cfg, info, sessionKind, metadata)
+	return resolved, transport
+}
+
+// resolveWorkerRuntimeProviderAndAgent is resolveWorkerRuntimeProviderWithConfigAndMetadata
+// that also reports the agent the provider was resolved through (nil when it
+// came from the provider-only fallback), so callers can render that agent's
+// templated start_command for the target session (ga-b1u4yg).
+func resolveWorkerRuntimeProviderAndAgent(cfg *config.City, info session.Info, sessionKind string, metadata map[string]string) (*config.ResolvedProvider, string, *config.Agent) {
 	if cfg == nil {
-		return nil, ""
+		return nil, "", nil
 	}
 	found, foundAgent := resolveAgentIdentity(cfg, info.Template, "")
 	if session.UseAgentTemplateForProviderResolution(sessionKind, metadata, info.Provider, found.Provider, foundAgent) {
 		if foundAgent {
 			if resolved, err := config.ResolveProvider(&found, &cfg.Workspace, cfg.Providers, exec.LookPath); err == nil {
-				return resolved, config.ResolveSessionCreateTransport(found.Session, resolved)
+				return resolved, config.ResolveSessionCreateTransport(found.Session, resolved), &found
 			}
 		}
 	}
@@ -996,10 +1079,80 @@ func resolveWorkerRuntimeProviderWithConfigAndMetadata(cfg *config.City, info se
 		}
 		resolved, err := config.ResolveProvider(&config.Agent{Provider: providerName}, &cfg.Workspace, cfg.Providers, exec.LookPath)
 		if err == nil {
-			return resolved, strings.TrimSpace(resolved.ProviderSessionCreateTransport())
+			return resolved, strings.TrimSpace(resolved.ProviderSessionCreateTransport()), nil
 		}
 	}
-	return nil, ""
+	// Permissive retry: the strict passes above also fail on
+	// ErrProviderNotInPATH (a reduced PATH in cron/systemd/upgrade windows),
+	// and returning nil for that case would hand the caller the env-only
+	// RESET override — actively discarding a correctly DECLARED provider env,
+	// worse than the transient PATH fault. A provider that resolves with a
+	// permissive lookPath still exists in config, so its declared env is
+	// authoritative; a relaunch with a genuinely missing binary then fails
+	// loudly at spawn, which is honest. Only a provider that is gone from
+	// config falls through to nil (ga-xd3bjx item 1, reviewer finding 2).
+	permissive := func(name string) (string, error) { return name, nil }
+	if session.UseAgentTemplateForProviderResolution(sessionKind, metadata, info.Provider, found.Provider, foundAgent) && foundAgent {
+		if resolved, err := config.ResolveProvider(&found, &cfg.Workspace, cfg.Providers, permissive); err == nil {
+			return resolved, config.ResolveSessionCreateTransport(found.Session, resolved), &found
+		}
+	}
+	for _, providerName := range []string{info.Provider, info.Template} {
+		providerName = strings.TrimSpace(providerName)
+		if providerName == "" {
+			continue
+		}
+		resolved, err := config.ResolveProvider(&config.Agent{Provider: providerName}, &cfg.Workspace, cfg.Providers, permissive)
+		if err == nil {
+			return resolved, strings.TrimSpace(resolved.ProviderSessionCreateTransport()), nil
+		}
+	}
+	return nil, "", nil
+}
+
+// renderResolvedCommandForSession renders the templated launch command
+// (start_command) of a provider resolved through agentCfg for the TARGET
+// session, with the same renderer and SessionSetupContext fields the
+// reconciler's create path uses (resolveTemplate Step 11). The Agent identity
+// comes from sessionRenderIdentity, the reconciler's own rediscovery chain for
+// a session bead. Without it, resume paths launched the raw template — the
+// control dispatcher's `--follow {{.Agent}}` — and died (ga-b1u4yg). The
+// context is built from the session record and the city config, never from
+// the caller's environment.
+func renderResolvedCommandForSession(cityPath string, cfg *config.City, agentCfg *config.Agent, info session.Info, workDir string, resolved *config.ResolvedProvider) *config.ResolvedProvider {
+	if cfg == nil || agentCfg == nil || resolved == nil {
+		return resolved
+	}
+	renderAgent, qualifiedName := sessionRenderIdentity(cityPath, cfg, agentCfg, info)
+	return renderResolvedCommandForNewSession(cityPath, cfg, renderAgent, qualifiedName, info.SessionName, firstNonEmptyGCString(workDir, info.WorkDir), resolved)
+}
+
+// sessionRenderIdentity returns the (agent, qualified name) pair the
+// reconciler renders an existing session bead's templates with — the same
+// branch buildDesiredState's session-bead rediscovery takes: manual sessions
+// keep their persisted concrete identity, named sessions their configured
+// identity, pool sessions their canonical instance identity.
+func sessionRenderIdentity(cityPath string, cfg *config.City, agentCfg *config.Agent, info session.Info) (*config.Agent, string) {
+	if isManualSessionInfoForAgent(info, agentCfg) {
+		qualifiedName := sessionBeadQualifiedNameInfo(cityPath, agentCfg, cfg.Rigs, info)
+		return sessionBeadConfigAgent(agentCfg, qualifiedName), qualifiedName
+	}
+	renderAgent, qualifiedName := canonicalSessionIdentityWithConfigInfo(cfg, agentCfg, info)
+	if renderAgent == nil {
+		renderAgent = agentCfg
+	}
+	return renderAgent, qualifiedName
+}
+
+// renderResolvedCommandForNewSession renders a resolved provider's templated
+// launch command for a session the CLI is about to create (and possibly start
+// directly, when no controller is running), under the concrete identity,
+// session name, and work dir the create path already computed (ga-b1u4yg).
+func renderResolvedCommandForNewSession(cityPath string, cfg *config.City, agentCfg *config.Agent, qualifiedName, sessionName, workDir string, resolved *config.ResolvedProvider) *config.ResolvedProvider {
+	if cfg == nil || agentCfg == nil || resolved == nil {
+		return resolved
+	}
+	return workdirutil.RenderResolvedProviderCommandForSession(resolved, cityPath, workdirutil.CityName(cityPath, cfg), qualifiedName, *agentCfg, cfg.Rigs, sessionName, workDir)
 }
 
 func workerDeliveryIntentForSubmitIntent(intent session.SubmitIntent) worker.DeliveryIntent {

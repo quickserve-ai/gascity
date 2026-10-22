@@ -450,7 +450,7 @@ func readPacksLock(t *testing.T, cityPath string) []byte {
 func assertImportCheckOK(t *testing.T, cityPath string) {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
-	if code := doImportCheck(cityPath, &stdout, &stderr); code != 0 || !strings.Contains(stdout.String(), "Import state OK") {
+	if code := doImportCheck(cityPath, &stdout, &stderr, false); code != 0 || !strings.Contains(stdout.String(), "Import state OK") {
 		t.Fatalf("gc import check = %d\nstdout: %s\nstderr: %s", code, stdout.String(), stderr.String())
 	}
 }

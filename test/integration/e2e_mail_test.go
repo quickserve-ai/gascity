@@ -16,7 +16,7 @@ func TestE2E_MailSend(t *testing.T) {
 	}
 	cityDir := setupE2ECity(t, nil, city)
 
-	out, err := gc(cityDir, "mail", "send", "mailrecv", "hello from e2e test")
+	out, err := gc(cityDir, "mail", "send", "--from", "human", "mailrecv", "hello from e2e test")
 	if err != nil {
 		t.Fatalf("gc mail send failed: %v\noutput: %s", err, out)
 	}
@@ -36,7 +36,7 @@ func TestE2E_MailCheckInject(t *testing.T) {
 	cityDir := setupE2ECity(t, nil, city)
 
 	// Send a message.
-	out, err := gc(cityDir, "mail", "send", "injecter", "injected test")
+	out, err := gc(cityDir, "mail", "send", "--from", "human", "injecter", "injected test")
 	if err != nil {
 		t.Fatalf("gc mail send failed: %v\noutput: %s", err, out)
 	}
@@ -62,7 +62,7 @@ func TestE2E_MailInbox(t *testing.T) {
 
 	// Send two messages.
 	for _, body := range []string{"first msg", "second msg"} {
-		out, err := gc(cityDir, "mail", "send", "inboxer", body)
+		out, err := gc(cityDir, "mail", "send", "--from", "human", "inboxer", body)
 		if err != nil {
 			t.Fatalf("gc mail send %q failed: %v\noutput: %s", body, err, out)
 		}
@@ -91,7 +91,7 @@ func TestE2E_MailRead(t *testing.T) {
 	cityDir := setupE2ECity(t, nil, city)
 
 	// Send a message.
-	out, err := gc(cityDir, "mail", "send", "reader", "read me please")
+	out, err := gc(cityDir, "mail", "send", "--from", "human", "reader", "read me please")
 	if err != nil {
 		t.Fatalf("gc mail send failed: %v\noutput: %s", err, out)
 	}
@@ -130,7 +130,7 @@ func TestE2E_MailArchive(t *testing.T) {
 	cityDir := setupE2ECity(t, nil, city)
 
 	// Send a message.
-	out, err := gc(cityDir, "mail", "send", "archiver", "archive me")
+	out, err := gc(cityDir, "mail", "send", "--from", "human", "archiver", "archive me")
 	if err != nil {
 		t.Fatalf("gc mail send failed: %v\noutput: %s", err, out)
 	}

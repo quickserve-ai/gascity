@@ -349,6 +349,45 @@ func TestPreWakeCommit_FreshModeClearsPreviousConversationMetadata(t *testing.T)
 	if got.Metadata["continuation_reset_pending"] != "" {
 		t.Fatalf("continuation_reset_pending = %q, want consumed", got.Metadata["continuation_reset_pending"])
 	}
+	if got.Metadata[sessionpkg.PriorSessionKeyMetadata] != "old-provider-conversation" {
+		t.Fatalf("prior_session_key = %q, want the cleared conversation preserved", got.Metadata[sessionpkg.PriorSessionKeyMetadata])
+	}
+}
+
+// A seeded resume (gc session resume) must survive the pre-wake commit even
+// on wake_mode=fresh sessions — the seed IS the requested conversation, and
+// honoring fresh semantics here would clear it before the start it was
+// created for.
+func TestPreWakeCommit_SeededResumeSurvivesFreshMode(t *testing.T) {
+	now := time.Date(2026, 3, 8, 12, 0, 0, 0, time.UTC)
+	clk := &clock.Fake{Time: now}
+	store := beads.NewMemStore()
+
+	b, err := store.Create(beads.Bead{
+		Title: "seeded-session",
+		Metadata: map[string]string{
+			"session_name":  "seeded-worker",
+			"template":      "worker",
+			"generation":    "2",
+			"wake_mode":     "fresh",
+			"session_key":   "seeded-conversation-uuid",
+			"resume_seeded": "true",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, _, err := preWakeCommit(seedSessionInfo(b), sessionFrontDoor(store), clk); err != nil {
+		t.Fatalf("preWakeCommit: %v", err)
+	}
+	got, _ := store.Get(b.ID)
+	if got.Metadata["session_key"] != "seeded-conversation-uuid" {
+		t.Fatalf("session_key = %q, want seeded key preserved through fresh-mode wake", got.Metadata["session_key"])
+	}
+	if got.Metadata["resume_seeded"] != "true" {
+		t.Fatalf("resume_seeded = %q, want still pending until the start commits", got.Metadata["resume_seeded"])
+	}
 }
 
 func TestPreWakeCommit_ResumeModePreservesPreviousConversationMetadata(t *testing.T) {
@@ -425,6 +464,7 @@ func TestPreWakeCommit_FreshModeTraceLogsClearedProviderMetadata(t *testing.T) {
 			"started_config_hash":     "old-core-hash",
 			"started_live_hash":       "old-live-hash",
 			"live_hash":               "old-live-hash",
+			"resume_seeded":           "stale-not-true",
 			"startup_dialog_verified": "true",
 			// Priming markers share the fresh-wake reset (S19 Stage 2); set them
 			// so the trace log lists them among the cleared keys.
@@ -482,6 +522,7 @@ func TestPreWakeCommit_FreshModeTraceSilentWhenTraceDisabled(t *testing.T) {
 			"started_config_hash":     "old-core-hash",
 			"started_live_hash":       "old-live-hash",
 			"live_hash":               "old-live-hash",
+			"resume_seeded":           "stale-not-true",
 			"startup_dialog_verified": "true",
 		},
 	})
@@ -612,6 +653,7 @@ func TestPreWakeCommit_FreshModeTraceSilentOnStoreFailure(t *testing.T) {
 			"started_config_hash":     "old-core-hash",
 			"started_live_hash":       "old-live-hash",
 			"live_hash":               "old-live-hash",
+			"resume_seeded":           "stale-not-true",
 			"startup_dialog_verified": "true",
 		},
 	})
@@ -1189,10 +1231,13 @@ func TestAdvanceSessionDrains_DeferredInterrupt_CanceledBeforeSignal(t *testing.
 	if !ds.followUp {
 		t.Error("drain follow-up tick should be requested when deferred drain-ack is set")
 	}
-	// Verify GC_DRAIN_ACK was set (not Ctrl-C)
-	ack, _ := sp.GetMeta("test-session", "GC_DRAIN_ACK")
-	if ack != "1" {
-		t.Errorf("GC_DRAIN_ACK = %q, want \"1\"", ack)
+	// Verify the reconciler's ack marker was published (not Ctrl-C), and that
+	// it did not claim the agent's GC_DRAIN_ACK key.
+	if acked, err := newDrainOps(sp).isDrainAcked("test-session"); err != nil || !acked {
+		t.Errorf("reconciler drain ack: acked=%v err=%v, want the marker published", acked, err)
+	}
+	if ack, _ := sp.GetMeta("test-session", "GC_DRAIN_ACK"); ack != "" {
+		t.Errorf("GC_DRAIN_ACK = %q, want empty: the reconciler's ack must not use the agent's key", ack)
 	}
 	for _, c := range sp.Calls {
 		if c.Method == "Interrupt" {

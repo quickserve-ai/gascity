@@ -307,11 +307,33 @@ func queueChangedResolvedProviderSessionMetadata(existing map[string]string, que
 	if name != "" && existing["provider"] != name {
 		queue("provider", name)
 	}
+	// When the resolved provider IS its own family root (a builtin, or an
+	// alias shadowing its builtin's name — [providers.omp] base="builtin:omp"
+	// resolves to name == ancestor == "omp"), the != name convention stores
+	// no kind/ancestor. That convention must not preserve a STALE lineage: a
+	// seat re-pointed from claude to omp updated only "provider" and kept
+	// provider_kind/builtin_ancestor "claude" forever, so every consumer of
+	// the ancestry ladder — GC_PROVIDER stamping, session-log routing, the
+	// context meter — kept reading the dead harness (ga-vat7sn defect 1,
+	// measured on a live seat 2026-09-05). When resolution succeeded and the
+	// stored value belongs to a DIFFERENT family than the resolved lineage,
+	// correct it to the true (self-rooted) value.
+	ancestor := strings.TrimSpace(resolved.BuiltinAncestor)
 	if family := resolvedProviderFamilyMetadata(resolved); family != "" && existing["provider_kind"] != family {
 		queue("provider_kind", family)
+	} else if family == "" && ancestor != "" {
+		if stored := strings.TrimSpace(existing["provider_kind"]); stored != "" &&
+			session.ProviderFamilyOf(stored) != session.ProviderFamilyOf(ancestor) {
+			queue("provider_kind", ancestor)
+		}
 	}
-	if ancestor := strings.TrimSpace(resolved.BuiltinAncestor); ancestor != "" && ancestor != name && existing["builtin_ancestor"] != ancestor {
+	if ancestor != "" && ancestor != name && existing["builtin_ancestor"] != ancestor {
 		queue("builtin_ancestor", ancestor)
+	} else if ancestor != "" {
+		if stored := strings.TrimSpace(existing["builtin_ancestor"]); stored != "" && stored != ancestor &&
+			session.ProviderFamilyOf(stored) != session.ProviderFamilyOf(ancestor) {
+			queue("builtin_ancestor", ancestor)
+		}
 	}
 }
 
@@ -534,6 +556,11 @@ func reopenClosedConfiguredNamedSessionBead(
 		// (ga-igcny0.1.1). The Tx wrapper is kept only for the labeled commit.
 		// Where the store fences, the write is conditional on the re-read's
 		// revision, as v2's reopenNamed writes; a lost fence is no reopen.
+		//
+		// batch carries session-liveness keys, which inside a Tx stay VERSIONED
+		// (see beadPolicyStore.Tx) precisely so this one-write property survives:
+		// routing them to the liveness table would make the reopen observable
+		// split across two stores, which is the case this comment rules out.
 		open := "open"
 		opts := beads.UpdateOpts{Status: &open, Metadata: batch}
 		var lockedErr error
@@ -776,6 +803,76 @@ func retireDuplicateConfiguredNamedSessionBeads(
 		if sn := strings.TrimSpace(winnerBead.Metadata["session_name"]); sn != "" {
 			bySessionName[sn] = winnerBead
 			indexBySessionName[sn] = winner
+		}
+	}
+
+	// ga-e4jb: a manual session created from a named session's raw backing
+	// SINGLE-session template (e.g. `gc session new qcore/cherub-law.lana`
+	// with no --alias) claims the template qualified name as its alias and
+	// carries no configured_named_session metadata, so the identity dedup
+	// above never sees it — yet it runs the same agent in the same work dir
+	// as the configured named session, and the desired-state overlay keeps
+	// respawning it after every kill. When a live canonical bead exists,
+	// retire such shadow beads. alias == backing template is the shadow
+	// signature: factory/pool sessions keep an EMPTY alias (sanctioned, see
+	// the phase-0 factory spec) and deliberately-aliased sessions are their
+	// own identity — both spared, as are pool-managed ephemerals.
+	for i := range cfg.NamedSessions {
+		identity := cfg.NamedSessions[i].QualifiedName()
+		spec, ok := findNamedSessionSpec(cfg, cityName, identity)
+		if !ok {
+			continue
+		}
+		canonical, hasCanonical := session.FindCanonicalNamedSessionBead(openBeads, spec)
+		if !hasCanonical {
+			continue
+		}
+		backing := namedSessionBackingTemplate(spec)
+		if backing == "" {
+			continue
+		}
+		for idx := range openBeads {
+			b := openBeads[idx]
+			if b.ID == canonical.ID || b.Status == "closed" {
+				continue
+			}
+			if isNamedSessionBead(b) || isPoolManagedSessionBead(b) {
+				continue
+			}
+			template := strings.TrimSpace(b.Metadata["template"])
+			agentName := strings.TrimSpace(b.Metadata["agent_name"])
+			if template != backing && agentName != backing {
+				continue
+			}
+			if strings.TrimSpace(b.Metadata["alias"]) != backing {
+				continue
+			}
+			oldSessionName := strings.TrimSpace(b.Metadata["session_name"])
+			if !stopRuntimeBeforeSessionBeadMutation(cityPath, store, sp, cfg, b, "shadows configured named session", stderr) {
+				continue
+			}
+			batch := session.RetireNamedSessionPatch(now, "duplicate-repair", spec.Identity)
+			if setMetaBatch(sessionFrontDoor(store), b.ID, batch, stderr) != nil {
+				continue
+			}
+			if err := sessionFrontDoor(store).SetStatusOpen(b.ID); err != nil {
+				fmt.Fprintf(stderr, "session beads: archiving shadow of named session %s: %v\n", spec.Identity, err) //nolint:errcheck
+				continue
+			}
+			reassignWorkAssignedToRetiredSessionBead(sw.Legs(), store, b, canonical.ID, stderr)
+			reassignStateAssignedToRetiredSessionBead(store, b.ID, canonical.ID, now, stderr)
+			if b.Metadata == nil {
+				b.Metadata = make(map[string]string, len(batch))
+			}
+			for k, v := range batch {
+				b.Metadata[k] = v
+			}
+			b.Status = "open"
+			openBeads[idx] = b
+			if oldSessionName != "" {
+				delete(bySessionName, oldSessionName)
+				delete(indexBySessionName, oldSessionName)
+			}
 		}
 	}
 	return openBeads
@@ -1187,6 +1284,10 @@ func sweepAssignedWorkLegs(legs WorkLegs, stderr io.Writer, visit func(index int
 // not land, so a stale-assignee item is not masked behind a "repaired" close.
 type unclaimResult struct {
 	Released int
+	// Withheld counts beads the named-release guard kept on their assignee and
+	// PROPOSED for release instead (ga-9n8hjv). They are neither released nor
+	// failed: the work is still owned, by a named agent.
+	Withheld int
 	Failed   int
 }
 
@@ -1209,6 +1310,22 @@ func unclaimWorkAssignedToRetiredSessionBead(
 	stderr io.Writer,
 ) ReleaseOutcome {
 	return unclaimWorkAssignedToRetiredSessionBeadVia(legs, store, sessionBead, fallbackRoute, stderr)
+}
+
+// configuredNamedIdentitiesIn is the subset of ids that name a [[named_session]]
+// still configured in cfg (ga-sdynmb): the identities a retired session's
+// release leaves alone, since the respawned agent re-acquires their work.
+func configuredNamedIdentitiesIn(cfg *config.City, ids []string) map[string]struct{} {
+	var keep map[string]struct{}
+	for _, id := range ids {
+		if id = strings.TrimSpace(id); id != "" && isConfiguredNamedSessionIdentity(cfg, id) {
+			if keep == nil {
+				keep = make(map[string]struct{}, len(ids))
+			}
+			keep[id] = struct{}{}
+		}
+	}
+	return keep
 }
 
 // unclaimWorkAssignedToRetiredSessionBeadVia is unclaimWorkAssignedToRetiredSessionBead
@@ -1240,10 +1357,27 @@ func unclaimWorkAssignedToRetiredSessionBeadVia(
 	if err := clearSessionCurrentClaim(sessionStore, sessionBead.ID); err != nil {
 		fmt.Fprintf(stderr, "session beads: clearing current claim on retired session %s: %v\n", sessionBead.ID, err) //nolint:errcheck
 	}
-	scope := releaseScopeOwn(sessionBead)
+	// ga-sdynmb: A RESTART IS NOT A RETIREMENT. When the closing session's
+	// assignee names a [[named_session]] that is STILL in the city config, that
+	// identity outlives this session bead: the supervisor respawns the same agent
+	// under the same identity and its own hook re-finds the work. Detaching here
+	// left 91 crew beads open+unassigned+unrouted across three session rolls on
+	// 2026-08-17/18 -- invisible to the pool demand probe (keys on
+	// gc.routed_to), skipped by releaseOrphanedPoolAssignments (skips
+	// empty-routed beads), and deliberately not recovered by the witness
+	// (orphan recovery is scoped to POOL/EPHEMERAL identities, so crew work is
+	// never dumped into the polecat pool). So work held under such an identity
+	// is left out of the release scope (ReleaseScope.except).
+	// isConfiguredNamedSessionIdentity is structural (cfg only, no store
+	// lookup), so it holds exactly when the identity survives the close, and it
+	// already excludes a SUSPENDED named agent, whose work must still be
+	// released. Ephemeral identifiers (the session bead ID, the "rig--agent"
+	// session_name form) match no configured identity and are still released,
+	// so work bound to a dying identifier is never stranded on it.
+	scope := releaseScopeOwn(sessionBead).except(configuredNamedIdentitiesIn(legs.cfg, sessionAssignmentIdentifiers(sessionBead)))
 	seat := releaseSeatOfBead(sessionBead)
 	seat.fallback = fallbackRoute // "" keeps whatever routing each claim carries
-	out, err := ReleaseClaims(seatWorkFor(legs, scope), scope, seat, releaseRetired, ReleaseOpts{})
+	out, err := ReleaseClaims(seatWorkFor(legs, scope), scope, seat, releaseRetired, ReleaseOpts{Audit: stderr})
 	logRelease(stderr, "retired", sessionBead.ID, out, err)
 	return out
 }
@@ -1292,7 +1426,7 @@ func releaseDrainAckClaims(legs WorkLegs, sessionBead beads.Bead, refuseStarted 
 	}
 	scope := releaseScopeOwn(sessionBead)
 	sw := seatWorkFor(legs, scope)
-	out, err := ReleaseClaims(sw, scope, releaseSeatOfBead(sessionBead), releaseDrainAck, ReleaseOpts{Deadline: time.Now().Add(budget), RefuseStarted: refuseStarted})
+	out, err := ReleaseClaims(sw, scope, releaseSeatOfBead(sessionBead), releaseDrainAck, ReleaseOpts{Deadline: time.Now().Add(budget), RefuseStarted: refuseStarted, Audit: stderr})
 	if out.Refused {
 		// The refusal releases nothing, but a leg read that failed alongside
 		// it is still a fault worth naming.
@@ -1381,7 +1515,7 @@ func releaseUnexecutedClaimsOnKill(
 		!isPoolSessionSlotFreeable(sessionBead, now) {
 		return
 	}
-	out, err := ReleaseClaims(sw, releaseScopeOfBead(sessionBead, sw.Legs().cfg), releaseSeatOfBead(sessionBead), releaseKilledSeat, ReleaseOpts{})
+	out, err := ReleaseClaims(sw, releaseScopeOfBead(sessionBead, sw.Legs().cfg), releaseSeatOfBead(sessionBead), releaseKilledSeat, ReleaseOpts{Audit: stderr})
 	if err != nil {
 		fmt.Fprintf(stderr, "session beads: checking killed session %s for started work: %v; releasing nothing\n", sessionBead.ID, err) //nolint:errcheck
 		return
@@ -1454,6 +1588,12 @@ func reassignWorkAssignedToRetiredSessionBead(
 						continue
 					}
 					seen[key] = struct{}{}
+					// Work on a named agent's durable identity stays there: the
+					// winner serves that identity, and re-homing it onto a session
+					// bead ID would make it releasable by the next close (ga-9n8hjv).
+					if assigneeIsDurableNamedIdentity(legs.cfg, namedSessionIdentity(retiredSession), item.Assignee) {
+						continue
+					}
 					if err := wa.ReassignWorkBead(item, newSessionID); err != nil {
 						fmt.Fprintf(stderr, "session beads: reassigning work %s from retired session %s to %s: %v\n", item.ID, retiredSession.ID, newSessionID, err) //nolint:errcheck
 					}
@@ -1506,6 +1646,12 @@ func reassignWorkAssignedToRetiredSessionInfo(
 						continue
 					}
 					seen[key] = struct{}{}
+					// Work on a named agent's durable identity stays there: the
+					// winner serves that identity, and re-homing it onto a session
+					// bead ID would make it releasable by the next close (ga-9n8hjv).
+					if assigneeIsDurableNamedIdentity(legs.cfg, namedSessionIdentityInfo(retiredSession), item.Assignee) {
+						continue
+					}
 					if err := wa.ReassignWorkBead(item, newSessionID); err != nil {
 						fmt.Fprintf(stderr, "session beads: reassigning work %s from retired session %s to %s: %v\n", item.ID, retiredSession.ID, newSessionID, err) //nolint:errcheck
 					}
@@ -1540,13 +1686,14 @@ func unclaimWorkAssignedToRetiredSessionInfo(
 	if err := clearSessionCurrentClaim(store, retiredSession.ID); err != nil {
 		fmt.Fprintf(stderr, "session beads: clearing current claim on retired session %s: %v\n", retiredSession.ID, err) //nolint:errcheck
 	}
-	out, err := ReleaseClaims(sw, releaseScope(retiredSession, sw.Legs().cfg), releaseSeatOfInfo(retiredSession), releaseStrandedRepair, ReleaseOpts{})
+	out, err := ReleaseClaims(sw, releaseScope(retiredSession, sw.Legs().cfg), releaseSeatOfInfo(retiredSession), releaseStrandedRepair, ReleaseOpts{Audit: stderr})
 	logRelease(stderr, "retired", retiredSession.ID, out, err)
 	if err != nil {
 		res.Failed++
 	}
 	res.Failed += len(out.Failed)
 	res.Released = len(out.Released)
+	res.Withheld = out.withheld()
 	return res
 }
 
@@ -1633,7 +1780,7 @@ func repairStrandedPoolWorkerBead(
 		// re-attempts (episode marker still aged, session still not-alive).
 		// The denominator counts every attempt, including releases that correctly
 		// no-oped because the work had already moved to a live worker.
-		fmt.Fprintf(stderr, "session beads: stranded-repair for %s deferred: %d of %d unassign(s) failed; leaving session bead open for retry\n", info.ID, res.Failed, res.Failed+res.Released) //nolint:errcheck
+		fmt.Fprintf(stderr, "session beads: stranded-repair for %s deferred: %d of %d unassign(s) failed; leaving session bead open for retry\n", info.ID, res.Failed, res.Failed+res.Released+res.Withheld) //nolint:errcheck
 		return false
 	}
 	// A claim no lane serves stayed assigned (O5): the close completes, and
@@ -1920,8 +2067,29 @@ func syncSessionBeadsWithSnapshotAndRigStores(
 			// real reconfiguration conflict to begin with. The step-aside name is
 			// bounded exactly as poolRuntimeSessionName bounds it.
 			carveOut := spec.Agent != nil && spec.Agent.UsesCanonicalSingletonPoolIdentity() && beadSessionName == boundSessionNameLength(spec.SessionName+poolRuntimeNameSuffix)
-			if !closeSeatIfRuntimeStopped(store, sw, sp, sessionInfoFromBead(b), closeWhy{reason: "reconfigured", gate: closeGated}, now, stderr) {
-				if !carveOut {
+			// A pool shadow adopted under this identity (ga-dfp1b) still runs
+			// under its shadow name, which the desired state drives; the
+			// canonical session replaces it, so its runtime is stopped first
+			// — after the work check, never over assigned work — and the
+			// guard below then retires the bead. A plain rename keeps
+			// upstream's decline: nothing stops a running session behind an
+			// operator's back. The canonical-singleton step-aside bead above is
+			// not a shadow (upstream adopts it as the canonical session), so it
+			// is never stopped here.
+			shadowStopped := true
+			if !carveOut && shadowAdoptedByDesired(beadSessionName, cityName, cfg, desiredState) {
+				shadowStopped = stopAdoptedPoolShadowRuntime(cityPath, store, sw, sp, cfg, b, stderr)
+			}
+			if !shadowStopped || !closeSeatIfRuntimeStopped(store, sw, sp, sessionInfoFromBead(b), closeWhy{reason: "reconfigured", gate: closeGated}, now, stderr) {
+				// Only a bead that can still CONTINUE the identity blocks a fresh
+				// one. An archived, continuity-ineligible bead (a removed named
+				// session) has already given up its alias and session_name; it
+				// stays open only because it still holds work, which since
+				// ga-9n8hjv is the named agent's withheld, proposed work. Blocking
+				// on it would keep the re-added agent from ever coming back, with no
+				// log line. Mint the fresh bead beside it instead (the phase0 spec's
+				// "archived history stays, a fresh canonical bead is created").
+				if !carveOut && namedSessionContinuityEligible(b) {
 					blockedReconfiguredNamedIdentities[identity] = true
 				}
 				continue
@@ -4048,6 +4216,56 @@ func closeSeatIfRuntimeStopped(store beads.Store, sw *SeatWork, sp runtime.Provi
 	return closeSeat(store, sw, info, why, now, stderr)
 }
 
+// shadowAdoptedByDesired reports whether the bead named sessionName is a pool shadow the desired state
+// has adopted under a configured named identity (ga-dfp1b): its session name
+// is desired with a named identity, yet it is not that identity's canonical
+// session name, so the canonical named session replaces it. Its runtime is
+// stopped first (stopRuntimeBeforeSessionBeadMutation, upstream's own
+// stop-then-mutate shape) and the ordinary close guard then retires the bead;
+// upstream #6596's running-runtime decline stays in force for every other bead.
+func shadowAdoptedByDesired(sessionName, cityName string, cfg *config.City, desiredState map[string]TemplateParams) bool {
+	if cfg == nil || sessionName == "" {
+		return false
+	}
+	tp, ok := desiredState[sessionName]
+	if !ok || strings.TrimSpace(tp.ConfiguredNamedIdentity) == "" {
+		return false
+	}
+	spec, found := findNamedSessionSpec(cfg, cityName, tp.ConfiguredNamedIdentity)
+	return found && spec.SessionName != "" && spec.SessionName != sessionName
+}
+
+// stopAdoptedPoolShadowRuntime stops the runtime of a pool shadow the desired
+// state has adopted under a configured named identity, so the ordinary close
+// guard can retire the bead. Assigned work is checked FIRST, as the carry's
+// pre-#6596 close guard did: a shadow that still holds open work keeps running,
+// and the close guard declines it on the same finding. It reports false when
+// the runtime was not stopped — work held, the work check failed, or the stop
+// itself failed — and the caller then takes the decline path. The check reads
+// the wide identity set live (RefuseScope): it gates ending a live runtime.
+func stopAdoptedPoolShadowRuntime(
+	cityPath string,
+	store beads.Store,
+	sw *SeatWork,
+	sp runtime.Provider,
+	cfg *config.City,
+	b beads.Bead,
+	stderr io.Writer,
+) bool {
+	if stderr == nil {
+		stderr = io.Discard
+	}
+	hasAssignedWork, err := sessionHasOpenAssignedWorkInStores(sw, refuseScope(sessionInfoFromBead(b), cfg))
+	if err != nil {
+		fmt.Fprintf(stderr, "session work guard: checking assigned work for %s: %v\n", b.ID, err) //nolint:errcheck
+		return false
+	}
+	if hasAssignedWork {
+		return false
+	}
+	return stopRuntimeBeforeSessionBeadMutation(cityPath, store, sp, cfg, b, "adopted pool shadow replaced by its configured named session", stderr)
+}
+
 func stopRuntimeBeforeSessionBeadMutation(
 	cityPath string,
 	store beads.Store,
@@ -4229,6 +4447,12 @@ func closeBeadPreservingAssignees(store beads.Store, sw *SeatWork, expected sess
 	// with the metadata ordered first. There the metadata may land while the
 	// Close fails; the helper then reports failure and the reconciler re-runs
 	// the close next tick, so no bead is durably left half-closed.
+	//
+	// ClosePatch carries session-liveness keys (state, slept_at, ...). On the
+	// terminal write those deliberately stay VERSIONED rather than splitting to
+	// the liveness table (ga-lys454; see beadPolicyStore.Tx): the terminal state
+	// and the Close must land in one store, fenced, so no stale table row can
+	// shadow the committed terminal state.
 	if commitLegacyClose(sessionFrontDoor(store), expected, session.ClosePatch(now, reason), now, stderr, "session") != session.CommitLanded {
 		return false
 	}
@@ -4307,8 +4531,12 @@ func releaseWorkFromClosedSessionBeadExcept(store beads.Store, sw *SeatWork, ses
 	// stamps the fallback only when BOTH routed_to and run_target are empty,
 	// and restoreCarriedWorkRoutes (#3421) then backfills gc.routed_to from it.
 	// The close-time re-read (Late) adds what was assigned since sw's read.
-	scope := releaseScopeOfBead(sessionBead, sw.Legs().cfg).except(preserve)
-	out, err := ReleaseClaims(sw, scope, releaseSeatOfBead(sessionBead), releaseCloseCascade, ReleaseOpts{Late: true})
+	// RELEASE set, not the capture set: a closing session's durable named
+	// identity (session_name, configured_named_identity) must not be used to
+	// detach its work (ga-9n8hjv; see durableSessionIdentities). The
+	// caller's preserve set withholds further identities on top of it.
+	scope := releaseScopeOfBead(sessionBead, sw.Legs().cfg).except(preserve).except(durableSessionIdentities(sw.Legs().cfg, sessionBead))
+	out, err := ReleaseClaims(sw, scope, releaseSeatOfBead(sessionBead), releaseCloseCascade, ReleaseOpts{Late: true, Audit: stderr})
 	logRelease(stderr, "closing", sessionBead.ID, out, err)
 	return out
 }

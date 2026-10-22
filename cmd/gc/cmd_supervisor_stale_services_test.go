@@ -244,6 +244,8 @@ func TestSweepStaleIsolatedSupervisorServicesMissingDirIsNoop(t *testing.T) {
 }
 
 func TestInstallSupervisorLaunchdSweepsStaleSiblings(t *testing.T) {
+	skipUnlessDarwinLaunchd(t)
+
 	homeDir := t.TempDir()
 	gcHome := filepath.Join(t.TempDir(), "isolated-home")
 	t.Setenv("HOME", homeDir)
@@ -264,7 +266,7 @@ func TestInstallSupervisorLaunchdSweepsStaleSiblings(t *testing.T) {
 	t.Cleanup(func() { supervisorLaunchctlRun = oldRun })
 
 	data := &supervisorServiceData{
-		GCPath:       "/tmp/gc-new",
+		GCPath:       writeSupervisorLaunchdTestGC(t),
 		LogPath:      filepath.Join(gcHome, "supervisor.log"),
 		GCHome:       gcHome,
 		LaunchdLabel: supervisorLaunchdLabel(),

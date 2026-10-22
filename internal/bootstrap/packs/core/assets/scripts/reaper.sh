@@ -148,10 +148,13 @@ TOTAL_WOULD_PURGE=0
 TOTAL_MAIL_WISPS=0
 TOTAL_WORKFLOW_ROOTS_CLOSED=0
 TOTAL_WOULD_CLOSE_WORKFLOW_ROOTS=0
+# bd stores UTC in every timestamp column, so each age cutoff below uses
+# UTC_TIMESTAMP(). The server-local clock is off by the host's UTC offset and
+# shifts an hour at each DST change. Closes go through `gc bd` (upstream
+# #6751), which stamps closed_at and updated_at itself; this script writes no
+# timestamp of its own.
+TOTAL_WOULD_CLOSE_STALE=0
 TOTAL_WORKFLOW_ROOTS_STORE_REF_SKIPPED=0
-# Candidate workflow issue roots in non-city scopes, which Step 2 counts but
-# does not close.
-TOTAL_WORKFLOW_ISSUE_ROOTS_SKIPPED=0
 TOTAL_WORKFLOW_ROOT_CANDIDATES=0
 TOTAL_WORKFLOW_ROOTS_CHECKED=0
 TOTAL_ISSUES_CLOSED=0
@@ -885,8 +888,8 @@ reap_scope() {
     # and parent-child subtree has no live descendants. Roots stamped with
     # gc.root_store_ref for another store are skipped; cross-store subtrees
     # need cross-store traversal before reaping can be safe. Wisp roots are
-    # closed in every scope; issue roots are city issues and close only in the
-    # city scope, so other scopes only count them. reap_workflow_roots closes
+    # closed in every scope; issue roots are city issues and are read and
+    # closed only in the city scope (no census outside it). reap_workflow_roots closes
     # each census page's stale roots as it goes; the census window leaves time
     # for the later steps and scopes, and each census starts at a random
     # candidate, so the censuses it cuts short still reach every root.
@@ -898,14 +901,10 @@ reap_scope() {
 
     run_budget_exhausted && return 0
 
-    if get_sql_count "workflow issue roots skipped by root store ref" "$(workflow_root_store_ref_skipped_count_query "$DB" "workflow_issue_root_candidates" "issues" "i" "'message', 'epic'")"; then
+    if [ "$SCOPE_KIND" = "city" ] && get_sql_count "workflow issue roots skipped by root store ref" "$(workflow_root_store_ref_skipped_count_query "$DB" "workflow_issue_root_candidates" "issues" "i" "'message', 'epic'")"; then
         TOTAL_WORKFLOW_ROOTS_STORE_REF_SKIPPED=$((TOTAL_WORKFLOW_ROOTS_STORE_REF_SKIPPED + SQL_COUNT_RESULT))
     fi
-    if [ "$SCOPE_KIND" != "city" ]; then
-        if get_sql_count "workflow issue root candidate" "$(workflow_root_candidate_count_query "$DB" "workflow_issue_root_candidates" "issues" "i" "'message', 'epic'")"; then
-            TOTAL_WORKFLOW_ISSUE_ROOTS_SKIPPED=$((TOTAL_WORKFLOW_ISSUE_ROOTS_SKIPPED + SQL_COUNT_RESULT))
-        fi
-    else
+    if [ "$SCOPE_KIND" = "city" ]; then
         reap_workflow_roots issue "workflow_issue_root_candidates" "issues" "i" "'message', 'epic'"
     fi
 
@@ -981,8 +980,8 @@ reap_scope() {
     run_budget_exhausted && return 0
 
     # Step 5: auto-close stale issues (exclude P0/P1, epics, durable extmsg
-    # records, TTL-stamped beads and beads with an active dependency in either
-    # direction). Only the city scope's issues are auto-closed; stale rig
+    # records, TTL-stamped beads, operator directives and beads with an active
+    # dependency in either direction). A dry run lists each row it would close. Only the city scope's issues are auto-closed; stale rig
     # issues are counted as skipped.
     if get_sql_rows "stale issue" "
         SELECT id, CASE WHEN COALESCE(assignee, '') = '' THEN 'bare' ELSE 'force' END
@@ -1018,12 +1017,22 @@ reap_scope() {
             WHERE i.status IN ('open', 'in_progress')
             AND d.depends_on_issue_id IS NOT NULL
         )
+        -- A directive stays binding because its trigger is rare, so age alone never reaps it.
+        -- NOT EXISTS, not a second NOT IN: Dolt 2.2.4 then drops the NOT from the dependency guard above.
+        AND NOT EXISTS (SELECT 1 FROM \`$DB\`.labels od WHERE od.issue_id = issues.id AND od.label = 'operator-directive')
     "; then
         rows=$SQL_ROWS_RESULT
         count=$(count_lines "$rows")
-        if [ "$count" -gt 0 ] && [ -z "$DRY_RUN" ]; then
+        if [ "$count" -gt 0 ]; then
             if [ "$SCOPE_KIND" != "city" ]; then
                 TOTAL_STALE_ISSUES_SKIPPED=$((TOTAL_STALE_ISSUES_SKIPPED + count))
+            elif [ -n "$DRY_RUN" ]; then
+                # A dry run lists each city-store row it would close, with its close mode.
+                while IFS=, read -r issue_id close_mode; do
+                    [ -z "$issue_id" ] && continue
+                    printf 'reaper: would-close-stale %s %s %s\n' "$DB" "$issue_id" "$close_mode"
+                    TOTAL_WOULD_CLOSE_STALE=$((TOTAL_WOULD_CLOSE_STALE + 1))
+                done <<< "$rows"
             else
                 # close_mode comes from the query's per-row CASE: 'force' when
                 # the row carried a non-empty assignee at select time and
@@ -1436,9 +1445,9 @@ else
     "$ESCALATE_SCRIPT" --resolve-incident "reaper:anomalies" >/dev/null || true
 fi
 
-SUMMARY="reaper — scopes:$TOTAL_SCOPES, stale_wisps:$TOTAL_STALE_WISPS, closed_wisps:$TOTAL_CLOSED_WISPS, held_wisps:$TOTAL_HELD_WISPS, workflow_roots:$TOTAL_WORKFLOW_ROOTS_CLOSED, workflow_root_census:$TOTAL_WORKFLOW_ROOTS_CHECKED/$TOTAL_WORKFLOW_ROOT_CANDIDATES, skipped_cross_store_workflow_roots:$TOTAL_WORKFLOW_ROOTS_STORE_REF_SKIPPED, skipped_non_city_workflow_issue_roots:$TOTAL_WORKFLOW_ISSUE_ROOTS_SKIPPED, purged:$TOTAL_PURGED, sessions-pruned:$TOTAL_SESSIONS_PRUNED, closed:$TOTAL_ISSUES_CLOSED, expired:$TOTAL_EXPIRED_ISSUES_CLOSED, expired_skipped:$TOTAL_EXPIRED_ISSUES_SKIPPED, skipped_non_city_issues:$TOTAL_STALE_ISSUES_SKIPPED, mail_wisps:$TOTAL_MAIL_WISPS"
+SUMMARY="reaper — scopes:$TOTAL_SCOPES, stale_wisps:$TOTAL_STALE_WISPS, closed_wisps:$TOTAL_CLOSED_WISPS, held_wisps:$TOTAL_HELD_WISPS, workflow_roots:$TOTAL_WORKFLOW_ROOTS_CLOSED, workflow_root_census:$TOTAL_WORKFLOW_ROOTS_CHECKED/$TOTAL_WORKFLOW_ROOT_CANDIDATES, skipped_cross_store_workflow_roots:$TOTAL_WORKFLOW_ROOTS_STORE_REF_SKIPPED, purged:$TOTAL_PURGED, sessions-pruned:$TOTAL_SESSIONS_PRUNED, closed:$TOTAL_ISSUES_CLOSED, expired:$TOTAL_EXPIRED_ISSUES_CLOSED, expired_skipped:$TOTAL_EXPIRED_ISSUES_SKIPPED, skipped_non_city_issues:$TOTAL_STALE_ISSUES_SKIPPED, mail_wisps:$TOTAL_MAIL_WISPS"
 if [ -n "$DRY_RUN" ]; then
-    SUMMARY="$SUMMARY, would_close_wisps:$TOTAL_WOULD_CLOSE_WISPS, would_close_workflow_roots:$TOTAL_WOULD_CLOSE_WORKFLOW_ROOTS, would_purge:$TOTAL_WOULD_PURGE, would_expire:$TOTAL_WOULD_EXPIRE (dry run)"
+    SUMMARY="$SUMMARY, would_close_wisps:$TOTAL_WOULD_CLOSE_WISPS, would_close_workflow_roots:$TOTAL_WOULD_CLOSE_WORKFLOW_ROOTS, would_purge:$TOTAL_WOULD_PURGE, would_expire:$TOTAL_WOULD_EXPIRE, would_close_stale:$TOTAL_WOULD_CLOSE_STALE (dry run)"
 fi
 
 maintenance_done "$SUMMARY"

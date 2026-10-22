@@ -1485,6 +1485,12 @@ func TestArchiveManyDoesNotUseCloseAll(t *testing.T) {
 }
 
 func TestArchiveMatchingSkipsPerMessageGet(t *testing.T) {
+	// noMessageGetStore rejects every per-message Get, which is the point of
+	// this test for ArchiveMatching — but the send-path read-after-write guard
+	// legitimately performs one Get per send while seeding. Disable the guard
+	// so the fixture still asserts exactly what it was written to assert: that
+	// ARCHIVING does not fall back to per-message Get (ga-0ejdbv).
+	t.Setenv("GC_MAIL_VERIFY", "0")
 	base := beads.NewMemStore()
 	store := noMessageGetStore{MemStore: base}
 	p := New(store)
@@ -1759,7 +1765,14 @@ func TestReplyAgainstBdStoreValidatesTitle(t *testing.T) {
 			id := "bd-" + title
 			return []byte(`{"id":"` + id + `","title":"` + title + `","status":"open","issue_type":"message","created_at":"2026-04-24T00:00:00Z"}`), nil
 		case "show":
-			// bd show --json returns a JSON array.
+			// bd show --json returns a JSON array. Answer for the requested ID
+			// rather than always for bd-Hello: the reply path now verifies its
+			// own write by reading it back, so a fixture that only ever returns
+			// the ORIGINAL message would fail that verification (ga-0ejdbv).
+			requested := args[len(args)-1]
+			if requested != "bd-Hello" {
+				return []byte(`[{"id":"` + requested + `","title":"Re: Hello","status":"open","issue_type":"message","assignee":"alice","from":"bob","created_at":"2026-04-24T00:00:00Z","labels":["thread:t1"]}]`), nil
+			}
 			return []byte(`[{"id":"bd-Hello","title":"Hello","status":"open","issue_type":"message","assignee":"bob","from":"alice","created_at":"2026-04-24T00:00:00Z","labels":["thread:t1"]}]`), nil
 		case "update":
 			return []byte(`{}`), nil
@@ -3155,3 +3168,45 @@ var (
 	_ mail.Provider    = (*Provider)(nil)
 	_ mail.DedupSender = (*Provider)(nil)
 )
+
+func TestMarkUnreadReopensClosedMessage(t *testing.T) {
+	store := beads.NewMemStore()
+	p := New(store)
+
+	b, err := store.Create(beads.Bead{
+		Title:    "HANDOFF: test",
+		Type:     "message",
+		Assignee: "cheryl",
+		Labels:   []string{mail.HandoffLabel},
+		Metadata: map[string]string{"close_reason": RetentionSweepCloseReason},
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := p.MarkRead(b.ID); err != nil {
+		t.Fatalf("mark read: %v", err)
+	}
+	if err := store.Close(b.ID); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	if err := p.MarkUnread(b.ID); err != nil {
+		t.Fatalf("mark unread: %v", err)
+	}
+
+	got, err := store.Get(b.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Status != "open" {
+		t.Errorf("status = %q, want open (mark-unread must reopen a swept/closed message)", got.Status)
+	}
+	for _, l := range got.Labels {
+		if l == "read" {
+			t.Error("read label still present after mark-unread")
+		}
+	}
+	if got.Metadata["mail.read"] != "false" {
+		t.Errorf("mail.read = %q, want false", got.Metadata["mail.read"])
+	}
+}

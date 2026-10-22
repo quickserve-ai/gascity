@@ -62,7 +62,8 @@ type allocDifference struct {
 }
 
 // allocDifferences are the explained differences, by ID, each citing
-// CONTRACT v5 (AL1 keeps v4.3 §2-§3 and §6 except as it notes).
+// CONTRACT v5 (AL1 keeps v4.3 §2-§3 and §6 except as it notes) or, for a
+// fork carry's own behavior, its carry row.
 var allocDifferences = map[string]allocDifference{
 	"create-budget": {
 		"v5 P4",
@@ -99,6 +100,10 @@ var allocDifferences = map[string]allocDifference{
 	"named-singleton-custom-count": {
 		"v5 §12.2 #71, PAR-SC, POOL-008 (owner ruling 2026-10-17)",
 		"a named session desired with no row (always, or on_demand through work assigned to its identity) on a singleton template whose custom check counts work: v2 plans the canonical named create, where legacy's build creates a pool-managed ephemeral row that its desired state maps to the named identity",
+	},
+	"carry-named-canonical-mint": {
+		"carry row ga-dfp1b L2 (7ee2e4dd36); accounting only, pinned by TestAlwaysNamedCustomCheckMintStaysDesiredAcrossTicks",
+		"legacy's guarded pool create mints a mode=always singleton identity's canonical named row on the first tick, and the recount reads that row as the slot's holder (accepted 0), as upstream's recount does from the second tick for every canonical row; no consumer decides differently, since the row stays config-eligible and wakes on WakeConfig whatever the count",
 	},
 }
 
@@ -230,7 +235,7 @@ func legacyAllocation(t *testing.T, c diffCity) allocOutcome {
 	// The reconciler's accepted counts: the demand snapshot's second
 	// compute over the build's result (city_runtime.go, POOL-063).
 	open := snap.OpenInfos()
-	work := filterAssignedWorkBeadsForPoolDemand(cfg, cityPath, store, open, result.AssignedWorkBeads, result.AssignedWorkStoreRefs)
+	work := filterAssignedWorkBeadsForPoolDemand(cfg, cityPath, store, open, result.AssignedWorkBeads, result.AssignedWorkStoreRefs, nil)
 	counts := retainScaleCheckPartialPoolDesired(cfg, PoolDesiredCounts(ComputePoolDesiredStatesTracedAt(cfg, work, open, result.ScaleCheckCounts, diffNow, nil)),
 		snap, effectivePoolPartialRetentionTemplates(result))
 	if counts == nil {
@@ -689,7 +694,7 @@ func scaleCheckDiffCities() []diffCity {
 		},
 		{
 			name:       "named sessions backed by custom checks: on_demand and always (POOL-008)",
-			explain:    map[string]explained{"create:named:mayor": {"named-singleton-custom-count", "legacy false, v2 true"}, "create:pool:mayor/mayor#": {"named-singleton-custom-count", "legacy true, v2 false"}},
+			explain:    map[string]explained{"create:named:mayor": {"named-singleton-custom-count", "legacy false, v2 true"}, "create:pool:mayor/mayor#": {"named-singleton-custom-count", "legacy true, v2 false"}, "accepted:mayor": {"carry-named-canonical-mint", "legacy 0, v2 1"}},
 			cfg:        named,
 			beads:      []beads.Bead{diffWork("dw-1", "chat"), diffWork("dw-2", "worker")},
 			scaleCheck: true,

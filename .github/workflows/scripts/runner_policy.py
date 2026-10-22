@@ -9,6 +9,10 @@ from pathlib import Path
 
 ALLOWLIST_PATH = Path(".github/blacksmith-allowlist.txt")
 
+# The repository Blacksmith runners exist for. A fork of it (the quickserve-ai
+# carry) has none, so its jobs would queue forever on a Blacksmith label.
+UPSTREAM_REPOSITORY = "gastownhall/gascity"
+
 BLACKSMITH_RUNNERS = {
     "runner_2vcpu": "blacksmith-2vcpu-ubuntu-2404",
     "runner_8vcpu": "blacksmith-8vcpu-ubuntu-2404",
@@ -49,6 +53,7 @@ def select_runners(
     allowlist: set[str],
     *,
     force_blacksmith: bool = False,
+    repository: str = UPSTREAM_REPOSITORY,
 ) -> tuple[bool, str, dict[str, str]]:
     """Return whether to use Blacksmith, the reason, and runner labels.
 
@@ -57,8 +62,13 @@ def select_runners(
     concurrent-job cap (fork and push jobs waited p90 4-9 minutes on
     2026-10-02/03, Blacksmith jobs 7-9 seconds). The arguments stay for the
     callers and tests; the allowlist no longer selects runners.
+
+    Any other repository gets GitHub-hosted runners, forced or not: it has
+    no Blacksmith runners to queue on (pl-axh9).
     """
     del event_name, author, allowlist, force_blacksmith
+    if repository.strip().lower() != UPSTREAM_REPOSITORY:
+        return False, f"GitHub-hosted runners off {UPSTREAM_REPOSITORY} (no Blacksmith runners here)", GITHUB_RUNNERS
     return True, "Blacksmith for every event (OSS repository)", BLACKSMITH_RUNNERS
 
 
@@ -96,6 +106,7 @@ def main() -> None:
         author,
         load_allowlist(),
         force_blacksmith=force_blacksmith,
+        repository=os.environ.get("GITHUB_REPOSITORY", "").strip() or UPSTREAM_REPOSITORY,
     )
     append_outputs(use_blacksmith, reason, runners)
     append_summary(use_blacksmith, reason, event_name, author)

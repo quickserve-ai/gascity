@@ -11,8 +11,10 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -30,6 +32,108 @@ import (
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/spf13/cobra"
 )
+
+// unreadCallCountingProvider counts how a caller asks for unread mail. It
+// embeds a nil mail.Provider: only the two methods below may be called.
+type unreadCallCountingProvider struct {
+	mail.Provider
+	checks      []string
+	multiCalls  [][]string
+	byRecipient map[string][]mail.Message
+}
+
+func (p *unreadCallCountingProvider) Check(recipient string) ([]mail.Message, error) {
+	p.checks = append(p.checks, recipient)
+	return p.byRecipient[recipient], nil
+}
+
+//nolint:unparam // the error result is mail.MultiRecipientInboxer's signature
+func (p *unreadCallCountingProvider) InboxRecipients(recipients []string) ([]mail.Message, error) {
+	p.multiCalls = append(p.multiCalls, append([]string(nil), recipients...))
+	var out []mail.Message
+	for _, r := range recipients {
+		out = append(out, p.byRecipient[r]...)
+	}
+	return out, nil
+}
+
+// perAddressOnlyProvider hides InboxRecipients, like a provider that cannot
+// answer for several addresses at once.
+type perAddressOnlyProvider struct {
+	mail.Provider
+	inner *unreadCallCountingProvider
+}
+
+func (p perAddressOnlyProvider) Check(recipient string) ([]mail.Message, error) {
+	return p.inner.Check(recipient)
+}
+
+// TestMailCheckAsksAMultiRecipientProviderOnce pins pl-d9lw item 1's second
+// half: a seat's mail check reads all of its addresses in ONE provider call,
+// so per-mailbox costs (the closed-session lookup) are paid once per prompt,
+// not once per address. The result is the same set in the same order as the
+// per-address path, which a provider without the batch method still gets.
+func TestMailCheckAsksAMultiRecipientProviderOnce(t *testing.T) {
+	t0 := time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
+	older := mail.Message{ID: "m-1", Subject: "older", CreatedAt: t0}
+	newer := mail.Message{ID: "m-2", Subject: "newer", CreatedAt: t0.Add(time.Minute)}
+	seed := func() *unreadCallCountingProvider {
+		return &unreadCallCountingProvider{byRecipient: map[string][]mail.Message{
+			"seat":       {newer},
+			"rig/seat":   {older, newer}, // the same message under two addresses
+			"ga-wisp-s1": nil,
+		}}
+	}
+	addresses := []string{"seat", "rig/seat", "ga-wisp-s1"}
+	ids := func(msgs []mail.Message) []string {
+		out := make([]string, 0, len(msgs))
+		for _, m := range msgs {
+			out = append(out, m.ID)
+		}
+		return out
+	}
+
+	batch := seed()
+	got, err := collectUnreadMailMessages(batch, batch.Check, addresses)
+	if err != nil {
+		t.Fatalf("collectUnreadMailMessages: %v", err)
+	}
+	if len(batch.multiCalls) != 1 || len(batch.checks) != 0 {
+		t.Fatalf("batch provider: %d InboxRecipients calls and %d Check calls, want 1 and 0", len(batch.multiCalls), len(batch.checks))
+	}
+	if !slices.Equal(batch.multiCalls[0], addresses) {
+		t.Fatalf("InboxRecipients got %v, want every address %v", batch.multiCalls[0], addresses)
+	}
+
+	plain := seed()
+	want, err := collectUnreadMailMessages(perAddressOnlyProvider{inner: plain}, plain.Check, addresses)
+	if err != nil {
+		t.Fatalf("collectUnreadMailMessages (per-address): %v", err)
+	}
+	if len(plain.checks) != len(addresses) || len(plain.multiCalls) != 0 {
+		t.Fatalf("per-address provider: %d Check calls and %d batch calls, want %d and 0", len(plain.checks), len(plain.multiCalls), len(addresses))
+	}
+	if !slices.Equal(ids(got), ids(want)) || !slices.Equal(ids(got), []string{"m-1", "m-2"}) {
+		t.Fatalf("batch result %v, per-address result %v, want both [m-1 m-2]", ids(got), ids(want))
+	}
+
+	single := seed()
+	if _, err := collectUnreadMailMessages(single, single.Check, addresses[:1]); err != nil {
+		t.Fatalf("collectUnreadMailMessages (one address): %v", err)
+	}
+	if len(single.checks) != 1 || len(single.multiCalls) != 0 {
+		t.Fatalf("one address: %d Check calls and %d batch calls, want 1 and 0", len(single.checks), len(single.multiCalls))
+	}
+
+	// The command itself, not only the helper: gc mail check for a seat with
+	// three addresses makes one provider call.
+	cmdProvider := seed()
+	var stdout, stderr bytes.Buffer
+	doMailCheckTarget(cmdProvider, resolvedMailTarget{display: "seat", recipients: addresses}, false, &stdout, &stderr)
+	if len(cmdProvider.multiCalls) != 1 || len(cmdProvider.checks) != 0 {
+		t.Fatalf("gc mail check: %d batch calls and %d Check calls, want 1 and 0; stderr: %s", len(cmdProvider.multiCalls), len(cmdProvider.checks), stderr.String())
+	}
+}
 
 type countOnlyMailProvider struct{}
 
@@ -1827,6 +1931,141 @@ func TestResolveMailRecipientIdentity_BareRigScopedNamedRejectsAmbiguousLiveConf
 	}
 }
 
+// ga-mk8tp4: a city seat and a rig seat share the bare name "barry". From inside
+// the rig, "/barry" must reach the city seat, and bare "barry" must refuse while
+// naming an address for each candidate. Both seats are LIVE, so the send path's
+// live-session matcher (which runs before the config resolver) is exercised too.
+func TestResolveMailRecipientIdentity_RootedAddressReachesTheCitySeatFromARigCwd(t *testing.T) {
+	t.Setenv("GC_SESSION", "fake")
+	rigDir := t.TempDir()
+	t.Setenv("GC_DIR", rigDir)
+
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Rigs:      []config.Rig{{Name: "qcore", Path: rigDir}},
+		Agents: []config.Agent{
+			{Name: "barry", StartCommand: "true"},
+			{Name: "barry", Dir: "qcore", StartCommand: "true"},
+		},
+		NamedSessions: []config.NamedSession{
+			{Template: "barry", Mode: "always"},
+			{Template: "barry", Dir: "qcore", Mode: "always"},
+		},
+	}
+	for _, identity := range []string{"barry", "qcore/barry"} {
+		if _, err := store.Create(beads.Bead{
+			Type:   session.BeadType,
+			Labels: []string{session.LabelSession},
+			Metadata: map[string]string{
+				"alias":                     identity,
+				"session_name":              strings.ReplaceAll(identity, "/", "--"),
+				"configured_named_session":  "true",
+				"configured_named_identity": identity,
+				"configured_named_mode":     "always",
+			},
+		}); err != nil {
+			t.Fatalf("Create(%s): %v", identity, err)
+		}
+	}
+	if got := currentRigContext(cfg); got != "qcore" {
+		t.Fatalf("currentRigContext = %q, want qcore (the test must run from inside the rig)", got)
+	}
+
+	address, err := resolveMailRecipientIdentity(t.TempDir(), cfg, store, "/barry")
+	if err != nil {
+		t.Fatalf("resolveMailRecipientIdentity(/barry) from the qcore rig: %v", err)
+	}
+	if address != "barry" {
+		t.Fatalf("address = %q, want the city seat barry", address)
+	}
+
+	_, err = resolveMailRecipientIdentity(t.TempDir(), cfg, store, "barry")
+	if !errors.Is(err, session.ErrAmbiguous) {
+		t.Fatalf("resolveMailRecipientIdentity(barry) = %v, want ErrAmbiguous", err)
+	}
+	if !strings.Contains(err.Error(), "/barry") || !strings.Contains(err.Error(), "qcore/barry") {
+		t.Fatalf("error = %q, want it to name /barry and qcore/barry", err)
+	}
+}
+
+// ga-mk8tp4 (review finding 1): "/barry" from inside the rig is stored under
+// the bare mailbox "barry", and the send's wake step (newMailNudgeFunc, and the
+// cloud-wake guard) resolves that stored mailbox again. In rig context bare
+// "barry" is ambiguous, so the send printed "Sent message" and then "nudge
+// failed". The wake must reach the city seat. The resolver here is the real
+// session-ID resolution chain resolveNudgeTarget runs, over an in-memory city.
+func TestResolveMailWakeTarget_StoredCityMailboxWakesTheCitySeatFromARigCwd(t *testing.T) {
+	t.Setenv("GC_SESSION", "fake")
+	rigDir := t.TempDir()
+	t.Setenv("GC_DIR", rigDir)
+	cityPath := t.TempDir()
+
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Rigs:      []config.Rig{{Name: "qcore", Path: rigDir}},
+		Agents: []config.Agent{
+			{Name: "barry", StartCommand: "true"},
+			{Name: "barry", Dir: "qcore", StartCommand: "true"},
+		},
+		NamedSessions: []config.NamedSession{
+			{Template: "barry", Mode: "always"},
+			{Template: "barry", Dir: "qcore", Mode: "always"},
+		},
+	}
+	ids := map[string]string{}
+	for _, identity := range []string{"barry", "qcore/barry"} {
+		b, err := store.Create(beads.Bead{
+			Type:   session.BeadType,
+			Labels: []string{session.LabelSession},
+			Metadata: map[string]string{
+				"alias":                     identity,
+				"session_name":              strings.ReplaceAll(identity, "/", "--"),
+				"configured_named_session":  "true",
+				"configured_named_identity": identity,
+				"configured_named_mode":     "always",
+			},
+		})
+		if err != nil {
+			t.Fatalf("Create(%s): %v", identity, err)
+		}
+		ids[identity] = b.ID
+	}
+	if got := currentRigContext(cfg); got != "qcore" {
+		t.Fatalf("currentRigContext = %q, want qcore (the test must run from inside the rig)", got)
+	}
+	resolve := func(identifier string) (nudgeTarget, error) {
+		id, err := resolveSessionIDWithConfig(cityPath, cfg, store, identifier)
+		return nudgeTarget{sessionID: id}, err
+	}
+
+	// Preflight: the stored mailbox, re-resolved bare in rig context, is
+	// ambiguous. Without this the test below could pass vacuously.
+	if _, err := resolve("barry"); !errors.Is(err, session.ErrAmbiguous) {
+		t.Fatalf("bare barry from the rig = %v, want ErrAmbiguous", err)
+	}
+
+	address, err := resolveMailRecipientIdentity(cityPath, cfg, store, "/barry")
+	if err != nil {
+		t.Fatalf("resolveMailRecipientIdentity(/barry): %v", err)
+	}
+	target, err := resolveMailWakeTarget(address, resolve)
+	if err != nil {
+		t.Fatalf("resolveMailWakeTarget(%q) from the qcore rig: %v", address, err)
+	}
+	if target.sessionID != ids["barry"] {
+		t.Fatalf("wake target = %q, want the city seat %q (rig seat is %q)", target.sessionID, ids["barry"], ids["qcore/barry"])
+	}
+
+	// A rig-qualified mailbox still wakes the rig seat and never takes the
+	// rooted retry.
+	target, err = resolveMailWakeTarget("qcore/barry", resolve)
+	if err != nil || target.sessionID != ids["qcore/barry"] {
+		t.Fatalf("resolveMailWakeTarget(qcore/barry) = %q, %v; want %q", target.sessionID, err, ids["qcore/barry"])
+	}
+}
+
 // --- gc mail inbox ---
 
 type recordingMailInboxReader struct {
@@ -2297,10 +2536,10 @@ func TestMailReplyNotifySuccess(t *testing.T) {
 	mp.Send("alice", "bob", "Hello", "first") //nolint:errcheck
 
 	var nudged, nudgedMessageID string
-	nf := func(recipient, messageID string) error {
+	nf := func(recipient, messageID string) (string, error) {
 		nudged = recipient
 		nudgedMessageID = messageID
-		return nil
+		return "", nil
 	}
 
 	var stdout, stderr bytes.Buffer
@@ -2324,8 +2563,8 @@ func TestMailReplyNotifyNudgeError(t *testing.T) {
 	mp := beadmail.New(store)
 	mp.Send("alice", "bob", "Hello", "first") //nolint:errcheck
 
-	nf := func(_, _ string) error {
-		return fmt.Errorf("session not found")
+	nf := func(_, _ string) (string, error) {
+		return "", fmt.Errorf("session not found")
 	}
 
 	var stdout, stderr bytes.Buffer
@@ -2427,9 +2666,9 @@ func TestCmdMailReplyHumanNotifyQueuesNudge(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := cmdMailReply([]string{original.ID, "reply body"}, "", "", true, &stdout, &stderr)
+	code := cmdMailReplyAsHuman([]string{original.ID, "reply body"}, true, &stdout, &stderr)
 	if code != 0 {
-		t.Fatalf("cmdMailReply() = %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+		t.Fatalf("cmdMailReplyAsHuman() = %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "to alice") {
 		t.Fatalf("stdout = %q, want reply addressed to alice", stdout.String())
@@ -2462,9 +2701,9 @@ func TestCmdMailReplyExecProviderNotifyQueuesNudge(t *testing.T) {
 	t.Setenv("GC_MAIL", "exec:"+script)
 
 	var stdout, stderr bytes.Buffer
-	code := cmdMailReply([]string{"gc-1", "reply body"}, "", "", true, &stdout, &stderr)
+	code := cmdMailReplyAsHuman([]string{"gc-1", "reply body"}, true, &stdout, &stderr)
 	if code != 0 {
-		t.Fatalf("cmdMailReply() = %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+		t.Fatalf("cmdMailReplyAsHuman() = %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
 
 	assertQueuedMailNudge(t, cityPath, sessionID, stderr.String())
@@ -2479,7 +2718,7 @@ func TestMailReplyNudgeAliasQueuesNudge(t *testing.T) {
 	if cmd.Flags().Lookup("nudge") == nil {
 		t.Fatal("reply command missing --nudge alias")
 	}
-	cmd.SetArgs([]string{"gc-1", "--nudge", "reply body"})
+	cmd.SetArgs([]string{"gc-1", "--from", "human", "--nudge", "reply body"})
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("reply --nudge: %v; stdout=%s stderr=%s", err, stdout.String(), stderr.String())
 	}
@@ -2499,9 +2738,9 @@ func TestCmdMailReplyExecProviderNotifyWithoutCityWarnsAndSendsReply(t *testing.
 	t.Chdir(t.TempDir())
 
 	var stdout, stderr bytes.Buffer
-	code := cmdMailReply([]string{"gc-1", "reply body"}, "", "", true, &stdout, &stderr)
+	code := cmdMailReplyAsHuman([]string{"gc-1", "reply body"}, true, &stdout, &stderr)
 	if code != 0 {
-		t.Fatalf("cmdMailReply() = %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+		t.Fatalf("cmdMailReplyAsHuman() = %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "Replied to gc-1") {
 		t.Fatalf("stdout = %q, want reply confirmation", stdout.String())
@@ -3553,10 +3792,10 @@ func TestMailSendNotifySuccess(t *testing.T) {
 	recipients := map[string]bool{"human": true, "mayor": true}
 
 	var nudged, nudgedMessageID string
-	nf := func(recipient, messageID string) error {
+	nf := func(recipient, messageID string) (string, error) {
 		nudged = recipient
 		nudgedMessageID = messageID
-		return nil
+		return "", nil
 	}
 
 	var stdout, stderr bytes.Buffer
@@ -3587,10 +3826,10 @@ func TestMailSendReportsSentBeforeNudging(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	nudged := false
 	var stdoutAtNudge string
-	nf := func(_, _ string) error {
+	nf := func(_, _ string) (string, error) {
 		nudged = true
 		stdoutAtNudge = stdout.String()
-		return nil
+		return "", nil
 	}
 
 	code := doMailSend(mp, events.Discard, recipients, "human", []string{"mayor", "wake up"}, nf, &stdout, &stderr)
@@ -3610,8 +3849,8 @@ func TestMailSendNotifyNudgeError(t *testing.T) {
 	mp := beadmail.New(store)
 	recipients := map[string]bool{"human": true, "mayor": true}
 
-	nf := func(_, _ string) error {
-		return fmt.Errorf("session not found")
+	nf := func(_, _ string) (string, error) {
+		return "", fmt.Errorf("session not found")
 	}
 
 	var stdout, stderr bytes.Buffer
@@ -3635,9 +3874,9 @@ func TestMailSendNotifyToHuman(t *testing.T) {
 	recipients := map[string]bool{"human": true, "mayor": true}
 
 	nudgeCalled := false
-	nf := func(_, _ string) error {
+	nf := func(_, _ string) (string, error) {
 		nudgeCalled = true
-		return nil
+		return "", nil
 	}
 
 	var stdout bytes.Buffer
@@ -5284,6 +5523,210 @@ name = "mayor"
 	assertAutoHandoffRetainedAddressable(t, store, auto.ID)
 }
 
+// setMailInjectProbeDeadline shortens the inject probe's client deadline for
+// one test so a stalled-probe case runs in milliseconds, not seconds.
+func setMailInjectProbeDeadline(t *testing.T, d time.Duration) {
+	t.Helper()
+	prev := mailInjectProbeDeadline
+	mailInjectProbeDeadline = d
+	t.Cleanup(func() { mailInjectProbeDeadline = prev })
+}
+
+// delayedMailHandler holds each request for delay before handing it to next,
+// modeling a supervisor inbox read that waits on a slow store. It returns
+// early when the client abandons the request, so srv.Close never waits out
+// the delay. requests counts the reads that actually reached the server.
+func delayedMailHandler(delay time.Duration, requests *atomic.Int32, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		select {
+		case <-r.Context().Done():
+			return
+		case <-time.After(delay):
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// TestRouteMailCheckInjectStalledProbeStillInjectsLocalMail pins ga-c3omvr.
+// The probe's supervisor read stalls far past the inject deadline and then
+// answers store_slow, which is what the server does when its own 25s mail read
+// deadline fires. The hook must stop waiting at the inject deadline and inject
+// the local mailbox that turn, instead of being held until the hook's 15s kill
+// (or answering with only a degraded notice and no mail).
+func TestRouteMailCheckInjectStalledProbeStillInjectsLocalMail(t *testing.T) {
+	clearInheritedBeadsEnv(t)
+	cityPath := t.TempDir()
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_BEADS_SCOPE_ROOT", "")
+	t.Setenv("GC_CITY_PATH", cityPath)
+	t.Setenv("GC_DEBUG", "1")
+	t.Setenv("GC_ALIAS", "mayor")
+	t.Setenv("GC_SESSION_NAME", "mayor")
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte(`[workspace]
+name = "test-city"
+
+[[agent]]
+name = "mayor"
+`), 0o644); err != nil {
+		t.Fatalf("write city.toml: %v", err)
+	}
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	if _, err := store.Create(beads.Bead{
+		Type:   "session",
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":        "mayor",
+			"session_name": "mayor",
+		},
+	}); err != nil {
+		t.Fatalf("Create session: %v", err)
+	}
+	local, err := store.Create(beads.Bead{
+		Title:    "local mail must not wait on the probe",
+		Type:     "message",
+		Assignee: "mayor",
+		From:     "alice",
+	})
+	if err != nil {
+		t.Fatalf("Create message: %v", err)
+	}
+
+	const deadline = 100 * time.Millisecond
+	const stall = 10 * time.Second
+	setMailInjectProbeDeadline(t, deadline)
+	var requests atomic.Int32
+	srv := newRemoteMailTestServer(t, delayedMailHandler(stall, &requests,
+		mailProblemHandler(http.StatusServiceUnavailable, "store_slow: mail read timed out after 25s")(t)))
+	defer srv.Close()
+	c := api.NewCityScopedClient(srv.URL, "test-city")
+
+	var stdout, stderr bytes.Buffer
+	start := time.Now()
+	code := routeMailCheck(cityPath, nil, true, "", c, "", &stdout, &stderr)
+	elapsed := time.Since(start)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("probe requests = %d, want 1 (the stall was never exercised)", got)
+	}
+	if limit := deadline + 3*time.Second; elapsed >= limit {
+		t.Errorf("routeMailCheck took %v, want < %v: the inject probe waited on the stalled supervisor read instead of its own deadline", elapsed, limit)
+	}
+	if !strings.Contains(stdout.String(), local.ID) {
+		t.Errorf("stalled probe starved local injection: stdout missing local message %s:\n%s", local.ID, stdout.String())
+	}
+	if strings.Contains(stdout.String(), mailCheckDegradedNotice) {
+		t.Errorf("stdout carries a degraded notice alongside the local injection:\n%s", stdout.String())
+	}
+	assertMailRouteLog(t, stderr.String(), "fallback", "inject-local-side-effects")
+}
+
+// TestRouteMailCheckNonInjectKeepsFullMailReadDeadline guards the other side
+// of ga-c3omvr: only the inject probe is short. A plain `gc mail check` must
+// still wait out a supervisor read slower than the inject deadline and serve
+// the API answer, rather than falling back to the (empty) local provider.
+func TestRouteMailCheckNonInjectKeepsFullMailReadDeadline(t *testing.T) {
+	cityPath := writeMailTestCity(t)
+	t.Setenv("GC_DEBUG", "1")
+	setMailInjectProbeDeadline(t, 50*time.Millisecond)
+	var requests atomic.Int32
+	srv := newRemoteMailTestServer(t, delayedMailHandler(500*time.Millisecond, &requests, okMailCheckHandler(t)))
+	defer srv.Close()
+	c := api.NewCityScopedClient(srv.URL, "test-city")
+
+	var stdout, stderr bytes.Buffer
+	code := routeMailCheck(cityPath, []string{"mayor"}, false, "", c, "", &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (API answer); stderr=%q stdout=%q", code, stderr.String(), stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "1 unread message(s)") {
+		t.Fatalf("stdout = %q, want the API inbox count", stdout.String())
+	}
+	assertMailRouteLog(t, stderr.String(), "api", "")
+}
+
+// TestRouteMailCheckInjectFastProbeContractUnchanged pins that a probe
+// answering inside the inject deadline keeps its pre-ga-c3omvr outcomes:
+// store_slow and partial reads emit exactly their notice without the local
+// injection, and a non-fallback error exits 0 silently.
+func TestRouteMailCheckInjectFastProbeContractUnchanged(t *testing.T) {
+	tests := []struct {
+		name       string
+		handler    mailMatrixHandler
+		wantStdout string
+	}{
+		{
+			name:       "store-slow-error",
+			handler:    mailProblemHandler(http.StatusServiceUnavailable, "store_slow: mail read timed out after 25s"),
+			wantStdout: expectedMailCheckDegradedInjectOutput(),
+		},
+		{
+			name:       "partial-store-slow",
+			handler:    partialStoreSlowMailCheckHandler,
+			wantStdout: expectedMailCheckDegradedInjectOutput(),
+		},
+		{
+			name:       "partial-provider-error",
+			handler:    partialProviderErrorMailCheckHandler,
+			wantStdout: expectedMailCheckPartialDegradedInjectOutput(),
+		},
+		{
+			name:       "non-fallback-error",
+			handler:    mailProblemHandler(http.StatusNotFound, "not_found: no such recipient"),
+			wantStdout: "",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cityPath := writeMailTestCity(t)
+			t.Setenv("GC_DEBUG", "1")
+			setMailInjectProbeDeadline(t, 5*time.Second)
+			srv := newRemoteMailTestServer(t, tc.handler(t))
+			defer srv.Close()
+			c := api.NewCityScopedClient(srv.URL, "test-city")
+
+			var stdout, stderr bytes.Buffer
+			if code := routeMailCheck(cityPath, []string{"mayor"}, true, "", c, "", &stdout, &stderr); code != 0 {
+				t.Fatalf("exit = %d, want 0; stderr=%q stdout=%q", code, stderr.String(), stdout.String())
+			}
+			if got := stdout.String(); got != tc.wantStdout {
+				t.Fatalf("stdout = %q, want %q", got, tc.wantStdout)
+			}
+			assertMailRouteLog(t, stderr.String(), "api", "error")
+		})
+	}
+}
+
+// TestMailInjectProbeTimeoutFitsInsideHookTimeout ties the probe deadline to
+// the hook that runs it. The Claude UserPromptSubmit hook kills `mail check
+// --inject` at its --timeout; the probe must end well inside that so the local
+// read that does the injection still has most of the budget (ga-c3omvr).
+func TestMailInjectProbeTimeoutFitsInsideHookTimeout(t *testing.T) {
+	if mailInjectProbeDeadline != mailInjectProbeTimeout {
+		t.Fatalf("mailInjectProbeDeadline = %v, want the production mailInjectProbeTimeout %v", mailInjectProbeDeadline, mailInjectProbeTimeout)
+	}
+	data, err := os.ReadFile(filepath.Join("..", "..", "internal", "hooks", "config", "claude.json"))
+	if err != nil {
+		t.Fatalf("read Claude hook config: %v", err)
+	}
+	m := regexp.MustCompile(`--timeout (\S+) [^"]*-- mail check --inject`).FindSubmatch(data)
+	if m == nil {
+		t.Fatalf("Claude hook config has no `gc hook run --timeout <d> ... -- mail check --inject` command")
+	}
+	hookTimeout, err := time.ParseDuration(string(m[1]))
+	if err != nil {
+		t.Fatalf("parse hook timeout %q: %v", m[1], err)
+	}
+	if mailInjectProbeTimeout > hookTimeout/3 {
+		t.Fatalf("mailInjectProbeTimeout = %v, want <= a third of the %v hook timeout so local injection keeps the rest", mailInjectProbeTimeout, hookTimeout)
+	}
+}
+
 func TestRenderMailCheckFromAPIInjectCodexUsesUserPromptSubmit(t *testing.T) {
 	cr := api.CachedRead[api.MailListView]{
 		Body: api.MailListView{
@@ -5506,5 +5949,192 @@ func TestCmdMailSendAllFlagBodyWinsOverPositional(t *testing.T) {
 	msg := mailSendTestFindMessage(t, cityPath)
 	if msg.Description != "flag body" {
 		t.Errorf("Description = %q, want %q (--all -m flag body should win over positional)", msg.Description, "flag body")
+	}
+}
+
+func TestResolveMailRecipientIdentity_NameSquatStillResolvesTheConfiguredMailbox(t *testing.T) {
+	// ga-isa3j4, the field shape (krieger 2026-09-19): a live bead holds a
+	// rig-scoped named session's RUNTIME name (qcore--barry) without being that
+	// session. Mail resolution failed on the conflict, so `gc mail send`
+	// refused and STORED NOTHING. The squatter does not answer to the mailbox
+	// address (qcore/barry), so the mail resolves to the configured mailbox and
+	// is stored.
+	store := beads.NewMemStore()
+	cityPath := t.TempDir()
+	cfg := &config.City{
+		Workspace:     config.Workspace{Name: "test-city"},
+		Rigs:          []config.Rig{{Name: "qcore", Path: filepath.Join(cityPath, "qcore")}},
+		Agents:        []config.Agent{{Name: "barry", Dir: "qcore", StartCommand: "true"}},
+		NamedSessions: []config.NamedSession{{Template: "barry", Dir: "qcore"}},
+	}
+	spec, ok := findNamedSessionSpec(cfg, config.EffectiveCityName(cfg, filepath.Base(cityPath)), "qcore/barry")
+	if !ok {
+		t.Fatal("findNamedSessionSpec(qcore/barry) = false")
+	}
+	if spec.SessionName == spec.Identity {
+		t.Fatalf("fixture: session_name %q must differ from identity %q", spec.SessionName, spec.Identity)
+	}
+	if _, err := store.Create(beads.Bead{
+		Title:  "squatter",
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"session_name": spec.SessionName,
+			"template":     "other",
+			"agent_name":   "other",
+			"state":        "asleep",
+		},
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := resolveSessionIDWithConfig(cityPath, cfg, store, "qcore/barry"); !errors.Is(err, errNamedSessionConflict) {
+		t.Fatalf("fixture: resolveSessionIDWithConfig err = %v, want the squat conflict", err)
+	}
+	got, err := resolveMailRecipientIdentity(cityPath, cfg, store, "qcore/barry")
+	if err != nil {
+		t.Fatalf("resolveMailRecipientIdentity(qcore/barry) = %v, want the configured mailbox despite the squat", err)
+	}
+	if got != spec.Identity {
+		t.Fatalf("recipient = %q, want configured identity %q", got, spec.Identity)
+	}
+}
+
+func TestResolveMailRecipientIdentity_RuntimeNameEqualToIdentityStillRefuses(t *testing.T) {
+	// When the runtime name IS the mailbox address (city-scoped default
+	// template: session_name "mayor"), the squatter's API inbox lists it, so
+	// delivery would leak. Refuse, as before.
+	store := beads.NewMemStore()
+	cityPath := t.TempDir()
+	cfg := &config.City{
+		Workspace:     config.Workspace{Name: "test-city"},
+		Agents:        []config.Agent{{Name: "mayor", StartCommand: "true"}},
+		NamedSessions: []config.NamedSession{{Template: "mayor"}},
+	}
+	spec, _ := findNamedSessionSpec(cfg, config.EffectiveCityName(cfg, filepath.Base(cityPath)), "mayor")
+	if _, err := store.Create(beads.Bead{
+		Type:     session.BeadType,
+		Labels:   []string{session.LabelSession},
+		Metadata: map[string]string{"session_name": spec.SessionName, "template": "other", "agent_name": "other", "state": "asleep"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveMailRecipientIdentity(cityPath, cfg, store, "mayor"); err == nil {
+		t.Fatal("runtime-name squat on the mailbox address resolved; want the refusal")
+	}
+}
+
+func TestResolveMailRecipientIdentity_AliasSquatStillRefuses(t *testing.T) {
+	// Review 2026-09-23: a squatter holding the configured identity as its
+	// ALIAS lists that address in its own inbox. Falling through would store
+	// the configured seat's mail where the squatter reads it, so this shape
+	// keeps the loud refusal.
+	store := beads.NewMemStore()
+	cityPath := t.TempDir()
+	cfg := &config.City{
+		Workspace:     config.Workspace{Name: "test-city"},
+		Agents:        []config.Agent{{Name: "mayor", StartCommand: "true"}},
+		NamedSessions: []config.NamedSession{{Template: "mayor"}},
+	}
+	if _, err := store.Create(beads.Bead{
+		Title:  "alias squatter",
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":        "mayor",
+			"session_name": "other-runtime",
+			"template":     "other",
+			"agent_name":   "other",
+			"state":        "asleep",
+		},
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := resolveMailRecipientIdentity(cityPath, cfg, store, "mayor"); err == nil {
+		t.Fatal("alias squat resolved a recipient; want the refusal (the squatter would read the mail)")
+	}
+}
+
+func TestResolveMailRecipientIdentity_TwoSquattersOneHoldingTheAliasStillRefuses(t *testing.T) {
+	// Review 2026-09-23 (second round): the conflict lookup reports ONE bead.
+	// With one bead on the runtime name and another holding the identity as
+	// its alias, checking only the reported bead let the mail through to an
+	// address the alias holder reads. Any live bead answering to the mailbox
+	// must keep the refusal.
+	store := beads.NewMemStore()
+	cityPath := t.TempDir()
+	cfg := &config.City{
+		Workspace:     config.Workspace{Name: "test-city"},
+		Rigs:          []config.Rig{{Name: "qcore", Path: filepath.Join(cityPath, "qcore")}},
+		Agents:        []config.Agent{{Name: "barry", Dir: "qcore", StartCommand: "true"}},
+		NamedSessions: []config.NamedSession{{Template: "barry", Dir: "qcore"}},
+	}
+	spec, ok := findNamedSessionSpec(cfg, config.EffectiveCityName(cfg, filepath.Base(cityPath)), "qcore/barry")
+	if !ok {
+		t.Fatal("findNamedSessionSpec(qcore/barry) = false")
+	}
+	var ids []string
+	for _, md := range []map[string]string{
+		{"session_name": spec.SessionName, "template": "other", "agent_name": "other", "state": "asleep"},
+		{"session_name": "rogue-runtime", "alias": spec.Identity, "template": "other", "agent_name": "other", "state": "active"},
+	} {
+		b, err := store.Create(beads.Bead{Type: session.BeadType, Labels: []string{session.LabelSession}, Metadata: md})
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		ids = append(ids, b.ID)
+	}
+	if _, err := resolveSessionIDWithConfig(cityPath, cfg, store, "qcore/barry"); !errors.Is(err, errNamedSessionConflict) {
+		t.Fatalf("fixture: resolveSessionIDWithConfig err = %v, want the squat conflict", err)
+	}
+	got, err := resolveMailRecipientIdentity(cityPath, cfg, store, "qcore/barry")
+	if err == nil {
+		t.Fatalf("resolved %q with an alias holder live; want the refusal (it would read the mail)", got)
+	}
+	// ga-lm5coj: the conflict error advises closing the runtime-name holder,
+	// but the reader is the other bead. The refusal must say that acting on
+	// the named bead alone will not unblock the send.
+	if want := "session bead " + ids[1] + " (not " + ids[0] + ")"; !strings.Contains(err.Error(), want) ||
+		!strings.Contains(err.Error(), "will not unblock this send") {
+		t.Fatalf("err = %q, want it to name the reader %s apart from the conflict bead %s", err, ids[1], ids[0])
+	}
+}
+
+func TestResolveMailRecipientIdentity_SquatWithOnlyTheSeatsOwnArchivedBeadStillResolves(t *testing.T) {
+	// ga-isa3j4 review round 3: the seat's own archived bead keeps its alias
+	// and is not canonical. It is the seat, not a squatter; treating it as an
+	// alias holder re-creates the lost-mail bug for exactly the field shape
+	// (a drained seat whose runtime name another bead took).
+	store := beads.NewMemStore()
+	cityPath := t.TempDir()
+	cfg := &config.City{
+		Workspace:     config.Workspace{Name: "test-city"},
+		Rigs:          []config.Rig{{Name: "qcore", Path: filepath.Join(cityPath, "qcore")}},
+		Agents:        []config.Agent{{Name: "barry", Dir: "qcore", StartCommand: "true"}},
+		NamedSessions: []config.NamedSession{{Template: "barry", Dir: "qcore"}},
+	}
+	spec, ok := findNamedSessionSpec(cfg, config.EffectiveCityName(cfg, filepath.Base(cityPath)), "qcore/barry")
+	if !ok {
+		t.Fatal("findNamedSessionSpec(qcore/barry) = false")
+	}
+	for _, md := range []map[string]string{
+		{
+			session.NamedSessionMetadataKey: "true", session.NamedSessionIdentityMetadata: spec.Identity, "alias": spec.Identity,
+			"session_name": "old-runtime", "state": "archived", "continuity_eligible": "false",
+		},
+		{"session_name": spec.SessionName, "template": "other", "agent_name": "other", "state": "asleep"},
+	} {
+		if _, err := store.Create(beads.Bead{Type: session.BeadType, Labels: []string{session.LabelSession}, Metadata: md}); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+	}
+	if _, err := resolveSessionIDWithConfig(cityPath, cfg, store, "qcore/barry"); !errors.Is(err, errNamedSessionConflict) {
+		t.Fatalf("fixture: resolveSessionIDWithConfig err = %v, want the squat conflict", err)
+	}
+	got, err := resolveMailRecipientIdentity(cityPath, cfg, store, "qcore/barry")
+	if err != nil {
+		t.Fatalf("resolveMailRecipientIdentity = %v, want the configured mailbox (the archived bead is the seat)", err)
+	}
+	if got != spec.Identity {
+		t.Fatalf("recipient = %q, want %q", got, spec.Identity)
 	}
 }

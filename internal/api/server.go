@@ -73,6 +73,13 @@ type Server struct {
 	// history check in tests. Nil uses outputStreamPollInterval.
 	structuredPeekPoll <-chan time.Time
 
+	// structuredPeekLoopReady, when non-nil, receives one signal from each
+	// structured fallback stream after its initial peek and history check,
+	// just before it starts reading structuredPeekPoll. Tests use it to
+	// create history only once the stream is waiting on the injected poll.
+	// Nil in production.
+	structuredPeekLoopReady chan<- struct{}
+
 	// idem caches responses for Idempotency-Key replay on create endpoints.
 	idem *idempotencyCache
 
@@ -99,6 +106,9 @@ type Server struct {
 	// and is threaded into each factory; otherwise every poll re-parses an
 	// unchanged mirror.
 	activityMemo *worker.DerivedActivityMemo
+	// formulaMemo remembers the formula each acting bead belongs to across the
+	// per-request worker factories (usage attribution).
+	formulaMemo *worker.FormulaNameMemo
 
 	// agentVisibilityWaitTimeout overrides the POST /agents visibility wait
 	// in tests. Zero uses defaultAgentVisibilityWaitTimeout.
@@ -297,6 +307,7 @@ func newServerFor(state State, readOnly bool, city *cityOps) *Server {
 		webhookDedup:   newWebhookDedupCache(defaultWebhookDedupTTL),
 		webhookLimiter: newWebhookRateLimiter(),
 		activityMemo:   worker.NewDerivedActivityMemo(),
+		formulaMemo:    worker.NewFormulaNameMemo(),
 	}
 	// Latch the rollout snapshot once: prefer the State's boot latch (the
 	// production controllerState); fall back to resolving from Config() for

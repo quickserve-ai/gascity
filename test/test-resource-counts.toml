@@ -27,7 +27,12 @@ calls = 68
 [[count]]
 path = "cmd/gc/bd_env_test.go"
 resource = "net_listen"
-calls = 8
+calls = 9
+
+[[count]]
+path = "cmd/gc/bead_worktree_reaper_stash_gate_test.go"
+resource = "subprocess"
+calls = 2
 
 [[count]]
 path = "cmd/gc/beads_provider_lifecycle_test.go"
@@ -472,7 +477,7 @@ calls = 1
 [[count]]
 path = "cmd/gc/cmd_start_drift_test.go"
 resource = "http_test_server"
-calls = 1
+calls = 2
 
 [[count]]
 path = "cmd/gc/cmd_start_test.go"
@@ -583,7 +588,7 @@ calls = 3
 [[count]]
 path = "cmd/gc/cmd_supervisor_test.go"
 resource = "http_test_server"
-calls = 2
+calls = 5
 
 [[count]]
 path = "cmd/gc/cmd_supervisor_test.go"
@@ -699,7 +704,7 @@ calls = 2
 [[count]]
 path = "cmd/gc/dolt_runtime_test_helpers_test.go"
 resource = "fixed_sleep"
-calls = 1
+calls = 2
 
 [[count]]
 path = "cmd/gc/dolt_runtime_test_helpers_test.go"
@@ -709,17 +714,17 @@ calls = 2
 [[count]]
 path = "cmd/gc/dolt_runtime_test_helpers_test.go"
 resource = "subprocess"
-calls = 1
+calls = 2
 
 [[count]]
 path = "cmd/gc/dolt_scope_watchdog_test.go"
 resource = "fixed_sleep"
-calls = 6
+calls = 10
 
 [[count]]
 path = "cmd/gc/dolt_scope_watchdog_test.go"
 resource = "subprocess"
-calls = 5
+calls = 6
 
 [[count]]
 path = "cmd/gc/dolt_standalone_conflict_test.go"
@@ -797,6 +802,12 @@ resource = "subprocess"
 calls = 2
 
 [[count]]
+path = "cmd/gc/gc_beads_bd_created_db_migrate_consent_test.go"
+resource = "subprocess"
+calls = 1
+medium = 1
+
+[[count]]
 path = "cmd/gc/gc_beads_bd_force_reinit_guard_test.go"
 resource = "subprocess"
 calls = 1
@@ -865,9 +876,14 @@ calls = 3
 tagged = true
 
 [[count]]
+path = "cmd/gc/mail_remote_test.go"
+resource = "http_test_server"
+calls = 9
+
+[[count]]
 path = "cmd/gc/main_test.go"
 resource = "cwd"
-calls = 62
+calls = 68
 
 [[count]]
 path = "cmd/gc/main_test.go"
@@ -915,6 +931,11 @@ calls = 2
 [[count]]
 path = "cmd/gc/nudge_dispatcher_test.go"
 resource = "listener_helper"
+calls = 4
+
+[[count]]
+path = "cmd/gc/op_record_content_test.go"
+resource = "http_test_server"
 calls = 4
 
 [[count]]
@@ -1116,6 +1137,12 @@ resource = "slow_process_gate"
 calls = 1
 
 [[count]]
+path = "cmd/gc/session_content_idle_human_prompt_test.go"
+resource = "subprocess"
+calls = 1
+tagged = true
+
+[[count]]
 path = "cmd/gc/session_lifecycle_chaos_test.go"
 resource = "fixed_sleep"
 calls = 1
@@ -1124,6 +1151,21 @@ calls = 1
 path = "cmd/gc/session_lifecycle_parallel_test.go"
 resource = "fixed_sleep"
 calls = 1
+
+[[count]]
+path = "cmd/gc/session_liveness_test.go"
+resource = "fixed_sleep"
+calls = 1
+
+[[count]]
+path = "cmd/gc/session_liveness_test.go"
+resource = "net_listen"
+calls = 1
+
+[[count]]
+path = "cmd/gc/session_liveness_test.go"
+resource = "subprocess"
+calls = 2
 
 [[count]]
 path = "cmd/gc/session_model_phase0_hook_spec_test.go"
@@ -1303,7 +1345,7 @@ calls = 1
 [[count]]
 path = "examples/bd/dolt/health_test.go"
 resource = "subprocess"
-calls = 20
+calls = 21
 
 [[count]]
 path = "examples/bd/dolt/logs_test.go"
@@ -1356,6 +1398,12 @@ resource = "subprocess"
 calls = 2
 
 [[count]]
+path = "examples/bd/dolt/stale_db_close_reason_real_bd_test.go"
+resource = "subprocess"
+calls = 2
+tagged = true
+
+[[count]]
 path = "examples/bd/dolt/stale_db_formula_test.go"
 resource = "subprocess"
 calls = 11
@@ -1367,6 +1415,11 @@ calls = 1
 
 [[count]]
 path = "examples/bd/dolt/sync_ffclassify_test.go"
+resource = "subprocess"
+calls = 5
+
+[[count]]
+path = "examples/bd/dolt/sync_multiremote_test.go"
 resource = "subprocess"
 calls = 2
 
@@ -1432,7 +1485,7 @@ tagged = true
 [[count]]
 path = "examples/gastown/maintenance_scripts_dolt_integration_test.go"
 resource = "subprocess"
-calls = 4
+calls = 5
 tagged = true
 
 [[count]]
@@ -1609,7 +1662,7 @@ calls = 10
 [[count]]
 path = "internal/api/handler_sessions_test.go"
 resource = "fixed_sleep"
-calls = 9
+calls = 8
 
 [[count]]
 path = "internal/api/handler_sessions_test.go"
@@ -1757,7 +1810,7 @@ tagged = true
 [[count]]
 path = "internal/beads/bdstore_exec_internal_test.go"
 resource = "subprocess"
-calls = 3
+calls = 4
 tagged = true
 
 [[count]]
@@ -1997,6 +2050,21 @@ calls = 1
 medium = 1
 
 [[count]]
+path = "internal/liveness/sqlstore_dolt_test.go"
+resource = "fixed_sleep"
+calls = 4
+
+[[count]]
+path = "internal/liveness/sqlstore_dolt_test.go"
+resource = "net_listen"
+calls = 1
+
+[[count]]
+path = "internal/liveness/sqlstore_dolt_test.go"
+resource = "subprocess"
+calls = 2
+
+[[count]]
 path = "internal/mail/exec/mcp_conformance_test.go"
 resource = "subprocess"
 calls = 1
@@ -2021,6 +2089,11 @@ path = "internal/orders/trigger_exec_unix_test.go"
 resource = "subprocess"
 calls = 1
 tagged = true
+
+[[count]]
+path = "internal/packman/reachability_test.go"
+resource = "subprocess"
+calls = 2
 
 [[count]]
 path = "internal/packregistry/catalog_test.go"
@@ -2289,10 +2362,9 @@ calls = 4
 tagged = true
 
 [[count]]
-path = "internal/runtime/ssh/ssh_localhost_integration_test.go"
+path = "internal/runtime/ssh/ssh_test.go"
 resource = "subprocess"
 calls = 1
-tagged = true
 
 [[count]]
 path = "internal/runtime/subprocess/fence_test.go"
@@ -2394,6 +2466,12 @@ calls = 6
 tagged = true
 
 [[count]]
+path = "internal/runtime/tmux/nudge_size_probe_test.go"
+resource = "fixed_sleep"
+calls = 5
+tagged = true
+
+[[count]]
 path = "internal/runtime/tmux/nudge_submit_confirm_integration_test.go"
 resource = "fixed_sleep"
 calls = 3
@@ -2409,6 +2487,12 @@ tagged = true
 path = "internal/runtime/tmux/nudge_submit_key_sequence_integration_test.go"
 resource = "fixed_sleep"
 calls = 4
+tagged = true
+
+[[count]]
+path = "internal/runtime/tmux/secretenv_integration_test.go"
+resource = "subprocess"
+calls = 1
 tagged = true
 
 [[count]]
@@ -2719,6 +2803,12 @@ resource = "subprocess"
 calls = 1
 
 [[count]]
+path = "scripts/mol_scoped_work_teardown_test.go"
+resource = "subprocess"
+calls = 1
+medium = 1
+
+[[count]]
 path = "scripts/precommit_contract_test.go"
 resource = "subprocess"
 calls = 11
@@ -2767,7 +2857,7 @@ calls = 1
 [[count]]
 path = "test/acceptance/beads_proxied_default_test.go"
 resource = "fixed_sleep"
-calls = 2
+calls = 3
 tagged = true
 
 [[count]]
@@ -2997,6 +3087,36 @@ calls = 1
 tagged = true
 
 [[count]]
+path = "test/conversationlane/harness_test.go"
+resource = "fixed_sleep"
+calls = 2
+tagged = true
+
+[[count]]
+path = "test/conversationlane/harness_test.go"
+resource = "subprocess"
+calls = 2
+tagged = true
+
+[[count]]
+path = "test/conversationlane/x2_test.go"
+resource = "fixed_sleep"
+calls = 2
+tagged = true
+
+[[count]]
+path = "test/conversationlane/x6_test.go"
+resource = "fixed_sleep"
+calls = 1
+tagged = true
+
+[[count]]
+path = "test/conversationlane/x8_test.go"
+resource = "fixed_sleep"
+calls = 2
+tagged = true
+
+[[count]]
 path = "test/dashport/projection_test.go"
 resource = "listener_helper"
 calls = 11
@@ -3197,7 +3317,7 @@ tagged = true
 [[count]]
 path = "test/integration/integration_test.go"
 resource = "subprocess"
-calls = 11
+calls = 12
 tagged = true
 
 [[count]]
@@ -3235,6 +3355,21 @@ path = "test/integration/supervisor_unit_guard_test.go"
 resource = "subprocess"
 calls = 1
 tagged = true
+
+[[count]]
+path = "test/tmuxtest/guard_test.go"
+resource = "fixed_sleep"
+calls = 1
+
+[[count]]
+path = "test/tmuxtest/guard_test.go"
+resource = "subprocess"
+calls = 5
+
+[[count]]
+path = "test/tmuxtest/guard_test.go"
+resource = "tmux"
+calls = 4
 
 [[count]]
 path = "test/tmuxtest/orphan_sweep_sigkill_test.go"

@@ -69,6 +69,7 @@ func TestAgentFieldSync(t *testing.T) {
 		"SessionLiveAppend":       true, // append modifier, no Agent field
 		"InstallAgentHooksAppend": true, // append modifier, no Agent field
 		"InjectFragmentsAppend":   true, // append modifier, no Agent field
+		"OptInSkillsAppend":       true, // append modifier, no Agent field
 		"SkillsAppend":            true, // append modifier, no Agent field
 		"MCPAppend":               true, // append modifier, no Agent field
 		"Pool":                    true, // legacy PoolOverride, maps to flat Agent fields via applyPoolOverride
@@ -181,6 +182,7 @@ func TestApplyAgentPatchCoversAllFields(t *testing.T) {
 		PreStart:                []string{"pre-cmd"},
 		PromptTemplate:          strVal("prompts/test.md"),
 		Session:                 strVal("acp"),
+		WakeTransport:           strVal("claude-cloud"),
 		Provider:                strVal("claude"),
 		ContextAdvisory:         contextAdvisory,
 		Upstream:                strVal("bedrock"),
@@ -213,6 +215,8 @@ func TestApplyAgentPatchCoversAllFields(t *testing.T) {
 		SessionLiveAppend:       []string{"live-append"},
 		InstallAgentHooksAppend: []string{"gemini"},
 		InjectFragmentsAppend:   []string{"frag2"},
+		OptInSkills:             Fragments("helper.login"),
+		OptInSkillsAppend:       []string{"helper.audit"},
 		Skills:                  []string{"code-review"},
 		SkillsAppend:            []string{"security"},
 		MCP:                     []string{"beads-health"},
@@ -249,6 +253,7 @@ func TestApplyAgentPatchCoversAllFields(t *testing.T) {
 		"SessionLiveAppend":       true,
 		"InstallAgentHooksAppend": true,
 		"InjectFragmentsAppend":   true,
+		"OptInSkillsAppend":       true,
 		// Tombstone fields (deprecated in v0.15.1, removed in v0.16) are
 		// parsed but not applied. See engdocs/proposals/skill-materialization.md
 		"Skills":       true,
@@ -315,6 +320,9 @@ func TestApplyAgentPatchCoversAllFields(t *testing.T) {
 	if len(agent.InjectFragments) != 2 || agent.InjectFragments[1] != "frag2" {
 		t.Errorf("InjectFragmentsAppend not applied: %v", agent.InjectFragments)
 	}
+	if len(agent.OptInSkills) != 2 || agent.OptInSkills[1] != "helper.audit" {
+		t.Errorf("OptInSkillsAppend not applied: %v", agent.OptInSkills)
+	}
 }
 
 // TestApplyAgentOverrideCoversAllFields verifies that applyAgentOverride
@@ -340,6 +348,7 @@ func TestApplyAgentOverrideCoversAllFields(t *testing.T) {
 		PreStart:                []string{"pre-cmd"},
 		PromptTemplate:          strVal("prompts/test.md"),
 		Session:                 strVal("acp"),
+		WakeTransport:           strVal("claude-cloud"),
 		Provider:                strVal("claude"),
 		ContextAdvisory:         contextAdvisory,
 		Upstream:                strVal("bedrock"),
@@ -372,6 +381,8 @@ func TestApplyAgentOverrideCoversAllFields(t *testing.T) {
 		SessionLiveAppend:       []string{"live-append"},
 		InstallAgentHooksAppend: []string{"gemini"},
 		InjectFragmentsAppend:   []string{"frag2"},
+		OptInSkills:             Fragments("helper.login"),
+		OptInSkillsAppend:       []string{"helper.audit"},
 		Skills:                  []string{"code-review"},
 		SkillsAppend:            []string{"security"},
 		MCP:                     []string{"beads-health"},
@@ -405,6 +416,7 @@ func TestApplyAgentOverrideCoversAllFields(t *testing.T) {
 		"SessionLiveAppend":       true,
 		"InstallAgentHooksAppend": true,
 		"InjectFragmentsAppend":   true,
+		"OptInSkillsAppend":       true,
 		// Tombstone fields (deprecated in v0.15.1, removed in v0.16) are
 		// parsed but not applied. See engdocs/proposals/skill-materialization.md
 		"Skills":       true,
@@ -468,6 +480,9 @@ func TestApplyAgentOverrideCoversAllFields(t *testing.T) {
 	}
 	if len(agent.InjectFragments) != 2 || agent.InjectFragments[1] != "frag2" {
 		t.Errorf("InjectFragmentsAppend not applied: %v", agent.InjectFragments)
+	}
+	if len(agent.OptInSkills) != 2 || agent.OptInSkills[1] != "helper.audit" {
+		t.Errorf("OptInSkillsAppend not applied: %v", agent.OptInSkills)
 	}
 }
 

@@ -2,6 +2,7 @@ package beads
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/gastownhall/gascity/internal/rollout/gate"
@@ -126,8 +127,9 @@ func (s *ProxiedStore) DepMetadata(issueID, dependsOnID string) (string, bool, e
 // guard exists to keep a relocated id from becoming.
 //
 // A demoted store answers with the bd leaf's own semantics, through its batch
-// when it has one. A bd leaf without one is looped through DepList on THIS
-// store, which keeps the demotion routing live on every id.
+// when it has one. A bd leaf without one, or whose backend refuses the batch
+// (ErrDepListBatchUnsupported), is looped through DepList on THIS store, which
+// keeps the demotion routing live on every id.
 func (s *ProxiedStore) DepListBatch(ids []string) (map[string][]Dep, error) {
 	if native := s.nativeLeaf(); native != nil {
 		if err := s.guardRelocatedIDs("dep list batch", ids...); err != nil {
@@ -137,7 +139,10 @@ func (s *ProxiedStore) DepListBatch(ids []string) (map[string][]Dep, error) {
 		return deps, s.classifyReadError(err)
 	}
 	if batch, ok := DepListBatchFor(s.bd); ok {
-		return batch.DepListBatch(ids)
+		deps, err := batch.DepListBatch(ids)
+		if !errors.Is(err, ErrDepListBatchUnsupported) {
+			return deps, err
+		}
 	}
 	result := make(map[string][]Dep, len(ids))
 	for _, id := range ids {
@@ -192,6 +197,19 @@ func (s *ProxiedStore) enrichReadyProjectionForCache(items []Bead) ([]Bead, erro
 	}
 	enriched, err := enricher.enrichReadyProjectionForCache(items)
 	return enriched, s.classifyReadError(err)
+}
+
+// reconcileDigestForCache follows the read leaf for the same reason: the
+// digest describes the rows List returns, and the read leaf lists them. A
+// leaf without it answers unsupported, which sends the cache's reconcile down
+// its full list (ga-ckbnpj).
+func (s *ProxiedStore) reconcileDigestForCache() (map[string]string, error) {
+	reader, ok := s.readLeaf().(cacheReconcileDigestStore)
+	if !ok {
+		return nil, errReconcileDigestUnsupported
+	}
+	digest, err := reader.reconcileDigestForCache()
+	return digest, s.classifyReadError(err)
 }
 
 // The third — cacheDependencySnapshotStore (dependencySnapshotForCache) — is
@@ -292,13 +310,14 @@ func (s *ProxiedStore) ConditionalWriterHandle() (ConditionalWriter, bool) {
 //
 // There used to be two more — for MetadataCASWriterHandle and
 // AtomicConditionalCloserHandle — and they were deleted because nothing could
-// reach them (council pr2 D-F8): MetadataCASWriterFor and
-// AtomicConditionalCloserFor follow ConditionalWritesResolveTarget BEFORE they
-// ask for a handle, and this wrapper's target is the bd leaf, so both resolvers
-// always answered with the leaf's own capability. An adapter only a direct
-// method call reaches, which no production code makes, bracketed nothing and
-// let the H6 register list two capabilities as inside the bracket that were
-// not.
+// reach them (council pr2 D-F8): MetadataCASWriterFor follows
+// ConditionalWritesResolveTarget BEFORE it asks for a handle, and this
+// wrapper's target is the bd leaf, so it always answered with the leaf's own
+// capability. AtomicConditionalCloserFor has since started asking each hop for
+// a handle before following it, so this wrapper COULD front the atomic close
+// now; it still does not, and that is deliberate: the bd leaf provides no
+// atomic close, so a handle here would bracket nothing, exactly the H6
+// register defect the deletion fixed.
 //
 // They are values rather than pointers and hold no state of their own: the
 // bracket's state is the wrapper's, and an adapter that could outlive or

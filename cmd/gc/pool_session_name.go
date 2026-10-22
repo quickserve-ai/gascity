@@ -5,8 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"log"
 	"path"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -47,6 +49,55 @@ func sessionBeadAssigneeIdentities(sb beads.Bead) []string {
 		}
 	}
 	return identities
+}
+
+// durableSessionIdentities is the set of a closing session's identities its work
+// must not be detached under (ga-9n8hjv). The session bead ID and the pool alias
+// (plus alias history) are session handles: once the session is gone they name
+// nothing, so this filter does not withhold them.
+// session_name and configured_named_identity are durable identities: a configured
+// named seat between sessions is its normal state, and releasing under them strips
+// the seat's portfolio each time it cycles (measured 2026-09-11: 50 beads detached
+// 9 s after one session bead closed, 11 of them reset in_progress -> open).
+//
+// With cfg, it withholds every identity of the seat that names a LIVE configured
+// named session (isConfiguredNamedSessionIdentity, which excludes a suspended one:
+// the named-session tier never claims for a suspended agent, so this filter does
+// not withhold its identities), as unclaimWorkAssignedToRetiredSessionBead does.
+// With a nil cfg it must not call isConfiguredNamedSessionIdentity, which returns
+// false there and would fail open; instead, when the bead carries
+// configured_named_identity, it withholds that and session_name, which can only
+// release less, and releaseOrphanedPoolAssignments on the next reconcile tick is
+// the fallback. The close cascade's release scope drops this set
+// (releaseWorkFromClosedSessionBeadExcept, and the v2 close effect).
+func durableSessionIdentities(cfg *config.City, sb beads.Bead) map[string]struct{} {
+	withheld := map[string]struct{}{}
+	if cfg != nil {
+		ids := append(sessionBeadAssigneeIdentities(sb), releaseScopeOfBead(sb, cfg).ids...)
+		for _, id := range ids {
+			if id = strings.TrimSpace(id); id != "" && isConfiguredNamedSessionIdentity(cfg, id) {
+				withheld[id] = struct{}{}
+			}
+		}
+		return withheld
+	}
+	// ONLY a CONFIGURED NAMED session withholds anything. A pool session carries a
+	// session_name too, and work claimed under it belongs to a worker that is gone --
+	// TestCloseBeadReleasesWorkAssignedBySessionName ("worker-gm-dead"),
+	// ...CleanupDeadRuntimeSessionCorpses... ("crashed-worker", "worker-7") are that
+	// contract. Withholding there would strand a dead polecat's claim forever, and the
+	// pool fallback cannot recover an UNROUTED one. The presence of
+	// configured_named_identity on the session bead is what separates the two, and it
+	// needs no *config.City to read.
+	if strings.TrimSpace(sb.Metadata["configured_named_identity"]) == "" {
+		return withheld
+	}
+	for _, key := range []string{"session_name", "configured_named_identity"} {
+		if val := strings.TrimSpace(sb.Metadata[key]); val != "" {
+			withheld[val] = struct{}{}
+		}
+	}
+	return withheld
 }
 
 // sessionBeadAssigneeIdentitiesInfo is the session.Info mirror of
@@ -255,6 +306,14 @@ func releaseOrphanedPoolAssignments(
 	// at ~14 minutes.
 	sessionStoreLiveAssignee := make(map[string]bool, len(assignedWorkBeads))
 	ownerStoreLiveAssignee := make(map[string]bool, len(assignedWorkBeads))
+	// No session is in hand here, so only the assignee can mark work as a named
+	// agent's. assigneePreservesNamedSessionRoute above skips a named claim on its
+	// own template; this guard, at the writer, withholds one on ANY template and
+	// for a suspended agent, and proposes it instead (ga-9n8hjv).
+	namedGuard := namedReleaseGuardForAssignee(cfg)
+	// Work held under a dead named session's bead ID is the one case the
+	// assignee alone cannot identify; orphanSweepGuard looks the handle up.
+	handleGuards := make(map[string]orphanSweepGuardResult)
 	sweepStart := time.Now()
 	var probeElapsed time.Duration
 	memoizedProbeCount := 0
@@ -274,6 +333,8 @@ func releaseOrphanedPoolAssignments(
 	var released []releasedPoolAssignment
 	claimGate := newForeignClaimGate(cfg, sessionStore)
 	defer claimGate.log()
+	var heldByGate heldByOrphanReleaseGate
+	defer heldByGate.log()
 	for i, wb := range assignedWorkBeads {
 		if wb.Status != "open" && wb.Status != "in_progress" {
 			continue
@@ -301,6 +362,24 @@ func releaseOrphanedPoolAssignments(
 		}
 		agentCfg := findAgentByTemplate(cfg, template)
 		if agentCfg == nil || !agentCfg.SupportsGenericEphemeralSessions() {
+			continue
+		}
+		// OPERATOR STOP LEVER (ga-h5435p), deliberately ahead of every liveness
+		// check and of the detached probe, which spawns a subprocess: when the
+		// switch is thrown for this rig the sweeper must do NOTHING for its
+		// work, not merely decline the final write.
+		//
+		// Placed AFTER the candidacy filters above so the held count means
+		// "claims this lever actually held" rather than "beads the loop walked
+		// past" — the summary line is read as cutover evidence that the lever
+		// took effect, so it has to be the honest number.
+		//
+		// With no usable store refs this tick the owning rig is resolved from
+		// the bead itself, failing closed if it cannot be resolved while any rig
+		// has the switch thrown.
+		gateRig, gateAllowed := poolOrphanReleaseGate(cfg, workStoreRef, storeRefAware, wb)
+		if !gateAllowed {
+			heldByGate.add(gateRig, wb.ID)
 			continue
 		}
 		// Resolved before the liveness gates because the graph-resident-session
@@ -385,9 +464,16 @@ func releaseOrphanedPoolAssignments(
 			}
 			continue
 		}
+		// Named-agent work is proposed, never released (ga-9n8hjv fence #1): a
+		// bare handle the session store resolves to a named session counts as
+		// named. releaseListed applies the guard (releaseSeat.guard).
+		guard, decided := orphanSweepGuard(cfg, sessionStore.Store, wb, namedGuard, handleGuards)
+		if !decided {
+			continue
+		}
 		// The verb's route guard is the one this sweep's pre-filter lacks:
 		// an expanded workflow root's run_target is no lane (NEW-5).
-		if out := releaseListed([]seatWorkHit{{store: ownerStore, bead: wb}}, releaseOrphan, releaseSeat{}, cfg, ReleaseOpts{}); len(out.Released) == 0 {
+		if out := releaseListed([]seatWorkHit{{store: ownerStore, bead: wb}}, releaseOrphan, releaseSeat{guard: guard}, cfg, ReleaseOpts{}); len(out.Released) == 0 {
 			keepLog.log(wb.ID, assignee, out.Why[wb.ID])
 			continue
 		}
@@ -452,14 +538,11 @@ func (l *deadAssigneeKeepLog) log(id, assignee, why string) bool {
 // closed on an unreadable liveness observation. Releasing work from a seat that
 // is actually alive is data loss, not recovery (ga-g3pf0).
 //
-// Every per-bead gate from releaseOrphanedPoolAssignments applies unchanged,
-// including the live re-read in liveWorkAssignmentStillReleasable — the tick
-// snapshot names candidates but never by itself justifies a release. The one
-// exception is the foreign-claim gate, which this site does not consult: every
-// identifier it releases under is read off this city's own orphaned session
-// bead or derived from its roster for that bead, so it already carries the
-// provenance that gate looks for (see the package comment in
-// pool_orphan_foreign_identity.go).
+// Every per-bead gate from releaseOrphanedPoolAssignments applies, the roster
+// gate taking the seat's own record as provenance (orphanCloseHold, shared
+// with the v2 close effect), and the live re-read in
+// liveWorkRowStillReleasable included — the tick snapshot names candidates
+// but never by itself justifies a release.
 //
 // assignedWorkStores is the index-aligned snapshot of the legs the census read
 // assignedWorkBeads through, and it is how a binding-resident row is released at
@@ -472,17 +555,24 @@ func (l *deadAssigneeKeepLog) log(id, assignee, why string) bool {
 // beads are skipped entirely rather than routed-fallback resolved. Callers must
 // reject a misaligned slice before calling — see reconcileSessionBeads, which
 // nils it and logs the mismatch.
+//
+// assignedWorkStoreRefs is the index-aligned store ref of each row (empty for
+// the city store). The orphan_release stop lever reads the owning rig off it
+// exactly as the sweep does; a slice of any other length is unusable, and the
+// rig is then resolved from the bead.
 func releaseConfirmedOrphanSessionWork(
 	cfg *config.City,
 	store beads.Store,
 	rigStores map[string]beads.Store,
 	assignedWorkBeads []beads.Bead,
 	assignedWorkStores []beads.Store,
+	assignedWorkStoreRefs []string,
 	info session.Info,
 ) []releasedPoolAssignment {
 	if cfg == nil || store == nil || len(assignedWorkBeads) == 0 {
 		return nil
 	}
+	storeRefAware := len(assignedWorkStoreRefs) == len(assignedWorkBeads)
 	identifiers := make(map[string]struct{}, 5)
 	for _, id := range sessionAssignmentIdentifiersForConfigInfo(info, cfg) {
 		if id = strings.TrimSpace(id); id != "" {
@@ -492,11 +582,24 @@ func releaseConfirmedOrphanSessionWork(
 	if len(identifiers) == 0 {
 		return nil
 	}
-
+	// The dead session may be a named one (a non-canonical or mislabeled bead
+	// carrying the identity); its work is proposed, never released (ga-9n8hjv).
 	var released []releasedPoolAssignment
 	seat := releaseSeatOfInfo(info)
+	seat.guard = namedReleaseGuardForSessionInfo(cfg, info)
 	for i, wb := range assignedWorkBeads {
-		if _, ok := identifiers[strings.TrimSpace(wb.Assignee)]; !ok {
+		assignee := strings.TrimSpace(wb.Assignee)
+		if _, ok := identifiers[assignee]; !ok {
+			continue
+		}
+		// The orphan close's own gates (the roster gate with the seat's record
+		// as provenance, and the orphan_release stop lever), shared with the v2
+		// close effect's orphan release (orphanCloseHold).
+		workStoreRef := ""
+		if storeRefAware {
+			workStoreRef = assignedWorkStoreRefs[i]
+		}
+		if orphanCloseHold(cfg, seat, wb, workStoreRef, storeRefAware) != "" {
 			continue
 		}
 		ownerStore := assignedWorkOwnerStore(cfg, store, rigStores, assignedWorkStores, i, wb)
@@ -511,6 +614,77 @@ func releaseConfirmedOrphanSessionWork(
 		}
 	}
 	return released
+}
+
+// Why the orphan close holds a claim back (orphanCloseHold).
+const (
+	orphanCloseHeldForeign = "orphan-close-foreign" // the roster gate: an identity this city cannot observe
+	orphanCloseHeldSwitch  = "orphan-close-off"     // the rig's orphan_release = false (ga-h5435p)
+)
+
+// orphanCloseHold is the orphan close's own two gates on one claim of the
+// orphaned seat, for both engines: the legacy tie-break
+// (releaseConfirmedOrphanSessionWork) and the v2 close effect's orphan release
+// (ReleaseClaims under releaseOrphan). It returns "" when the claim may be
+// released; otherwise it logs the hold, never silently, and returns why.
+//
+// THE ROSTER GATE, WITH THE SEAT'S OWN RECORD AS PROVENANCE (the #5952 carry,
+// composed with #7763). The seat's identifiers include RAW metadata strings
+// read off the store (the bead ID, session_name: see
+// sessionAssignmentIdentifierRawInfo), and a stored value that collides with
+// another city's <rig>/<name> identity would otherwise carry that identity
+// straight into a release here. So an assignee the roster cannot observe is
+// protected, as in the sweep, unless the orphaned seat's own record answers to
+// it under a key that holds a qualified identity: its alias, its configured
+// named identity or its alias history (session.HasRecordAnsweringTo's keys,
+// the provenance the sweep's foreignClaimGate accepts). That keeps upstream's
+// point about this site: a namepool seat's stable alias leaves the roster when
+// its name leaves the namepool, an orphaned seat is exactly one whose config
+// is gone, and refusing its own alias claim would re-wedge it (ga-jrnou). A
+// bead ID or a session_name never legitimately holds "<rig>/<name>", so a
+// qualified assignee matched only through one of those is the collision, and
+// it is held.
+//
+// THE STOP LEVER (ga-h5435p). A thrown orphan_release = false stops every
+// autonomous write to the rig's work, and the orphan close writes the same
+// fields the sweep does. The rig is read off the claim's store ref when the
+// caller has one (storeRefAware), so city-owned work is never held by a
+// disabled rig (a held release leaves the orphaned seat holding the work, and
+// the close guard then refuses to close it); only without a ref is the rig
+// resolved from the bead, failing closed while any rig has the switch thrown.
+//
+// The shared-pack residual applies here as everywhere: a pool instance
+// byte-identical across cities passes any roster test (see the package comment
+// in pool_orphan_foreign_identity.go).
+func orphanCloseHold(cfg *config.City, seat releaseSeat, wb beads.Bead, storeRef string, storeRefAware bool) string {
+	assignee := strings.TrimSpace(wb.Assignee)
+	if !poolAssigneeIsLocallyObservable(cfg, config.EffectiveCityName(cfg, ""), assignee) && !slices.Contains(seat.records, assignee) {
+		log.Printf("releaseConfirmedOrphanSessionWork: protected %q (%s): assignee is not locally observable — refusing orphan-close release", assignee, wb.ID)
+		return orphanCloseHeldForeign
+	}
+	if rigName, allowed := poolOrphanReleaseGate(cfg, storeRef, storeRefAware, wb); !allowed {
+		if rigName == "" {
+			rigName = "<unresolved>"
+		}
+		log.Printf("releaseConfirmedOrphanSessionWork: orphan_release=false held %s in rig %q: refusing orphan-close release of %q", wb.ID, rigName, assignee)
+		return orphanCloseHeldSwitch
+	}
+	return ""
+}
+
+// orphanCloseClaims splits the claims an orphan close read through legs into
+// those it may release and those orphanCloseHold holds back; each claim's
+// store ref is the leg it was read on (orphanReleaseStoreRefOf).
+func orphanCloseClaims(legs WorkLegs, seat releaseSeat, claims []seatWorkHit) (releasable, held []seatWorkHit) {
+	for _, c := range claims {
+		ref, aware := orphanReleaseStoreRefOf(legs, c.store)
+		if orphanCloseHold(legs.cfg, seat, c.bead, ref, aware) != "" {
+			held = append(held, c)
+			continue
+		}
+		releasable = append(releasable, c)
+	}
+	return releasable, held
 }
 
 // assignedWorkOwnerStore resolves the store that owns the assigned work bead at
@@ -714,8 +888,18 @@ func isCanonicalWorkflowRoot(wb beads.Bead) bool {
 //     correct path for continuation-group beads: the group is never exposed on
 //     an open, unassigned bead. A store that cannot fence the write is refused
 //     and logged rather than written blind.
-func releaseOrphanedPoolAssignment(store beads.Store, wb beads.Bead, clearDetached bool) bool {
+//
+// guard is REQUIRED (ga-9n8hjv, fence #1): when it names the work as a named
+// agent's, nothing is released and the release is PROPOSED on the bead instead
+// (see named_release_guard.go). It returns false then, as for any skipped release.
+func releaseOrphanedPoolAssignment(store beads.Store, wb beads.Bead, clearDetached bool, guard namedReleaseGuard) bool {
 	if store == nil || strings.TrimSpace(wb.ID) == "" {
+		return false
+	}
+	if reason := guard.withholdReasonForBead(wb); reason != "" {
+		if _, err := proposeNamedRelease(store, wb, reason, orphanReleaseAuditPath, log.Writer()); err != nil {
+			log.Printf("releaseOrphanedPoolAssignments: %v", err)
+		}
 		return false
 	}
 	update := beads.UpdateOpts{
@@ -976,20 +1160,52 @@ func directSessionBeadIDCandidates(assignee string) []string {
 	return candidates
 }
 
-// liveWorkAssignmentStillReleasable confirms the snapshot is not stale before
-// clearing assignee, collapsing a read failure to "not releasable" for callers
-// that have no error channel. Open status is required for the issue #2793 path —
-// graph.v2 step beads stuck on a dead session's long-form assignee are
-// status=open, not in_progress.
-//
-// The check itself lives in liveWorkAssignmentAssigneeMatches (work_assignment.go).
-func liveWorkAssignmentStillReleasable(store beads.Store, id, expectedStatus, assignee string) bool {
-	matches, err := liveWorkAssignmentAssigneeMatches(store, id, expectedStatus, assignee)
+// liveWorkRowStillReleasable is the pre-release staleness check for the two
+// sweep decision sites (ga-91tu1o): the live row must still hold the
+// snapshot's status and assignee, and a read failure counts as "not
+// releasable". Both sites choose their guards from the cached
+// assigned-work snapshot: the routed template picks the named- and
+// ephemeral-session guards and the rig gate, the canonical-root shape exempts
+// workflow roots, the gc.detached spec decides whether a probe runs, and
+// gc.continuation_group picks the single-write recheck release over the
+// two-write CAS path. A live status+assignee match does not cover those inputs.
+// The cache heals a missed event on its periodic full rescan (every 30-120s,
+// CachingStore reconcile), but a sweep inside that window decides on the stale
+// snapshot. The live row must therefore carry the same inputs; any divergence
+// skips the release for this pass, logged, and a later pass decides once the
+// snapshot agrees with the row. This can only withhold a release.
+func liveWorkRowStillReleasable(store beads.Store, snapshot beads.Bead, assignee string) bool {
+	live, found, err := liveWorkAssignmentRow(store, snapshot.ID, snapshot.Status)
 	if err != nil {
-		log.Printf("releaseOrphanedPoolAssignments: live work validation failed for %q: %v", id, err)
+		log.Printf("releaseOrphanedPoolAssignments: live work validation failed for %q: %v", snapshot.ID, err)
 		return false
 	}
-	return matches
+	if !found || strings.TrimSpace(live.Assignee) != strings.TrimSpace(assignee) {
+		return false
+	}
+	if diff := orphanReleaseInputsDiff(snapshot, live); diff != "" {
+		log.Printf("releaseOrphanedPoolAssignments: skipping release for %s: cached snapshot diverges from the live row (%s)", snapshot.ID, diff)
+		return false
+	}
+	return true
+}
+
+// orphanReleaseInputsDiff names the release-decision inputs that differ between
+// the cached snapshot and the live row, or "" when they agree.
+func orphanReleaseInputsDiff(snapshot, live beads.Bead) string {
+	var diffs []string
+	if a, b := routedToOrLegacyWorkflowTarget(snapshot), routedToOrLegacyWorkflowTarget(live); a != b {
+		diffs = append(diffs, fmt.Sprintf("routed target %q -> %q", a, b))
+	}
+	if a, b := isCanonicalWorkflowRoot(snapshot), isCanonicalWorkflowRoot(live); a != b {
+		diffs = append(diffs, fmt.Sprintf("canonical workflow root %t -> %t", a, b))
+	}
+	for _, key := range []string{detachedProbeMetadataKey, beadmeta.ContinuationGroupMetadataKey} {
+		if a, b := strings.TrimSpace(snapshot.Metadata[key]), strings.TrimSpace(live.Metadata[key]); a != b {
+			diffs = append(diffs, fmt.Sprintf("%s %q -> %q", key, a, b))
+		}
+	}
+	return strings.Join(diffs, "; ")
 }
 
 func assigneePreservesNamedSessionRoute(cfg *config.City, cityPath, template, assignee, workStoreRef string, storeRefAware bool) bool {

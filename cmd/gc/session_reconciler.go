@@ -30,6 +30,7 @@ import (
 	"github.com/gastownhall/gascity/internal/clock"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
+	"github.com/gastownhall/gascity/internal/mail"
 	"github.com/gastownhall/gascity/internal/reconcilekey"
 	"github.com/gastownhall/gascity/internal/runtime"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
@@ -38,6 +39,38 @@ import (
 )
 
 const maxIdleSleepProbesPerTick = 3
+
+// freshWakeHeartbeatCooldown is how long a self-draining always-mode
+// fresh-wake named session (heartbeat shape, e.g. gastown.boot) is held
+// asleep after a clean drain-ack with no assigned work. Without it the
+// named-always wake pass re-selects the session immediately and each
+// cycle launches a full provider process with a fresh transcript
+// (ga-kaei: ~1,570/day at boot's ~50s natural cadence). Follow-up: make
+// this a per-agent heartbeat_interval config field.
+const freshWakeHeartbeatCooldown = 5 * time.Minute
+
+// applyDrainAckWithHeartbeatCooldown writes a bare drain-ack's lifecycle patch
+// together with a cooldown hold until until (ga-kaei): one disposition move
+// (EvHeartbeat) on a fresh read, with the patch's lifecycle keys beside it. It
+// returns what ApplyLifecycle would: the patch written, nil with no error when
+// the row is closed, and an error when every CAS attempt lost.
+func applyDrainAckWithHeartbeatCooldown(store beads.Store, id string, patch sessionpkg.MetadataPatch, until, now time.Time) (sessionpkg.MetadataPatch, error) {
+	life := sessionpkg.LifecycleOnly(patch)
+	w, err := sessionFrontDoor(store).ApplyDispositionFresh(id, sessionpkg.ActorController,
+		sessionpkg.DispEvent{Kind: sessionpkg.EvHeartbeat, Until: until},
+		func(_, _ sessionpkg.Disposition, _ sessionpkg.Info) sessionpkg.MetadataPatch { return life }, now)
+	switch {
+	case err != nil:
+		return nil, err
+	case w.Result == sessionpkg.CommitClosed:
+		return nil, nil
+	case w.Result != sessionpkg.CommitLanded:
+		return nil, fmt.Errorf("writing session %q: lost to concurrent writes; retry", id)
+	case w.Wrote == nil:
+		return sessionpkg.MetadataPatch{}, nil
+	}
+	return w.Wrote, nil
+}
 
 type wakeTarget struct {
 	// info is the typed session.Info the wake evaluation + start-candidate stage
@@ -71,6 +104,35 @@ func lifecycleTimerBlockerInfo(info sessionpkg.Info, now time.Time) string {
 	default:
 		return ""
 	}
+}
+
+// heartbeatHeldPoolSeatInfo reports whether info is a pool-managed seat kept
+// alive by a heartbeat hold: held_until in the future with no sleep_intent.
+// gc runtime heartbeat writes only held_until; gc session suspend writes
+// held_until with sleep_intent="user-hold" precisely so the seat drains. Such a
+// seat is excluded from pool reuse and from the demand floor by construction,
+// so it can be surplus while its hold runs; the orphan arm and the drain-ack
+// branch keep it (gastownhall/gascity#6173), as the timer arm does (#3994).
+//
+// The hold is read through the row's disposition (R7): a live held_until
+// with no sleep intent of any kind decodes as a live Heartbeat.
+func heartbeatHeldPoolSeatInfo(info sessionpkg.Info, now time.Time) bool {
+	if !isPoolManagedSessionInfo(info) || isNamedSessionInfo(info) {
+		return false
+	}
+	d := sessionpkg.DispositionOfInfo(info)
+	noIntent := d.Operator != sessionpkg.OperatorSuspended && !d.WaitIntent && !d.IdleStop && d.Unknown&sessionpkg.UnknownIntent == 0
+	return noIntent && d.Heartbeat.After(now)
+}
+
+// heartbeatHoldUntilInfo is a heartbeat-held seat's held_until as its traces
+// and log lines report it, read through the row's disposition (R7).
+func heartbeatHoldUntilInfo(info sessionpkg.Info) string {
+	until := sessionpkg.DispositionOfInfo(info).Heartbeat
+	if until.IsZero() {
+		return ""
+	}
+	return until.UTC().Format(time.RFC3339)
 }
 
 // maxSessionAgeBlockerInfo reports the active blocker for the max-session-age
@@ -253,6 +315,70 @@ func markDrainAckStopPending(act legacyAct, info sessionpkg.Info, dops drainOps,
 		fmt.Fprintf(act.stderr, "session reconciler: marking drain-ack stop-pending %s refused (%v); deciding again next tick\n", name, res) //nolint:errcheck
 	}
 	return info, sessionpkg.Decided{}, false
+}
+
+// configDriftSeatHasLiveWork reports whether info's seat holds open or
+// in_progress work, read live from the store rather than from the tick's seat
+// work snapshot: the config-drift drain's claim fence asks it at the stop's
+// commit point, where a claim that landed after the snapshot was read is
+// exactly the one it exists to see.
+func configDriftSeatHasLiveWork(sw *SeatWork, info sessionpkg.Info) (bool, error) {
+	return sessionHasOpenAssignedWorkForReachableStore(sw.fresh(releaseScope(info, sw.Legs().cfg)), info)
+}
+
+// abandonConfigDriftStopPendingOnClaim is the post-write half of the
+// config-drift drain's claim fence. The drain-ack arm checks for live work,
+// then marks the row draining, and `gc hook --claim` refuses a seat whose row
+// reads draining. A claim whose fence read the row before the mark landed can
+// still commit after the arm's pre-check, so the arm re-reads the seat's work
+// AFTER the mark. If work is there, it reverts the mark, cancels the
+// config-drift drain and its ack, and reports true: the caller queues no stop.
+//
+// The revert is committed on the stop-pending decision (Store.Commit at
+// FactsLegacyDrainStop): it writes only if a fresh read of the row still
+// carries the state, state_reason, generation and instance_token the mark
+// left. How far that protects another writer's state (a different drain's
+// included) depends on the store:
+//   - With conditional writes, the write is fenced at the revision of that
+//     read, so the revert never overwrites another writer's state.
+//   - Without them (conditional_writes off, or auto over a store that cannot
+//     write conditionally), the read and the write are separate operations.
+//     A competing write the read sees makes the revert back off, but one that
+//     lands after the read and before the revert's write is overwritten with
+//     prior's lifecycle fields, and the drain is abandoned as if the row were
+//     still this arm's
+//     (TestConfigDriftDrainAck_RevertWithoutConditionalWritesCanOverwriteInWindow).
+//
+// With the claim's own post-claim re-read of the row
+// (writeHookClaimWorkResultForBead) this is a write-then-read on both sides.
+// On a store where a committed write is visible to every later read from any
+// process (read-after-write, which the bd/dolt store and MemStore provide), at
+// least one side sees the other, so a claim never stays on a session this
+// drain stops. When both see each other, both back off: the claim is released
+// and the drain abandoned; the drift is re-detected next tick and the released
+// work is claimable again.
+//
+// A failed probe fails closed (revert, keep the session running). A revert
+// that does not land leaves the stop to proceed exactly as before.
+func abandonConfigDriftStopPendingOnClaim(store beads.Store, sp runtime.Provider, dt *drainTracker, sw *SeatWork, prior, marked sessionpkg.Info, stop sessionpkg.Decided, name string, stderr io.Writer) (sessionpkg.Info, bool) {
+	hasWork, err := configDriftSeatHasLiveWork(sw, prior)
+	if err != nil {
+		fmt.Fprintf(stderr, "session reconciler: re-checking assigned work after config-drift stop-pending mark for %s: %v\n", name, err) //nolint:errcheck
+		hasWork = true
+	}
+	if !hasWork {
+		return marked, false
+	}
+	patch := sessionpkg.RevertDrainAckStopPendingPatch(prior)
+	res, err := sessionFrontDoor(store).Commit(stop, patch)
+	if err != nil || res != sessionpkg.CommitLanded {
+		fmt.Fprintf(stderr, "session reconciler: config-drift stop of %s found claimed work after its mark but could not revert the mark (%v, %v); stopping as decided\n", name, res, err) //nolint:errcheck
+		return marked, false
+	}
+	if !cancelSessionConfigDriftDrainInfo(prior, sp, dt) {
+		_ = clearReconcilerDrainAckMetadata(sp, name)
+	}
+	return marked.ApplyPatch(patch), true
 }
 
 func clearDrainTrackerForStopPending(id string, dt *drainTracker) {
@@ -499,6 +625,120 @@ func recordResetStallIfDue(
 	}
 }
 
+// clearStaleResetMarkerIfHealthy self-heals a continuation-reset marker whose
+// startup ack never arrived. RestartRequestPatch (gc handoff / request-restart,
+// applied by both the reconciler and the worker handle's Reset) commits
+// continuation_reset_pending + reset_committed_at, and the marker is normally
+// cleared by CommitStartedPatch when the controller itself performs the next
+// start. But a runtime can also come back via paths that never commit a start
+// through this bead — pane-level respawn with the SessionStart hook seeding
+// session_key — leaving the fulfilled promise armed indefinitely. Armed, it is
+// a time bomb: the moment the session next dies for ANY reason, the wake path
+// honors the stale marker and starts FRESH, discarding the live conversation
+// (ga-2aq43: a 20:31Z handoff marker hard-reset the healthy attached mayor at
+// 00:04Z, 3.5h later, mid-crash).
+//
+// Evidence bar for clearing: the runtime is alive well past the startup
+// window AND either a user is attached or provider activity is observed
+// after reset_committed_at + startupTimeout — proof this runtime is
+// conducting a conversation that began after the reset commit. The one
+// legitimate marker+alive state (stale runtime pending a fresh cycle) is
+// transient — the wake machinery kills it within a tick — so it never
+// accumulates the required age. Worst-case misfire converts "handoff didn't
+// yield a fresh session" (re-runnable) for "healthy session destroyed"
+// (unrecoverable) — the safe direction.
+//
+// It returns the patch it persisted through the session front door (nil when
+// nothing was cleared) so the caller folds it onto the tick snapshot.
+func clearStaleResetMarkerIfHealthy(
+	info sessionpkg.Info,
+	store beads.Store,
+	sp runtime.Provider,
+	template string,
+	name string,
+	alive bool,
+	startupTimeout time.Duration,
+	now time.Time,
+	dt *drainTracker,
+	rec events.Recorder,
+	stderr io.Writer,
+	trace *sessionReconcilerTraceCycle,
+) sessionpkg.MetadataPatch {
+	if store == nil || sp == nil || !alive || startupTimeout <= 0 {
+		return nil
+	}
+	resetCommittedAt, committedAt, pending := resetPendingCommittedAtInfo(info)
+	if !pending {
+		return nil
+	}
+	staleAfter := 2 * startupTimeout
+	if staleAfter < 2*time.Minute {
+		staleAfter = 2 * time.Minute
+	}
+	elapsed := now.Sub(committedAt)
+	if elapsed <= staleAfter {
+		return nil
+	}
+	healthyAfter := committedAt.Add(startupTimeout)
+	evidence := ""
+	if sp.IsAttached(name) {
+		evidence = "attached"
+	} else if sessionActivityReportable(sp, name) {
+		if lastActivity, err := sp.GetLastActivity(name); err == nil && !lastActivity.IsZero() && lastActivity.After(healthyAfter) {
+			evidence = "activity_after_reset"
+		}
+	}
+	if evidence == "" {
+		return nil
+	}
+	batch := sessionpkg.MetadataPatch{
+		"continuation_reset_pending":   "",
+		sessionpkg.ResetCommittedAtKey: "",
+	}
+	if err := sessionFrontDoor(store).ApplyPatch(info.ID, batch); err != nil {
+		if stderr != nil {
+			fmt.Fprintf(stderr, "session reconciler: clearing stale reset marker for %s: %v\n", name, err) //nolint:errcheck
+		}
+		return nil
+	}
+	if dt != nil {
+		dt.clearResetStall(info.ID)
+	}
+	elapsedSeconds := int(elapsed / time.Second)
+	msg := fmt.Sprintf(
+		"session reconciler: cleared stale reset marker for %s: runtime healthy (%s), reset_committed_at=%s elapsed_s=%d",
+		name, evidence, resetCommittedAt, elapsedSeconds,
+	)
+	if stderr != nil {
+		fmt.Fprintln(stderr, msg) //nolint:errcheck
+	}
+	if rec != nil {
+		rec.Record(events.Event{
+			Type:    events.SessionUpdated,
+			Actor:   "gc",
+			Subject: name,
+			Message: msg,
+		})
+	}
+	if trace != nil {
+		trace.RecordDecision(
+			TraceSiteReconcilerResetStalled,
+			TraceReasonResetStalled,
+			TraceOutcomeClearedStaleMarker,
+			template,
+			name,
+			map[string]any{
+				"bead_id":            info.ID,
+				"evidence":           evidence,
+				"elapsed_s":          elapsedSeconds,
+				"reset_committed_at": resetCommittedAt,
+				"startup_timeout_s":  int(startupTimeout / time.Second),
+			},
+		)
+	}
+	return batch
+}
+
 func drainAckAsyncStopKey(sessionID, name string) string {
 	if id := strings.TrimSpace(sessionID); id != "" {
 		return "id:" + id
@@ -706,6 +946,18 @@ func recordDrainAckAssignedWorkEvent(
 	if !found {
 		return
 	}
+	emitDrainAckAssignedWorkEvent(rec, info, subject, template, strandedBead)
+}
+
+// emitDrainAckAssignedWorkEvent records SessionDrainAckedWithAssignedWork for a
+// bead drainAckClaimableAnomalyBead already found. It is split from the
+// classification so the drain-ack teardown can classify BEFORE it releases the
+// work (after the release the classifier finds nothing) and still record the
+// observation.
+func emitDrainAckAssignedWorkEvent(rec events.Recorder, info sessionpkg.Info, subject, template string, strandedBead beads.Bead) {
+	if rec == nil {
+		return
+	}
 	rec.Record(events.Event{
 		Type:      events.SessionDrainAckedWithAssignedWork,
 		Actor:     "gc",
@@ -885,6 +1137,17 @@ func finalizeDrainAckStoppedSession(
 	if template == "" {
 		template = info.Template
 	}
+	if info.LivenessReadDegraded {
+		// The overlay read for this bead failed, so info carries committed
+		// metadata: a healthy session's sleep_intent and held_until live only in
+		// the liveness table and read as empty here. Completing now would relabel
+		// a parked seat idle and drop its standing intent, and the degraded write
+		// is fenced, so it would outlive the outage (fork PR #59 review, item 1).
+		// Leave the ack and the stop-pending row alone; a later tick finalizes on
+		// a real read.
+		fmt.Fprintf(stderr, "session reconciler: deferring drain-ack finalize of %s: session liveness read degraded\n", name) //nolint:errcheck
+		return drainAckFinalizeResult{}
+	}
 	recordStopped := func(performedStop bool) {
 		// gc.agent.stops.total counts the stop action, so only the observer
 		// that actually performs the stop transition records it. Under NDI
@@ -976,6 +1239,86 @@ func finalizeDrainAckStoppedSession(
 			choice = finalizePatch(facts)
 		}
 	}
+	// ga-x99xh0: a pool seat that drain-acked while holding claimable or
+	// in_progress work is torn down and its work released in the same act (see
+	// session_drain_ack_teardown.go), instead of sleeping with the work and being
+	// resumed by it. Reason reporting is separate from teardown permission: every
+	// drain-ack with assigned work logs what the seat is retained for, but only a
+	// pool seat at a call site that permits closing is mutated.
+	//
+	// For a teardown-eligible seat the work is classified first, because the
+	// release empties the classifier; the bead it found is the observation, and
+	// the drain_acked_with_assigned_work event is recorded from it exactly once
+	// (at the teardown close, or at the shared emit below). Non-eligible seats
+	// are not classified here at all — they reach the shared
+	// recordDrainAckAssignedWorkEvent below, as before.
+	var ackedWork *beads.Bead
+	classified := false
+	if hasAssignedWork {
+		refusal := drainAckTeardownRefusal(cfg, info)
+		if refusal == "" && !closeIfUnassigned {
+			refusal = drainAckRetainedCloseNotPermitted
+		}
+		eligible := refusal == ""
+		outcome := drainAckTeardownOutcome{retainedFor: refusal}
+		observed := "assigned work"
+		if eligible {
+			anomaly, found, anomalyErr := drainAckClaimableAnomalyBead(evidence, info, clk.Now().UTC())
+			classified = true
+			if anomalyErr != nil {
+				fmt.Fprintf(stderr, "session reconciler: classifying drain-acked work for %s: %v\n", name, anomalyErr) //nolint:errcheck
+			}
+			if found {
+				ackedWork = &anomaly
+				observed = "assigned work " + anomaly.ID
+				outcome = tearDownDrainAckedPoolSeat(store, evidence, info, anomaly.ID, clk.Now().UTC(), stderr)
+				if outcome.closed {
+					if dops != nil {
+						_ = dops.clearDrain(name)
+					}
+					if dt != nil {
+						dt.clearIdleProbe(info.ID)
+						dt.remove(info.ID)
+					}
+					recordStopped(true)
+					emitDrainAckAssignedWorkEvent(rec, info, template, template, anomaly)
+					fmt.Fprintf(stderr, "session reconciler: drain-acked %s: observed %s; released %d of %d; seat closed\n", name, observed, outcome.released, outcome.attempted) //nolint:errcheck
+					return drainAckFinalizeResult{batch: sessionpkg.ClosePatch(clk.Now().UTC(), drainAckTeardownCloseReason), closed: true}
+				}
+			} else {
+				// hasAssignedWork held but nothing claimable or in_progress was
+				// found: only provably non-claimable work (blocked/deferred), or
+				// work another observer already released. Not torn down here.
+				outcome.retainedFor = "no_claimable_work"
+			}
+		}
+		if closeIfUnassigned {
+			// Witness re-read whenever the teardown did not close, found or not:
+			// a concurrent observer may have read the same ack, released the work
+			// and closed the seat after this one read hasAssignedWork. Writing
+			// the asleep patch and a performed stop onto that closed bead would be
+			// wrong. The winner already recorded the event, so the witness emits
+			// no second drain_acked_with_assigned_work; the SessionStopped
+			// re-emit keeps parity with the no-work witness above. A per-ack
+			// idempotency key for full cross-observer dedupe is out of scope
+			// (ga-x99xh0 freeze ruling).
+			if witnessInfo, err := sessionFrontDoor(store).Get(info.ID); err == nil && witnessInfo.Closed {
+				if dops != nil {
+					_ = dops.clearDrain(name)
+				}
+				if dt != nil {
+					dt.clearIdleProbe(info.ID)
+					dt.remove(info.ID)
+				}
+				recordStopped(false)
+				return drainAckFinalizeResult{witnessInfo: &witnessInfo}
+			}
+		}
+		// Observation and outcome are logged separately: the seat was OBSERVED
+		// holding work, the sweep released N of M, and the seat was kept for the
+		// named reason. No claim is made about what it holds now.
+		fmt.Fprintf(stderr, "session reconciler: drain-acked %s: observed %s; released %d of %d; seat kept: %s\n", name, observed, outcome.released, outcome.attempted, outcome.retainedFor) //nolint:errcheck
+	}
 	// finalizePatch clears restart_requested: a drain-ack that completes a
 	// restart-request cycle (gc session reset → agent drain-ack) must
 	// consume it, or a later cache-reconcile re-emission resurrects it as a
@@ -989,6 +1332,42 @@ func finalizeDrainAckStoppedSession(
 	write := sessionFrontDoor(store).ApplyLifecycle
 	if choice.AsSleep {
 		write = sessionFrontDoor(store).ApplySleep
+	}
+	sessionpkg.StampPriorSessionKeyInfo(batch, info)
+	// An always-mode named session with wake_mode=fresh re-qualifies for wake
+	// the moment its drain-ack lands: ComputeAwakeSet's named-always branch has
+	// no drained-exclusion, and drain-ack pokes an immediate reconcile. A
+	// self-draining heartbeat (gastown.boot) therefore re-wakes at its own
+	// runtime cadence (~50s), minting a fresh provider transcript every cycle
+	// (ga-kaei). Stamp a cooldown hold with the bare drain-ack: the
+	// disposition's heartbeat cell (EvHeartbeat), written with the drain-ack's
+	// lifecycle in one fenced write, since held_until is a cell key
+	// ApplyLifecycle refuses. A live heartbeat hold refuses PreWake, so the
+	// seat stays down for the cooldown; an operator's wake clears it.
+	//
+	// The cooldown extends a hold and never shortens one. A held_until already
+	// past the cooldown is somebody else's hold — gc session suspend's
+	// indefinite sentinel, or an agent keep-alive — and overwriting it releases
+	// that hold early (EvHeartbeat leaves a suspend's own Until alone, but it
+	// replaces a longer heartbeat hold): a suspended always+fresh seat was respawned when the
+	// five-minute stamp expired, with no operator act (fork PR #59 review,
+	// item 3).
+	if !hasAssignedWork &&
+		info.WakeMode == "fresh" &&
+		strings.TrimSpace(info.ConfiguredNamedMode) == "always" {
+		cooldownUntil := clk.Now().Add(freshWakeHeartbeatCooldown).UTC()
+		// The row's own hold, read through its disposition (R7): an
+		// operator suspend's Until, or a heartbeat's.
+		held := sessionpkg.DispositionOfInfo(info)
+		heldUntil := held.Until
+		if held.Heartbeat.After(heldUntil) {
+			heldUntil = held.Heartbeat
+		}
+		if !heldUntil.After(cooldownUntil) {
+			write = func(id string, patch sessionpkg.MetadataPatch) (sessionpkg.MetadataPatch, error) {
+				return applyDrainAckWithHeartbeatCooldown(store, id, patch, cooldownUntil, clk.Now())
+			}
+		}
 	}
 	written, err := write(info.ID, batch)
 	if err == nil && written == nil {
@@ -1015,7 +1394,9 @@ func finalizeDrainAckStoppedSession(
 		dt.remove(info.ID)
 	}
 	recordStopped(true)
-	if hasAssignedWork {
+	if ackedWork != nil {
+		emitDrainAckAssignedWorkEvent(rec, info, template, template, *ackedWork)
+	} else if hasAssignedWork && !classified {
 		recordDrainAckAssignedWorkEvent(evidence, info, template, template, name, clk.Now().UTC(), rec, stderr)
 	}
 	// Non-close drain-ack: the snapshot fold is the ApplyPatchInfo result above.
@@ -1983,6 +2364,14 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		log.Printf("reconcileSessionBeads: assigned work/store length mismatch: work=%d stores=%d", len(assignedWorkBeads), len(orphanReleaseStores))
 		orphanReleaseStores = nil
 	}
+	// The same alignment contract holds for the store refs the orphan_release
+	// stop lever reads the owning rig from: a misaligned slice falls back to
+	// resolving the rig from each bead.
+	orphanReleaseStoreRefs := reconcileOpts.assignedWorkStoreRefs
+	if len(orphanReleaseStoreRefs) > 0 && len(orphanReleaseStoreRefs) != len(assignedWorkBeads) {
+		log.Printf("reconcileSessionBeads: assigned work/store-ref length mismatch: work=%d storeRefs=%d", len(assignedWorkBeads), len(orphanReleaseStoreRefs))
+		orphanReleaseStoreRefs = nil
+	}
 	maxAgeTr := reconcileOpts.maxSessionAgeTr
 	assignedWorkDeferTr := reconcileOpts.assignedWorkDeferTr
 	asyncStopTracker := reconcileOpts.asyncStopTracker
@@ -2010,8 +2399,16 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 	// fold advances rows[i].Info so the snapshot build below projects the healed
 	// values without re-reading the bead (the coherence the old raw mirror
 	// provided for the later re-projection).
+	//
+	// A row whose liveness read was degraded is not healed: its held_until and
+	// sleep_intent are committed values, and a clear written from them is fenced
+	// and would shadow the live table rows once the overlay recovers.
 	for i := range rows {
+		if rows[i].Info.LivenessReadDegraded {
+			continue
+		}
 		rows[i].Info = healExpiredTimersInfo(rows[i].Info, sessFront, clk)
+		rows[i].Info = healReleasedWaitHoldReasonInfo(rows[i].Info, sessFront)
 	}
 	// Phase 0b: retire duplicate configured-named sessions — Info twin over the
 	// rows, returning the folded row set (retired losers carry their retire batch).
@@ -2127,6 +2524,27 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 	var startCandidates []startCandidate
 	var wakeTargets []wakeTarget
 	rollbacksThisTick := 0
+	// allowConfigDriftRestart spends the per-tick config-drift restart budget
+	// (ga-9n5hj): a wave rolls maxConfigDriftRestartsPerTick sessions per tick,
+	// and the first deferral announces the wave once (stderr, the
+	// session.config_drift_wave event, and the drift-wave mail after the pass).
+	configDriftRestartsThisTick := 0
+	configDriftWaveAnnounced := false
+	configDriftWaveMsg := ""
+	allowConfigDriftRestart := func(templateName, name string) bool {
+		if configDriftRestartsThisTick < maxConfigDriftRestartsPerTick {
+			configDriftRestartsThisTick++
+			return true
+		}
+		if !configDriftWaveAnnounced {
+			configDriftWaveAnnounced = true
+			msg := fmt.Sprintf("config-drift wave: more than %d sessions need drift restarts this tick; rolling %d per tick (first deferred: %s)", maxConfigDriftRestartsPerTick, maxConfigDriftRestartsPerTick, name)
+			configDriftWaveMsg = msg
+			fmt.Fprintf(stderr, "session reconciler: %s\n", msg) //nolint:errcheck
+			rec.Record(events.Event{Type: events.SessionConfigDriftWave, Actor: "gc", Subject: templateName, Message: msg})
+		}
+		return false
+	}
 	// attemptRollbackPendingCreate returns the metadata batch the rollback mirrored
 	// onto the raw bead, so each forward-pass caller can fold it onto the typed
 	// snapshot (Step 6d write-returns-Info). The batch carries NO Closed change:
@@ -2562,6 +2980,41 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			default:
 				if dops != nil {
 					if acked, _ := dops.isDrainAcked(name); acked {
+						// A live heartbeat hold on a pool seat outranks a reconciler-owned
+						// orphan or no-wake-reason ack the same way assigned work does: the
+						// hold arrived after the drain began, and stopping the seat here
+						// would lose the run it is protecting (gastownhall/gascity#6173).
+						// It runs ahead of the partial-store deferral below because it
+						// needs no work query — the hold is on the session bead in hand —
+						// and a deferred tick would still let the drain scan advance the
+						// existing drain to a forced stop. Agent acks and non-cancelable
+						// reasons are left alone.
+						if providerAlive && heartbeatHeldPoolSeatInfo(infoPostHeal, clk.Now()) {
+							if cancelSessionDrainForHeartbeatHoldInfo(infoPostHeal, sp, dt) ||
+								cancelRecoveredDrainForHeartbeatHoldInfo(infoPostHeal, sp, name) {
+								// The cancel cleared everything the reconciler owns: its
+								// tracker entry and its own ack keys. Nothing else is
+								// touched. GC_DRAIN is written only by `gc runtime drain`,
+								// so a value there is an operator's explicit request, which
+								// the hold has no standing to withdraw — it stands, and the
+								// seat drains on the agent's ack or the request's deadline.
+								// GC_DRAIN_ACK is the agent's key: an ack that lands inside
+								// the cancel keeps it and its provenance
+								// (clearReconcilerOwnDrainAckMetadata) and stops the seat on
+								// the next tick.
+								template := normalizedSessionTemplateInfo(infoPostHeal, cfg)
+								if template == "" {
+									template = infoPostHeal.Template
+								}
+								fmt.Fprintf(stdout, "Canceled drain-acked session '%s' (heartbeat hold)\n", name) //nolint:errcheck
+								if trace != nil {
+									trace.RecordDecision(TraceSiteDrainCancel, TraceReasonUserHold, TraceOutcomeCancel, template, name, traceRecordPayload{
+										"held_until": heartbeatHoldUntilInfo(infoPostHeal),
+									})
+								}
+								continue
+							}
+						}
 						// gc-hz0nu: every drain-acked decision below depends on the
 						// store-derived desired-state / assigned-work view. During a
 						// partial store query (transient Dolt failure) that view is
@@ -2693,6 +3146,43 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 					}
 				}
 				if providerAlive {
+					reason := "orphaned"
+					if configuredNames[name] {
+						reason = "suspended"
+					}
+					// A pool-managed seat that is no longer desired but carries a live
+					// heartbeat hold is kept, the way the no-wake-reason arm keeps it
+					// (#3994): a held seat is excluded from pool reuse and from the
+					// demand floor by construction, so a slot shrink or a demand
+					// recount makes it surplus while its hold — the seat's own
+					// keep-alive contract — is still running, and draining it here
+					// lost the run the hold was protecting
+					// (gastownhall/gascity#6173). Scoped like the timer-arm gate: a
+					// heartbeat hold only (no sleep_intent — a suspend parks the seat
+					// with sleep_intent="user-hold" precisely so it drains), and pool
+					// seats only: a named session whose spec was removed keeps its
+					// suspend drain, which is operator intent. An orphan drain already
+					// in flight is canceled through the hold lens, since the plain
+					// lens refuses "orphaned". The held seat's slot already counts as
+					// occupied, so keeping it mints no extra agent capacity; shared
+					// workspace capacity is not re-counted here.
+					if reason == "orphaned" && heartbeatHeldPoolSeatInfo(infoPostHeal, clk.Now()) {
+						cancelSessionDrainForHeartbeatHoldInfo(infoPostHeal, sp, dt)
+						if trace != nil {
+							template := normalizedSessionTemplateInfo(infoPostHeal, cfg)
+							if template == "" {
+								template = infoPostHeal.Template
+							}
+							trace.RecordDecision(TraceSiteReconcilerOrphaned, TraceReasonCode(reason), TraceOutcomeKeptOpen, template, name, traceRecordPayload{
+								"store_query_partial": storeQueryPartial,
+								"provider_alive":      providerAlive,
+								"blocker":             string(TraceReasonUserHold),
+								"held_until":          heartbeatHoldUntilInfo(infoPostHeal),
+							})
+						}
+						fmt.Fprintf(stdout, "Skipping drain for '%s': heartbeat hold active until %s\n", name, heartbeatHoldUntilInfo(infoPostHeal)) //nolint:errcheck
+						continue
+					}
 					// When a store query failed (partial results),
 					// skip drain — the session may have work that we
 					// couldn't see due to the transient failure.
@@ -2701,10 +3191,6 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 					if storeQueryPartial {
 						logDrainSkip(dt, stdout, id, fmt.Sprintf("Skipping drain for '%s': store query partial (transient failure)", name), clk.Now())
 						continue
-					}
-					reason := "orphaned"
-					if configuredNames[name] {
-						reason = "suspended"
 					}
 					// The drain ends a live runtime: the wide set, read live (O4).
 					hasAssignedWork, assignedErr := sessionHasOpenAssignedWorkInStores(sw, refuseScope(infoByID[id], cfg))
@@ -2914,7 +3400,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 						//
 						// Restricted to "orphaned": a "suspended" seat is configured and
 						// merely scaled down, so its work stays put for its return.
-						if released := releaseConfirmedOrphanSessionWork(cfg, sw.Legs().workStore(), sw.Legs().rigs, assignedWorkBeads, orphanReleaseStores, infoByID[id]); len(released) > 0 {
+						if released := releaseConfirmedOrphanSessionWork(cfg, sw.Legs().workStore(), sw.Legs().rigs, assignedWorkBeads, orphanReleaseStores, orphanReleaseStoreRefs, infoByID[id]); len(released) > 0 {
 							emitDeadAssigneeReopenedEvents(rec, assignedWorkBeads, released, clk.Now().UTC())
 						}
 						closed = closeSeat(store, sw, infoByID[id], closeWhy{reason: reason, gate: gate}, clk.Now().UTC(), stderr)
@@ -2984,6 +3470,12 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			_, _ = peek(rateLimitPeekLines)
 		}
 		recordResetStallIfDue(cityPath, store, sp, cfg, infoByID[id], tp.TemplateName, name, running, alive, startupTimeout, clk.Now().UTC(), dt, rec, stderr, trace)
+		// The alive half of the reset-marker lifecycle (ga-2aq43): a marker
+		// whose runtime is demonstrably healthy is cleared, and the clear is
+		// folded onto the snapshot (write-returns-Info) so this tick's later
+		// readers do not honor the stale marker. Disjoint from the not-alive
+		// eviction above.
+		tick.apply(id, clearStaleResetMarkerIfHealthy(infoByID[id], store, sp, tp.TemplateName, name, alive, startupTimeout, clk.Now().UTC(), dt, rec, stderr, trace))
 
 		// Zombie capture: session exists but process dead — grab scrollback for forensics.
 		// markProviderTerminalError persists + folds its write onto the snapshot in one
@@ -3238,6 +3730,27 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 							continue
 						}
 					}
+					// A live heartbeat hold on a pool seat outranks a reconciler-owned
+					// orphan or no-wake-reason ack on the desired branch as well. A
+					// held seat reaches this arm through a concrete SessionBeadID
+					// request (reusablePoolSessionInfosForRequest keeps held seats
+					// reusable for those), and the hold arrived after the drain began,
+					// so the stop below would lose the run the hold protects — the
+					// lens the not-desired arm applies (gastownhall/gascity#6173, #6178
+					// review). It needs no work query, so it runs ahead of the
+					// assigned-work check. Agent acks and non-cancelable reasons are
+					// left alone.
+					if reconcilerOwnedAck && alive && heartbeatHeldPoolSeatInfo(infoByID[id], clk.Now()) &&
+						(cancelSessionDrainForHeartbeatHoldInfo(infoByID[id], sp, dt) ||
+							cancelRecoveredDrainForHeartbeatHoldInfo(infoByID[id], sp, name)) {
+						fmt.Fprintf(stdout, "Canceled drain-acked session '%s' (heartbeat hold)\n", name) //nolint:errcheck
+						if trace != nil {
+							trace.RecordDecision(TraceSiteDrainCancel, TraceReasonUserHold, TraceOutcomeCancel, tp.TemplateName, name, traceRecordPayload{
+								"held_until": heartbeatHoldUntilInfo(infoByID[id]),
+							})
+						}
+						continue
+					}
 					if reconcilerOwnedAck && assignedWorkDrainReasonCancelable(ackReason) {
 						hasAssignedWork, assignedErr := sessionHasAwakeAssignedWorkForReachableStore(sw, infoByID[id])
 						if assignedErr != nil {
@@ -3320,6 +3833,38 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 							}
 							continue
 						}
+						// Re-check the live-assigned-work guard that gated the drift
+						// drain's begin, here at the commit point. The begin read an idle
+						// session, but the drain then spends ticks (begin, deferred ack,
+						// this stop) with the session row still awake, and the claim fence
+						// in `gc hook --claim` refuses only a row already marked draining.
+						// A claim that landed in that window would otherwise be stopped
+						// mid-work and re-served only after a restart. Abandon the drain
+						// instead: the drift check re-detects the drift each tick and
+						// defers it until the work completes. A failed probe fails closed
+						// (keep the session running), the verdict the drift check's own
+						// guard reaches.
+						if alive {
+							hasAssignedWork, assignedErr := configDriftSeatHasLiveWork(sw, infoByID[id])
+							if assignedErr != nil {
+								fmt.Fprintf(stderr, "session reconciler: checking assigned work before config-drift drain-ack stop for %s: %v\n", name, assignedErr) //nolint:errcheck
+								hasAssignedWork = true
+							}
+							if hasAssignedWork {
+								drainCancelled := cancelSessionConfigDriftDrainInfo(infoByID[id], sp, dt)
+								if !drainCancelled {
+									_ = clearReconcilerDrainAckMetadata(sp, name)
+								}
+								logDrainSkip(dt, stdout, id, fmt.Sprintf("Abandoning config-drift drain for '%s': live assigned work found", name), clk.Now())
+								if trace != nil {
+									trace.RecordDecision(TraceSiteReconcilerDrainAck, TraceReasonConfigDrift, TraceOutcomeCancelReconcilerAck, tp.TemplateName, name, traceRecordPayload{
+										"active_reason":  "live_assigned_work",
+										"drain_canceled": drainCancelled,
+									})
+								}
+								continue
+							}
+						}
 					}
 					// Only a live runtime can raise an interaction: a dead or zombie
 					// target's failed probe must not cancel the drain it acked.
@@ -3346,6 +3891,18 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 					}
 					if alive {
 						if updated, stop, ok := markDrainAckStopPending(legacyAct{cityPath: cityPath, store: store, sp: sp, cfg: cfg, stderr: stderr}, infoByID[id], dops, dt, clk); ok {
+							if configDriftAck {
+								if reverted, abandoned := abandonConfigDriftStopPendingOnClaim(store, sp, dt, sw, infoByID[id], updated, stop, name, stderr); abandoned {
+									tick.set(id, reverted)
+									logDrainSkip(dt, stdout, id, fmt.Sprintf("Abandoning config-drift drain for '%s': work claimed before the drain was visible", name), clk.Now())
+									if trace != nil {
+										trace.RecordDecision(TraceSiteReconcilerDrainAck, TraceReasonConfigDrift, TraceOutcomeCancelReconcilerAck, tp.TemplateName, name, traceRecordPayload{
+											"active_reason": "live_assigned_work_after_mark",
+										})
+									}
+									continue
+								}
+							}
 							// markDrainAckStopPending persisted + folded the stop-pending
 							// transition (write-returns-Info, Step 6d) — assign the returned Info,
 							// same as the orphan-arm site above (STEP6-PREPASS-AUDIT group 3).
@@ -3400,6 +3957,18 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			if lastActivityErr == nil && !lastActivity.IsZero() && clk.Now().Sub(lastActivity) > gateThreshold {
 				exempt := pendingInteractionKeepsAwakeInfo(infoByID[id], sp, name, clk) ||
 					pendingCreateStartInFlightInfo(infoByID[id], clk, startupTimeout)
+				// A pinned configured named session is never stopped on a
+				// recycler restart request: the restart-request guard below
+				// clears the marker and ends the tick for it. Requesting one
+				// anyway repeats that on every tick the session stays idle, and
+				// each of those ticks ends before the config-drift gate, so a
+				// pending drift is neither logged nor recorded as deferred.
+				if !exempt && pinnedConfiguredNamedSessionKillProtected(infoByID[id]) {
+					exempt = true
+					if trace != nil {
+						trace.RecordDecision(TraceSiteReconcilerProgressStallExempt, TraceReasonPinned, TraceOutcomeExempt, tp.TemplateName, name, nil)
+					}
+				}
 				if !exempt {
 					attached, attachErr := sessionAttachedForConfigDrift(id, sp, cityPath, store, cfg, name)
 					if attachErr != nil {
@@ -3594,6 +4163,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 					// is still awake. See ga-2fpf9z.
 					batch["state"] = string(sessionpkg.StateAsleep)
 				}
+				sessionpkg.StampPriorSessionKeyInfo(batch, infoByID[id])
 				if err := sessionFrontDoor(store).ApplyPatch(id, batch); err != nil {
 					fmt.Fprintf(stderr, "session reconciler: recording restart handoff for %s: %v\n", name, err) //nolint:errcheck
 					continue
@@ -3791,7 +4361,12 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			storedHash := infoByID[id].StartedConfigHash
 			if template != "" && storedHash != "" {
 				cfgAgent := findAgentByTemplate(cfg, template)
-				if cfgAgent != nil {
+				// A suspended agent's session is being stopped, not restarted.
+				// A drift reset would kill it and stamp pending-create, which
+				// the awake set no longer launches for a suspended agent, so
+				// the lease would expire and the bead close as a failed create,
+				// losing it (#6307). Leave drift to the resume (ga-9qanni).
+				if cfgAgent != nil && !isAgentEffectivelySuspendedWith(cfg, cityPath, cfgAgent, suspState) {
 					agentCfg := sessionCoreConfigForHashInfo(tp, infoByID[id])
 					currentHash := runtime.CoreFingerprint(agentCfg)
 					if storedHash != currentHash {
@@ -3823,9 +4398,52 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 							}
 							continue
 						}
+						driftedFields := runtime.CoreFingerprintDriftFieldsFromJSON(infoByID[id].CoreHashBreakdown, agentCfg)
+						// Prompt-only drift (FPExtra: append_fragments and
+						// other rendered-prompt inputs) applies LAZILY: it
+						// only affects the NEXT conversation, so it is never
+						// worth killing a live session over. Skip before the
+						// diagnostics so a lazily-drifted roster doesn't spam
+						// stderr every tick; the new config lands at the next
+						// natural cycle (wake, pool respawn, asleep repair,
+						// or an unrelated restart). ga-9n5hj: the 2026-07-18
+						// crash was an FPExtra-only wave force-restarting the
+						// whole roster after guard expiry.
+						//
+						// CopyFiles-ONLY drift is also lazy, but is ACCEPTED IN
+						// PLACE (core baselines rebaselined) rather than skipped:
+						// a staged copy is never re-read by the running process,
+						// so the drain buys nothing and destroys context
+						// (hq-wi4ka, the 2026-08-20 fleet drain). Rebasing records
+						// that the copy refreshes at the next natural start. On a
+						// persist failure we fall THROUGH to the eager drain path
+						// so a transient store error never silently suppresses a
+						// real config change.
+						if configDriftLazyApplicable(driftedFields) {
+							if configDriftCopyFilesOnly(driftedFields) {
+								acceptBatch, acceptErr := acceptCopyFilesDriftInPlace(id, sessFront, agentCfg)
+								if acceptErr == nil {
+									tick.apply(id, acceptBatch)
+									if trace != nil {
+										trace.RecordDecision(TraceSiteReconcilerConfigDrift, TraceReasonConfigDrift, TraceOutcomeDeferredLazy, tp.TemplateName, name, configDriftTracePayload(storedHash, currentHash, driftedFields, traceRecordPayload{
+											"active_reason": "lazy_copyfiles_inplace",
+										}))
+									}
+									fmt.Fprintf(stdout, "Accepted copy-files config drift in place for '%s' (applies at next start)\n", name) //nolint:errcheck
+									continue
+								}
+								fmt.Fprintf(stderr, "session reconciler: accepting copy-files drift in place for %s: %v; falling back to drain\n", name, acceptErr) //nolint:errcheck
+							} else {
+								if trace != nil {
+									trace.RecordDecision(TraceSiteReconcilerConfigDrift, TraceReasonConfigDrift, TraceOutcomeDeferredLazy, tp.TemplateName, name, configDriftTracePayload(storedHash, currentHash, driftedFields, traceRecordPayload{
+										"active_reason": "lazy_prompt_only",
+									}))
+								}
+								continue
+							}
+						}
 						fmt.Fprintf(stderr, "config-drift %s: stored=%s current=%s cmd=%q\n", name, truncateHashForLog(storedHash), truncateHashForLog(currentHash), agentCfg.Command) //nolint:errcheck
 						// Diagnostic: log per-field breakdown to identify the drifting field.
-						driftedFields := runtime.CoreFingerprintDriftFieldsFromJSON(infoByID[id].CoreHashBreakdown, agentCfg)
 						runtime.LogCoreFingerprintDrift(stderr, name, infoByID[id].CoreHashBreakdown, agentCfg)
 						// Launch-only drift (B2.3): the box (provision half) is
 						// unchanged but the agent (launch half) moved. When the
@@ -3905,8 +4523,14 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 								}
 								continue
 							}
+							if !allowConfigDriftRestart(tp.TemplateName, name) {
+								if trace != nil {
+									trace.RecordDecision(TraceSiteReconcilerConfigDrift, TraceReasonConfigDrift, TraceOutcomeDeferredStagger, tp.TemplateName, name, configDriftTracePayload(storedHash, currentHash, driftedFields, nil))
+								}
+								continue
+							}
 							if launchOnlyDrift {
-								relaunched, launchBatch := relaunchAgentForLaunchDrift(ctx, sp, sessFront, infoByID[id], name,
+								relaunched, launchBatch := relaunchAgentForLaunchDrift(ctx, reconcileOpts.sessionStartFence, sp, sessFront, infoByID[id], name,
 									tp, cityPath, cfg, store, dispatchSources, storedHash, currentHash, storedProvision, storedLaunch,
 									driftedFields, rec, trace, stdout, stderr)
 								// Fold the returned batch unconditionally (Step 6d write-returns-Info).
@@ -3930,6 +4554,12 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 							// aggregating refresh @~2710 today, but folding here future-proofs
 							// that refresh's retirement (STEP6-PREPASS-AUDIT group 10).
 							tick.apply(id, resetConfiguredNamedSessionForConfigDriftInfo(cityPath, infoByID[id], tp, store, sp, name, alive, string(sessionpkg.StateStartPending), clk.Now().UTC(), stderr))
+							// Record a handoff BEFORE committing the restart so
+							// the rebuilt named session can recover its context
+							// (hq-wi4ka: config-drift restart with no handoff
+							// destroys the conversation). Best-effort.
+							sendConfigDriftHandoffMailWithStores(reconcilerMailStore(cityPath, cfg, store, rec), store, rec, tp.DisplayName(),
+								configDriftHandoffBody(tp.DisplayName(), driftedFields, clk.Now()), stderr)
 							if trace != nil {
 								trace.RecordDecision(TraceSiteReconcilerConfigDrift, TraceReasonConfigDrift, TraceOutcomeRestartInPlace, tp.TemplateName, name, configDriftTracePayload(storedHash, currentHash, driftedFields, nil))
 							}
@@ -3978,16 +4608,28 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 								continue
 							}
 							if hasAssignedWork {
+								// Abandon a config-drift drain begun on an earlier tick,
+								// before this work was claimed: skipping only the begin
+								// would let the drain scan publish its ack and the
+								// drain-ack arm stop the session mid-claim.
+								drainCancelled := cancelSessionConfigDriftDrainInfo(infoByID[id], sp, dt)
 								if trace != nil {
 									trace.RecordDecision(TraceSiteReconcilerConfigDrift, TraceReasonConfigDrift, TraceOutcomeDeferredActive, tp.TemplateName, name, configDriftTracePayload(storedHash, currentHash, driftedFields, traceRecordPayload{
-										"active_reason": "live_assigned_work",
+										"active_reason":  "live_assigned_work",
+										"drain_canceled": drainCancelled,
 									}))
 								}
 								logDrainSkip(dt, stdout, id, fmt.Sprintf("Skipping config-drift drain for '%s': live assigned work found", name), clk.Now())
 								continue
 							}
+							if !allowConfigDriftRestart(tp.TemplateName, name) {
+								if trace != nil {
+									trace.RecordDecision(TraceSiteReconcilerConfigDrift, TraceReasonConfigDrift, TraceOutcomeDeferredStagger, tp.TemplateName, name, configDriftTracePayload(storedHash, currentHash, driftedFields, nil))
+								}
+								continue
+							}
 							if launchOnlyDrift {
-								relaunched, launchBatch := relaunchAgentForLaunchDrift(ctx, sp, sessFront, infoByID[id], name,
+								relaunched, launchBatch := relaunchAgentForLaunchDrift(ctx, reconcileOpts.sessionStartFence, sp, sessFront, infoByID[id], name,
 									tp, cityPath, cfg, store, dispatchSources, storedHash, currentHash, storedProvision, storedLaunch,
 									driftedFields, rec, trace, stdout, stderr)
 								// Fold the returned batch unconditionally (Step 6d write-returns-Info).
@@ -4011,6 +4653,10 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 								ddt = defaultDrainTimeout
 							}
 							if beginSessionDrainInfo(infoByID[id], sp, dt, "config-drift", clk, ddt) {
+								// Record a handoff BEFORE the drain so the rebuilt
+								// session can recover its context (hq-wi4ka). Best-effort.
+								sendConfigDriftHandoffMailWithStores(reconcilerMailStore(cityPath, cfg, store, rec), store, rec, tp.DisplayName(),
+									configDriftHandoffBody(tp.DisplayName(), driftedFields, clk.Now()), stderr)
 								fmt.Fprintf(stdout, "Draining session '%s': config-drift\n", name) //nolint:errcheck
 								if trace != nil {
 									trace.RecordDecision(TraceSiteReconcilerConfigDrift, TraceReasonConfigDrift, TraceOutcomeDrain, tp.TemplateName, name, configDriftTracePayload(storedHash, currentHash, driftedFields, nil))
@@ -4282,7 +4928,10 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		}
 		if it != nil && alive {
 			facts := sessionpkg.TimerFacts{
-				Triggered: it.checkIdle(name, tp.TemplateName, infoByID[id].Provider, infoByID[id].Transport, sp, clk.Now()),
+				// The provider FAMILY, not its configured name: a city names its
+				// providers freely (claude-opus-<account>), and the tracker's
+				// content clock is keyed on what the runtime is (pl-mhyy).
+				Triggered: it.checkIdle(name, tp.TemplateName, sessionProviderFamily(infoByID[id]), infoByID[id].Transport, sp, clk.Now()),
 			}
 			if facts.Triggered {
 				facts.Blocker = lifecycleTimerBlockerInfo(infoByID[id], clk.Now())
@@ -4441,6 +5090,19 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		"assigned_work_bead_cnt": len(assignedWorkBeads),
 	})
 
+	// Drift-wave mail (ga-9n5hj residual, ruling 2026-07-20): a wave lasts
+	// many ticks, but the coordinator needs one durable notice per wave, not
+	// one per tick — the event stream above stays the per-tick record.
+	if driftWaveMailNotifier.observeTick(configDriftWaveAnnounced, clk.Now().UTC()) {
+		recipient := ""
+		if cfg != nil {
+			recipient = strings.TrimSpace(cfg.Session.DriftWaveNotify)
+		}
+		if recipient != "" {
+			sendConfigDriftWaveMail(reconcilerMailStore(cityPath, cfg, store, rec), rec, recipient, configDriftWaveMsg, stderr)
+		}
+	}
+
 	if ctx != nil && ctx.Err() != nil {
 		return 0
 	}
@@ -4461,11 +5123,14 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 	for i := range orderedIDs {
 		sessionInfos[i] = infoByID[orderedIDs[i]]
 	}
-	awakeInput, runtimeObservationErrors := buildAwakeInputFromReconcilerWithObservationErrors(
+	awakeInput, awakeWorkSources, runtimeObservationErrors := buildAwakeInputFromReconcilerWithWorkSources(
 		cfg, cityPath, sessionInfos, poolDesired, namedSessionDemand, namedRoutedDemand, workSet, readyWaitSet,
 		assignedWorkBeads, reconcileOpts.readyAssignedFlags, wakeTargets, sp, clk.Now(),
 	)
-	awakeDecisions := ComputeAwakeSet(awakeInput)
+	// A bead parked for certification is not wake demand for its sleeping owner
+	// (ga-mzovhi); the park is read live from the store each row came through.
+	awakeDecisions := computeAwakeSetWithCertParks(&awakeInput, awakeWorkSources,
+		newLiveCertParkedWorkProbe(assignedWorkBeads, reconcileOpts.assignedWorkStores, stderr))
 	wakeEvals := awakeSetToWakeEvals(awakeDecisions, awakeInput.SessionBeads)
 
 	// Resolve full sleep policies before idle probe selection. ComputeAwakeSet
@@ -4601,8 +5266,13 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		// (sleep_intent="user-hold") and config-suppressed sessions are excluded,
 		// and the respawn arm's own quarantine/circuit-breaker/provider-health
 		// gates still apply. See TestReconcileSessionBeads_HeartbeatHeldDeadSessionRespawns.
+		//
+		// An empty sleep_intent only proves a heartbeat hold when the overlay read
+		// succeeded: on a degraded read every liveness key is the committed value,
+		// and a suspend's intent reads as empty there (fork PR #59 review, item 1).
 		if !shouldWake && !target.alive && !eval.ConfigSuppressed &&
 			decision.HasAssignedWork && info.SleepIntent == "" &&
+			!info.LivenessReadDegraded &&
 			lifecycleTimerBlockerInfo(info, clk.Now()) == "user_hold" {
 			shouldWake = true
 		}
@@ -4917,6 +5587,36 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 				cancelSessionDrainInfo(info, sp, dt)
 				continue
 			}
+			// Keep-alive by held work: a live pool seat that still holds assigned
+			// work — open or in_progress — is not drained by the reconciler's own
+			// timers (no-wake-reason, idle-sleep, config-suppressed). Its step may
+			// carry no wake demand right now: an open step whose dependency is
+			// running on another seat reads not-ready, so the awake set sees no
+			// reason to keep the holder. The holder is mid-molecule all the same.
+			// A drain sent here is acked at once by `gc hook --claim --drain-ack`
+			// and the seat abandons its run; the step strands and the work re-runs
+			// (#5731, #5473). Explicit intents (suspend, idle-stop-pending,
+			// max-age) still drain, exactly as they win over a heartbeat hold. A
+			// probe error fails closed — retain, do not drain — like every other
+			// assigned-work gate. Pool seats only: a named seat's held work is the
+			// retired-session lane's concern.
+			if intent == "" && isPoolManagedSessionInfo(info) {
+				holdsWork, holdsErr := sessionHasOpenAssignedWorkForReachableStore(sw, info)
+				if holdsErr != nil {
+					fmt.Fprintf(stderr, "session reconciler: checking assigned work before draining %s: %v (retaining)\n", name, holdsErr) //nolint:errcheck
+					holdsWork = true
+				}
+				if holdsWork {
+					cancelSessionDrainInfo(info, sp, dt)
+					if trace != nil {
+						trace.RecordDecision(TraceSiteReconcilerDrainDecision, TraceReasonAssignedWork, TraceOutcomeNoChange, target.tp.TemplateName, name, traceRecordPayload{
+							"sleep_intent": intent,
+							"kept_by":      "assigned_work",
+						})
+					}
+					continue
+				}
+			}
 			var reason string
 			switch {
 			case intent == "idle-stop-pending":
@@ -4935,6 +5635,15 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 				// downstream identity-preservation and drainReasonCancelable
 				// treat this drain as suspend-class/revertible instead of a
 				// generic non-wake close.
+				reason = "suspended"
+			case configuredNames[name] && sessionAgentSuspendedInfo(cfg, cityPath, info, suspState):
+				// The same for one agent patched suspended=true. As
+				// "no-wake-reason" the drain was canceled by the seat's own
+				// assigned work every other tick, so a suspended refinery holding
+				// a patrol wisp was never stopped (ga-9qanni). "suspended" is not
+				// cancelable by work or by a returning wake reason, and its
+				// completion parks the bead asleep, which keeps it for resume
+				// (#6307).
 				reason = "suspended"
 			default:
 				reason = "no-wake-reason"
@@ -5015,7 +5724,13 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		// seat in place on its bead); and it never takes the stranded branch
 		// below.
 		hasAssignedWork := false
-		poolFreeable := !shouldWake && !target.alive && isPoolSessionSlotFreeableInfo(info, clk.Now()) && isPoolManagedSessionInfo(info) && !isNamedSessionInfo(info)
+		// A seat whose only assigned work is parked for certification is asleep
+		// by design, not stranded (ga-mzovhi): before parked work stopped being
+		// wake demand, the assigned-work wake kept such a seat out of this gate,
+		// and without that the stranded repair below would unassign the parked
+		// bead and leave the cert-landing-patrol's flip with no owner to wake.
+		poolFreeable := !shouldWake && !target.alive && isPoolSessionSlotFreeableInfo(info, clk.Now()) && isPoolManagedSessionInfo(info) && !isNamedSessionInfo(info) &&
+			!certParkedOwnerDecision(decision, hasDec)
 		killedSeat := poolFreeable && strings.TrimSpace(info.SleepReason) == string(sessionpkg.SleepReasonKilled)
 		if killedSeat && killedSeatSnapshotHasRoutedClaim(cfg, assignedWorkBeads, info) {
 			releaseUnexecutedClaimsOnKill(sw, store, clk.Now(), info, stderr)
@@ -5058,7 +5773,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			if !storeQueryPartial &&
 				repairStrandedPoolWorkerBead(sw, store, infoByID[target.info.ID], clk, stderr) {
 				tick.markClosed(target.info.ID)
-				pruneAgentHomeWorktreeIfSafeInfo(infoByID[target.info.ID], cityPath, cfg, stderr)
+				pruneAgentHomeWorktreeIfSafeInfo(infoByID[target.info.ID], cityPath, cfg, sp, stderr)
 			}
 		}
 		if poolFreeable && !hasAssignedWork {
@@ -5082,7 +5797,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 				// when the session bead is retired. Skipped under safety
 				// gates (uncommitted, unpushed, stashed) and overridable
 				// via cfg.Daemon.AutoPruneWorkerDir.
-				pruneAgentHomeWorktreeIfSafeInfo(infoByID[target.info.ID], cityPath, cfg, stderr)
+				pruneAgentHomeWorktreeIfSafeInfo(infoByID[target.info.ID], cityPath, cfg, sp, stderr)
 			}
 		}
 	}
@@ -6189,6 +6904,182 @@ func sessionHasOpenAssignedWorkForTier(store beads.Store, assignee, status strin
 	return wa.HasNonSessionWork(items), nil
 }
 
+// maxConfigDriftRestartsPerTick bounds config-drift restarts/drains per
+// reconciler tick so a wave rolls gradually instead of simultaneously
+// (ga-9n5hj; see the budget closure in reconcileSessionBeads).
+const maxConfigDriftRestartsPerTick = 2
+
+// configDriftWaveRenotifyInterval is how long a wave must keep rolling
+// before the notifier mails a reminder. A healthy wave clears in a few
+// ticks; one still active after this interval deserves a second look.
+const configDriftWaveRenotifyInterval = time.Hour
+
+// configDriftWaveNotifier dedupes drift-wave mail across reconciler ticks:
+// one mail when a wave starts, a reminder if the same wave is still rolling
+// after configDriftWaveRenotifyInterval, and re-arm once a tick passes with
+// no wave. State is in-process only — a supervisor restart mid-wave mails
+// once more, which is acceptable for an incident-grade notice.
+type configDriftWaveNotifier struct {
+	mu         sync.Mutex
+	waveActive bool
+	lastMailed time.Time
+}
+
+var driftWaveMailNotifier configDriftWaveNotifier
+
+// observeTick records this tick's wave state and reports whether a mail
+// should be sent now.
+func (n *configDriftWaveNotifier) observeTick(waveAnnounced bool, now time.Time) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if !waveAnnounced {
+		n.waveActive = false
+		return false
+	}
+	if n.waveActive && now.Sub(n.lastMailed) < configDriftWaveRenotifyInterval {
+		return false
+	}
+	n.waveActive = true
+	n.lastMailed = now
+	return true
+}
+
+// reset re-arms the notifier. Test hook.
+func (n *configDriftWaveNotifier) reset() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.waveActive = false
+	n.lastMailed = time.Time{}
+}
+
+// sendConfigDriftWaveMail delivers a drift-wave notice as durable mail so
+// the configured coordinator sees a roster-wide roll even when not watching
+// the event stream (ruling ga-wisp-j23i1gj: default recipient is the mayor,
+// who relays to the operator when the wave is roster-wide). Best-effort:
+// failures log to stderr and never block the tick. store is the mail-class
+// store (the reconciler passes reconcilerMailStore).
+func sendConfigDriftWaveMail(store beads.Store, rec events.Recorder, recipient, msg string, stderr io.Writer) {
+	if store == nil || recipient == "" || msg == "" {
+		return
+	}
+	b, err := store.Create(beads.Bead{
+		Title: "config-drift wave: staggered roster roll in progress",
+		Description: msg + "\n\nDeferred sessions restart on later ticks (budget " +
+			fmt.Sprintf("%d", maxConfigDriftRestartsPerTick) + "/tick); attached sessions and live work re-check their guards each tick. " +
+			"Per-tick detail: session.config_drift_wave events and the reconciler trace. " +
+			"If this wave is unexpected, check for an unintended city-wide config edit (eager fields roll the roster; see ga-9n5hj).",
+		Type:      "message",
+		Assignee:  recipient,
+		From:      controllerMailIdentity,
+		Ephemeral: true,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "session reconciler: sending config-drift wave mail to %s: %v\n", recipient, err) //nolint:errcheck // best-effort stderr
+		return
+	}
+	rec.Record(events.Event{
+		Type:    events.MailSent,
+		Actor:   controllerMailIdentity,
+		Subject: b.ID,
+		Message: recipient,
+		Payload: mailEventPayload(nil),
+	})
+}
+
+// sendConfigDriftHandoffMail records a durable handoff for a session about to
+// be recycled by config drift, so the conversation's context survives the
+// drain. Without it a config-drift restart is a kill+rematerialize with NO
+// handoff and the context is destroyed — the 2026-08-19/20 fleet drains
+// (hq-wi4ka) lost every crew session's context this way. The reconciler wires
+// the same auto-handoff path the PreCompact "context cycle" hook uses
+// (cmd_handoff.go createHandoffMail, labels gc:auto-handoff +
+// archive-after-inject): the mail is addressed to the session's own identity
+// so the rebuilt session picks its prior context up on wake.
+//
+// Best-effort: a mail failure logs to stderr and NEVER blocks or cancels the
+// drain — config-drift handling is a reconvergence restart, and failing to
+// record a handoff must not strand a drifted session running stale config.
+// recipient is the session's mail address (its alias/qualified name, matching
+// GC_ALIAS); it is skipped (no mail) when empty.
+//
+// This single-store form serves a city whose messaging and session classes
+// share one store; the reconciler sends through
+// sendConfigDriftHandoffMailWithStores with the resolved mail-class store.
+func sendConfigDriftHandoffMail(store beads.Store, rec events.Recorder, recipient, body string, stderr io.Writer) {
+	sendConfigDriftHandoffMailWithStores(store, store, rec, recipient, body, stderr)
+}
+
+// configDriftHandoffBody is what the restarted seat actually reads (ga-68f9qa).
+//
+// This mail used to be sent with a SUBJECT AND NOTHING ELSE: createHandoffMail
+// takes the body as args[1] and the call site passed a one-element slice, so
+// `message` stayed "". The seat was restarted, the note was injected, and it
+// carried no information at all — while still wearing AutoHandoffLabel and a
+// "HANDOFF:" subject, so anything counting handoffs scored it as a clean one.
+// An empty handoff is worse than no handoff: no handoff is at least visible as
+// a gap (ga-ksac39, katya's R3).
+//
+// SCOPE, deliberately narrow: only what the reconciler already holds at the
+// call site. No store query for the seat's in-progress beads — that is
+// ga-ksac39 S2, and this is a BEST-EFFORT path on the drift-restart critical
+// line, where a new failure mode would cost more than the extra context buys.
+// No pane tail, now or later, by decision rather than omission: argv on this
+// box has carried live provider keys (ga-icxer4), and a redactor is a denylist
+// that fails open.
+func configDriftHandoffBody(agent string, driftedFields []string, at time.Time) string {
+	var b strings.Builder
+	b.WriteString("You were restarted by the controller because your configuration drifted.\n\n")
+	b.WriteString("  agent:   " + agent + "\n")
+	b.WriteString("  when:    " + at.UTC().Format(time.RFC3339) + "\n")
+	if len(driftedFields) > 0 {
+		b.WriteString("  drifted: " + strings.Join(driftedFields, ", ") + "\n")
+	}
+	b.WriteString("\nThis note is MECHANICAL: the controller wrote it, not your previous\n")
+	b.WriteString("session. It carries no reasoning, no plan, and no summary of what you\n")
+	b.WriteString("were doing — only the facts above, which are the only things the\n")
+	b.WriteString("controller actually knows.\n\n")
+	b.WriteString("It deliberately does not tell you how to recover, and does not tell you\n")
+	b.WriteString("what to assume about your own context. The controller does not know\n")
+	b.WriteString("which startup protocol your pack defines, and it is not the right place\n")
+	b.WriteString("to find out whether your conversation was resumed or started fresh.\n")
+	b.WriteString("Follow your own role prompt; a confident wrong instruction from here is\n")
+	b.WriteString("worse than none.\n")
+	return b.String()
+}
+
+// sendConfigDriftHandoffMailWithStores is sendConfigDriftHandoffMail over the
+// two stores createHandoffMail takes, mirroring gc handoff: the handoff message
+// bead is MESSAGING-class (msgStore) and beadmail's addressing reads are
+// SESSIONS-class (sessStore). On a split city the two differ, and minting the
+// handoff into the session store would write it where nothing delivers from.
+func sendConfigDriftHandoffMailWithStores(msgStore, sessStore beads.Store, rec events.Recorder, recipient, body string, stderr io.Writer) {
+	if msgStore == nil || sessStore == nil || recipient == "" {
+		return
+	}
+	// No restart hint: this restart proceeds whatever the note's fate, so the
+	// "NOT restarted, re-run gc handoff" advice would be false here.
+	createHandoffMailReporting(msgStore, sessStore, rec, controllerMailIdentity, recipient,
+		[]string{"HANDOFF: config-drift restart", body}, "HANDOFF: config-drift restart",
+		[]string{mail.AutoHandoffLabel, mail.ArchiveAfterInjectLabel, "priority:1"}, stderr,
+		"session reconciler: config-drift handoff", "")
+}
+
+// reconcilerMailStore resolves the MESSAGING-class store for the mail the
+// reconciler itself sends (config-drift handoffs and drift-wave notices). The
+// reconciler is handed the SESSIONS-class store, which on a split city is not
+// where mail lives, so the class is resolved through the routes this process
+// answers residency from (a running controller's registered boot routes, else
+// the one-shot funnel) over the city work store that controller registered.
+// Without a registration the session store stands in for the work store: the
+// same store on every city that relocates nothing.
+func reconcilerMailStore(cityPath string, cfg *config.City, sessStore beads.Store, rec events.Recorder) beads.Store {
+	work := registeredCityWorkStore(cityPath)
+	if work == nil {
+		work = sessStore
+	}
+	return resolveMailMessagesStore(residencyRoutesForCity(cityPath), work, cfg, cityPath, rec)
+}
+
 // namedSessionActivityThreshold is the maximum age of the last reliable
 // activity reference for a named session to be considered "actively in use".
 //
@@ -6482,6 +7373,67 @@ func sessionConfigDriftKey(info sessionpkg.Info, cfg *config.City, tp TemplatePa
 	return storedHash + ":" + currentHash
 }
 
+// configDriftLazyFields are core-fingerprint fields whose drift affects only
+// the rendered prompt/context of the NEXT conversation — nothing about the
+// currently running process. Drift confined to these fields never restarts or
+// drains a live session; it applies at the session's next natural cycle.
+// Deliberately narrow: FPExtra is exactly the field the 2026-07-18 city-wide
+// [agent_defaults].append_fragments change drifted (ga-9n5hj). Env is NOT
+// lazy — fingerprinted env keys (BEADS_DIR, GC_RIG, CLAUDE_CONFIG_DIR pins)
+// change where an agent reads work or which account it bills, and running
+// indefinitely on the old values is itself a hazard.
+//
+// The two fields share the "next cycle, nothing about the live process"
+// property but are applied differently (see the classification site):
+//   - FPExtra-only drift is SKIPPED: the stored hash is left stale so a
+//     concurrent eager change (command/env) keeps the mismatch visible and the
+//     drift re-evaluates each tick until a natural cycle picks the new prompt
+//     up. A prompt fragment never needs a restart to take effect.
+//   - CopyFiles-only drift is ACCEPTED IN PLACE: the core baselines are
+//     rebaselined (acceptCopyFilesDriftInPlace) because a staged copy is
+//     written into the session workDir before the process starts and is never
+//     re-read while it runs (internal/runtime/staging.go StageWorkDir). A
+//     CopyFiles-ONLY drift describes re-materializing staged content for the
+//     NEXT start, not a change to the live agent's behavior. The 2026-08-20
+//     fleet drain (hq-wi4ka) proved the eager path is catastrophic here: a
+//     one-line edit to a tracked script under <city>/scripts flipped all 14
+//     sessions' CopyFiles hash and drained the fleet with no handoff,
+//     destroying every conversation — to change a file no running session had
+//     open. Rebasing in place records that the copy refreshes at the next
+//     natural start and stops the drain without destroying context. Unlike
+//     FPExtra, CopyFiles sits in the PROVISION half (fingerprint_partition.go),
+//     so without an in-place accept the drift would otherwise force a full
+//     re-provision rebuild.
+//
+// Both stay narrow: drift in these fields combined with ANY other field keeps
+// the eager path, and non-listed fields are unaffected. Env remains eager.
+var configDriftLazyFields = map[string]bool{
+	"FPExtra":   true,
+	"CopyFiles": true,
+}
+
+// configDriftCopyFilesOnly reports whether the drift is exactly CopyFiles
+// (no other field). Such drift is accepted in place (rebaselined) rather than
+// skipped like FPExtra — see configDriftLazyFields.
+func configDriftCopyFilesOnly(driftedFields []string) bool {
+	return len(driftedFields) == 1 && driftedFields[0] == "CopyFiles"
+}
+
+// configDriftLazyApplicable reports whether ALL drifted fields are lazily
+// applicable. An empty field list (no stored breakdown — legacy bead) cannot
+// be classified and keeps the eager path.
+func configDriftLazyApplicable(driftedFields []string) bool {
+	if len(driftedFields) == 0 {
+		return false
+	}
+	for _, f := range driftedFields {
+		if !configDriftLazyFields[f] {
+			return false
+		}
+	}
+	return true
+}
+
 func configDriftTracePayload(storedHash, currentHash string, driftedFields []string, extra traceRecordPayload) traceRecordPayload {
 	fields := append([]string(nil), driftedFields...)
 	if fields == nil {
@@ -6742,6 +7694,7 @@ func resetConfiguredNamedSessionForConfigDriftInfo(
 	if preserveResume {
 		batch["started_config_hash"] = priorStartedConfigHash
 	}
+	sessionpkg.StampPriorSessionKeyInfo(batch, info)
 	batch[namedSessionConfigDriftDeferredAtMetadata] = ""
 	batch[namedSessionConfigDriftDeferredKeyMetadata] = ""
 	batch[sessionAttachedConfigDriftDeferredAtMetadata] = ""
@@ -7507,6 +8460,53 @@ func sessionHashRebaselineMetadata(agentCfg runtime.Config) (map[string]string, 
 	}, nil
 }
 
+// copyFilesDriftRebaselineMetadata builds the rebaseline patch for a
+// CopyFiles-ONLY config drift accepted in place. Unlike
+// sessionHashRebaselineMetadata (the version-artifact path, where the config
+// did not actually change so every baseline moves), this moves ONLY the core
+// identity baselines — started_config_hash, started_provision_hash,
+// started_launch_hash, and core_hash_breakdown — and deliberately leaves
+// started_live_hash/live_hash untouched: a CopyFiles drift says nothing about
+// the live half, and moving the live baseline here would mask a concurrent
+// SessionLive change that the live-drift clause is responsible for
+// re-applying. The staged content itself is NOT re-copied (the running process
+// never re-reads it); the new content takes effect at the session's next
+// natural start, and rebaselining simply records that outcome so the
+// reconciler stops reporting drift for a change that requires no restart.
+func copyFilesDriftRebaselineMetadata(agentCfg runtime.Config) (map[string]string, error) {
+	breakdownJSON, err := json.Marshal(runtime.CoreFingerprintBreakdown(agentCfg))
+	if err != nil {
+		return nil, fmt.Errorf("marshaling core_hash_breakdown: %w", err)
+	}
+	return map[string]string{
+		"started_config_hash":    runtime.CoreFingerprint(agentCfg),
+		"started_provision_hash": runtime.ProvisionFingerprint(agentCfg),
+		"started_launch_hash":    runtime.LaunchFingerprint(agentCfg),
+		"core_hash_breakdown":    string(breakdownJSON),
+	}, nil
+}
+
+// acceptCopyFilesDriftInPlace rebaselines a CopyFiles-ONLY drift in place
+// instead of draining the session. Returns (patch, nil) on success so the
+// caller can fold it onto the typed snapshot (Step 6d write-returns-Info),
+// (nil, nil) when there is nothing to do (empty id / nil front-door), and
+// (nil, err) on persist failure — on failure the caller falls through to the
+// normal eager drain path so a transient store error never silently suppresses
+// a real config change.
+func acceptCopyFilesDriftInPlace(id string, sessFront *sessionpkg.Store, agentCfg runtime.Config) (map[string]string, error) {
+	if id == "" || sessFront == nil {
+		return nil, nil
+	}
+	patch, err := copyFilesDriftRebaselineMetadata(agentCfg)
+	if err != nil {
+		return nil, err
+	}
+	if err := sessFront.ApplyPatch(id, patch); err != nil {
+		return nil, fmt.Errorf("accepting copy-files drift in place: %w", err)
+	}
+	return patch, nil
+}
+
 // silentRebaselineSessionHashes overwrites the six fingerprint metadata
 // fields (started_config_hash, started_provision_hash, started_launch_hash,
 // started_live_hash, live_hash, core_hash_breakdown) with values produced by
@@ -7579,6 +8579,7 @@ func silentRebaselineSessionHashes(id string, sessFront *sessionpkg.Store, agent
 // protection.
 func relaunchAgentForLaunchDrift(
 	ctx context.Context,
+	startFence *sessionStartFence,
 	sp runtime.Provider,
 	sessFront *sessionpkg.Store,
 	info sessionpkg.Info,
@@ -7686,7 +8687,15 @@ func relaunchAgentForLaunchDrift(
 		fmt.Fprintf(stderr, "session reconciler: launch-drift relaunch for %s minted a speculative resume key (no prior conversation); falling back to full restart\n", name) //nolint:errcheck
 		return false, relaunchAbortResidueFold(preparedInfo, sessFront, hadResumeKeyBeforePrepare)
 	}
-	if err := r.Relaunch(ctx, name, prepared.cfg); err != nil {
+	// The relaunch respawns the agent process in its work_dir: bracket it in
+	// the worktree reaper's session-start fence like any start (ga-yuiof4
+	// item 3), deferred so a panic or error cannot leave it counted in flight.
+	relaunchErr := func() error {
+		startFence.beginStart()
+		defer startFence.endStart()
+		return r.Relaunch(ctx, name, prepared.cfg)
+	}()
+	if err := relaunchErr; err != nil {
 		// ErrRelaunchUnsupported (a wrapper whose backend cannot relaunch) or a
 		// genuine failure (e.g. the warm box vanished → ErrSessionNotFound). Fall
 		// back to the full restart so the launch change is still applied.

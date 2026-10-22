@@ -747,6 +747,16 @@ func TestProvider_JoinedForeignAgentPaneIsNotTheAgent(t *testing.T) {
 	foreign := f.mustRun(t, "list-panes", "-t", "=gc-test-other:", "-F", "#{pane_id}")
 	f.mustRun(t, "new-session", "-d", "-s", "gc-test-keepalive", "sleep 300")
 	f.mustRun(t, "join-pane", "-b", "-s", foreign, "-t", f.agent)
+	agentWindow := f.mustRun(t, "display-message", "-p", "-t", f.agent, "#{window_id}")
+	if got := f.mustRun(t, "display-message", "-p", "-t", foreign, "#{window_id}"); got != agentWindow {
+		t.Fatalf("joined pane %s is in window %s, want the agent's %s (precondition)", foreign, got, agentWindow)
+	}
+	// Whether join-pane -b lists the joined pane first depends on the tmux
+	// version, so put it first by id: the foreign pane must lead the list for
+	// a first-pane resolver to mistake it for the agent.
+	if first, _, _ := strings.Cut(f.mustRun(t, "list-panes", "-s", "-t", paneTarget(f.name), "-F", "#{pane_id}"), "\n"); first != foreign {
+		f.mustRun(t, "swap-pane", "-s", f.agent, "-t", foreign)
+	}
 	first, _, _ := strings.Cut(f.mustRun(t, "list-panes", "-s", "-t", paneTarget(f.name), "-F", "#{pane_id}"), "\n")
 	if first != foreign {
 		t.Fatalf("first pane = %s, want the joined foreign pane %s (precondition)", first, foreign)
@@ -1100,12 +1110,12 @@ func TestProvider_RelaunchWithholdsControllerTokenFromRespawnedPane(t *testing.T
 	)
 	t.Setenv(tokenVar, token)
 
-	// A socket unique to this test, so the tmux server it starts forks from THIS
-	// process and its global environment carries the token — that server env is
-	// the thing respawn-pane hands to the new process.
+	// A socket unique to this test, whose server global environment carries the
+	// token — that server env is the thing respawn-pane hands to the new process.
 	cfg := DefaultConfig()
 	cfg.SocketName = privateSocketName("rp")
 	p := NewProviderWithConfig(cfg)
+	seedServerGlobalEnv(t, p.Tmux(), tokenVar, token)
 	name := "gc-test-relaunch-token-pin"
 	_ = p.Stop(name)
 	defer func() { _ = p.Stop(name) }()
@@ -1160,6 +1170,7 @@ func TestProvider_RelaunchRepinsControllerTokenInPreexistingWarmBox(t *testing.T
 	cfg := DefaultConfig()
 	cfg.SocketName = privateSocketName("rr")
 	p := NewProviderWithConfig(cfg)
+	seedServerGlobalEnv(t, p.Tmux(), tokenVar, token)
 	name := "gc-test-relaunch-token-repin"
 	_ = p.Stop(name)
 	defer func() { _ = p.Stop(name) }()

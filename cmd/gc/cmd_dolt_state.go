@@ -421,6 +421,7 @@ func newDoltStateCmd(stdout, stderr io.Writer) *cobra.Command {
 	_ = stopManaged.MarkFlagRequired("city")
 	cmd.AddCommand(stopManaged)
 
+	lifecycleLockFD := -1
 	startManaged := &cobra.Command{
 		Use:    "start-managed",
 		Short:  "Start the managed Dolt process for a city",
@@ -428,26 +429,17 @@ func newDoltStateCmd(stdout, stderr io.Writer) *cobra.Command {
 		Args:   cobra.NoArgs,
 		RunE: func(_ *cobra.Command, _ []string) error {
 			if guardErr := admitLegacyManagedDoltLifecycle(cityPath); guardErr != nil {
-				fmt.Fprintf(stderr, "gc dolt-state start-managed: %v\n", guardErr) //nolint:errcheck
+				writeStartManagedFailure(stdout, stderr, guardErr, true)
 				return errExit
 			}
-			lock, _, lockErr := openManagedDoltLifecycleLock(cityPath)
+			releaseLock, lockErr := acquireStartManagedLifecycleLock(cityPath, lifecycleLockFD)
 			if lockErr != nil {
-				fmt.Fprintf(stderr, "gc dolt-state start-managed: %v\n", lockErr) //nolint:errcheck
+				writeStartManagedFailure(stdout, stderr, lockErr, true)
 				return errExit
 			}
-			locked, lockErr := tryManagedDoltLifecycleLock(lock)
-			if lockErr != nil || !locked {
-				releaseManagedDoltLifecycleLock(lock)
-				if lockErr == nil {
-					lockErr = fmt.Errorf("managed dolt lifecycle is busy")
-				}
-				fmt.Fprintf(stderr, "gc dolt-state start-managed: %v\n", lockErr) //nolint:errcheck
-				return errExit
-			}
-			defer releaseManagedDoltLifecycleLock(lock)
+			defer releaseLock()
 			if guardErr := admitLegacyManagedDoltLifecycle(cityPath); guardErr != nil {
-				fmt.Fprintf(stderr, "gc dolt-state start-managed: %v\n", guardErr) //nolint:errcheck
+				writeStartManagedFailure(stdout, stderr, guardErr, true)
 				return errExit
 			}
 			report, err := startManagedDoltProcess(cityPath, hostText, portText, userText, logLevel, time.Duration(timeoutMS)*time.Millisecond)
@@ -458,7 +450,14 @@ func newDoltStateCmd(stdout, stderr io.Writer) *cobra.Command {
 				}
 			}
 			if err != nil {
-				fmt.Fprintf(stderr, "gc dolt-state start-managed: %v\n", err) //nolint:errcheck
+				// Refused only where a bare start could add a second server:
+				// the data-dir store lock still held, or a failure after the
+				// scope watchdog started. Every other failure, including the
+				// disk floor (checkManagedDoltDiskPreflight), stays a plain
+				// error on purpose: gc-beads-bd.sh then takes the bare start
+				// with no disk check, which is what production has always
+				// run; refusing to start over the floor is a separate decision.
+				writeStartManagedFailure(stdout, stderr, err, isManagedDoltStartRefusal(err))
 				return errExit
 			}
 			return nil
@@ -470,6 +469,7 @@ func newDoltStateCmd(stdout, stderr io.Writer) *cobra.Command {
 	startManaged.Flags().StringVar(&userText, "user", "", "Dolt user")
 	startManaged.Flags().StringVar(&logLevel, "log-level", "warning", "Dolt log level")
 	startManaged.Flags().IntVar(&timeoutMS, "timeout-ms", 30000, "readiness timeout in milliseconds")
+	startManaged.Flags().IntVar(&lifecycleLockFD, "lifecycle-lock-fd", -1, "inherited fd on which the caller holds the managed dolt lifecycle lock")
 	_ = startManaged.MarkFlagRequired("city")
 	_ = startManaged.MarkFlagRequired("port")
 	cmd.AddCommand(startManaged)

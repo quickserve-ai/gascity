@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"slices"
 	"strings"
 	"sync"
@@ -48,6 +49,10 @@ const (
 	releaseOrphan // the confirmed orphan and the dead-assignee sweep: one policy
 	releaseRetired
 	releaseLadder // the work ladder's release of an unstarted claim (PHASE1-2 §6.5)
+	// releaseDrainAckTeardown is the carry's drain-ack teardown of a pool seat
+	// that acked holding work (ga-x99xh0): unlike D5's drain-ack it gives back
+	// open claims too, since the seat is closed in the same act.
+	releaseDrainAckTeardown
 )
 
 // laneRule says when a released claim's route counts as served.
@@ -108,6 +113,30 @@ var releasePolicies = map[releaseWhy]releasePolicy{
 	releaseOrphan:         {statuses: openOrStarted, lane: laneDirect, pool: true},
 	releaseRetired:        {statuses: openOrStarted, lane: laneCarried, seatRoute: true},
 	releaseLadder:         {statuses: startedOnly, lane: laneCarried, seatRoute: true},
+	// The carry's drain-ack teardown (ga-x99xh0): the seat closes in the same
+	// act, so its open claims are given back too, as on the stranded repair.
+	releaseDrainAckTeardown: {statuses: openOrStarted, lane: laneCarried, seatRoute: true},
+}
+
+// releaseAuditPaths labels each release path on the audit line a landed
+// release writes (ReleaseWorkBead, ga-9n8hjv), so a successful release is never
+// silent, and on the proposal a withheld one stamps
+// (gc.release_proposed_path). The orphan paths write through
+// releaseOrphanedPoolAssignment, under the label it has always proposed with.
+// orphanReleaseAuditPath labels both orphan releases (the dead-assignee
+// sweep and the confirmed-orphan close) wherever they propose: in
+// releaseListed and in releaseOrphanedPoolAssignment's own guard check.
+const orphanReleaseAuditPath = "orphaned-pool-assignment"
+
+var releaseAuditPaths = map[releaseWhy]string{
+	releaseKilledSeat:       "killed-seat-unexecuted-claim",
+	releaseDrainAck:         "draining-session-unexecuted-claim",
+	releaseCloseCascade:     "closing-session-release",
+	releaseStrandedRepair:   "stranded-pool-worker-repair",
+	releaseOrphan:           orphanReleaseAuditPath,
+	releaseRetired:          "retired-session-unclaim",
+	releaseLadder:           "work-ladder-unstarted-claim",
+	releaseDrainAckTeardown: drainAckTeardownReleasePath,
 }
 
 // Why a claim was kept or failed.
@@ -116,6 +145,8 @@ const (
 	keptUnservedRoute = "unserved-route"
 	keptMoved         = "moved"
 	keptDetachedAlive = "detached-alive"
+	keptNamedProposed = "named-release-proposed" // ga-9n8hjv fence #1
+	keptOrphanClose   = "orphan-close-held"      // the orphan close's own gates (orphanCloseHold)
 	failedBudget      = "budget"
 )
 
@@ -141,10 +172,28 @@ type releaseSeat struct {
 	// recordedUnread: the work_started cell could not be read, so it may name
 	// any claim (PHASE1-2 §6.1: unreadable reads as every claim started).
 	recordedUnread bool
+	// named and alias are the seat's own named-session facts (metadata, so
+	// they hold with no config and for a removed agent): releaseListed builds
+	// the named-release guard from them (ga-9n8hjv fence #1). guard, when
+	// built, is a caller's guard that replaces that one (the orphan sweep's
+	// per-bead guard, the orphan close's session guard).
+	named bool
+	alias string
+	guard namedReleaseGuard
+	// records are the identities the seat's own record answers to under the
+	// keys that can hold a qualified "<rig>/<name>" identity (alias,
+	// configured named identity, alias history: session.HasRecordAnsweringTo's
+	// keys): the provenance the orphan close's roster gate accepts
+	// (orphanCloseHold). Only the session.Info form carries them, which both
+	// orphan closes hold; without them that gate protects more, never less.
+	records []string
 }
 
 func releaseSeatOfBead(b beads.Bead) releaseSeat {
-	s := releaseSeat{id: b.ID, name: b.Metadata["session_name"], template: b.Metadata["template"], fallback: retiredSessionFallbackRoute(b)}
+	s := releaseSeat{
+		id: b.ID, name: b.Metadata["session_name"], template: b.Metadata["template"], fallback: retiredSessionFallbackRoute(b),
+		named: isNamedSessionBead(b) || strings.TrimSpace(b.Metadata["configured_named_identity"]) != "", alias: b.Metadata["alias"],
+	}
 	s.nameStarted(b.Metadata[sessionpkg.CurrentBeadIDKey], b.Metadata[beadmeta.CurrentClaimBeadIDMetadataKey])
 	s.nameRecorded(startedClaimBead(b.Metadata[executionClaimStartedKey]))
 	s.nameWorkStarted(b.Metadata[sessionpkg.WorkStartedKey])
@@ -152,7 +201,15 @@ func releaseSeatOfBead(b beads.Bead) releaseSeat {
 }
 
 func releaseSeatOfInfo(info sessionpkg.Info) releaseSeat {
-	s := releaseSeat{id: info.ID, name: info.SessionNameMetadata, template: info.Template, fallback: retiredSessionFallbackRouteInfo(info)}
+	s := releaseSeat{
+		id: info.ID, name: info.SessionNameMetadata, template: info.Template, fallback: retiredSessionFallbackRouteInfo(info),
+		named: isNamedSessionInfo(info) || strings.TrimSpace(info.ConfiguredNamedIdentity) != "", alias: info.Alias,
+	}
+	for _, id := range append([]string{info.ConfiguredNamedIdentity, info.Alias}, info.AliasHistory...) {
+		if id = strings.TrimSpace(id); id != "" {
+			s.records = append(s.records, id)
+		}
+	}
 	s.nameStarted(info.CurrentlyProcessingBeadID, info.CurrentClaimBeadID)
 	s.nameRecorded(startedClaimBead(info.ExecutionClaimStarted))
 	s.nameWorkStarted(info.WorkStartedRaw)
@@ -225,24 +282,57 @@ type ReleaseOpts struct {
 	// released, and the outcome is Refused with those claims Kept. A seat's
 	// own drain-ack uses it: it must finish such work before it acks.
 	RefuseStarted bool
+	// Audit receives the line each landed release (RELEASED) and each named
+	// proposal (WITHHELD) writes (ga-9n8hjv): a successful release is never
+	// silent. A seat path passes the stderr its caller reports on, as the
+	// carry's release loops did; nil writes to the process log, which is where
+	// the orphan releases' lines have always gone.
+	Audit io.Writer
 }
 
 // ReleaseOutcome is what a release did with each claim.
 type ReleaseOutcome struct {
 	Released, Kept, Failed []seatWorkHit
 	Why                    map[string]string // by bead ID, for Kept and Failed
-	Route                  map[string]string // by bead ID, for a claim kept unserved: the route it would take
+	Route                  map[string]string // by bead ID, for a claim kept unserved (a named proposal included): the route it would take
 	Refused                bool              // RefuseStarted refused the release: Kept are the started claims
+	// keptWhy is each Kept claim's own reason, by index: Why is keyed by bead
+	// ID, which two stores can share (storeScopedBeadKey).
+	keptWhy []string
+}
+
+// keptReason is why Kept[i] was kept: its own reason when the release
+// recorded one, else Why's entry for its ID.
+func (o ReleaseOutcome) keptReason(i int) string {
+	if i < len(o.keptWhy) {
+		return o.keptWhy[i]
+	}
+	return o.Why[o.Kept[i].bead.ID]
+}
+
+// withheld counts the claims kept because the named-release guard proposed
+// them instead (ga-9n8hjv fence #1): still owned, by a named agent.
+func (o ReleaseOutcome) withheld() int {
+	n := 0
+	for _, k := range o.Kept {
+		if o.Why[k.bead.ID] == keptNamedProposed {
+			n++
+		}
+	}
+	return n
 }
 
 // strandedClaim is one claim kept because no lane serves it.
 type strandedClaim struct{ id, route, reason string }
 
-// Unserved are the claims kept because no lane serves them, by ID.
+// Unserved are the claims kept because no lane serves them, by ID: those
+// kept for that alone, and the named-agent proposals no lane would serve
+// either (ga-9n8hjv fence #1 keeps them first).
 func (o ReleaseOutcome) Unserved() []strandedClaim {
 	var out []strandedClaim
 	for _, k := range o.Kept {
-		if id := k.bead.ID; o.Why[id] == keptUnservedRoute {
+		id := k.bead.ID
+		if _, unrouted := o.Route[id]; o.Why[id] == keptUnservedRoute || o.Why[id] == keptNamedProposed && unrouted {
 			out = append(out, strandedClaim{id: id, route: o.Route[id], reason: keptUnservedRoute})
 		}
 	}
@@ -266,7 +356,7 @@ func ReleaseClaims(sw *SeatWork, scope ReleaseScope, seat releaseSeat, why relea
 		out := ReleaseOutcome{Why: map[string]string{}, Route: map[string]string{}}
 		for _, c := range claims {
 			if seat.keepsStarted(c.bead) {
-				out.Kept, out.Why[c.bead.ID], out.Refused = append(out.Kept, c), keptStarted, true
+				out.Kept, out.keptWhy, out.Why[c.bead.ID], out.Refused = append(out.Kept, c), append(out.keptWhy, keptStarted), keptStarted, true
 			}
 		}
 		if out.Refused {
@@ -279,15 +369,36 @@ func ReleaseClaims(sw *SeatWork, scope ReleaseScope, seat releaseSeat, why relea
 	if err != nil && p.startedKeeps {
 		return ReleaseOutcome{}, err
 	}
-	return releaseListed(claims, why, seat, sw.Legs().cfg, opts), err
+	// Under releaseOrphan this is the orphan close (the v2 close effect's): a
+	// seat's claims read through its legs. It takes the orphan close's own
+	// gates, as the legacy tie-break does; a claim one holds stays assigned to
+	// the seat, kept. (The dead-assignee sweep lists and gates its own claims
+	// and calls releaseListed.)
+	var held []seatWorkHit
+	if why == releaseOrphan {
+		claims, held = orphanCloseClaims(sw.Legs(), seat, claims)
+	}
+	out := releaseListed(claims, why, seat, sw.Legs().cfg, opts)
+	for _, h := range held {
+		out.Kept, out.keptWhy = append(out.Kept, h), append(out.keptWhy, keptOrphanClose)
+		out.Why[h.bead.ID] = keptOrphanClose
+	}
+	return out, err
 }
 
 // releaseListed is ReleaseClaims' body for claims a caller already listed
 // (the orphan releases list them from the tick's census).
 func releaseListed(claims []seatWorkHit, why releaseWhy, seat releaseSeat, cfg *config.City, opts ReleaseOpts) ReleaseOutcome {
 	p := releasePolicies[why]
+	audit := opts.Audit
+	if audit == nil {
+		audit = log.Writer()
+	}
 	out := ReleaseOutcome{Why: map[string]string{}, Route: map[string]string{}}
-	keep := func(c seatWorkHit, why string) { out.Kept = append(out.Kept, c); out.Why[c.bead.ID] = why }
+	keep := func(c seatWorkHit, why string) {
+		out.Kept, out.keptWhy = append(out.Kept, c), append(out.keptWhy, why)
+		out.Why[c.bead.ID] = why
+	}
 	var mine []seatWorkHit
 	for _, c := range claims {
 		if slices.Contains(p.statuses, c.bead.Status) {
@@ -304,9 +415,36 @@ func releaseListed(claims []seatWorkHit, why releaseWhy, seat releaseSeat, cfg *
 	if p.seatRoute {
 		fallback = seat.fallback
 	}
+	guard := seat.guard
+	if !guard.built {
+		guard = newNamedReleaseGuard(cfg, seat.id)
+		guard.sessionNamed = seat.named || guard.anyResolvesToNamedSession(seat.name, seat.alias)
+	}
 	for _, c := range mine {
 		if p.startedNamedKeeps && seat.keepsStarted(c.bead) {
 			keep(c, keptStarted)
+			continue
+		}
+		// A named agent's work is never released by a teardown or a sweep: the
+		// release is proposed (label and metadata on the bead, a WITHHELD audit
+		// line) and the claim stays assigned, so it is kept, not released
+		// (ga-9n8hjv fence #1). The guard sits ahead of every check that could
+		// release the claim, as it did at the carry's writers; only the
+		// started-claim keep above, which releases nothing, comes first.
+		if reason := guard.withholdReasonForBead(c.bead); reason != "" {
+			if _, err := proposeNamedRelease(c.store, c.bead, reason, releaseAuditPaths[why], audit); err != nil {
+				out.Failed = append(out.Failed, c)
+				out.Why[c.bead.ID] = err.Error()
+				continue
+			}
+			keep(c, keptNamedProposed)
+			// A proposed claim no lane would serve is stranded work as well (O5,
+			// revised): both rules keep it assigned, and a judge's release would
+			// land it in no lane, so the close stamps and names it as it does any
+			// unserved claim it keeps.
+			if route, served := releaseRoute(cfg, c.bead, fallback, p.lane); !served {
+				out.Route[c.bead.ID] = route
+			}
 			continue
 		}
 		if route, served := releaseRoute(cfg, c.bead, fallback, p.lane); !served {
@@ -321,7 +459,10 @@ func releaseListed(claims []seatWorkHit, why releaseWhy, seat releaseSeat, cfg *
 		}
 		if p.pool {
 			assignee := strings.TrimSpace(c.bead.Assignee)
-			if !liveWorkAssignmentStillReleasable(c.store, c.bead.ID, c.bead.Status, assignee) {
+			// The live re-read also requires the snapshot's routing inputs (the
+			// routed template, the canonical-root shape, gc.detached) to match, so a
+			// re-route the cache missed cannot release a live claim (ga-91tu1o).
+			if !liveWorkRowStillReleasable(c.store, c.bead, assignee) {
 				keep(c, keptMoved)
 				continue
 			}
@@ -330,11 +471,11 @@ func releaseListed(claims []seatWorkHit, why releaseWhy, seat releaseSeat, cfg *
 				keep(c, keptDetachedAlive)
 				continue
 			}
-			if !releaseOrphanedPoolAssignment(c.store, c.bead, clearDetached) {
+			if !releaseOrphanedPoolAssignment(c.store, c.bead, clearDetached, guard) {
 				keep(c, keptMoved)
 				continue
 			}
-		} else if err := workAssignmentForStore(beads.WorkStore{Store: c.store}).ReleaseWorkBead(c.bead, fallback); err != nil {
+		} else if err := workAssignmentForStore(beads.WorkStore{Store: c.store}).ReleaseWorkBead(c.bead, fallback, guard, audit, releaseAuditPaths[why]); err != nil {
 			out.Failed = append(out.Failed, c)
 			out.Why[c.bead.ID] = err.Error()
 			continue

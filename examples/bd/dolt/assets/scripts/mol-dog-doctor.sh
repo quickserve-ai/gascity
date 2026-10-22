@@ -8,7 +8,8 @@
 # Runs as an exec order (no LLM, no agent, no wisp).
 #
 # RPO note: BACKUP_STALE_S (default 43200 = 12h = 2x backup interval) is the
-# threshold at which backup artifact age triggers a [WARN: backup stale] advisory.
+# threshold at which backup age (the newer of the backup remote's manifest and
+# the last successful sync's stamp) triggers a [WARN: backup stale] advisory.
 # With 6h backup syncs and fail-closed journal corruption recovery, maximum data
 # loss on journal corruption without manual intervention is one 6h backup interval.
 # If BACKUP_STALE_S exceeds 2x the backup interval, a single missed backup cycle
@@ -148,6 +149,25 @@ backup_commit_mtime_for_db() {
     fi
 }
 
+# Succeed when the backup backup_commit_mtime_for_db dates for a database is a
+# Dolt remote's: its db-named directory's manifest or, without that directory,
+# a matching manifest. Only then can the local sync-success stamp (ga-g3p5rm)
+# speak for it: the stamp proves a `dolt backup sync`, and a bare-file
+# artifact dir has no Dolt remote for a sync to have written.
+backup_has_manifest_for_db() {
+    db_name="$1"
+    if [ -d "$BACKUP_ARTIFACT_DIR/$db_name" ]; then
+        [ -f "$BACKUP_ARTIFACT_DIR/$db_name/manifest" ]
+        return
+    fi
+    while IFS= read -r -d '' backup_path; do
+        if backup_path_matches_db "$db_name" "${backup_path#$BACKUP_ARTIFACT_DIR/}"; then
+            return 0
+        fi
+    done < <(find "$BACKUP_ARTIFACT_DIR" -type f -name manifest -print0 2>/dev/null)
+    return 1
+}
+
 append_backup_stale() {
     backup_stale_item="$1"
     if [ -n "$BACKUP_STALE_ITEMS" ]; then
@@ -218,8 +238,9 @@ if [ "${ORPHAN_COUNT:-0}" -gt 0 ]; then
     ORPHAN_WARN=" [WARN: $ORPHAN_COUNT orphan DBs detected — run gc dolt cleanup]"
 fi
 
-# Backup freshness: check each database's newest restorable backup, read from
-# the backup remote's manifest. See backup_commit_mtime_for_db.
+# Backup freshness: check each database's newest restorable backup, dated by
+# the newer of the backup remote's manifest (backup_commit_mtime_for_db) and
+# the last successful sync's stamp (ga-g3p5rm). See the loop below.
 # Every user database is in scope. DBs without a configured <db>-backup
 # remote are reported as a coverage gap rather than silently excluded —
 # the exclusion is how unconfigured production DBs went unbacked-up until
@@ -247,14 +268,53 @@ if [ -n "$BACKUP_ELIGIBLE_DBS" ]; then
     else
         NOW_S=$(date +%s)
         for db in $BACKUP_ELIGIBLE_DBS; do
+            # A Dolt remote's backup is dated by the newer of two proofs that a
+            # sync completed:
+            #   - the remote's manifest (backup_commit_mtime_for_db, upstream
+            #     #7381), rewritten last by a sync that adopted new data, so
+            #     the orphan chunks a KILLED sync leaves never date it;
+            #   - the local sync-success stamp (ga-g3p5rm), written whenever
+            #     `dolt backup sync` exits 0. An up-to-date sync does not
+            #     rewrite the manifest, so the manifest alone would page on
+            #     every idle database.
+            # Nothing to date is "missing", whatever the stamp says. A
+            # bare-file artifact dir (no manifest) keeps upstream's dating by
+            # its newest file, and the stamp does not count there. A stale
+            # remote with no stamp at all says so: no sync of it was ever
+            # recorded as successful.
             BACKUP_COMMIT_MTIME=$(backup_commit_mtime_for_db "$db")
             if [ "$BACKUP_COMMIT_MTIME" -le 0 ]; then
                 append_backup_stale "$db backup missing"
                 continue
             fi
-            BACKUP_AGE=$((NOW_S - BACKUP_COMMIT_MTIME))
+            # The stamp counts only while a manifest exists: a bare-file
+            # artifact dir (no manifest) is dated by its newest file alone, as
+            # upstream dates it, so a fresh stamp cannot make a stale chunk
+            # read fresh where no Dolt remote was ever synced.
+            # Guarded for `set -euo pipefail`: a missing stamp is normal (a
+            # database not synced since the stamp shipped), and an unguarded
+            # pipeline over a nonexistent file would abort the doctor pass.
+            BACKUP_STAMP_COUNTS=0
+            BACKUP_SYNCED_AT=0
+            if backup_has_manifest_for_db "$db"; then
+                BACKUP_STAMP_COUNTS=1
+                if [ -f "$LOCAL_BACKUP_FRESHNESS_DIR/$db" ]; then
+                    BACKUP_SYNCED_AT=$(sed -n 's/^synced_at_epoch=//p' \
+                        "$LOCAL_BACKUP_FRESHNESS_DIR/$db" 2>/dev/null | head -1 || true)
+                fi
+            fi
+            case "$BACKUP_SYNCED_AT" in ''|*[!0-9]*) BACKUP_SYNCED_AT=0 ;; esac
+            BACKUP_FRESH_AT="$BACKUP_COMMIT_MTIME"
+            if [ "$BACKUP_SYNCED_AT" -gt "$BACKUP_FRESH_AT" ]; then
+                BACKUP_FRESH_AT="$BACKUP_SYNCED_AT"
+            fi
+            BACKUP_AGE=$((NOW_S - BACKUP_FRESH_AT))
             if [ "$BACKUP_AGE" -gt "$BACKUP_STALE_S" ]; then
-                append_backup_stale "$db backup is $((BACKUP_AGE / 3600))h old"
+                if [ "$BACKUP_STAMP_COUNTS" -eq 1 ] && [ "$BACKUP_SYNCED_AT" -le 0 ]; then
+                    append_backup_stale "$db backup is $((BACKUP_AGE / 3600))h old (no successful sync recorded)"
+                else
+                    append_backup_stale "$db backup is $((BACKUP_AGE / 3600))h old"
+                fi
             fi
         done
     fi

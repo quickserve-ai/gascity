@@ -46,6 +46,25 @@ func RuntimeEnv(sessionID, sessionName string, generation, continuationEpoch int
 		// when empty, mirroring GC_INSTANCE_TOKEN) so a fresh incarnation never
 		// inherits a parent's stale holder token.
 		"BEADS_HOLDER_TOKEN": instanceToken,
+		// BEADS_ACTOR is the audit identity bd stamps on every write this
+		// session makes (issues.created_by, comments.author). bd resolves its
+		// actor as $BEADS_ACTOR -> git user.name -> $USER, so a session that
+		// reaches the runtime without it writes to the ledger under the repo's
+		// git user -- a HUMAN.
+		//
+		// It belongs HERE, beside BEADS_HOLDER_TOKEN and for the same reason:
+		// this is the one wiring point every start path passes through, so the
+		// identity a session presents to bd cannot depend on which path started
+		// it. The create-time template env seeds the same value
+		// (cmd/gc/template_resolve.go), but the resume/restart resolver does
+		// not: it rebuilds session env from the provider env plus the city
+		// anchors only (cmd/gc/worker_handle.go). On 2026-08-17 the mayor was
+		// the one session brought up by resume after a machine restart, ran for
+		// ~12 hours with no BEADS_ACTOR, and recorded its rulings as "Cherub
+		// Kumar" -- the Overseer (ga-xs28em). Set unconditionally (even when
+		// empty, mirroring GC_INSTANCE_TOKEN) so a fresh incarnation never
+		// inherits a parent's stale actor.
+		"BEADS_ACTOR": sessionName,
 	}
 	return env
 }

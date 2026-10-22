@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/materialize"
 )
 
@@ -20,11 +21,13 @@ import (
 // a real path (e.g. the doctor check) can do so when formatting errors.
 const citySentinel = "<city>"
 
-// SkillCollision describes an agent-local skill name provided by two
-// or more agents whose skills materialize into the same scope root and
-// the same on-disk sink. Providers are grouped by resolved sink, not by
-// name: distinct providers that share a sink (codex and pi both use
-// .agents/skills) collide with each other.
+// SkillCollision describes a skill name that agents materializing into
+// the same scope root and the same on-disk sink cannot all have: an
+// agent-local skill name provided by two or more agents, or a name that
+// resolves to two or more different source directories across the
+// agents' agent-local skills and opted-in skills. Providers are grouped
+// by resolved sink, not by name: distinct providers that share a sink
+// (codex and pi both use .agents/skills) collide with each other.
 type SkillCollision struct {
 	// ScopeRoot is the scope root the colliding agents materialize
 	// into. For rig-scoped agents this is the rig's configured path
@@ -40,14 +43,37 @@ type SkillCollision struct {
 	// SkillName is the colliding agent-local skill name.
 	SkillName string
 	// AgentNames lists, in sorted order, every agent providing the
-	// same agent-local skill name into this (ScopeRoot, sink) pair.
+	// same skill name into this (ScopeRoot, sink) pair.
 	AgentNames []string
+	// OptIn reports that at least one of the agents provides the name by
+	// opting in to a pack's opt-in skill (Agent.OptInSkills) rather than
+	// from its own agent-local skills.
+	OptIn bool
 }
 
-// ValidateSkillCollisions groups agents by (scope-root, resolved sink),
-// builds the multi-map agent-local-skill-name → [agent-names], and
-// returns one SkillCollision entry per name with more than one agent.
-// Returns nil when there are no collisions. The sink comes from
+// OptInAtScopeRoot reports whether stage 1 writes an agent's opted-in
+// skills into its scope-root sink. An agent with its own work_dir gets
+// them in that work_dir from the per-session pass instead, where only its
+// own skills are wanted, so they cannot collide with another agent's.
+type OptInAtScopeRoot func(agent *config.Agent) bool
+
+// ValidateSkillCollisions checks agent-local skills only: two agents
+// providing one agent-local skill name into the same sink collide. It is
+// ValidateSkillCollisionsWithOptIn without opt-in skills.
+func ValidateSkillCollisions(cfg *config.City) []SkillCollision {
+	return ValidateSkillCollisionsWithOptIn(cfg, nil)
+}
+
+// ValidateSkillCollisionsWithOptIn groups agents by (scope-root, resolved
+// sink), builds the multi-map skill-name → [agent-names] over each agent's
+// agent-local skills and, where atScopeRoot places them in that sink, its
+// opted-in skills, and returns one SkillCollision entry per name that two
+// or more agents provide as agent-local skills, or that resolves to two or
+// more source directories. Two agents opting in to the same skill share
+// one source and do not collide. An agent's own agent-local skill
+// overrides its opt-in of the same name, as it overrides a shared skill.
+// A nil atScopeRoot counts no opt-in skills. Returns nil when there are no
+// collisions. The sink comes from
 // materialize.VendorSink, so this gate stays in step with what the
 // materializer actually writes — including providers that share a sink.
 //
@@ -59,12 +85,12 @@ type SkillCollision struct {
 //   - empty scope is treated as "rig" (the default)
 //
 // Agents whose provider resolves to no sink contribute nothing — they
-// have nowhere to collide. Agents with no SkillsDir or whose SkillsDir
-// holds no skills also contribute nothing.
+// have nowhere to collide. Agents with no agent-local skills and no
+// opt-in skills also contribute nothing.
 //
 // Collisions are returned sorted by (ScopeRoot, Vendor, SkillName) so
 // tests and user-facing output are stable.
-func ValidateSkillCollisions(cfg *config.City) []SkillCollision {
+func ValidateSkillCollisionsWithOptIn(cfg *config.City, atScopeRoot OptInAtScopeRoot) []SkillCollision {
 	if cfg == nil || len(cfg.Agents) == 0 {
 		return nil
 	}
@@ -75,9 +101,8 @@ func ValidateSkillCollisions(cfg *config.City) []SkillCollision {
 	}
 
 	type bucketKey struct{ scope, sink string }
-	// buckets: scope+sink → skillName → agent name → that agent's
-	// provider (kept so the collision can name a concrete provider).
-	buckets := make(map[bucketKey]map[string]map[string]string)
+	// buckets: scope+sink → skillName → the agents providing it.
+	buckets := make(map[bucketKey]map[string]*skillProviders)
 
 	for i := range cfg.Agents {
 		a := &cfg.Agents[i]
@@ -107,34 +132,59 @@ func ValidateSkillCollisions(cfg *config.City) []SkillCollision {
 		}
 
 		names := listAgentLocalSkills(a.SkillsDir)
-		if len(names) == 0 {
+		// Opt-in names resolve against the catalogs in the agent's
+		// scope, and count in this sink only where stage 1 writes them.
+		// An unresolvable name failed config load already, and a read
+		// error leaves the unread opt-ins out, as a read error leaves
+		// agent-local skills out above.
+		var optIn []config.OptInSkill
+		if atScopeRoot != nil && len(a.OptInSkills) > 0 && atScopeRoot(a) {
+			optIn, _ = config.AgentOptInSkills(fsys.OSFS{}, cfg, a)
+		}
+		if len(names) == 0 && len(optIn) == 0 {
 			continue
 		}
 
 		key := bucketKey{scope: scope, sink: sink}
 		bucket := buckets[key]
 		if bucket == nil {
-			bucket = make(map[string]map[string]string)
+			bucket = make(map[string]*skillProviders)
 			buckets[key] = bucket
 		}
-		for _, name := range names {
-			agents := bucket[name]
-			if agents == nil {
-				agents = make(map[string]string)
-				bucket[name] = agents
+		provide := func(name string) *skillProviders {
+			p := bucket[name]
+			if p == nil {
+				p = &skillProviders{agents: make(map[string]string), sources: make(map[string]bool)}
+				bucket[name] = p
 			}
-			agents[a.QualifiedName()] = vendor
+			p.agents[a.QualifiedName()] = vendor
+			return p
+		}
+		local := make(map[string]bool, len(names))
+		for _, name := range names {
+			local[name] = true
+			p := provide(name)
+			p.localAgents++
+			p.sources[filepath.Join(a.SkillsDir, name)] = true
+		}
+		for _, s := range optIn {
+			if local[s.Name] {
+				continue
+			}
+			p := provide(s.Name)
+			p.optIn = true
+			p.sources[s.Dir] = true
 		}
 	}
 
 	var collisions []SkillCollision
 	for key, bucket := range buckets {
-		for skillName, agents := range bucket {
-			if len(agents) < 2 {
+		for skillName, p := range bucket {
+			if p.localAgents < 2 && len(p.sources) < 2 {
 				continue
 			}
-			names := make([]string, 0, len(agents))
-			for n := range agents {
+			names := make([]string, 0, len(p.agents))
+			for n := range p.agents {
 				names = append(names, n)
 			}
 			sort.Strings(names)
@@ -142,9 +192,10 @@ func ValidateSkillCollisions(cfg *config.City) []SkillCollision {
 				ScopeRoot: key.scope,
 				// Deterministic: the provider of the first agent
 				// in sorted order.
-				Vendor:     agents[names[0]],
+				Vendor:     p.agents[names[0]],
 				SkillName:  skillName,
 				AgentNames: names,
+				OptIn:      p.optIn,
 			})
 		}
 	}
@@ -159,6 +210,18 @@ func ValidateSkillCollisions(cfg *config.City) []SkillCollision {
 		return collisions[i].SkillName < collisions[j].SkillName
 	})
 	return collisions
+}
+
+// skillProviders records, for one skill name in one sink, the agents
+// providing it (agent name → that agent's provider, kept so a collision
+// can name a concrete provider), how many provide it as an agent-local
+// skill, the source directories it resolves to, and whether any agent
+// provides it by opting in.
+type skillProviders struct {
+	agents      map[string]string
+	localAgents int
+	sources     map[string]bool
+	optIn       bool
 }
 
 // scopeRootFor returns the scope-root key for an agent. Empty scope is

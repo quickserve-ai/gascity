@@ -280,11 +280,44 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 			// NO --model, while named-session resolution hard-errored on the
 			// same value. A whole city ran unpinned for hours while four
 			// agents were unwakeable (ra-jbbv0).
+			//
+			// Carried divergence (CARRY.md, "Claude model enum"): "opus",
+			// "opus-5" and "fable-5" launch at the 1M window, and the superseded
+			// pins stay selectable. A declared choice wins over the open template
+			// (config.OptionFlagArgs), so these aliases are the only thing that
+			// turns a short value into its 1M launch id; without them "opus"
+			// would reach the CLI verbatim and land on the 200k tier.
 			modelOption(
-				modelAlias("fable-5", "Fable 5", "claude-fable-5"),
-				modelAlias("opus", "Opus", "claude-opus-4-8"),
-				modelAlias("opus-5", "Opus 5", "claude-opus-5"),
+				// "fable-5" carries the [1m] suffix for the same reason "opus" does
+				// (ga-ljcm7c): without it the model lands on the 200k context tier,
+				// and every fable lane spawned through gc silently lost 800k of
+				// window while the CLI accepted the suffixed form all along. The
+				// bare pin stays selectable as "fable-5-200k"; a pinned value the
+				// enum does not declare would otherwise reach the CLI verbatim.
+				modelAlias("fable-5", "Fable 5 (1M)", "claude-fable-5[1m]"),
+				modelAlias("fable-5-200k", "Fable 5 (200k)", "claude-fable-5"),
+				// "opus" tracks the CURRENT Opus generation at the 1M context window
+				// through the CLI's own family alias + [1m] suffix, NOT a dated model
+				// ID (Cherub 2026-07-28: agents should "default to the latest version
+				// of opus ... on start"). A hardcoded generation has now gone stale
+				// under the fleet twice — sonnet-4-6 (ga-w8e27) and opus-4-8 here,
+				// after Opus 5 shipped — so the alias is the durable fix: the CLI
+				// resolves the newest Opus at spawn time. The [1m] suffix preserves
+				// the 1M window the dated opus-4-8 pin gave us; without it the alias
+				// lands on the 200k tier. Brackets are safe through gc's quoting
+				// layer: shellquote treats [ and ] as metacharacters and single-quotes
+				// the arg, and StripFlags re-splits before comparing tokens, so
+				// restart/override paths still match and don't duplicate the flag.
+				// The dated pins below stay for determinism and rollback.
+				modelAlias("opus", "Opus (latest, 1M)", "opus[1m]"),
+				modelAlias("opus-5", "Opus 5", "claude-opus-5[1m]"),
+				modelAlias("opus-4-8", "Opus 4.8", "claude-opus-4-8"),
 				modelAlias("opus-4-7", "Opus 4.7", "claude-opus-4-7"),
+				// "sonnet" tracks the current Sonnet generation, same as "opus"
+				// tracks latest above; "sonnet-4-6" is the explicit pin for the prior
+				// generation, same pattern as "opus-4-8"/"opus-4-7" (ga-w8e27 sweep,
+				// 2026-07-21: this choice was still pointing at claude-sonnet-4-6, a
+				// stale generation, while "opus" then tracked the current 4.8).
 				modelAlias("sonnet", "Sonnet", "claude-sonnet-5"),
 				modelAlias("sonnet-5", "Sonnet 5", "claude-sonnet-5"),
 				modelAlias("sonnet-4-6", "Sonnet 4.6", "claude-sonnet-4-6"),
@@ -309,10 +342,14 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 		// API key). Codex auth is the API key; no separate auth-token var.
 		UpstreamBaseURLEnv: "OPENAI_BASE_URL",
 		UpstreamAPIKeyEnv:  "OPENAI_API_KEY",
+		// No model or effort default: unless the city, agent or session
+		// chooses one, codex runs on the user's own ~/.codex/config.toml.
+		// Which models an account may use depends on how it is logged in
+		// (a ChatGPT-account login rejects ids an API key accepts), so a
+		// catalog pin here broke every turn for those users while the
+		// session looked healthy.
 		OptionDefaults: map[string]string{
 			"permission_mode": "unrestricted",
-			"model":           "gpt-5.5",
-			"effort":          "xhigh",
 		},
 		PromptMode:        "arg",
 		ReadyPromptPrefix: "\u203a ",
@@ -363,6 +400,10 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 				},
 			},
 			modelOption(
+				// gpt-6-astra (ga-dvz9bc): the open option already honors it, so a
+				// pin validates without this entry; it is listed so pickers and
+				// docs show it beside the other curated ids.
+				modelChoice("gpt-6-astra", "GPT-6 Astra"),
 				modelChoice("gpt-5.6-sol", "GPT-5.6 Sol"),
 				modelChoice("gpt-5.6-terra", "GPT-5.6 Terra"),
 				modelChoice("gpt-5.6-luna", "GPT-5.6 Luna"),
@@ -637,10 +678,16 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 		UpstreamAPIKeyEnv:  "AMP_API_KEY",
 		Args:               []string{"--dangerously-allow-all", "--no-ide"},
 		PromptMode:         "arg",
-		ProcessNames:       []string{"amp"},
-		InstructionsFile:   "AGENTS.md",
-		ResumeFlag:         "threads continue",
-		ResumeStyle:        "subcommand",
+		// A profile with NO readiness signal leaves every session stuck in
+		// state=creating forever (the omp incident, ga-8ouxd): gc never
+		// observes ready, the reconciler retries the start until it gives
+		// up. Delay-based like the other TUIs whose prompt glyph is
+		// unverified; replace with ReadyPromptPrefix when one is measured.
+		ReadyDelayMs:     8000,
+		ProcessNames:     []string{"amp"},
+		InstructionsFile: "AGENTS.md",
+		ResumeFlag:       "threads continue",
+		ResumeStyle:      "subcommand",
 	},
 	"opencode": {
 		DisplayName:  "OpenCode",
@@ -795,10 +842,14 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 		// gastownhall/gascity#672. Nudges still drain via the supervisor
 		// dispatcher / per-session poller without requiring provider
 		// hooks.
-		DisplayName:      "Auggie CLI",
-		Command:          "auggie",
-		Args:             []string{"--allow-indexing"},
-		PromptMode:       "arg",
+		DisplayName: "Auggie CLI",
+		Command:     "auggie",
+		Args:        []string{"--allow-indexing"},
+		PromptMode:  "arg",
+		// See the amp comment: no readiness signal = sessions never leave
+		// state=creating (ga-8ouxd). Delay until a real prompt glyph is
+		// measured.
+		ReadyDelayMs:     8000,
 		ProcessNames:     []string{"auggie"},
 		InstructionsFile: "AGENTS.md",
 		ResumeFlag:       "--resume",
@@ -832,11 +883,48 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 		Command:          "omp",
 		Args:             []string{"--hook", ".omp/hooks/gc-hook.ts"},
 		PromptMode:       "arg",
+		ReadyDelayMs:     8000,
 		ProcessNames:     []string{"omp", "node", "bun"},
 		SupportsHooks:    true,
 		InstructionsFile: "AGENTS.md",
 		ResumeFlag:       "--resume",
 		ResumeStyle:      "flag",
+		// Per-seat model pinning (ga-dfnyv5): effort rides inside omp's
+		// --model string as a :<effort> suffix (verified live on omp 18.1.10,
+		// 2026-09-04/05). "Default" (empty) leaves the seat on omp's own
+		// configured default. omp also exposes a separate --thinking flag,
+		// surfaced as its own option so a pin need not hardcode effort.
+		OptionsSchema: []BuiltinProviderOption{
+			// Open like every other model option (ga-fyh): a pin outside these
+			// curated aliases reaches omp verbatim as --model <id>
+			// ("<provider>/<model>[:<effort>]") instead of failing validation.
+			// Built by hand rather than with modelOption only to keep the
+			// "Default (omp config)" label; omp defines no -m short flag.
+			{
+				Key:   "model",
+				Label: "Model",
+				Type:  "select",
+				Choices: []BuiltinOptionChoice{
+					{Value: "", Label: "Default (omp config)"},
+					{Value: "astra-high", Label: "GPT-6 Astra (high)", FlagArgs: []string{"--model", "openai-codex/gpt-6-astra:high"}},
+					{Value: "astra-medium", Label: "GPT-6 Astra (medium)", FlagArgs: []string{"--model", "openai-codex/gpt-6-astra:medium"}},
+					{Value: "sol-high", Label: "GPT-5.6 Sol (high)", FlagArgs: []string{"--model", "openai-codex/gpt-5.6-sol:high"}},
+					{Value: "sol-medium", Label: "GPT-5.6 Sol (medium)", FlagArgs: []string{"--model", "openai-codex/gpt-5.6-sol:medium"}},
+				},
+				FlagTemplate: []string{"--model", optionValuePlaceholder},
+			},
+			{
+				Key:   "thinking",
+				Label: "Thinking Level",
+				Type:  "select",
+				Choices: []BuiltinOptionChoice{
+					{Value: "", Label: "Default"},
+					{Value: "high", Label: "High", FlagArgs: []string{"--thinking", "high"}},
+					{Value: "medium", Label: "Medium", FlagArgs: []string{"--thinking", "medium"}},
+					{Value: "low", Label: "Low", FlagArgs: []string{"--thinking", "low"}},
+				},
+			},
+		},
 	},
 	"antigravity": {
 		DisplayName: "Antigravity",

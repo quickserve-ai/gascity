@@ -21,12 +21,14 @@ import (
 // / session.State / session.MetadataPatch, and beads.Bead / SetMetadataBatch /
 // Update / Close are confined inside the impl.
 //
-// PHASE 0 STATUS: these write methods are the skeleton front door. Their
-// SIGNATURES are the contract Phase 4 routes call sites through; the bodies
-// already emit byte-identical bead writes to the raw ops they replace
-// (ApplyPatch == setMetaBatch == store.SetMetadataBatch with empty-skip), so a
-// recording-fake store can prove parity now. No production caller is routed
-// through them yet — that is Phase 4/5.
+// STATUS: these write methods are the session front door and are WIRED:
+// production reconciler, wait, soft-reload and CLI paths call ApplyPatch /
+// ApplyPatchInfo. The bodies emit byte-identical bead writes to the raw ops
+// they replaced (ApplyPatch == setMetaBatch == store.SetMetadataBatch with
+// empty-skip). The migration is NOT complete: raw SetMetadata /
+// SetMetadataBatch calls on session beads remain in cmd/gc, so "single write
+// chokepoint" below describes the design, not a guarantee. Before relying on
+// it, grep cmd/gc for raw SetMetadata* on session beads (ga-1wq7u5).
 
 // ApplyPatch applies a MetadataPatch to the session bead identified by id. It is
 // the single write chokepoint for session metadata transitions: every typed
@@ -896,7 +898,11 @@ func CommitPastKillFence() CommitOpt {
 // so `bd close` carries terminal's close_reason. The metadata is ordered
 // first, so a failed Close leaves the clears landed and the caller retries.
 // That arm keeps a residual race: a writer that lands after the read, or
-// between the Tx's two writes, is closed over.
+// between the Tx's two writes, is closed over. A Tx answering
+// beads.ErrWriteUnconfirmed (its writes committed, a read-back timed out) is
+// settled by a re-read: a row that reads closed is CommitLanded; otherwise the
+// error stands, still wrapping beads.ErrWriteUnconfirmed, so a caller can tell
+// "retry" from "failed".
 func (s *Store) CommitClose(d Decided, terminal MetadataPatch, now time.Time, opts ...CommitOpt) (res CommitResult, err error) {
 	defer func() {
 		if res != CommitLanded {
@@ -954,9 +960,22 @@ func (s *Store) CommitClose(d Decided, terminal MetadataPatch, now time.Time, op
 		}
 		return tx.Close(id)
 	}); err != nil {
+		if errors.Is(err, beads.ErrWriteUnconfirmed) && s.readsClosed(id) {
+			// The Tx's writes committed and only a read-back timed out: a
+			// row that now reads closed is this close landing, not a failure.
+			log.Printf("session %s: close landed; %v", id, err)
+			return CommitLanded, nil
+		}
 		return 0, err
 	}
 	return CommitLanded, nil
+}
+
+// readsClosed reports whether id reads closed now. A failed read is not
+// evidence of a close.
+func (s *Store) readsClosed(id string) bool {
+	b, err := s.validatedBead(id)
+	return err == nil && b.Status == "closed"
 }
 
 // errCloseContended is closeAtomically's exhausted fence.

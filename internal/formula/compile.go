@@ -35,7 +35,7 @@ import (
 //  10. ApplyRalph — expand inline Ralph run/check steps
 //  11. toRecipe — flatten step tree to Recipe
 func Compile(_ context.Context, name string, searchPaths []string, vars map[string]string) (*Recipe, error) {
-	return compileFormula(name, searchPaths, vars, true)
+	return compileFormula(name, searchPaths, vars, true, IsFormulaV2Enabled())
 }
 
 // CompileWithoutRuntimeVarValidation compiles a formula while deferring
@@ -45,14 +45,21 @@ func Compile(_ context.Context, name string, searchPaths []string, vars map[stri
 // preserve idempotency or report residual title placeholders alongside missing
 // vars.
 func CompileWithoutRuntimeVarValidation(_ context.Context, name string, searchPaths []string, vars map[string]string) (*Recipe, error) {
-	return compileFormula(name, searchPaths, vars, false)
+	return compileFormula(name, searchPaths, vars, false, IsFormulaV2Enabled())
+}
+
+// CompileWithoutRuntimeVarValidationForHost is CompileWithoutRuntimeVarValidation
+// judged against an explicit formula_v2 setting instead of the process-wide
+// flag, for callers (gc doctor) that must evaluate a city's configuration
+// regardless of what the process last applied.
+func CompileWithoutRuntimeVarValidationForHost(_ context.Context, name string, searchPaths []string, vars map[string]string, v2Enabled bool) (*Recipe, error) {
+	return compileFormula(name, searchPaths, vars, false, v2Enabled)
 }
 
 const explicitGraphRequirementError = `requires: formulas that use graph-only constructs must declare [requires] formula_compiler = ">=2.0.0" or the deprecated contract = "graph.v2" explicitly`
 
-func compileFormula(name string, searchPaths []string, vars map[string]string, validateRuntimeVars bool) (*Recipe, error) {
+func compileFormula(name string, searchPaths []string, vars map[string]string, validateRuntimeVars, v2Enabled bool) (*Recipe, error) {
 	parser := NewParser(searchPaths...).SetSource(SourceFromEnv())
-	v2Enabled := IsFormulaV2Enabled()
 	var composedRequirements []formulaCompilerConstraint
 	collectComposedRequirements := func(f *Formula) error {
 		constraints, err := formulaCompilerConstraints(f)
@@ -314,6 +321,7 @@ func toRecipeWithGraph(f *Formula, graphWorkflow bool) (*Recipe, error) {
 		Pour:          f.Pour,
 		ContentHash:   f.ContentHash,
 		FormulaSource: f.Source,
+		PathAgnostic:  f.PathAgnostic,
 	}
 
 	// Determine root title: use {{title}} placeholder if the variable
@@ -680,11 +688,15 @@ func isDetachedGraphStep(step *Step) bool {
 // "blocks" edge here would make the root permanently unclosable: the store
 // refuses to close a blocked issue and the finalizer is the only bead that
 // would ever clear the blocker (ga-a6zy9). Ordering does not need the edge —
-// the finalizer already blocks on every graph sink, so it cannot run early,
-// and the root is a latch that is never routed or dispatched
-// (beadmeta.WorkflowTopologyKinds). The edge is retained as "tracks" so the
-// root still reaches its finalizer through the dependency graph for cascade
-// delete and open-descendant traversal, both of which accept that type.
+// the finalizer already blocks on every graph sink, so it cannot run early.
+// Without a blocking dep the root is Ready from the moment it is created, and
+// graph routing still stamps it with gc.routed_to, but a root with real child
+// steps is a latch, never dispatched work (beadmeta.WorkflowTopologyKinds):
+// molecule instantiation stamps it gc.workflow_expanded=true, and every worker
+// claim and demand reader excludes a root carrying that stamp whatever its
+// route. The edge is retained as "tracks" so the root still reaches its
+// finalizer through the dependency graph for cascade delete and
+// open-descendant traversal, both of which accept that type.
 func addWorkflowRootDeps(rootID string, steps []*Step, idMapping map[string]string, deps *[]RecipeDep) {
 	for _, step := range steps {
 		if step != nil && step.Metadata[beadmeta.KindMetadataKey] == beadmeta.KindWorkflowFinalize {

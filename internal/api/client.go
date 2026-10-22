@@ -25,11 +25,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/api/apierr"
 	"github.com/gastownhall/gascity/internal/api/genclient"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/extmsg"
 	"github.com/gastownhall/gascity/internal/mail"
+	"github.com/gastownhall/gascity/internal/mail/beadmail"
 	"github.com/gastownhall/gascity/internal/opjournal"
 	"github.com/gastownhall/gascity/internal/opjournal/legacyop"
 	"github.com/gastownhall/gascity/internal/session"
@@ -331,18 +333,34 @@ func (c *Client) bearerToken() (string, error) {
 const sessionMessageTimeout = 4 * time.Minute
 
 // defaultClientTimeout is the overall HTTP timeout for control-plane client
-// calls. The read paths (ListBeads, GetBead, GetStatus, ListMailInbox,
-// ListConvoys, ...) pass context.Background() and rely solely on this ceiling,
+// calls. The read paths (ListBeads, GetBead, GetStatus, ListConvoys, ...) pass
+// context.Background() and rely solely on this ceiling (mail reads carry their
+// own mailReadClientTimeout deadline),
 // and several of them federate the city store plus every rig store — a
 // dolt-backed rig store can take many seconds, so a 10s ceiling false-timed-out
 // healthy-but-slow federated reads. Most calls return in milliseconds; this
 // only bounds the slow federated reads and genuinely hung requests.
 const defaultClientTimeout = 60 * time.Second
 
+// mailReadClientTimeout is the per-request deadline for mail reads
+// (ListMailInboxPage, GetMail, CountMail). It must exceed the server's
+// defaultMailReadDeadline (25s) so a typed store_slow problem detail arrives
+// before the client abandons the request (ga-x49mfh), and must not exceed
+// defaultClientTimeout or remoteResponseHeaderTimeout, which would otherwise
+// cut the request first. Only mail reads use it; other calls are unchanged.
+const mailReadClientTimeout = 30 * time.Second
+
+// mailReadContext returns the request context for a mail read call.
+func mailReadContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), mailReadClientTimeout)
+}
+
 // SessionSubmitResponse is the domain-facing shape of a session submit result.
 // Replayed marks a SubmitSessionWithKey retry answered from a finished
 // request's stored outcome: nothing ran again, and Message says that the
 // retry's own options, resume included, took no effect (request_id rule 6).
+// OpID is the id of the op the server recorded the request as, empty when it
+// recorded none.
 type SessionSubmitResponse struct {
 	Status   string               `json:"status"`
 	ID       string               `json:"id"`
@@ -350,6 +368,7 @@ type SessionSubmitResponse struct {
 	Intent   session.SubmitIntent `json:"intent"`
 	Replayed bool                 `json:"replayed,omitempty"`
 	Message  string               `json:"message,omitempty"`
+	OpID     string               `json:"op_id,omitempty"`
 }
 
 // sseEvent is a parsed SSE frame from the event stream.
@@ -1241,6 +1260,37 @@ func (c *Client) GetStatus() (CachedRead[StatusView], error) {
 // callers can surface _cache_age_s on --json output and a staleness banner
 // on human output.
 func (c *Client) ListMailInbox(agent, rig string) (CachedRead[MailListView], error) {
+	return c.ListMailInboxPage(agent, rig, "", 0)
+}
+
+// ListMailInboxPage is ListMailInbox with explicit keyset paging: cursor is
+// the previous page's MailListView.NextCursor ("" for the first page) and
+// limit caps the page (0 = server default). The server never returns more than
+// one page per call, so a caller that wants the whole mailbox loops until
+// NextCursor is empty.
+func (c *Client) ListMailInboxPage(agent, rig, cursor string, limit int) (CachedRead[MailListView], error) {
+	ctx, cancel := mailReadContext()
+	defer cancel()
+	return c.listMailInboxPage(ctx, agent, rig, cursor, limit)
+}
+
+// ListMailInboxWithTimeout is ListMailInbox bounded by timeout instead of
+// mailReadClientTimeout, for a caller that must give up sooner than a full
+// mail read is allowed to take without shortening that deadline for every
+// other mail read (ga-c3omvr: the prompt-submit inject hook's probe). A
+// non-positive timeout uses mailReadClientTimeout. A request cut off by the
+// timeout fails as a transport error (IsConnError), the same as any other
+// abandoned request.
+func (c *Client) ListMailInboxWithTimeout(agent, rig string, timeout time.Duration) (CachedRead[MailListView], error) {
+	if timeout <= 0 {
+		timeout = mailReadClientTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return c.listMailInboxPage(ctx, agent, rig, "", 0)
+}
+
+func (c *Client) listMailInboxPage(ctx context.Context, agent, rig, cursor string, limit int) (CachedRead[MailListView], error) {
 	if err := c.requireCityScope(); err != nil {
 		return CachedRead[MailListView]{}, err
 	}
@@ -1251,7 +1301,14 @@ func (c *Client) ListMailInbox(agent, rig string) (CachedRead[MailListView], err
 	if rig != "" {
 		params.Rig = &rig
 	}
-	resp, err := c.cw.GetV0CityByCityNameMailWithResponse(context.Background(), c.cityName, params)
+	if cursor != "" {
+		params.Cursor = &cursor
+	}
+	if limit > 0 {
+		l := int64(limit)
+		params.Limit = &l
+	}
+	resp, err := c.cw.GetV0CityByCityNameMailWithResponse(ctx, c.cityName, params)
 	if err != nil {
 		return CachedRead[MailListView]{}, &connError{err: fmt.Errorf("request failed: %w", err)}
 	}
@@ -1278,7 +1335,9 @@ func (c *Client) GetMail(id, rig string) (CachedRead[mail.Message], error) {
 	if rig != "" {
 		params.Rig = &rig
 	}
-	resp, err := c.cw.GetV0CityByCityNameMailByIdWithResponse(context.Background(), c.cityName, id, params)
+	ctx, cancel := mailReadContext()
+	defer cancel()
+	resp, err := c.cw.GetV0CityByCityNameMailByIdWithResponse(ctx, c.cityName, id, params)
 	if err != nil {
 		return CachedRead[mail.Message]{}, &connError{err: fmt.Errorf("request failed: %w", err)}
 	}
@@ -1297,6 +1356,161 @@ func (c *Client) GetMail(id, rig string) (CachedRead[mail.Message], error) {
 	}, nil
 }
 
+// MailSendRequest carries the parameters of a mail send for Client.SendMail.
+type MailSendRequest struct {
+	Rig     string // optional rig whose mail provider receives the message
+	From    string // sender identity stored verbatim by the server (empty = server default)
+	To      string // recipient (server-side resolution)
+	Subject string // required by the API (minLength 1)
+	Body    string
+}
+
+// SendMail creates a message via POST /v0/city/{cityName}/mail. It is a
+// mutation: on a remote client it carries the city-write grant the transport
+// mints per request; on a local client the CSRF header alone applies.
+func (c *Client) SendMail(req MailSendRequest) (mail.Message, error) {
+	if err := c.requireCityScope(); err != nil {
+		return mail.Message{}, err
+	}
+	body := genclient.SendMailJSONRequestBody{To: req.To, Subject: req.Subject}
+	setStrPtr(&body.Rig, req.Rig)
+	setStrPtr(&body.From, req.From)
+	setStrPtr(&body.Body, req.Body)
+	params := &genclient.SendMailParams{XGCRequest: "true"}
+	resp, err := c.cw.SendMailWithResponse(context.Background(), c.cityName, params, body)
+	if err != nil {
+		return mail.Message{}, &connError{err: fmt.Errorf("request failed: %w", err)}
+	}
+	if resp == nil {
+		return mail.Message{}, &connError{err: fmt.Errorf("nil response")}
+	}
+	if err := mailNotPersistedFromResponse(resp.StatusCode(), pdOf(resp)); err != nil {
+		return mail.Message{}, err
+	}
+	if err := apiErrorFromResponse(resp.StatusCode(), pdOf(resp)); err != nil {
+		return mail.Message{}, err
+	}
+	if resp.JSON202 != nil {
+		return mailUnconfirmedFromGen(*resp.JSON202)
+	}
+	if resp.JSON201 == nil {
+		return mail.Message{}, fmt.Errorf("API returned %d with no body", resp.StatusCode())
+	}
+	return mailMessageFromGen(*resp.JSON201), nil
+}
+
+// errMailAcceptedUnconfirmed is the cause a 202 from send-mail or reply-mail
+// carries: the server's store reported the write created but it could not be
+// read back.
+var errMailAcceptedUnconfirmed = errors.New("server answered 202: the write was reported created but could not be read back")
+
+// mailUnconfirmedFromGen turns a 202 (UNCONFIRMED write) into the same error
+// shape a local provider returns for one: a *mail.DeliveryUnconfirmedError
+// naming the message ID, so a caller can tell "check before re-sending" from
+// "re-send" (ga-nee27h). The message is returned too, for callers that want
+// the ID without unwrapping the error.
+func mailUnconfirmedFromGen(g genclient.Message) (mail.Message, error) {
+	m := mailMessageFromGen(g)
+	return m, fmt.Errorf("delivery unconfirmed: %w", &mail.DeliveryUnconfirmedError{ID: m.ID, Cause: errMailAcceptedUnconfirmed})
+}
+
+// mailNotPersistedFromResponse returns an error wrapping beadmail.ErrNotPersisted
+// when a mail write answered with the registered mail-not-persisted problem
+// code (a write the server verified absent), and nil for anything else, so the
+// caller's generic handling applies. It reads the machine code, never the
+// detail prose (ga-th31cy).
+func mailNotPersistedFromResponse(status int, pd *genclient.ErrorModel) error {
+	if status < 500 || pd == nil {
+		return nil
+	}
+	code := ""
+	if pd.Code != nil {
+		code = strings.TrimSpace(*pd.Code)
+	}
+	if code == "" && pd.Type != nil {
+		code = strings.TrimPrefix(strings.TrimSpace(*pd.Type), apierr.URNPrefix)
+	}
+	if code != apierr.MailNotPersisted.Code {
+		return nil
+	}
+	detail := ""
+	if pd.Detail != nil {
+		detail = *pd.Detail
+	}
+	return fmt.Errorf("server verified the write absent (%s): %w", detail, beadmail.ErrNotPersisted)
+}
+
+// MailReplyRequest carries the parameters of a mail reply for Client.ReplyMail.
+type MailReplyRequest struct {
+	Rig     string // optional rig hint for locating the original message
+	From    string // sender identity stored verbatim by the server (empty = server default)
+	Subject string // optional; the server derives "Re: …" when empty
+	Body    string
+}
+
+// ReplyMail replies to message id via POST /v0/city/{cityName}/mail/{id}/reply.
+// The server addresses the reply to the original sender. It is a mutation and
+// carries the same write credential as SendMail.
+func (c *Client) ReplyMail(id string, req MailReplyRequest) (mail.Message, error) {
+	if err := c.requireCityScope(); err != nil {
+		return mail.Message{}, err
+	}
+	body := genclient.ReplyMailJSONRequestBody{}
+	setStrPtr(&body.From, req.From)
+	setStrPtr(&body.Subject, req.Subject)
+	setStrPtr(&body.Body, req.Body)
+	params := &genclient.ReplyMailParams{XGCRequest: "true"}
+	if req.Rig != "" {
+		params.Rig = &req.Rig
+	}
+	resp, err := c.cw.ReplyMailWithResponse(context.Background(), c.cityName, id, params, body)
+	if err != nil {
+		return mail.Message{}, &connError{err: fmt.Errorf("request failed: %w", err)}
+	}
+	if resp == nil {
+		return mail.Message{}, &connError{err: fmt.Errorf("nil response")}
+	}
+	if err := mailNotPersistedFromResponse(resp.StatusCode(), pdOf(resp)); err != nil {
+		return mail.Message{}, err
+	}
+	if err := apiErrorFromResponse(resp.StatusCode(), pdOf(resp)); err != nil {
+		return mail.Message{}, err
+	}
+	if resp.JSON202 != nil {
+		return mailUnconfirmedFromGen(*resp.JSON202)
+	}
+	if resp.JSON201 == nil {
+		return mail.Message{}, fmt.Errorf("API returned %d with no body", resp.StatusCode())
+	}
+	return mailMessageFromGen(*resp.JSON201), nil
+}
+
+// MarkMailRead marks message id read via POST /v0/city/{cityName}/mail/{id}/read.
+// It is a mutation: it carries the CSRF header and, on a remote client, the
+// city-write grant the transport mints per request. The operation is
+// idempotent server-side and reversible (mark-unread). A non-2xx response maps
+// through apiErrorFromResponse, so a 403/404/5xx surfaces with the server's
+// problem-details text rather than a bare status.
+func (c *Client) MarkMailRead(id string) error {
+	if err := c.requireCityScope(); err != nil {
+		return err
+	}
+	// "." and ".." survive path escaping but are collapsed by URL resolution,
+	// so they would POST a different route (e.g. /v0/city/{city}/read).
+	if id == "" || id == "." || id == ".." {
+		return fmt.Errorf("invalid message id %q", id)
+	}
+	params := &genclient.PostV0CityByCityNameMailByIdReadParams{XGCRequest: "true"}
+	resp, err := c.cw.PostV0CityByCityNameMailByIdReadWithResponse(context.Background(), c.cityName, id, params)
+	if err != nil {
+		return &connError{err: fmt.Errorf("request failed: %w", err)}
+	}
+	if resp == nil {
+		return &connError{err: fmt.Errorf("nil response")}
+	}
+	return apiErrorFromResponse(resp.StatusCode(), pdOf(resp))
+}
+
 // CountMail fetches total/unread message counts via
 // GET /v0/city/{cityName}/mail/count. An empty agent lets the server choose
 // the default caller identity; rig narrows to a single rig's provider.
@@ -1311,7 +1525,9 @@ func (c *Client) CountMail(agent, rig string) (CachedRead[MailCountView], error)
 	if rig != "" {
 		params.Rig = &rig
 	}
-	resp, err := c.cw.GetV0CityByCityNameMailCountWithResponse(context.Background(), c.cityName, params)
+	ctx, cancel := mailReadContext()
+	defer cancel()
+	resp, err := c.cw.GetV0CityByCityNameMailCountWithResponse(ctx, c.cityName, params)
 	if err != nil {
 		return CachedRead[MailCountView]{}, &connError{err: fmt.Errorf("request failed: %w", err)}
 	}
@@ -1527,12 +1743,16 @@ func (c *Client) submitSession(id, message string, intent session.SubmitIntent, 
 	if err := json.Unmarshal(env.Payload, &p); err != nil {
 		return SessionSubmitResponse{}, fmt.Errorf("decode submit result: %w", err)
 	}
-	return SessionSubmitResponse{
+	out := SessionSubmitResponse{
 		Status: "accepted",
 		ID:     p.SessionID,
 		Queued: p.Queued,
 		Intent: session.SubmitIntent(p.Intent),
-	}, nil
+	}
+	if accepted.Op != nil {
+		out.OpID = accepted.Op.Id
+	}
+	return out, nil
 }
 
 // postSubmitSession posts one submit request and returns its 202 body; key,
@@ -1591,7 +1811,7 @@ func replayedSubmitOutcome(body *genclient.AsyncAcceptedBody, intent session.Sub
 	}
 	return SessionSubmitResponse{
 		Status: "accepted", ID: op.Conversation, Queued: queued, Intent: intent,
-		Replayed: true, Message: replayMessage(op.Id, arm, reason),
+		Replayed: true, Message: replayMessage(op.Id, arm, reason), OpID: op.Id,
 	}, true, nil
 }
 

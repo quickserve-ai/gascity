@@ -136,6 +136,16 @@ var ErrNudgeDeliveryUnconfirmed = errors.New("nudge delivery unconfirmed")
 // sentinel so callers can dispatch with errors.Is.
 var ErrNudgeNotSent = errors.New("nudge not sent")
 
+// ErrSessionBusy reports that a nudge was deferred, not delivered: the session
+// was running a turn that the provider's submit keys would have interrupted,
+// either when the provider's wait for idle ran out (nothing was typed) or
+// for the whole submit window after the message was typed (the submit was
+// never sent, and the provider cleared the typed message). No submit reached
+// the session and nothing the nudge typed is left in its input. Callers must
+// treat it as "try later": keep a queued nudge queued and do not count the
+// attempt against a delivery cap.
+var ErrSessionBusy = errors.New("nudge deferred: session is busy")
+
 // ErrExecUnsupported reports that a provider implements [ExecProvider] but the
 // underlying runtime does not implement the RPP `exec` wire op (it answered
 // exit 2). Carriers treat this as "fall back to the legacy driving op".
@@ -694,6 +704,32 @@ type IdleSnapshotProvider interface {
 // signal they would use without a snapshot.
 var ErrIdleIndeterminate = errors.New("session idle state is indeterminate")
 
+// TurnRunningProvider is an optional extension for runtimes that can tell, in
+// one look, whether a session's agent is running a turn now, read the way the
+// runtime's own nudge reads it before it types into the session. It is
+// narrower than [IdleSnapshotProvider]'s busy reading, which counts an
+// active-processing indicator anywhere in what it captured: where the runtime
+// can place a provider family's turn status on the live screen it reads it
+// there alone (tmux, for Codex: the rows right above the live composer), so
+// a busy row an earlier turn left in the scrollback is not a running turn.
+//
+// running=false with a nil err says no turn is running now. A non-nil err
+// means the look could not be made; the caller must not take the session as
+// idle. Composites do not implement it: it is read on the session's routed
+// leaf ([TurnRunningFor]).
+type TurnRunningProvider interface {
+	TurnRunning(name string) (running bool, err error)
+}
+
+// TurnRunningFor returns the [TurnRunningProvider] of the backend serving
+// session name, the leaf [ResolveBackend] names, and false when that backend
+// takes no such reading.
+func TurnRunningFor(p Provider, name string) (TurnRunningProvider, bool) {
+	leaf, _, _ := ResolveBackend(p, name)
+	tr, ok := leaf.(TurnRunningProvider)
+	return tr, ok
+}
+
 // ExecProvider is an optional extension for runtimes that expose the RPP
 // connection primitive: run a command inside the box and return its standard
 // output and exit code. It is the op a [Carrier] drives the session-interaction
@@ -863,7 +899,9 @@ type InputClearProvider interface {
 //
 // Codex CLI emits a durable "<turn_aborted>" marker when an in-flight turn has
 // actually been canceled. Waiting for that marker avoids racing a replacement
-// prompt into a session that still intends to finish the interrupted turn.
+// prompt into a session that still intends to finish the interrupted turn. A
+// session that was running no turn records nothing, and its boundary is
+// already reached.
 type InterruptBoundaryWaitProvider interface {
 	WaitForInterruptBoundary(ctx context.Context, name string, since time.Time, timeout time.Duration) error
 }
@@ -912,6 +950,25 @@ func TurnInterruptModeFor(p Provider, name string) TurnInterruptMode {
 	default:
 		return TurnInterruptKeystroke
 	}
+}
+
+// BackgroundWorkStopper is an optional extension for runtimes that can stop
+// work a provider keeps running after its turn was interrupted. A session's
+// explicit stop (session.Manager.StopTurn) calls it once the interrupt
+// boundary is reached; an interrupt that delivers a replacement message does
+// not, so a replacement turn leaves earlier work alone.
+//
+// Codex CLI runs a turn's commands in background terminals that outlive the
+// interrupted turn. tmux stops them with Codex's /stop, which closes ALL of
+// the session's background terminals, including ones earlier turns started:
+// stopping a session stops its work. Claude Code keeps a command the model
+// ran in the background running the same way; tmux stops ALL of its
+// background shells from Claude's background-task view. StopBackgroundWork returns
+// [ErrInteractionUnsupported] for sessions it has no such work to stop for.
+// Work it could not stop is logged rather than returned, because the turn is
+// already stopped; only the caller's context ending is an error.
+type BackgroundWorkStopper interface {
+	StopBackgroundWork(ctx context.Context, name string) error
 }
 
 // RelaunchProvider is an optional extension for runtimes that can re-launch the
@@ -1076,8 +1133,10 @@ type CopyEntry struct {
 // HashPathContent returns a hex-encoded SHA-256 of the content at path.
 // For a regular file, hashes the file content. For a directory, hashes
 // a sorted manifest of relative paths and their contents while ignoring
-// runtime-generated Python cache and editor backup artifacts. Returns empty
-// string on any error (caller should treat as "unknown").
+// runtime-generated Python cache, editor backup, and Finder (.DS_Store)
+// artifacts. Returns empty string on any error (caller should treat as
+// "unknown"). For skill source directories use HashSkillSourceContent,
+// which additionally excludes git-ignored files.
 func HashPathContent(path string) string {
 	return HashPathContentExcluding(path, nil)
 }
@@ -1162,6 +1221,9 @@ func hashPathContentSkipEntry(d fs.DirEntry) bool {
 		default:
 			return false
 		}
+	}
+	if base == ".DS_Store" {
+		return true
 	}
 	switch filepath.Ext(base) {
 	case ".pyc", ".pyo":

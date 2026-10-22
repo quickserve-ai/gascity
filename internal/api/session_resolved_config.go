@@ -38,7 +38,14 @@ func resolvedSessionConfigForProvider(
 	if transport == "acp" {
 		resolvedCommand = resolved.ACPCommandString()
 	}
-	sessionEnv := cityAnchoredSessionEnv(cityPath, workspaceEnv, resolved.Env)
+	command = firstNonEmptyString(command, resolvedCommand, resolved.Name)
+	sessionEnv, err := checkedCityAnchoredSessionEnv(cityPath, workspaceEnv, resolved)
+	if err != nil {
+		return worker.ResolvedSessionConfig{}, err
+	}
+	if model := config.LaunchModelFromCommand(command); model != "" {
+		sessionEnv["GC_CONTEXT_LAUNCH_MODEL"] = model
+	}
 	return worker.NormalizeResolvedSessionConfig(worker.ResolvedSessionConfig{
 		Alias:        alias,
 		ExplicitName: explicitName,
@@ -47,7 +54,7 @@ func resolvedSessionConfigForProvider(
 		Transport:    transport,
 		Metadata:     metadata,
 		Runtime: worker.ResolvedRuntime{
-			Command:    firstNonEmptyString(command, resolvedCommand, resolved.Name),
+			Command:    command,
 			WorkDir:    workDir,
 			Provider:   resolved.Name,
 			SessionEnv: sessionEnv,

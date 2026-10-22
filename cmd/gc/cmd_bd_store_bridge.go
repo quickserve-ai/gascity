@@ -27,6 +27,7 @@ type bdStoreBridgeCreateRequest struct {
 	Assignee    string            `json:"assignee,omitempty"`
 	From        string            `json:"from,omitempty"`
 	Metadata    map[string]string `json:"metadata,omitempty"`
+	AwaitType   string            `json:"await_type,omitempty"`
 }
 
 type bdStoreBridgeUpdateRequest struct {
@@ -57,6 +58,7 @@ type bdStoreBridgeBead struct {
 	Description string            `json:"description,omitempty"`
 	Labels      []string          `json:"labels,omitempty"`
 	Metadata    map[string]string `json:"metadata,omitempty"`
+	AwaitType   string            `json:"await_type,omitempty"`
 }
 
 func newBdStoreBridgeCmd(stdout, stderr io.Writer) *cobra.Command {
@@ -121,7 +123,14 @@ func parseBdStoreBridgeCommandArgs(args []string) (op string, opArgs []string, d
 	return args[i], args[i+1:], dir, host, port, user, nil
 }
 
-func bdStoreBridgePassword() string {
+// bdStoreBridgePassword returns the ambient password the bridge may present to
+// the endpoint named on its command line. An ambient password that arrived with
+// a DIFFERENT ambient GC_DOLT_HOST/PORT belongs to that other endpoint and is
+// declined (gc-49ho; the rule is doltauth.AmbientIdentityAppliesTo).
+func bdStoreBridgePassword(host, port string) string {
+	if !ambientDoltIdentityAppliesTo(host, port) {
+		return ""
+	}
 	password := strings.TrimSpace(os.Getenv("GC_DOLT_PASSWORD"))
 	if password == "" {
 		password = strings.TrimSpace(os.Getenv("BEADS_DOLT_PASSWORD"))
@@ -139,7 +148,7 @@ func runBdStoreBridge(op string, args []string, dir, host, port, user string, st
 	if strings.TrimSpace(port) == "" {
 		return fmt.Errorf("missing --port")
 	}
-	password := bdStoreBridgePassword()
+	password := bdStoreBridgePassword(host, port)
 	env := bdStoreBridgeEnv(dir, host, port, user, password)
 	// Bridge operations can trigger bd hooks that recursively invoke gc. Pin
 	// those callbacks to this exact executable so an ambient GC_BIN cannot
@@ -166,6 +175,7 @@ func runBdStoreBridge(op string, args []string, dir, host, port, user string, st
 			Assignee:    req.Assignee,
 			From:        req.From,
 			Metadata:    req.Metadata,
+			AwaitType:   req.AwaitType,
 		})
 		if err != nil {
 			return err
@@ -430,5 +440,6 @@ func bridgeBead(item beads.Bead) bdStoreBridgeBead {
 		Description: item.Description,
 		Labels:      item.Labels,
 		Metadata:    item.Metadata,
+		AwaitType:   item.AwaitType,
 	}
 }

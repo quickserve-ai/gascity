@@ -117,6 +117,7 @@ func infoFromPersistedBeadFrozen(b beads.Bead) Info {
 		ResetCommittedAt:           b.Metadata[ResetCommittedAtKey],
 		Generation:                 b.Metadata["generation"],
 		StartedConfigHash:          b.Metadata["started_config_hash"],
+		ResumeSeeded:               b.Metadata[resumeSeededKey],
 		PinAwake:                   b.Metadata["pin_awake"],
 
 		HeldUntil:                      b.Metadata["held_until"],
@@ -129,6 +130,7 @@ func infoFromPersistedBeadFrozen(b beads.Bead) Info {
 		WakeMode:                       b.Metadata["wake_mode"],
 		DrainAt:                        b.Metadata["drain_at"],
 		SleepIntent:                    b.Metadata["sleep_intent"],
+		LivenessReadDegraded:           strings.TrimSpace(b.Metadata[beadmeta.LivenessReadDegradedMetadataKey]) != "",
 		InstanceToken:                  b.Metadata["instance_token"],
 		DetachedAt:                     b.Metadata["detached_at"],
 		CurrentlyProcessingBeadID:      b.Metadata[CurrentBeadIDKey],
@@ -160,6 +162,14 @@ func infoFromPersistedBeadFrozen(b beads.Bead) Info {
 		WakeRefusedEventAt:             b.Metadata["wake_refused_event_at"],
 		ProviderKind:                   b.Metadata["provider_kind"],
 		BuiltinAncestor:                b.Metadata["builtin_ancestor"],
+
+		CloudWakeSessionID:        b.Metadata[MetadataCloudWakeSessionID],
+		CloudWakeAccountDir:       b.Metadata[MetadataCloudWakeAccountDir],
+		CloudWakeBindingSuspect:   b.Metadata[MetadataCloudWakeBindingSuspect],
+		CloudWakeBindingSuspectAt: b.Metadata[MetadataCloudWakeBindingSuspectAt],
+		CloudWakeLastOutcome:      b.Metadata[MetadataCloudWakeLastOutcome],
+		CloudWakeLastOutcomeAt:    b.Metadata[MetadataCloudWakeLastOutcomeAt],
+		CloudWakeBoundAt:          b.Metadata[MetadataCloudWakeBoundAt],
 
 		SleepPolicyFingerprint:       b.Metadata["sleep_policy_fingerprint"],
 		RequestedSleepAfterIdle:      b.Metadata["requested_sleep_after_idle"],

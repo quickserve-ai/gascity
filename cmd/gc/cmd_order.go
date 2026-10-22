@@ -1052,7 +1052,7 @@ func doOrderRunExecTracked(a orders.Order, cityPath string, cfg *config.City, fr
 		}
 	}
 
-	result := doOrderRunExecResult(a, cityPath, cfg, vars, stdout, stderr)
+	result := doOrderRunExecResult(a, cityPath, cfg, vars, run.ID, stdout, stderr)
 	outcome := orders.RunOutcomeExec
 	if result.code != 0 {
 		outcome = orders.RunOutcomeExecFailed
@@ -1064,12 +1064,19 @@ func doOrderRunExecTracked(a orders.Order, cityPath string, cfg *config.City, fr
 		fmt.Fprintf(stderr, "gc order run: labeling exec tracking bead for %s: %v\n", scoped, err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
+	if result.code != 0 {
+		// Match the dispatcher's WHY stamp (ga-swawpo gap 2); best-effort.
+		excerpt := fmt.Sprintf("exit code %d (manual gc order run; error text on the caller's terminal)", result.code)
+		if err := front.SetError(run.ID, excerpt); err != nil {
+			fmt.Fprintf(stderr, "gc order run: stamping error excerpt for %s: %v\n", scoped, err) //nolint:errcheck // best-effort stderr
+		}
+	}
 	return result.code
 }
 
 // doOrderRunExec runs an exec order directly via shell.
 func doOrderRunExec(a orders.Order, cityPath string, cfg *config.City, vars map[string]string, stdout, stderr io.Writer) int {
-	return doOrderRunExecResult(a, cityPath, cfg, vars, stdout, stderr).code
+	return doOrderRunExecResult(a, cityPath, cfg, vars, "", stdout, stderr).code
 }
 
 type orderRunExecResult struct {
@@ -1077,7 +1084,7 @@ type orderRunExecResult struct {
 	failureLabel string
 }
 
-func doOrderRunExecResult(a orders.Order, cityPath string, cfg *config.City, vars map[string]string, stdout, stderr io.Writer) orderRunExecResult {
+func doOrderRunExecResult(a orders.Order, cityPath string, cfg *config.City, vars map[string]string, runID string, stdout, stderr io.Writer) orderRunExecResult {
 	var maxTimeout time.Duration
 	if cfg != nil {
 		maxTimeout = cfg.Orders.MaxTimeoutDuration()
@@ -1091,7 +1098,7 @@ func doOrderRunExecResult(a orders.Order, cityPath string, cfg *config.City, var
 		fmt.Fprintf(stderr, "gc order run: %s\n", redactOrderEnvError(err, os.Environ())) //nolint:errcheck // best-effort stderr
 		return orderRunExecResult{code: 1, failureLabel: "exec-failed"}
 	}
-	env, err := orderExecEnvWithError(cityPath, cfg, target, a, vars)
+	env, err := orderExecEnvForRun(cityPath, cfg, target, a, vars, runID)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc order run: %s\n", redactOrderEnvError(err, os.Environ())) //nolint:errcheck // best-effort stderr
 		return orderRunExecResult{code: 1, failureLabel: "exec-env-failed"}
@@ -1702,18 +1709,18 @@ func renderOrderHistoryFromAPI(cr api.CachedRead[[]api.OrderHistoryView], name, 
 	}
 
 	if hasRig {
-		fmt.Fprintf(stdout, "%-20s %-15s %-15s %s\n", "ORDER", "RIG", "BEAD", "EXECUTED") //nolint:errcheck
+		fmt.Fprintf(stdout, "%-20s %-15s %-15s %-21s %s\n", "ORDER", "RIG", "BEAD", "EXECUTED", "OUTCOME") //nolint:errcheck
 		for _, e := range entries {
 			rig := e.Rig
 			if rig == "" {
 				rig = "-"
 			}
-			fmt.Fprintf(stdout, "%-20s %-15s %-15s %s\n", e.Name, rig, e.BeadID, e.CreatedAt) //nolint:errcheck
+			fmt.Fprintf(stdout, "%-20s %-15s %-15s %-21s %s\n", e.Name, rig, e.BeadID, e.CreatedAt, orderHistoryAPIOutcomeUnavailable) //nolint:errcheck
 		}
 	} else {
-		fmt.Fprintf(stdout, "%-20s %-15s %s\n", "ORDER", "BEAD", "EXECUTED") //nolint:errcheck
+		fmt.Fprintf(stdout, "%-20s %-15s %-21s %s\n", "ORDER", "BEAD", "EXECUTED", "OUTCOME") //nolint:errcheck
 		for _, e := range entries {
-			fmt.Fprintf(stdout, "%-20s %-15s %s\n", e.Name, e.BeadID, e.CreatedAt) //nolint:errcheck
+			fmt.Fprintf(stdout, "%-20s %-15s %-21s %s\n", e.Name, e.BeadID, e.CreatedAt, orderHistoryAPIOutcomeUnavailable) //nolint:errcheck
 		}
 	}
 
@@ -1775,6 +1782,8 @@ func doOrderHistoryBounded(name, rig string, aa []orders.Order, resolveStores or
 		rig       string
 		id        string
 		createdAt time.Time
+		outcome   string
+		errText   string
 	}
 	var entries []historyEntry
 	seenEntries := make(map[string]bool)
@@ -1814,6 +1823,8 @@ func doOrderHistoryBounded(name, rig string, aa []orders.Order, resolveStores or
 					rig:       a.Rig,
 					id:        r.ID,
 					createdAt: r.CreatedAt,
+					outcome:   orderRunOutcomeDisplay(r),
+					errText:   r.Error,
 				})
 			}
 		}
@@ -1865,6 +1876,8 @@ func doOrderHistoryBounded(name, rig string, aa []orders.Order, resolveStores or
 				BeadID:    e.id,
 				Executed:  e.createdAt.Format(time.RFC3339),
 				CreatedAt: e.createdAt,
+				Outcome:   e.outcome,
+				Error:     e.errText,
 			})
 		}
 		return writeCLIJSONLineOrExit(stdout, stderr, "gc order history", payload)
@@ -1879,21 +1892,65 @@ func doOrderHistoryBounded(name, rig string, aa []orders.Order, resolveStores or
 	}
 
 	if hasRig {
-		fmt.Fprintf(stdout, "%-20s %-15s %-15s %s\n", "ORDER", "RIG", "BEAD", "EXECUTED") //nolint:errcheck
+		fmt.Fprintf(stdout, "%-20s %-15s %-15s %-21s %s\n", "ORDER", "RIG", "BEAD", "EXECUTED", "OUTCOME") //nolint:errcheck
 		for _, e := range entries {
 			rig := e.rig
 			if rig == "" {
 				rig = "-"
 			}
-			fmt.Fprintf(stdout, "%-20s %-15s %-15s %s\n", e.order, rig, e.id, e.createdAt.Format(time.RFC3339)) //nolint:errcheck
+			fmt.Fprintf(stdout, "%-20s %-15s %-15s %-21s %s\n", e.order, rig, e.id, e.createdAt.Format(time.RFC3339), outcomeWithError(e.outcome, e.errText)) //nolint:errcheck
 		}
 	} else {
-		fmt.Fprintf(stdout, "%-20s %-15s %s\n", "ORDER", "BEAD", "EXECUTED") //nolint:errcheck
+		fmt.Fprintf(stdout, "%-20s %-15s %-21s %s\n", "ORDER", "BEAD", "EXECUTED", "OUTCOME") //nolint:errcheck
 		for _, e := range entries {
-			fmt.Fprintf(stdout, "%-20s %-15s %s\n", e.order, e.id, e.createdAt.Format(time.RFC3339)) //nolint:errcheck
+			fmt.Fprintf(stdout, "%-20s %-15s %-21s %s\n", e.order, e.id, e.createdAt.Format(time.RFC3339), outcomeWithError(e.outcome, e.errText)) //nolint:errcheck
 		}
 	}
 	return 0
+}
+
+// outcomeWithError appends the dispatcher-stamped failure excerpt to the
+// OUTCOME cell so `gc order history` answers WHY a run failed without the
+// supervisor log (ga-swawpo gap 2). OUTCOME is the last column, so the
+// variable-length excerpt cannot break alignment.
+func outcomeWithError(outcome, errText string) string {
+	if errText == "" {
+		return outcome
+	}
+	return outcome + " — " + errText
+}
+
+// orderHistoryAPIOutcomeUnavailable is what the API-sourced history route
+// prints in the OUTCOME column. api.OrderHistoryView (and the genclient entry
+// behind it) carry no outcome field, so that route genuinely cannot report one.
+// It prints "-" rather than blank or a guess: a surface that cannot tell success
+// from failure must SAY so, which is the whole lesson of ga-kahru9.
+const orderHistoryAPIOutcomeUnavailable = "-"
+
+// orderRunOutcomeDisplay renders one order run's terminal outcome for
+// `gc order history`, distinguishing the three states a tracking bead can end in.
+// Collapsing them is what let a 5-hour sync outage read as healthy (ga-7unsv0):
+// 18 of 21 consecutive runs carried the exec-failed label and the CLI showed only
+// that an exec had happened.
+//
+//	Outcome.Display() non-empty -> success | failed | canceled  (dispatcher stamped it)
+//	open                        -> running                      (still in flight)
+//	closed, nothing stamped     -> unknown                      (killed or swept
+//	                                                             before the
+//	                                                             dispatcher could
+//	                                                             stamp an outcome)
+//
+// The third state is the dangerous one and must never render as success: a run
+// killed mid-flight is closed by the order-tracking retention sweep with no
+// outcome label at all, which is byte-identical on the surface to a clean run.
+func orderRunOutcomeDisplay(r orders.OrderRun) string {
+	if d := r.Outcome.Display(); d != "" {
+		return d
+	}
+	if r.Open {
+		return "running"
+	}
+	return "unknown"
 }
 
 type orderHistoryJSONResult struct {
@@ -1911,6 +1968,13 @@ type orderHistoryJSONEntry struct {
 	BeadID    string    `json:"bead_id"`
 	Executed  string    `json:"executed"`
 	CreatedAt time.Time `json:"created_at"`
+	// Outcome is the run's terminal outcome: success, failed, canceled,
+	// running, or unknown. Omitted entirely by the API route, which cannot
+	// report one — see orderRunOutcomeDisplay.
+	Outcome string `json:"outcome,omitempty"`
+	// Error is the dispatcher-stamped failure excerpt for a failed run
+	// (tracking-bead metadata error_excerpt), "" when absent (ga-swawpo).
+	Error string `json:"error,omitempty"`
 }
 
 type orderHistoryJSONSummary struct {

@@ -167,7 +167,7 @@ func TestRetireSuspendedRigScopeAfterItsSessionsDrain(t *testing.T) {
 // its retired proxy.
 func TestWrapWithCachingStoreLeavesASuspendedRigCold(t *testing.T) {
 	backing := &primeCountingStore{Store: beads.NewMemStore()}
-	wrapWithCachingStore(context.Background(), backing, nil, false)
+	wrapWithCachingStore(context.Background(), backing, nil, false, "", "")
 	if backing.lists != 0 {
 		t.Fatalf("a suspended rig's store was listed %d time(s) at wrap", backing.lists)
 	}
@@ -304,6 +304,75 @@ func TestBlockedRepairSkipsSuspendedScopesAndRunsOnResume(t *testing.T) {
 	}
 }
 
+// A rig that runs on a store built while it was suspended (no cache
+// reconciler) schedules a config reload from the tick, whatever the ticks
+// published in between, and asks again after rearmRetryInterval until an
+// armed store is installed. An armed store, and a rig still suspended,
+// schedule nothing (ga-r5ppfi).
+func TestRigOnAStoreBuiltWhileSuspendedSchedulesARearm(t *testing.T) {
+	cr, _, _, _ := quiescenceRuntime(t, "")
+	t.Setenv("GC_SUSPENDED", "")
+	cr.cs = &controllerState{beadsQuiescent: new(atomic.Bool), cityPath: cr.cityPath}
+	cr.configDirty = &atomic.Bool{}
+
+	oldCandidates := resumeRepairCandidates
+	t.Cleanup(func() { resumeRepairCandidates = oldCandidates })
+	resumeRepairCandidates = func(string, *config.City) []blockedRepairScope { return nil }
+
+	suspendRig := func(v bool) {
+		t.Helper()
+		if err := suspensionstate.SetRigSuspended(fsys.OSFS{}, cr.cityPath, "r1", &v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	install := func(armed bool) { // what a store build publishes beside the stores
+		cr.cs.mu.Lock()
+		cr.cs.rigStoreRefresh = map[string]bool{"r1": armed}
+		cr.cs.mu.Unlock()
+	}
+	tick := func() bool {
+		cr.enterBeadsQuiescenceIfDue(context.Background())
+		return cr.configDirty.Swap(false)
+	}
+
+	install(true)
+	if tick() {
+		t.Fatal("an armed store scheduled a reload")
+	}
+
+	// A store built while r1 was suspended, and no tick ever published the
+	// suspension (a manual reload can hide it): r1 runs now, so it is stale.
+	install(false)
+	if !tick() {
+		t.Fatal("a running rig on a store built without its reconciler scheduled no reload; its cache stays blind")
+	}
+	if tick() {
+		t.Fatal("asked again inside rearmRetryInterval")
+	}
+	// The reload failed (nothing installed an armed store): after the interval it asks again.
+	cr.lastRearmRequest = cr.lastRearmRequest.Add(-rearmRetryInterval)
+	if !tick() {
+		t.Fatal("a rearm whose reload installed nothing was not asked again")
+	}
+
+	// While the rig is suspended its store is meant to be cold.
+	cr.lastRearmRequest = time.Time{}
+	suspendRig(true)
+	if tick() {
+		t.Fatal("a suspended rig's cold store scheduled a reload")
+	}
+	suspendRig(false)
+	if !tick() {
+		t.Fatal("the resumed rig on its cold store scheduled no reload")
+	}
+
+	install(true) // the rebuild landed
+	cr.lastRearmRequest = time.Time{}
+	if tick() {
+		t.Fatal("a reload was scheduled after an armed store was installed")
+	}
+}
+
 // A suspended proxied scope's pair is stopped whenever it is found running,
 // not once: a late touch that restarted it is undone on the next tick.
 func TestRetireSuspendedProxiedScopeConvergesOnLiveState(t *testing.T) {
@@ -406,24 +475,51 @@ func TestConvergenceTickSkipsASuspendedRig(t *testing.T) {
 	}
 }
 
-// The closed-bead worktree reaper is not handed a suspended rig's store.
+// The closed-bead worktree reaper is not handed a suspended rig's store. The
+// carry runs the reaper off-tick on its single-flight lane (ga-yuiof4 item 3),
+// so the stores under test are the ones the lane's pass receives
+// (fencedReaperStores); the unsuspended control shows the seam is live.
 func TestReapClosedBeadWorktreesSkipsASuspendedRig(t *testing.T) {
-	cr, _, _, _ := quiescenceRuntime(t, "suspended_on_start = true\n")
-	t.Setenv("GC_SUSPENDED", "")
-	cr.standaloneRigStores = map[string]beads.Store{"r1": beads.NewMemStore()}
-	enabled := true
-	cr.cfg.Daemon.AutoReapClosedBeadWorktrees = &enabled
-	old := tickReapClosedBeadWorktreesFn
-	t.Cleanup(func() { tickReapClosedBeadWorktreesFn = old })
-	var handed map[string]beads.Store
-	tickReapClosedBeadWorktreesFn = func(_ string, _ *config.City, rigStores map[string]beads.Store, _ []string, _ bool, _ events.Recorder, _ *reapSkipTracker, _ io.Writer) reapReport {
-		handed = rigStores
-		return reapReport{}
-	}
-	p := &tickPass{ctx: context.Background(), sessionBeads: newSessionBeadSnapshotFromInfos(nil)}
-	cr.tickReapClosedBeadWorktrees(p)
-	if _, ok := handed["r1"]; ok {
-		t.Fatalf("the worktree reaper was handed the suspended rig's store: %v", handed)
+	for _, tc := range []struct {
+		name     string
+		rigExtra string
+		wantRig  bool
+	}{
+		{name: "suspended rig is withheld", rigExtra: "suspended_on_start = true\n"},
+		{name: "control: an active rig is handed", wantRig: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cr, _, _, _ := quiescenceRuntime(t, tc.rigExtra)
+			t.Setenv("GC_SUSPENDED", "")
+			cr.standaloneRigStores = map[string]beads.Store{"r1": beads.NewMemStore()}
+			enabled := true
+			cr.cfg.Daemon.AutoReapClosedBeadWorktrees = &enabled
+			var (
+				mu     sync.Mutex
+				handed []map[string]beads.Store
+			)
+			prev := runWorktreeReaperPassFn
+			runWorktreeReaperPassFn = func(in worktreeReaperPassInput) worktreeReaperPassResult {
+				mu.Lock()
+				handed = append(handed, in.cachedStores, in.rawStores)
+				mu.Unlock()
+				return worktreeReaperPassResult{}
+			}
+			t.Cleanup(func() { runWorktreeReaperPassFn = prev })
+			p := &tickPass{ctx: context.Background(), sessionBeads: newSessionBeadSnapshotFromInfos(nil)}
+			cr.tickReapClosedBeadWorktrees(p)
+			waitWorktreeReaperIdle(t, cr)
+			mu.Lock()
+			defer mu.Unlock()
+			if len(handed) == 0 {
+				t.Fatal("the worktree reaper pass never ran")
+			}
+			for _, stores := range handed {
+				if _, ok := stores["r1"]; ok != tc.wantRig {
+					t.Fatalf("rig r1 handed to the reaper = %v, want %v: %v", ok, tc.wantRig, stores)
+				}
+			}
+		})
 	}
 }
 

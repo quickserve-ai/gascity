@@ -5,6 +5,9 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -306,33 +309,193 @@ func TestRestartSupervisor_SystemdManaged(t *testing.T) {
 	}
 }
 
-func TestRestartSupervisor_LaunchdManaged(t *testing.T) {
-	h := &fakeRestartHelpers{}
+func TestRestartSupervisor_LaunchdManagedRefreshesRegistration(t *testing.T) {
+	var calls [][]string
+	h := restartHelpers{
+		Launchctl: func(args ...string) error {
+			calls = append(calls, append([]string(nil), args...))
+			return nil
+		},
+		ValidateLaunchdPlist: func(string, string, string) error { return nil },
+		WaitLaunchdUnloaded:  func(string, time.Duration) error { return nil },
+	}
 	spec := restartSpec{
 		LaunchdManaged: true,
 		PID:            12345,
 		LaunchdLabel:   "com.gascity.supervisor.test",
 	}
-	if err := restartSupervisor(spec, restartHelpersFromFake(h)); err != nil {
+	if err := restartSupervisor(spec, h); err != nil {
 		t.Fatalf("restartSupervisor: %v", err)
 	}
-	wantArgs := []string{"kickstart", "-k", supervisorLaunchdServiceTarget("com.gascity.supervisor.test")}
-	if len(h.launchctlArgs) != len(wantArgs) {
-		t.Fatalf("launchctl args = %v, want %v", h.launchctlArgs, wantArgs)
+	target := supervisorLaunchdServiceTarget(spec.LaunchdLabel)
+	domain := "gui/" + strconv.Itoa(os.Getuid())
+	// enable precedes bootstrap: `gc supervisor stop` disables the job
+	// (#5334) and launchd refuses to bootstrap a disabled service.
+	want := [][]string{
+		{"bootout", supervisorLaunchdServiceTarget(legacyGastownLaunchdLabel)},
+		{"bootout", target},
+		{"enable", target},
+		{"bootstrap", domain, supervisorLaunchdPlistPath()},
+		{"kickstart", "-p", target},
 	}
-	for i := range wantArgs {
-		if h.launchctlArgs[i] != wantArgs[i] {
-			t.Errorf("launchctl arg %d = %q, want %q", i, h.launchctlArgs[i], wantArgs[i])
-		}
+	if !reflect.DeepEqual(want, calls) {
+		t.Fatalf("launchctl calls = %v, want %v", calls, want)
 	}
-	if len(h.systemctlArgs) != 0 {
-		t.Errorf("systemctl invoked for launchd-managed restart: %v", h.systemctlArgs)
+}
+
+// TestRestartSupervisor_LaunchdManagedEnablesDisabledJobBeforeBootstrap
+// models launchd's disabled set: a label that `gc supervisor stop` disabled
+// (#5334) but that is still loaded reaches the refresh path, and launchd
+// refuses to bootstrap it until it is enabled again. Enabling after bootstrap
+// would leave the supervisor booted out and unregistered.
+func TestRestartSupervisor_LaunchdManagedEnablesDisabledJobBeforeBootstrap(t *testing.T) {
+	const label = "com.gascity.supervisor.test"
+	target := supervisorLaunchdServiceTarget(label)
+	disabled := true
+	var calls [][]string
+	h := restartHelpers{
+		Launchctl: func(args ...string) error {
+			calls = append(calls, append([]string(nil), args...))
+			switch args[0] {
+			case "enable":
+				if len(args) == 2 && args[1] == target {
+					disabled = false
+				}
+			case "bootstrap":
+				if disabled {
+					return errors.New("Bootstrap failed: 119: Service is disabled")
+				}
+			}
+			return nil
+		},
+		ValidateLaunchdPlist: func(string, string, string) error { return nil },
+		WaitLaunchdUnloaded:  func(string, time.Duration) error { return nil },
 	}
-	if h.killedPID != 0 {
-		t.Errorf("Kill called for launchd-managed restart (pid=%d); should delegate to launchd only", h.killedPID)
+	if err := restartSupervisor(restartSpec{LaunchdManaged: true, LaunchdLabel: label}, h); err != nil {
+		t.Fatalf("restartSupervisor on a disabled job = %v, want nil; launchctl calls = %v", err, calls)
 	}
-	if h.spawnExe != "" {
-		t.Errorf("Spawn called for launchd-managed restart; should delegate to launchd only")
+	if disabled {
+		t.Fatalf("job still disabled after refresh; launchctl calls = %v", calls)
+	}
+}
+
+func TestRestartSupervisor_LaunchdManagedPostBootoutFailureIncludesRecovery(t *testing.T) {
+	domain := supervisorLaunchdDomain()
+	const label = "com.gascity.supervisor.test"
+	target := supervisorLaunchdServiceTarget(label)
+	const plistPath = "/tmp/Gas City/supervisor.plist"
+	startRecovery := "launchctl kickstart -p " + shellSingleQuote(target)
+	bootstrapRecovery := "launchctl bootstrap " + shellSingleQuote(domain) + " " + shellSingleQuote(plistPath) + " && " + startRecovery
+	enableRecovery := "launchctl enable " + shellSingleQuote(target) + " && " + bootstrapRecovery
+	tests := []struct {
+		failingCommand string
+		wantRecovery   string
+	}{
+		{"enable", enableRecovery},
+		{"bootstrap", bootstrapRecovery},
+		{"kickstart", startRecovery},
+	}
+	for _, tc := range tests {
+		t.Run(tc.failingCommand, func(t *testing.T) {
+			h := restartHelpers{
+				Launchctl: func(args ...string) error {
+					if args[0] == tc.failingCommand {
+						return errors.New("injected failure")
+					}
+					return nil
+				},
+				ValidateLaunchdPlist: func(string, string, string) error { return nil },
+				WaitLaunchdUnloaded:  func(string, time.Duration) error { return nil },
+			}
+			err := restartSupervisor(restartSpec{
+				LaunchdManaged:   true,
+				LaunchdLabel:     label,
+				LaunchdPlistPath: plistPath,
+			}, h)
+			if err == nil {
+				t.Fatalf("restartSupervisor succeeded, want %s failure", tc.failingCommand)
+			}
+			for _, want := range []string{tc.failingCommand, "supervisor is stopped", tc.wantRecovery} {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("restartSupervisor error = %q, want recovery detail %q", err, want)
+				}
+			}
+			if !launchdRestartRollbackSafe(err) {
+				t.Fatalf("%s failure should be safe to roll back: %v", tc.failingCommand, err)
+			}
+		})
+	}
+}
+
+func TestRestartSupervisor_LaunchdManagedStopsWhenBootoutFails(t *testing.T) {
+	var calls [][]string
+	h := restartHelpers{
+		Launchctl: func(args ...string) error {
+			calls = append(calls, append([]string(nil), args...))
+			return errors.New("permission denied")
+		},
+		ValidateLaunchdPlist: func(string, string, string) error { return nil },
+		WaitLaunchdUnloaded:  func(string, time.Duration) error { return nil },
+	}
+	spec := restartSpec{LaunchdManaged: true, LaunchdLabel: "com.gascity.supervisor.test"}
+	err := restartSupervisor(spec, h)
+	if err == nil || !strings.Contains(err.Error(), "bootout") {
+		t.Fatalf("restartSupervisor error = %v, want bootout failure", err)
+	}
+	if !launchdRestartRollbackSafe(err) {
+		t.Fatalf("bootout-reported failure after confirmed unload should be rollback-safe: %v", err)
+	}
+	wantCalls := [][]string{
+		{"bootout", supervisorLaunchdServiceTarget(legacyGastownLaunchdLabel)},
+		{"bootout", supervisorLaunchdServiceTarget(spec.LaunchdLabel)},
+	}
+	if !reflect.DeepEqual(calls, wantCalls) {
+		t.Fatalf("launchctl calls = %v, want legacy cleanup then failed target bootout %v", calls, wantCalls)
+	}
+}
+
+func TestRestartSupervisor_LaunchdManagedValidatesBeforeBootout(t *testing.T) {
+	launchctlCalled := false
+	err := restartSupervisor(restartSpec{LaunchdManaged: true}, restartHelpers{
+		ValidateLaunchdPlist: func(string, string, string) error { return errors.New("malformed plist") },
+		WaitLaunchdUnloaded:  func(string, time.Duration) error { return nil },
+		Launchctl: func(...string) error {
+			launchctlCalled = true
+			return nil
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "preflight") {
+		t.Fatalf("restartSupervisor error = %v, want preflight failure", err)
+	}
+	if launchctlCalled {
+		t.Fatal("launchctl called after plist preflight failed")
+	}
+}
+
+func TestRestartSupervisor_LaunchdManagedWaitsForBootoutCompletion(t *testing.T) {
+	var calls [][]string
+	err := restartSupervisor(restartSpec{LaunchdManaged: true}, restartHelpers{
+		ValidateLaunchdPlist: func(string, string, string) error { return nil },
+		WaitLaunchdUnloaded: func(string, time.Duration) error {
+			return errors.New("job still loaded")
+		},
+		Launchctl: func(args ...string) error {
+			calls = append(calls, append([]string(nil), args...))
+			return nil
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "waiting for launchd bootout") {
+		t.Fatalf("restartSupervisor error = %v, want bootout wait failure", err)
+	}
+	if launchdRestartRollbackSafe(err) {
+		t.Fatalf("unknown bootout state must not be auto-rolled back: %v", err)
+	}
+	wantCalls := [][]string{
+		{"bootout", supervisorLaunchdServiceTarget(legacyGastownLaunchdLabel)},
+		{"bootout", supervisorLaunchdServiceTarget("")},
+	}
+	if !reflect.DeepEqual(calls, wantCalls) {
+		t.Fatalf("launchctl calls = %v, want legacy cleanup then target bootout %v", calls, wantCalls)
 	}
 }
 

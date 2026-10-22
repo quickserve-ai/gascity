@@ -116,10 +116,35 @@ concurrency:
 permissions:
   contents: read
 
+# Fork carry (pl-axh9, fork #198; re-expressed at re-sync #6 after upstream
+# #7239 folded bazel-test.yml into this workflow). The quickserve-ai fork has
+# no Blacksmith runners and no remote-execution secrets, so a job hard-coded to
+# either would sit queued there forever. A rule per job, not a list of jobs, so
+# it holds through the next upstream reshuffle:
+#   - a job that needs no org secret and no Blacksmith-only runner runs on the
+#     fork on GitHub-hosted runners: its runs-on is
+#     `github.repository == 'gastownhall/gascity' && <upstream's label> ||
+#     'ubuntu-latest'`, the expression the carry gives the runner-policy jobs
+#     of ci.yml, codeql.yml, container-scan.yml, govulncheck.yml,
+#     mac-regression.yml and review-formulas.yml;
+#   - a job that needs the remote-execution secret or a Blacksmith host runs
+#     upstream only, by `github.repository == 'gastownhall/gascity'` in its
+#     `if:` (#198's guard), and so does a step that needs a Blacksmith host
+#     inside a job the first rule covers. A job whose `if:` already requires
+#     `needs.rbe.outputs.mode == 'remote'` is upstream only as it stands (the
+#     fork never reaches mode remote, below), so upstream's condition is
+#     left as written (re-sync #7: rrc-seed, rrc-verify).
+# On the fork the lanes end in mode cache: a push or dispatch sees no
+# RBE_WEST_WORKERS variable, and a PR (the fork's own branches are fork heads)
+# asks gastownhall's rbe-west mint, where anything but a certificate leaves the
+# lane on the read-only cache (the rbe job takes cache when the mint is closed,
+# refuses or is unreachable; a lane whose certificate it refuses falls back to
+# cache). They execute on the GitHub-hosted runner with lookups in the
+# anonymous read-only cache.
 jobs:
   rbe:
     name: execution mode
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'gastownhall/gascity' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 5
     permissions:
       contents: read
@@ -337,7 +362,8 @@ jobs:
     # measurements per lane (ga-vnycm2.8, seeded runner cache) took 34-58 s
     # on 2 vCPU, 23-34 s on 4 and 15-19 s on 8. Unit and acceptance are the
     # critical lanes (ga-vnycm2.12).
-    runs-on: ${{ (matrix.lane == 'unit' || matrix.lane == 'acceptance') && 'blacksmith-8vcpu-ubuntu-2404' || 'blacksmith-4vcpu-ubuntu-2404' }}
+    # Fork carry: GitHub-hosted on the fork (the rule above jobs:).
+    runs-on: ${{ github.repository == 'gastownhall/gascity' && ((matrix.lane == 'unit' || matrix.lane == 'acceptance') && 'blacksmith-8vcpu-ubuntu-2404' || 'blacksmith-4vcpu-ubuntu-2404') || 'ubuntu-latest' }}
     timeout-minutes: 90
     permissions:
       contents: read
@@ -444,7 +470,11 @@ jobs:
       # would skip ("tmux not installed") rather than run.
       - name: Host tools for locally run integration tests
         if: (matrix.lane == 'integration-packages' || matrix.lane == 'integration-smoke') && (needs.rbe.outputs.mode == 'cache' || needs.rbe.outputs.mode == 'local' || steps.bazel-fallback.outcome == 'success')
+        # Fork carry (ga-azybk8 class, as setup-gascity-ubuntu): drop the
+        # third-party apt sources nothing here installs from; a bad index on
+        # any of them fails the whole update.
         run: |
+          sudo rm -f /etc/apt/sources.list.d/google-chrome* /etc/apt/sources.list.d/microsoft-prod*
           sudo apt-get update -qq
           sudo apt-get install -y -qq tmux lsof openssh-client
 
@@ -541,6 +571,24 @@ jobs:
           echo "GC_OPENAPI_BREAKING_BASE_SPEC=$spec" >> "$GITHUB_ENV"
           echo "OpenAPI breaking-change base: \`$BASE_SHA\`" >> "$GITHUB_STEP_SUMMARY"
 
+      # Fork carry (ga-l0b72a.3): on the fork the unit lane executes locally on
+      # a 16 GB GitHub-hosted runner, where nogo on //cmd/gc:gc_test (~7.5 GB)
+      # and a Go compile running beside it (~5.4 GB) took available memory to
+      # ~240 MB and filled the runner's 3 GB swap; the VM then shut the runner
+      # down at the same step on every attempt (sampled on fork draft #264,
+      # 2026-10-10). A 16 GB swapfile on the runner's free disk (63 GB at the
+      # kill) lets that peak page instead of killing the job, and the bazel
+      # step below caps the fork's unit lane at two locally executed actions.
+      # Upstream's unit lane runs on a Blacksmith host and takes neither.
+      - name: Fork runner swap for the unit lane
+        if: github.repository != 'gastownhall/gascity' && matrix.lane == 'unit' && steps.worker-env.outputs.pin-moved != 'true'
+        run: |
+          sudo fallocate -l 16G /swapfile-bazel
+          sudo chmod 600 /swapfile-bazel
+          sudo mkswap /swapfile-bazel >/dev/null
+          sudo swapon /swapfile-bazel
+          echo "bazel / unit: swap $(free -m | awk 'NR==3{print $2}') MB total after the fork swapfile" | tee -a "$GITHUB_STEP_SUMMARY"
+
       # --profile, --build_event_json_file, --execution_log_compact_file and
       # --experimental_build_event_upload_strategy are command options, so
       # they go after the command (CMD's first word), never in a startup
@@ -555,9 +603,21 @@ jobs:
           MODE: ${{ needs.rbe.outputs.mode }}
           LANE: ${{ matrix.lane }}
           EVIDENCE_ONLY: ${{ matrix.evidence-only == true }}
+          FORK_RUNNER: ${{ github.repository != 'gastownhall/gascity' }}
         run: |
           set -o pipefail
           read -r -a args <<<"$CMD"
+          # Fork carry (ga-l0b72a.3): the swapfile alone did not hold the
+          # fork's unit lane (#265's first run still lost its runner at
+          # 196/236 with 19 GB of swap), so on the fork that lane also
+          # executes at most two actions on the runner at once; nogo on
+          # //cmd/gc:gc_test and a multi-GB compile then rarely overlap.
+          # --local_resources bounds local execution only: the fork cache's
+          # 64 parallel lookups (--jobs, .bazelrc) are untouched, and no cache
+          # key changes.
+          if [ "$FORK_RUNNER" = true ] && [ "$LANE" = unit ]; then
+            args+=(--local_resources=cpu=2)
+          fi
           rc=0
           start=$(date +%s)
           bazel "${args[@]}" \
@@ -890,7 +950,7 @@ jobs:
     name: bazel / test cache report
     needs: [rbe, lane]
     if: always() && needs.rbe.result == 'success' && needs.rbe.outputs.lanes != '[]'
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'gastownhall/gascity' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 10
     permissions:
       contents: read
@@ -967,7 +1027,9 @@ jobs:
   coverage:
     name: bazel / coverage
     needs: rbe
-    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && needs.rbe.outputs.mode == 'remote'
+    # Fork carry: mode remote needs the remote-execution secret; the
+    # repository term makes the upstream-only rule explicit (above jobs:).
+    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && needs.rbe.outputs.mode == 'remote' && github.repository == 'gastownhall/gascity'
     runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 90
     permissions:
@@ -1078,7 +1140,7 @@ jobs:
   sync-check:
     name: BUILD files in sync
     needs: rbe
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'gastownhall/gascity' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 15
     permissions:
       contents: read
@@ -1152,7 +1214,10 @@ jobs:
   worker-host:
     name: rbe worker host
     needs: rbe
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    # Fork carry: secret-free, so it runs on the fork, GitHub-hosted; its
+    # host measurement needs a Blacksmith host and is upstream only (the rule
+    # above jobs:).
+    runs-on: ${{ github.repository == 'gastownhall/gascity' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 25
     permissions:
       contents: read
@@ -1250,7 +1315,7 @@ jobs:
 
       - name: Measure this Blacksmith host against the PR's manifest
         id: measure
-        if: steps.host.outputs.measure == 'true' || steps.pins.outputs.pin-changed == 'true'
+        if: (steps.host.outputs.measure == 'true' || steps.pins.outputs.pin-changed == 'true') && github.repository == 'gastownhall/gascity'
         env:
           WORKER_MODE: measure
           RBE_WORKER_DIR: ${{ steps.rbe-worker.outputs.dir }}
@@ -1290,7 +1355,7 @@ jobs:
     name: bazel test (side-by-side)
     needs: [rbe, lane, sync-check, worker-host]
     if: always()
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'gastownhall/gascity' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - name: Evaluate

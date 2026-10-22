@@ -3,12 +3,18 @@ package tmuxtest
 import (
 	"crypto/rand"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
+
+	"github.com/gastownhall/gascity/internal/pidutil"
 )
 
 func TestConfigureProcessEnvIsolatesTmuxSocketRoot(t *testing.T) {
@@ -161,4 +167,181 @@ func TestNewGuardWithSocketCityNameFormat(t *testing.T) {
 			t.Fatalf("city name %q has length %d, want 15", name, len(name))
 		}
 	}
+}
+
+// TestKillTmuxServersUnderReapsSpawnedServer pins the reap cmd/gc's TestMain
+// teardown runs before it deletes the per-run socket root (ga-utvl): a live
+// server bound to a socket under the root is gone afterwards, checked by PID
+// because the reap can succeed while the socket file lingers.
+//
+// The tmux server is spawned inline rather than through a helper: the resource
+// census only credits an exact Medium owner for calls lexically inside the
+// declared runnable.
+func TestKillTmuxServersUnderReapsSpawnedServer(t *testing.T) {
+	RequireTmux(t)
+	// Unix socket paths are capped (~104 bytes on macOS); t.TempDir() is too
+	// deep, so use a short /tmp root like the runtime does.
+	socketRoot, err := os.MkdirTemp("/tmp", "gct-ut-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(socketRoot) })
+
+	spawn := exec.Command("tmux", "-L", "test-city", "new-session", "-d", "-s", "probe", "sleep", "300")
+	spawn.Env = append(os.Environ(), tmuxTmpEnv+"="+socketRoot)
+	if out, err := spawn.CombinedOutput(); err != nil {
+		t.Fatalf("spawning probe tmux server: %v\n%s", err, out)
+	}
+	socketPath := filepath.Join(socketRoot, "tmux-"+strconv.Itoa(os.Getuid()), "test-city")
+	out, err := exec.Command("tmux", "-S", socketPath, "display-message", "-p", "#{pid}").Output()
+	if err != nil {
+		t.Fatalf("reading probe server pid: %v", err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		t.Fatalf("probe server pid %q: %v", out, err)
+	}
+	t.Cleanup(func() {
+		if pidutil.Alive(pid) {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+	})
+
+	KillTmuxServersUnder(socketRoot, io.Discard)
+
+	if pidutil.Alive(pid) {
+		t.Fatalf("tmux server %d survived KillTmuxServersUnder(%s)", pid, socketRoot)
+	}
+}
+
+// deadPID returns a PID that has already exited, for building a socket parent
+// dir whose owner is gone. If the host recycles it before the sweep runs, the
+// sweep skips the dir and the test fails loudly rather than passing silently.
+func deadPID(t *testing.T) int {
+	t.Helper()
+	cmd := exec.Command("true")
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("running true: %v", err)
+	}
+	return cmd.Process.Pid
+}
+
+// shortSweepRoot returns a /tmp-rooted dir. Unix socket paths are capped
+// (~104 bytes on macOS) and t.TempDir() is too deep to hold one.
+func shortSweepRoot(t *testing.T) string {
+	t.Helper()
+	root, err := os.MkdirTemp("/tmp", "gct-ut-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	return root
+}
+
+// TestSweepOrphanPIDPrefixedDirsReapsServerBeforeRemovingParent is the
+// regression test for ga-3qlrnv: the sweep used to RemoveAll a dead run's
+// socket parent without killing the tmux servers bound to sockets inside it.
+// The servers survived on socket paths that no longer existed, which put them
+// beyond every socket-addressed sweep in this package -- seven had accumulated
+// on the dev host, the oldest 34h old.
+//
+// The assertion is on the SERVER, not on the directory: removing the directory
+// is what the broken version did.
+//
+// The tmux server is spawned inline rather than through a helper: the resource
+// census only credits an exact Medium owner for calls lexically inside the
+// declared runnable, so a shared helper would leave this test's tmux dependency
+// as undeclared Small debt.
+func TestSweepOrphanPIDPrefixedDirsReapsServerBeforeRemovingParent(t *testing.T) {
+	RequireTmux(t)
+	root := shortSweepRoot(t)
+	owner := deadPID(t)
+	parent := filepath.Join(root, fmt.Sprintf("%s%d-probe", SocketParentDirPrefix, owner))
+	socketRoot := filepath.Join(parent, "tmux")
+	if err := os.MkdirAll(socketRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// The server is reaped in t.Cleanup by PID, not by socket: this test
+	// deliberately deletes the socket directory, which is exactly the state
+	// that leaves a server unreachable by every socket-addressed path here.
+	spawn := exec.Command("tmux", "-L", "test-city", "new-session", "-d", "-s", "probe", "sleep", "300")
+	spawn.Env = append(os.Environ(), tmuxTmpEnv+"="+socketRoot)
+	if out, err := spawn.CombinedOutput(); err != nil {
+		t.Fatalf("spawning probe tmux server: %v\n%s", err, out)
+	}
+	socketPath := filepath.Join(socketRoot, "tmux-"+strconv.Itoa(os.Getuid()), "test-city")
+	show := exec.Command("tmux", "-S", socketPath, "display-message", "-p", "#{pid}")
+	out, err := show.Output()
+	if err != nil {
+		t.Fatalf("reading probe server pid: %v", err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		t.Fatalf("probe server pid %q: %v", out, err)
+	}
+	t.Cleanup(func() {
+		if pidutil.Alive(pid) {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+	})
+
+	if !pidutil.Alive(pid) {
+		t.Fatalf("probe server %d not alive before sweep", pid)
+	}
+
+	// The sweep ignores dirs younger than socketParentSweepMinAge. Backdate
+	// last, after the writes that would bump mtime.
+	old := time.Now().Add(-2 * socketParentSweepMinAge)
+	if err := os.Chtimes(parent, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	SweepOrphanPIDPrefixedDirs(root, SocketParentDirPrefix, io.Discard)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for pidutil.Alive(pid) && time.Now().Before(deadline) {
+		time.Sleep(25 * time.Millisecond)
+	}
+	if pidutil.Alive(pid) {
+		t.Fatalf("tmux server %d survived the sweep; its socket dir %s is %s", pid, parent, dirState(parent))
+	}
+	if _, err := os.Stat(parent); !os.IsNotExist(err) {
+		t.Fatalf("socket parent survived sweep after its server was reaped: %v", err)
+	}
+}
+
+// TestSweepOrphanPIDPrefixedDirsRemovesParentWithDeadSocketFile pins the other
+// half of the liveness question. A socket FILE outlives a server that died
+// without cleaning up; if presence on disk counted as a live server, every such
+// leftover would pin its parent dir forever and the sweep would stop sweeping.
+func TestSweepOrphanPIDPrefixedDirsRemovesParentWithDeadSocketFile(t *testing.T) {
+	root := shortSweepRoot(t)
+	owner := deadPID(t)
+	parent := filepath.Join(root, fmt.Sprintf("%s%d-stale", SocketParentDirPrefix, owner))
+	socketDir := filepath.Join(parent, "tmux", "tmux-"+strconv.Itoa(os.Getuid()))
+	if err := os.MkdirAll(socketDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(socketDir, "test-city"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	old := time.Now().Add(-2 * socketParentSweepMinAge)
+	if err := os.Chtimes(parent, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	SweepOrphanPIDPrefixedDirs(root, SocketParentDirPrefix, io.Discard)
+
+	if _, err := os.Stat(parent); !os.IsNotExist(err) {
+		t.Fatalf("a socket file with no listener pinned its parent dir: %v", err)
+	}
+}
+
+func dirState(path string) string {
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return "GONE (the server is now unreachable by socket path)"
+	}
+	return "still present"
 }

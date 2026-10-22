@@ -746,8 +746,8 @@ func TestBinaryCheck_NotFound(t *testing.T) {
 func TestBinaryCheck_Skipped(t *testing.T) {
 	c := NewBinaryCheck("bd", "skipped (GC_BEADS=file)", nil)
 	r := c.Run(&CheckContext{})
-	if r.Status != StatusOK {
-		t.Errorf("status = %d, want OK (skipped)", r.Status)
+	if r.Status != StatusSkipped {
+		t.Errorf("status = %d, want StatusSkipped", r.Status)
 	}
 	if r.Message != "skipped (GC_BEADS=file)" {
 		t.Errorf("message = %q, want skip message", r.Message)
@@ -1349,6 +1349,81 @@ func TestBeadsStoreCheck_WarnsOnBdStoreFallback(t *testing.T) {
 	}
 	if r.FixHint == "" {
 		t.Error("FixHint is empty, want repair guidance")
+	}
+}
+
+func TestBeadsStoreCheck_FailsOnSchemaSkewFallback(t *testing.T) {
+	dir := setupCity(t, "[workspace]\nname = \"test\"\n\n[beads]\nprovider = \"file\"\n")
+	spy := &spyPingStore{pingFunc: func() error { return nil }}
+	c := NewBeadsStoreCheck(dir, func(_ string) (beads.StoreOpenResult, error) {
+		return beads.StoreOpenResult{
+			Store: spy,
+			Diagnostic: beads.BeadsDiagnostic{
+				Store:               beads.BeadsStoreNameBdStore,
+				NativeStoreEligible: false,
+				PreflightGate:       "native_open",
+				PreflightReason:     "schema version mismatch: database is at v55, binary knows up to v54 (1 migration ahead)",
+			},
+		}, nil
+	})
+	r := c.Run(&CheckContext{})
+	if r.Status != StatusError {
+		t.Fatalf("status = %d, want Error; msg = %s", r.Status, r.Message)
+	}
+	if !strings.Contains(r.Message, "schema version mismatch") {
+		t.Fatalf("message = %q, want schema mismatch cause", r.Message)
+	}
+	if !strings.Contains(r.FixHint, "refusing session reconciliation") {
+		t.Fatalf("FixHint = %q, want fail-closed reconciliation guidance", r.FixHint)
+	}
+}
+
+func TestBeadsStoreCheck_SchemaSkewWinsOverFallbackPingFailure(t *testing.T) {
+	dir := setupCity(t, "[workspace]\nname = \"test\"\n\n[beads]\nprovider = \"file\"\n")
+	spy := &spyPingStore{pingFunc: func() error { return errors.New("fallback bd is also stale") }}
+	c := NewBeadsStoreCheck(dir, func(_ string) (beads.StoreOpenResult, error) {
+		return beads.StoreOpenResult{
+			Store: spy,
+			Diagnostic: beads.BeadsDiagnostic{
+				Store:               beads.BeadsStoreNameBdStore,
+				NativeStoreEligible: false,
+				PreflightGate:       "native_open",
+				PreflightReason:     "schema version mismatch: database is at v55, binary knows up to v54 (1 migration ahead)",
+			},
+		}, nil
+	})
+	r := c.Run(&CheckContext{})
+	if r.Status != StatusError || !strings.Contains(r.Message, "native store schema mismatch") {
+		t.Fatalf("result = status %d message %q, want explicit schema mismatch blocker", r.Status, r.Message)
+	}
+}
+
+func TestBeadsStoreCheck_SchemaSkewWinsOverFallbackOpenFailure(t *testing.T) {
+	dir := setupCity(t, "[workspace]\nname = \"test\"\n\n[beads]\nprovider = \"file\"\n")
+	c := NewBeadsStoreCheck(dir, func(_ string) (beads.StoreOpenResult, error) {
+		return beads.StoreOpenResult{Diagnostic: beads.BeadsDiagnostic{
+			Store: beads.BeadsStoreNameBdStore, PreflightGate: "native_open",
+			PreflightReason: "schema version mismatch: database is at v55, binary knows up to v54 (1 migration ahead)",
+		}}, errors.New("fallback executable unavailable")
+	})
+	r := c.Run(&CheckContext{})
+	if r.Status != StatusError || !strings.Contains(r.Message, "native store schema mismatch") {
+		t.Fatalf("result = status %d message %q, want explicit schema mismatch blocker", r.Status, r.Message)
+	}
+}
+
+func TestBeadsStoreCheck_WarnsOnExecStoreFallback(t *testing.T) {
+	dir := setupCity(t, "[workspace]\nname = \"test\"\n\n[beads]\nprovider = \"file\"\n")
+	spy := &spyPingStore{pingFunc: func() error { return nil }}
+	c := NewBeadsStoreCheck(dir, func(_ string) (beads.StoreOpenResult, error) {
+		return beads.StoreOpenResult{Store: spy, Diagnostic: beads.BeadsDiagnostic{
+			Store: beads.BeadsStoreNameExecStore, PreflightGate: "bd_context_agreement",
+			PreflightReason: "native store context mismatch",
+		}}, nil
+	})
+	r := c.Run(&CheckContext{})
+	if r.Status != StatusWarning {
+		t.Fatalf("status = %d, want Warning; message = %q", r.Status, r.Message)
 	}
 }
 
@@ -2127,8 +2202,8 @@ func TestDoltServerCheck_InvalidCityExplicitOriginFailsResolution(t *testing.T) 
 func TestDoltServerCheck_Skipped(t *testing.T) {
 	c := NewDoltServerCheck("/tmp", true)
 	r := c.Run(&CheckContext{})
-	if r.Status != StatusOK {
-		t.Errorf("status = %d, want OK (skipped)", r.Status)
+	if r.Status != StatusSkipped {
+		t.Errorf("status = %d, want StatusSkipped", r.Status)
 	}
 }
 
@@ -3083,8 +3158,8 @@ func newTestDoltNomsSizeCheck(cityPath string, skip bool) *DoltNomsSizeCheck {
 func TestDoltNomsSizeCheck_Skipped(t *testing.T) {
 	c := newTestDoltNomsSizeCheck(t.TempDir(), true)
 	r := c.Run(&CheckContext{})
-	if r.Status != StatusOK {
-		t.Fatalf("status = %d, want OK (skipped); msg = %s", r.Status, r.Message)
+	if r.Status != StatusSkipped {
+		t.Fatalf("status = %d, want StatusSkipped; msg = %s", r.Status, r.Message)
 	}
 	if !strings.Contains(r.Message, "skipped") {
 		t.Errorf("message = %q, want skipped", r.Message)
@@ -3119,8 +3194,8 @@ func TestDoltNomsSizeCheck_SkipsExternalTargets(t *testing.T) {
 
 		c := newTestDoltNomsSizeCheck(dir, false)
 		r := c.Run(&CheckContext{})
-		if r.Status != StatusOK {
-			t.Fatalf("status = %d, want OK skip; msg = %s", r.Status, r.Message)
+		if r.Status != StatusSkipped {
+			t.Fatalf("status = %d, want StatusSkipped; msg = %s", r.Status, r.Message)
 		}
 		if !strings.Contains(r.Message, "skipped") {
 			t.Fatalf("message = %q, want skipped", r.Message)
@@ -3151,8 +3226,8 @@ path = "demo"
 
 		c := newTestDoltNomsSizeCheck(dir, false)
 		r := c.Run(&CheckContext{})
-		if r.Status != StatusOK {
-			t.Fatalf("status = %d, want OK skip; msg = %s", r.Status, r.Message)
+		if r.Status != StatusSkipped {
+			t.Fatalf("status = %d, want StatusSkipped; msg = %s", r.Status, r.Message)
 		}
 		if !strings.Contains(r.Message, "skipped") {
 			t.Fatalf("message = %q, want skipped", r.Message)
@@ -3189,8 +3264,8 @@ path = "demo"
 		}
 		c := newTestDoltNomsSizeCheck(dir, false)
 		r := c.Run(&CheckContext{})
-		if r.Status != StatusOK {
-			t.Fatalf("status = %d, want OK skip; msg = %s", r.Status, r.Message)
+		if r.Status != StatusSkipped {
+			t.Fatalf("status = %d, want StatusSkipped; msg = %s", r.Status, r.Message)
 		}
 		if !strings.Contains(r.Message, "skipped") {
 			t.Fatalf("message = %q, want skipped", r.Message)
@@ -3264,6 +3339,93 @@ func TestDoltNomsSizeCheck_ErrorAtThreshold(t *testing.T) {
 	}
 	if !strings.Contains(r.Message, "excessive") {
 		t.Errorf("message = %q, want excessive text", r.Message)
+	}
+}
+
+// The .dolt directory holds versioned history (noms/) and the git-remote
+// transport cache (git-remote-cache/) side by side. Reporting the total as
+// "noms" sent an operator to the compaction runbook for cache bytes that
+// compaction cannot reclaim, and whose flatten step permanently broke hq's
+// origin mirror (ga-p8kao1 / ga-npnoeo). The breakdown must be explicit.
+func TestDoltNomsSizeCheck_ReportsSubtreeBreakdown(t *testing.T) {
+	dir := setupManagedDoltCity(t)
+	doltDir := filepath.Join(dir, ".beads", "dolt", "hq", ".dolt")
+	writeFakeFile(t, filepath.Join(doltDir, "noms", "chunks"), 1*1024*1024*1024)
+	writeFakeFile(t, filepath.Join(doltDir, "git-remote-cache", "repo.git", "pack"), 2*1024*1024*1024)
+
+	c := newTestDoltNomsSizeCheck(dir, false)
+	r := c.Run(&CheckContext{})
+
+	if r.Status != StatusWarning {
+		t.Fatalf("status = %d, want Warning (3 GB total); msg = %s", r.Status, r.Message)
+	}
+	if !strings.Contains(r.Message, "versioned history 1.00 GB") {
+		t.Errorf("message = %q, want the noms subtree named and sized", r.Message)
+	}
+	if !strings.Contains(r.Message, "git remote cache 2.00 GB") {
+		t.Errorf("message = %q, want the transport cache named and sized", r.Message)
+	}
+	if strings.Contains(r.Message, "noms directory") {
+		t.Errorf("message = %q, must not label the whole .dolt total as the noms directory", r.Message)
+	}
+}
+
+// When the transport cache dominates, the hint must steer AWAY from
+// compaction rather than toward it.
+func TestDoltNomsSizeCheck_CacheDominantFixHintWarnsOffCompaction(t *testing.T) {
+	dir := setupManagedDoltCity(t)
+	doltDir := filepath.Join(dir, ".beads", "dolt", "hq", ".dolt")
+	writeFakeFile(t, filepath.Join(doltDir, "noms", "chunks"), 1*1024*1024*1024)
+	writeFakeFile(t, filepath.Join(doltDir, "git-remote-cache", "repo.git", "pack"), 4*1024*1024*1024)
+
+	c := newTestDoltNomsSizeCheck(dir, false)
+	r := c.Run(&CheckContext{})
+
+	if !strings.Contains(r.FixHint, "git-remote-cache") {
+		t.Errorf("fix hint = %q, want the transport cache named", r.FixHint)
+	}
+	if !strings.Contains(r.FixHint, "does NOT reclaim") {
+		t.Errorf("fix hint = %q, want an explicit statement that compaction cannot reclaim it", r.FixHint)
+	}
+	if !strings.Contains(r.FixHint, "do not flatten") {
+		t.Errorf("fix hint = %q, want the flatten warning", r.FixHint)
+	}
+}
+
+// A history-dominant database keeps the original runbook pointer.
+func TestDoltNomsSizeCheck_NomsDominantKeepsBloatRecoveryHint(t *testing.T) {
+	dir := setupManagedDoltCity(t)
+	doltDir := filepath.Join(dir, ".beads", "dolt", "hq", ".dolt")
+	writeFakeFile(t, filepath.Join(doltDir, "noms", "chunks"), 4*1024*1024*1024)
+	writeFakeFile(t, filepath.Join(doltDir, "git-remote-cache", "repo.git", "pack"), 1*1024*1024*1024)
+
+	c := newTestDoltNomsSizeCheck(dir, false)
+	r := c.Run(&CheckContext{})
+
+	if !strings.Contains(r.FixHint, "dolt-bloat-recovery") {
+		t.Errorf("fix hint = %q, want bloat-recovery doc reference", r.FixHint)
+	}
+	if strings.Contains(r.FixHint, "do not flatten") {
+		t.Errorf("fix hint = %q, must not warn off compaction when history dominates", r.FixHint)
+	}
+}
+
+func TestMeasureDoltDataSplit_RemainderNeverNegative(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeFile(t, filepath.Join(dir, "noms", "chunks"), 4096)
+	writeFakeFile(t, filepath.Join(dir, "git-remote-cache", "pack"), 4096)
+
+	// Total understates the parts, as a concurrent write during a
+	// non-atomic multi-pass measurement can produce.
+	split, err := measureDoltDataSplit(sumDirBytes, dir, 1024)
+	if err != nil {
+		t.Fatalf("measureDoltDataSplit: %v", err)
+	}
+	if split.Other != 0 {
+		t.Errorf("Other = %d, want 0 (remainder must not go negative)", split.Other)
+	}
+	if split.Noms != 4096 || split.GitRemoteCache != 4096 {
+		t.Errorf("Noms = %d, GitRemoteCache = %d, want 4096 each", split.Noms, split.GitRemoteCache)
 	}
 }
 
@@ -3403,6 +3565,201 @@ func TestDoltNomsSizeCheck_OrphanDatabaseWarnAtThreshold(t *testing.T) {
 	}
 }
 
+// TestDoltNomsSizeCheck_OutOfCityRigNotLabeledOrphan is a regression test for
+// ga-w7xo: a database that is referenced by an out-of-city rig scope root's
+// metadata.json must not be labeled "orphan database" even when
+// ResolveScopeConfigState fails for that scope root.
+func TestDoltNomsSizeCheck_OutOfCityRigNotLabeledOrphan(t *testing.T) {
+	cityDir := setupManagedDoltCity(t) // sets up "hq" as the city's managed db
+
+	// Create a configured out-of-city rig root with metadata that names "qcore".
+	rigDir := t.TempDir()
+	cityConfig := fmt.Sprintf("[workspace]\nname = %q\n\n[[rigs]]\nname = %q\npath = %q\n", "test", "qcore", rigDir)
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(cityConfig), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(rigDir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeDoctorCanonicalMetadata(t, fsys.OSFS{}, rigDir, "qcore")
+
+	// Create the "qcore" database directory in the city's managed data dir.
+	// The check must NOT label it "orphan database qcore".
+	writeFakeFile(t, filepath.Join(cityDir, ".beads", "dolt", "qcore", ".dolt", "noms", "big"), 3*1024*1024*1024)
+
+	// Build the check directly, injecting scope roots that include the out-of-city rig.
+	// applicableKnown=true bypasses the config-based applicable check so we can
+	// control scope roots without needing a full city.toml with a rig declaration.
+	c := &DoltNomsSizeCheck{
+		cityPath:        cityDir,
+		skip:            false,
+		measureDir:      sumDirBytes,
+		applicableKnown: true,
+		applicable:      true,
+		scopeRoots:      []string{cityDir, rigDir},
+	}
+	r := c.Run(&CheckContext{})
+
+	// The check may warn (large qcore db) but must not label qcore as orphan.
+	if strings.Contains(r.Message, "orphan database qcore") {
+		t.Fatalf("qcore must not be labeled orphan: message = %q", r.Message)
+	}
+}
+
+func TestDoltNomsSizeCheck_ExplicitRigOnManagedEndpointNotLabeledOrphan(t *testing.T) {
+	cityDir := setupManagedDoltCity(t)
+	cityTarget, err := contract.ResolveDoltConnectionTarget(fsys.OSFS{}, cityDir, cityDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rigDir := t.TempDir()
+	fs := fsys.OSFS{}
+	writeDoctorCanonicalConfig(t, fs, rigDir, contract.ConfigState{
+		IssuePrefix:    "qc",
+		EndpointOrigin: contract.EndpointOriginExplicit,
+		EndpointStatus: contract.EndpointStatusVerified,
+		DoltHost:       "localhost",
+		DoltPort:       cityTarget.Port,
+	})
+	if err := os.MkdirAll(filepath.Join(rigDir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeDoctorCanonicalMetadata(t, fs, rigDir, "qcore")
+	writeFakeFile(t, filepath.Join(cityDir, ".beads", "dolt", "qcore", ".dolt", "noms", "big"), 3*1024*1024*1024)
+
+	c := &DoltNomsSizeCheck{
+		cityPath:        cityDir,
+		skip:            false,
+		measureDir:      sumDirBytes,
+		applicableKnown: true,
+		applicable:      true,
+		scopeRoots:      []string{cityDir, rigDir},
+	}
+	r := c.Run(&CheckContext{})
+
+	if strings.Contains(r.Message, "orphan database qcore") {
+		t.Fatalf("rig on managed city endpoint must not be labeled orphan: message = %q", r.Message)
+	}
+}
+
+func TestDoltNomsSizeCheck_DistinctLoopbackRigDoesNotMaskOrphan(t *testing.T) {
+	cityDir := setupManagedDoltCity(t)
+	cityTarget, err := contract.ResolveDoltConnectionTarget(fsys.OSFS{}, cityDir, cityDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rigDir := t.TempDir()
+	fs := fsys.OSFS{}
+	writeDoctorCanonicalConfig(t, fs, rigDir, contract.ConfigState{
+		IssuePrefix:    "qc",
+		EndpointOrigin: contract.EndpointOriginExplicit,
+		EndpointStatus: contract.EndpointStatusVerified,
+		DoltHost:       "127.0.0.2",
+		DoltPort:       cityTarget.Port,
+	})
+	if err := os.MkdirAll(filepath.Join(rigDir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeDoctorCanonicalMetadata(t, fs, rigDir, "qcore")
+	writeFakeFile(t, filepath.Join(cityDir, ".beads", "dolt", "qcore", ".dolt", "noms", "big"), 3*1024*1024*1024)
+
+	c := &DoltNomsSizeCheck{cityPath: cityDir, measureDir: sumDirBytes, applicableKnown: true, applicable: true, scopeRoots: []string{cityDir, rigDir}}
+	r := c.Run(&CheckContext{})
+	if !strings.Contains(r.Message, "orphan database qcore") {
+		t.Fatalf("distinct loopback endpoint must not mask a managed orphan: message = %q", r.Message)
+	}
+}
+
+func TestDoltNomsSizeCheck_ExternalRigMetadataDoesNotMaskOrphan(t *testing.T) {
+	cityDir := setupManagedDoltCity(t)
+	rigDir := t.TempDir()
+	fs := fsys.OSFS{}
+	writeDoctorCanonicalConfig(t, fs, rigDir, contract.ConfigState{
+		IssuePrefix:    "qc",
+		EndpointOrigin: contract.EndpointOriginExplicit,
+		EndpointStatus: contract.EndpointStatusVerified,
+		DoltHost:       "rig-db.example.com",
+		DoltPort:       "4406",
+	})
+	writeDoctorCanonicalMetadata(t, fs, rigDir, "qcore")
+	writeFakeFile(t, filepath.Join(cityDir, ".beads", "dolt", "qcore", ".dolt", "noms", "big"), 3*1024*1024*1024)
+
+	c := &DoltNomsSizeCheck{
+		cityPath:        cityDir,
+		skip:            false,
+		measureDir:      sumDirBytes,
+		applicableKnown: true,
+		applicable:      true,
+		scopeRoots:      []string{cityDir, rigDir},
+	}
+	r := c.Run(&CheckContext{})
+
+	if !strings.Contains(r.Message, "orphan database qcore") {
+		t.Fatalf("external rig metadata must not mask a local orphan: message = %q", r.Message)
+	}
+}
+
+func TestDoltNomsSizeCheck_DoltLiteMetadataDoesNotMaskOrphan(t *testing.T) {
+	cityDir := setupManagedDoltCity(t)
+	rigDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(rigDir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := contract.EnsureCanonicalMetadata(fsys.OSFS{}, filepath.Join(rigDir, ".beads", "metadata.json"), contract.MetadataState{
+		Database:     "doltlite",
+		Backend:      "doltlite",
+		DoltDatabase: "qcore",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	writeFakeFile(t, filepath.Join(cityDir, ".beads", "dolt", "qcore", ".dolt", "noms", "big"), 3*1024*1024*1024)
+
+	c := &DoltNomsSizeCheck{
+		cityPath:        cityDir,
+		skip:            false,
+		measureDir:      sumDirBytes,
+		applicableKnown: true,
+		applicable:      true,
+		scopeRoots:      []string{cityDir, rigDir},
+	}
+	r := c.Run(&CheckContext{})
+
+	if !strings.Contains(r.Message, "orphan database qcore") {
+		t.Fatalf("DoltLite metadata must not mask a managed Dolt orphan: message = %q", r.Message)
+	}
+}
+
+func TestDoltNomsSizeCheck_EmbeddedDoltMetadataDoesNotMaskOrphan(t *testing.T) {
+	cityDir := setupManagedDoltCity(t)
+	rigDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(rigDir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := contract.EnsureCanonicalMetadata(fsys.OSFS{}, filepath.Join(rigDir, ".beads", "metadata.json"), contract.MetadataState{
+		Database:     "dolt",
+		Backend:      "dolt",
+		DoltMode:     "embedded",
+		DoltDatabase: "qcore",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	writeFakeFile(t, filepath.Join(cityDir, ".beads", "dolt", "qcore", ".dolt", "noms", "big"), 3*1024*1024*1024)
+
+	c := &DoltNomsSizeCheck{
+		cityPath:        cityDir,
+		skip:            false,
+		measureDir:      sumDirBytes,
+		applicableKnown: true,
+		applicable:      true,
+		scopeRoots:      []string{cityDir, rigDir},
+	}
+	r := c.Run(&CheckContext{})
+
+	if !strings.Contains(r.Message, "orphan database qcore") {
+		t.Fatalf("embedded Dolt metadata must not mask a managed server orphan: message = %q", r.Message)
+	}
+}
+
 func TestDoltNomsSizeCheck_SkipsSystemDatabaseMetadata(t *testing.T) {
 	dir := setupManagedDoltCity(t)
 	if err := os.WriteFile(filepath.Join(dir, ".beads", "metadata.json"), []byte(`{"dolt_database":"mysql"}`), 0o644); err != nil {
@@ -3420,8 +3777,8 @@ func TestDoltNomsSizeCheck_SkipsSystemDatabaseMetadata(t *testing.T) {
 		return 0, false, nil
 	}
 	r := c.Run(&CheckContext{})
-	if r.Status != StatusOK {
-		t.Fatalf("status = %d, want OK; msg = %s", r.Status, r.Message)
+	if r.Status != StatusSkipped {
+		t.Fatalf("status = %d, want StatusSkipped; msg = %s", r.Status, r.Message)
 	}
 }
 
@@ -3439,8 +3796,8 @@ func TestDoltNomsSizeCheck_SkipsInvalidDatabaseMetadata(t *testing.T) {
 		return 0, false, nil
 	}
 	r := c.Run(&CheckContext{})
-	if r.Status != StatusOK {
-		t.Fatalf("status = %d, want OK; msg = %s", r.Status, r.Message)
+	if r.Status != StatusSkipped {
+		t.Fatalf("status = %d, want StatusSkipped; msg = %s", r.Status, r.Message)
 	}
 }
 
@@ -3751,8 +4108,8 @@ func renderDoctorTestYAML(b *strings.Builder, m map[string]any, indent int) {
 func TestDoltConfigCheck_Skipped(t *testing.T) {
 	c := NewDoltConfigCheck(t.TempDir(), true)
 	r := c.Run(&CheckContext{})
-	if r.Status != StatusOK {
-		t.Fatalf("status = %d, want OK; msg = %s", r.Status, r.Message)
+	if r.Status != StatusSkipped {
+		t.Fatalf("status = %d, want StatusSkipped; msg = %s", r.Status, r.Message)
 	}
 	if !strings.Contains(r.Message, "skipped") {
 		t.Errorf("message = %q, want skipped", r.Message)
@@ -4072,8 +4429,8 @@ func TestDoltConfigCheck_SkipsExternalTargets(t *testing.T) {
 
 		c := NewDoltConfigCheck(dir, false)
 		r := c.Run(&CheckContext{})
-		if r.Status != StatusOK {
-			t.Fatalf("status = %d, want OK skip; msg = %s", r.Status, r.Message)
+		if r.Status != StatusSkipped {
+			t.Fatalf("status = %d, want StatusSkipped; msg = %s", r.Status, r.Message)
 		}
 		if !strings.Contains(r.Message, "skipped") {
 			t.Fatalf("message = %q, want skipped", r.Message)
@@ -4104,8 +4461,8 @@ path = "demo"
 
 		c := NewDoltConfigCheck(dir, false)
 		r := c.Run(&CheckContext{})
-		if r.Status != StatusOK {
-			t.Fatalf("status = %d, want OK skip; msg = %s", r.Status, r.Message)
+		if r.Status != StatusSkipped {
+			t.Fatalf("status = %d, want StatusSkipped; msg = %s", r.Status, r.Message)
 		}
 		if !strings.Contains(r.Message, "skipped") {
 			t.Fatalf("message = %q, want skipped", r.Message)
@@ -4121,14 +4478,14 @@ func TestManagedDoltChecksSkipInvalidCityConfig(t *testing.T) {
 
 	sizeCheck := NewDoltNomsSizeCheck(dir, false)
 	sizeResult := sizeCheck.Run(&CheckContext{})
-	if sizeResult.Status != StatusOK || !strings.Contains(sizeResult.Message, "skipped") {
-		t.Fatalf("dolt-noms-size status=%d message=%q, want skipped OK", sizeResult.Status, sizeResult.Message)
+	if sizeResult.Status != StatusSkipped || !strings.Contains(sizeResult.Message, "skipped") {
+		t.Fatalf("dolt-noms-size status=%d message=%q, want StatusSkipped", sizeResult.Status, sizeResult.Message)
 	}
 
 	configCheck := NewDoltConfigCheck(dir, false)
 	configResult := configCheck.Run(&CheckContext{})
-	if configResult.Status != StatusOK || !strings.Contains(configResult.Message, "skipped") {
-		t.Fatalf("dolt-config status=%d message=%q, want skipped OK", configResult.Status, configResult.Message)
+	if configResult.Status != StatusSkipped || !strings.Contains(configResult.Message, "skipped") {
+		t.Fatalf("dolt-config status=%d message=%q, want StatusSkipped", configResult.Status, configResult.Message)
 	}
 
 	versionCheck := NewScopedDoltVersionCheck(dir)
@@ -4137,8 +4494,8 @@ func TestManagedDoltChecksSkipInvalidCityConfig(t *testing.T) {
 		return "", nil
 	}
 	versionResult := versionCheck.Run(&CheckContext{})
-	if versionResult.Status != StatusOK || !strings.Contains(versionResult.Message, "skipped") {
-		t.Fatalf("dolt-version status=%d message=%q, want skipped OK", versionResult.Status, versionResult.Message)
+	if versionResult.Status != StatusSkipped || !strings.Contains(versionResult.Message, "skipped") {
+		t.Fatalf("dolt-version status=%d message=%q, want StatusSkipped", versionResult.Status, versionResult.Message)
 	}
 }
 
@@ -4310,8 +4667,8 @@ func TestDoltVersionCheck_Skipped(t *testing.T) {
 		return "", nil
 	}
 	r := c.Run(&CheckContext{})
-	if r.Status != StatusOK {
-		t.Fatalf("status = %d, want OK", r.Status)
+	if r.Status != StatusSkipped {
+		t.Fatalf("status = %d, want StatusSkipped", r.Status)
 	}
 	if !strings.Contains(r.Message, "skipped") {
 		t.Fatalf("message = %q, want skipped", r.Message)
@@ -4337,8 +4694,8 @@ func TestDoltVersionCheck_SkipsExternalTargets(t *testing.T) {
 			return "", nil
 		}
 		r := c.Run(&CheckContext{})
-		if r.Status != StatusOK {
-			t.Fatalf("status = %d, want OK skip; msg = %s", r.Status, r.Message)
+		if r.Status != StatusSkipped {
+			t.Fatalf("status = %d, want StatusSkipped; msg = %s", r.Status, r.Message)
 		}
 		if !strings.Contains(r.Message, "skipped") {
 			t.Fatalf("message = %q, want skipped", r.Message)
@@ -4373,8 +4730,8 @@ path = "demo"
 			return "", nil
 		}
 		r := c.Run(&CheckContext{})
-		if r.Status != StatusOK {
-			t.Fatalf("status = %d, want OK skip; msg = %s", r.Status, r.Message)
+		if r.Status != StatusSkipped {
+			t.Fatalf("status = %d, want StatusSkipped; msg = %s", r.Status, r.Message)
 		}
 		if !strings.Contains(r.Message, "skipped") {
 			t.Fatalf("message = %q, want skipped", r.Message)
@@ -4535,5 +4892,17 @@ func TestRigDoltServerCheck_NonDoltRigIsNotApplicable(t *testing.T) {
 	}
 	if !strings.Contains(r.Message, "not applicable") {
 		t.Fatalf("message = %q, want a not-applicable answer", r.Message)
+	}
+}
+
+func TestSameManagedDoltServerRejectsExternalCityEndpoint(t *testing.T) {
+	city := contract.DoltConnectionTarget{Host: "127.0.0.1", Port: "51361", External: true}
+	rig := contract.DoltConnectionTarget{Host: "localhost", Port: "51361", External: true}
+	if sameManagedDoltServer(city, rig) {
+		t.Fatal("external city endpoint must not classify a rig database as managed-local")
+	}
+	city.External = false
+	if !sameManagedDoltServer(city, rig) {
+		t.Fatal("managed city endpoint should match localhost alias at the same port")
 	}
 }

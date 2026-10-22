@@ -304,3 +304,70 @@ func TestApplyOverrides_PreservesNotFoundSubstring(t *testing.T) {
 		})
 	}
 }
+
+// An unmatched override must not stop the overrides after it. The dispatcher
+// tolerates the error and runs with whatever was applied, so a first-miss
+// return silently undid every enabled = false listed below the miss.
+func TestApplyOverrides_MissDoesNotSkipLaterOverrides(t *testing.T) {
+	t.Parallel()
+
+	aa := []Order{{Name: "patrol"}, {Name: "digest"}}
+	err := ApplyOverrides(aa, []Override{
+		{Name: "ghost"},
+		{Name: "patrol", Enabled: boolPtr(false)},
+		{Name: "digest", Interval: strPtr("1h")},
+	})
+	if err == nil || !strings.Contains(err.Error(), `order "ghost" not found`) {
+		t.Fatalf("ApplyOverrides error = %v, want the ghost miss", err)
+	}
+	if aa[0].IsEnabled() {
+		t.Error("patrol is enabled; the enabled = false below the miss was skipped")
+	}
+	if aa[1].Interval != "1h" {
+		t.Errorf("digest Interval = %q, want %q; the override below the miss was skipped", aa[1].Interval, "1h")
+	}
+}
+
+func TestApplyOverrides_ReportsEveryBadOverride(t *testing.T) {
+	t.Parallel()
+
+	aa := []Order{{Name: "patrol"}}
+	err := ApplyOverrides(aa, []Override{
+		{Name: "ghost-one"},
+		{},
+		{Name: "patrol", Interval: strPtr("5m")},
+		{Name: "ghost-two"},
+	})
+	if err == nil {
+		t.Fatal("ApplyOverrides succeeded; want an error naming every bad override")
+	}
+	for _, want := range []string{
+		`orders.overrides[0]: order "ghost-one" not found`,
+		`orders.overrides[1]: name is required`,
+		`orders.overrides[3]: order "ghost-two" not found`,
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q is missing %q", err.Error(), want)
+		}
+	}
+	if aa[0].Interval != "5m" {
+		t.Errorf("patrol Interval = %q, want %q", aa[0].Interval, "5m")
+	}
+}
+
+func TestApplyOverridesRunStaleAfter(t *testing.T) {
+	t.Parallel()
+
+	// A shared-pack formula order whose runs legitimately outlast the watchdog's
+	// 6h default must be tunable from the deployment, not only in pack source.
+	aa := []Order{{Name: "digest-generate", Formula: "mol-digest-generate", Trigger: "cooldown", Interval: "24h"}}
+	if err := ApplyOverrides(aa, []Override{{Name: "digest-generate", RunStaleAfter: strPtr("18h")}}); err != nil {
+		t.Fatalf("ApplyOverrides: %v", err)
+	}
+	if aa[0].RunStaleAfter != "18h" {
+		t.Errorf("override run_stale_after not applied: RunStaleAfter = %q, want %q", aa[0].RunStaleAfter, "18h")
+	}
+	if got := aa[0].RunStaleAfterOrDefault(); got != 18*time.Hour {
+		t.Errorf("RunStaleAfterOrDefault() = %v, want %v", got, 18*time.Hour)
+	}
+}

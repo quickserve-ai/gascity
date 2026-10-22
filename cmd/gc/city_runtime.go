@@ -34,6 +34,7 @@ import (
 	"github.com/gastownhall/gascity/internal/storeref"
 	"github.com/gastownhall/gascity/internal/supervisor"
 	"github.com/gastownhall/gascity/internal/telemetry"
+	"github.com/gastownhall/gascity/internal/worker"
 	"github.com/gastownhall/gascity/internal/workspacesvc"
 )
 
@@ -111,6 +112,8 @@ type CityRuntime struct {
 	// lastSuspension is the suspension state the previous tick saw, so the
 	// next one can tell which scopes resumed (repairResumedScopes).
 	lastSuspension *beadsScopeSuspension
+	// lastRearmRequest is when rearmResumedRigStores last scheduled a reload.
+	lastRearmRequest time.Time
 	// drainedLastTick records, per suspended scope root, whether its sessions
 	// were already drained on the previous tick (retireSuspendedScopes).
 	drainedLastTick map[string]bool
@@ -182,6 +185,11 @@ type CityRuntime struct {
 	detachedOrphan     *detachedOrphanLane
 	detachedOrphanOnce sync.Once
 
+	// claimLoop is the claim-loop guard (claim_loop_guard.go), fed by the same
+	// journal feed as the delta lanes; created on first use.
+	claimLoop     *claimLoopGuard
+	claimLoopOnce sync.Once
+
 	// ordersLane runs order dispatch off the tick (orders_lane.go). It owns
 	// od, retiredOrderDispatchers, the order-set bookkeeping and the watchdog
 	// clocks below; created on first use.
@@ -210,6 +218,7 @@ type CityRuntime struct {
 	inOrderPassConfig func(*ordersLane)
 
 	orderSweepWatchdogLast             time.Time
+	orderWispWatchdogLast              time.Time
 	orderTrackingRetentionWatchdogLast time.Time
 	nudgeMailSweepWatchdogLast         time.Time
 	wispIndexMigrationApplied          bool
@@ -286,13 +295,27 @@ type CityRuntime struct {
 	transcriptMetaStarted bool
 	transcriptMetaDone    chan struct{}
 
+	// formulaNameMemo is the process-lifetime memo of acting bead id to formula
+	// name for usage attribution, built once through formulaMemoOnce. Neither
+	// field is guarded by transcriptMetaMu.
+	formulaMemoOnce sync.Once
+	formulaNameMemo *worker.FormulaNameMemo
+
 	fsPressureConsecutiveSkips int
 	fsPressureEpisodeLogged    bool
 
-	// reapSkips carries worktree-reaper skip history between ticks so an
-	// unchanged skip is reported once instead of on every sweep. Owned by the
-	// serial tick, like the other per-tick state above.
-	reapSkips *reapSkipTracker
+	// worktreeReaper is the single-flight background lane the closed-bead
+	// worktree reaper runs on (ga-yuiof4 item 3). It owns the reaper-only
+	// state that used to sit here — the skip tracker and the cross-tick
+	// bead-status memo (ga-singc6) — and hands it to one pass at a time.
+	worktreeReaper     *worktreeReaperLane
+	worktreeReaperOnce sync.Once
+	// startFenceRegs are the providers the lane's session-start fence is
+	// registered on (internal/session.RegisterStartFence). Run goroutine only.
+	startFenceRegs []startFenceRegistration
+	// startFenceActive is set by run() once it has registered the fence on
+	// cr.sp; reload registers replacement providers only while it is set.
+	startFenceActive bool
 
 	convScopes          map[string]*convergenceScope // nil until bead store available; keyed by rig name ("" = city/HQ)
 	convScopesMu        sync.RWMutex                 // guards convScopes map pointer
@@ -518,7 +541,10 @@ func newCityRuntime(p CityRuntimeParams) (*CityRuntime, error) {
 	// live city's release sweeps at a binding it is about to close. The lock
 	// holder registers — see registerResidencyRoutes.
 
-	sweepOrphanedOrderTrackingAtBoot(routes, p.CityPath, p.Cfg, p.Rec, p.Stderr)
+	// The boot order-tracking sweep writes to the work and orders stores, so it
+	// does not run here: run() performs it (sweepOrphanedOrderTracking) only
+	// after the controller store passes the schema compatibility gate
+	// (ga-mw4dg).
 
 	od, orderSnapshot := buildOrderDispatcherWithSnapshot(routes, p.CityPath, p.Cfg, p.Rec, p.Stderr, "gc start: order scan")
 
@@ -555,7 +581,6 @@ func newCityRuntime(p CityRuntimeParams) (*CityRuntime, error) {
 		orderRescanLast:         time.Now(),
 		trace:                   newSessionReconcilerTraceManager(p.CityPath, p.CityName, p.Stderr),
 		rec:                     p.Rec,
-		reapSkips:               newReapSkipTracker(),
 		poolSessions:            p.PoolSessions,
 		forceStopShutdown:       p.ForceStopShutdown,
 		suspendedNames:          suspendedNames,
@@ -596,10 +621,15 @@ func newCityRuntime(p CityRuntimeParams) (*CityRuntime, error) {
 	cr.initWake(p.Wake)
 	cr.publishPoolDeathHandlers(p.PoolDeathHandlers)
 	cr.svc = workspacesvc.NewManager(&serviceRuntime{cr: cr})
-	if err := cr.svc.Reload(); err != nil {
-		fmt.Fprintf(cr.stderr, "%s: service init: %v\n", cr.logPrefix, err) //nolint:errcheck // best-effort stderr
-	}
+	// Services start in run(), after the schema compatibility gate (ga-mw4dg).
 	return cr, nil
+}
+
+// sweepOrphanedOrderTracking closes tracking beads left by a prior controller
+// in the work store and the orders binding (sweepOrphanedOrderTrackingAtBoot).
+// It runs only after the controller store passes the schema compatibility gate.
+func (cr *CityRuntime) sweepOrphanedOrderTracking() {
+	sweepOrphanedOrderTrackingAtBoot(cr.storageRoutes, cr.cityPath, cr.cfg, cr.rec, cr.stderr)
 }
 
 // setControllerState sets the API state for this city. The controller
@@ -629,19 +659,112 @@ func (cr *CityRuntime) crashTrack() crashTracker {
 	return cr.ct
 }
 
+// controllerStoreSchemaSkewDiagnostic returns the blocking native-store
+// diagnostic, if any, from the controller's latest city-store open.
+func (cr *CityRuntime) controllerStoreSchemaSkewDiagnostic() *beads.BeadsDiagnostic {
+	if cr.cs == nil {
+		return nil
+	}
+	diag := cr.cs.CityBeadsDiagnostic()
+	if diag == nil || !beads.IsSchemaSkewDiagnostic(*diag) {
+		return nil
+	}
+	return diag
+}
+
+// probePublishingOpenSchemaSkew runs, ahead of time, the city-store open a
+// publication of next makes when it cannot reuse the current stores
+// (controllerState.updateLocked), and latches its diagnostic as that open
+// would when it finds the store's schema ahead of this binary (ga-mw4dg).
+// A provider swap stops the runtimes the new provider cannot reach before it
+// publishes (CONTRACT P7), and those stops cannot be undone, while the
+// publishing open is the authoritative schema gate: the swap calls this
+// first, so a skewed store fails the reload closed with nothing stopped. A
+// publication that reuses the current stores opens nothing (the preflight
+// was its gate), and neither does this. The diagnostic is read whatever the
+// open returned, as updateLocked reads it: the factory can refuse a store and
+// still report the schema skew it found first (a conditional-writes refusal
+// keeps its native-selection diagnostic). An open that errs without skew is
+// left to the publication, which reports it.
+func (cr *CityRuntime) probePublishingOpenSchemaSkew(next *config.City) *beads.BeadsDiagnostic {
+	cs := cr.cs
+	if cs == nil || cs.runtimeUpdateCanReuseCurrentStores(next) {
+		return nil
+	}
+	opened, _ := newControllerStateOpenCityStore(cs.cityPath, cs.rolloutFlags.BeadsConditionalWrites(), cs.nativeTransport) // the error is the publication's to report
+	if opened.Store != nil {
+		closeBeadStoreHandle(opened.Store) //nolint:errcheck // a probe's handle; the publication opens its own
+	}
+	if !beads.IsSchemaSkewDiagnostic(opened.Diagnostic) {
+		return nil
+	}
+	diag := diagnosticPtr(opened.Diagnostic)
+	cs.mu.Lock()
+	cs.cityBeadsDiagnostic = diag
+	cs.mu.Unlock()
+	return diag
+}
+
+// holdForControllerStoreSchemaSkew blocks until shutdown when the controller
+// store is newer than this binary. The preserve latch protects every outer
+// lifecycle owner that may call shutdown after run returns.
+func (cr *CityRuntime) holdForControllerStoreSchemaSkew(ctx context.Context) bool {
+	diag := cr.controllerStoreSchemaSkewDiagnostic()
+	if diag == nil {
+		return false
+	}
+	cr.preserveSessionsOnShutdown()
+	stderr := cr.stderr
+	if stderr == nil {
+		stderr = io.Discard
+	}
+	fmt.Fprintf(stderr, "%s: CRITICAL: %s; session reconciliation held fail-closed until a schema-compatible gc binary is installed\n", cr.logPrefix, diag.PreflightReason) //nolint:errcheck // best-effort alarm
+	if ctx != nil {
+		<-ctx.Done()
+	}
+	return true
+}
+
 // run executes the reconciliation loop until ctx is canceled. This is
 // the per-city main loop — it watches config, reconciles agents, runs
 // wisp GC, and dispatches orders.
 func (cr *CityRuntime) run(ctx context.Context) {
+	// A controller store newer than this binary holds reconciliation before
+	// this runtime claims the city: the hold latches session preservation and
+	// returns without taking ownership, so no later shutdown() by an outer
+	// lifecycle owner can stop sessions or tear the shared server down
+	// (ga-mw4dg).
+	if cr.holdForControllerStoreSchemaSkew(ctx) {
+		return
+	}
 	// Reaching run() means every init-failure/discard point is behind us:
 	// this runtime is the live owner of the city, so its shutdown() is the
 	// one allowed to tear the provider's shared server down.
 	cr.ownedCity.Store(true)
 	defer cr.shutdown()
+	// Every runtime start any internal/session Manager makes through this
+	// city's provider — reconcile, control dispatcher, in-process API wakes —
+	// is bracketed by the worktree reaper lane's session-start fence
+	// (ga-yuiof4 item 3). Registered before anything here can start a session.
+	//
+	// Registrations are NEVER dropped mid-run, not even for a provider a
+	// reload replaced: an in-process API wake may already hold a worker handle
+	// built on the old provider and start through it after the swap. All of
+	// them are unregistered here when run() returns. Their number is bounded
+	// by the provider-changing reloads in one controller lifetime.
+	cr.startFenceActive = true
+	cr.registerSessionStartFence(cr.sp)
+	defer cr.retireSessionStartFences()
 	if cr.runsV2() {
 		// Deferred after shutdown, so it runs first: the v2 planner is
 		// stopped before shutdown stops the sessions.
 		defer cr.v2.stop()
+	}
+	cr.sweepOrphanedOrderTracking()
+	if cr.svc != nil {
+		if err := cr.svc.Reload(); err != nil {
+			fmt.Fprintf(cr.stderr, "%s: service init: %v\n", cr.logPrefix, err) //nolint:errcheck // best-effort stderr
+		}
 	}
 
 	dirty := cr.configDirty
@@ -814,6 +937,8 @@ func (cr *CityRuntime) run(ctx context.Context) {
 	// Dispatch due orders before startup session reconciliation. A cold-start
 	// reconcile can take minutes when it has stale or config-drifted sessions;
 	// due event/condition formulas should not wait behind that maintenance work.
+	// Store maintenance, retention included (#6429), runs on the orders lane's
+	// maintenance goroutine, never ahead of readiness.
 	startupOrdersStart := time.Now()
 	cr.safeTick(func() {
 		cr.dispatchOrders(ctx, cityRoot)
@@ -1234,36 +1359,66 @@ func convergenceStartupComplete(cr *CityRuntime) bool {
 	return true
 }
 
+// poolDeathObservation is one reading of pool liveness: the on_death handler
+// set in force and the sessions its provider listed as running, taken together
+// so a config reload cannot replace one without the other.
+type poolDeathObservation struct {
+	handlers map[string]poolDeathInfo
+	running  map[string]bool
+	listErr  error
+}
+
 // reconcilePoolDeaths detects pool instances that stopped since the prior
 // reconciliation and runs their configured death hooks.
 func (cr *CityRuntime) reconcilePoolDeaths(prevPoolRunning *map[string]bool) {
-	handlers := cr.publishedPoolDeathHandlers()
-	if len(handlers) == 0 {
+	cr.actOnPoolDeaths(cr.observePoolDeaths(), prevPoolRunning)
+}
+
+// observePoolDeaths reads pool liveness from the current handler set and
+// session provider. It lists no sessions when no pool declares a death hook.
+func (cr *CityRuntime) observePoolDeaths() poolDeathObservation {
+	obs := poolDeathObservation{handlers: cr.publishedPoolDeathHandlers()}
+	if len(obs.handlers) == 0 {
+		return obs
+	}
+	names, err := cr.sp.ListRunning("")
+	if err != nil {
+		obs.listErr = err
+		return obs
+	}
+	obs.running = make(map[string]bool, len(names))
+	for _, name := range names {
+		obs.running[name] = true
+	}
+	return obs
+}
+
+// actOnPoolDeaths runs the on_death hook of every pool instance that
+// prevPoolRunning recorded as running and obs no longer lists, then resets
+// prevPoolRunning from obs. A failed listing runs no hook and keeps
+// prevPoolRunning, so an instance is never judged dead from a partial list.
+func (cr *CityRuntime) actOnPoolDeaths(obs poolDeathObservation, prevPoolRunning *map[string]bool) {
+	if len(obs.handlers) == 0 {
 		return
 	}
-	currentRunning, listErr := cr.sp.ListRunning("")
-	if listErr != nil {
-		if runtime.IsPartialListError(listErr) {
-			fmt.Fprintf(cr.stderr, "%s: pool death check skipped due to partial session listing: %v\n", cr.logPrefix, listErr) //nolint:errcheck // best-effort stderr
+	if obs.listErr != nil {
+		if runtime.IsPartialListError(obs.listErr) {
+			fmt.Fprintf(cr.stderr, "%s: pool death check skipped due to partial session listing: %v\n", cr.logPrefix, obs.listErr) //nolint:errcheck // best-effort stderr
 		} else {
-			fmt.Fprintf(cr.stderr, "%s: pool death check skipped while listing sessions: %v\n", cr.logPrefix, listErr) //nolint:errcheck // best-effort stderr
+			fmt.Fprintf(cr.stderr, "%s: pool death check skipped while listing sessions: %v\n", cr.logPrefix, obs.listErr) //nolint:errcheck // best-effort stderr
 		}
 		return
 	}
-	currentSet := make(map[string]bool, len(currentRunning))
-	for _, name := range currentRunning {
-		currentSet[name] = true
-	}
 	if *prevPoolRunning != nil {
-		for sn, info := range handlers {
-			if (*prevPoolRunning)[sn] && !currentSet[sn] {
+		for sn, info := range obs.handlers {
+			if (*prevPoolRunning)[sn] && !obs.running[sn] {
 				_ = runPoolDeathHook(cr.poolDeathHook(), cr.stderr, sn, info) // reported on stderr
 			}
 		}
 	}
 	*prevPoolRunning = make(map[string]bool)
-	for sn := range handlers {
-		if currentSet[sn] {
+	for sn := range obs.handlers {
+		if obs.running[sn] {
 			(*prevPoolRunning)[sn] = true
 		}
 	}
@@ -1298,6 +1453,9 @@ type tickPass struct {
 	// at the first session phase, after the config reload, so it reads this
 	// tick's legs. Every session phase answers its seat-work questions from it.
 	seatWork *SeatWork
+	// poolLiveness is the pool liveness observed before this tick's config
+	// reload (tickObservePoolLiveness).
+	poolLiveness poolDeathObservation
 }
 
 func (p *tickPass) recordPhase(site TraceSiteCode, name string, start time.Time, fields map[string]any) {
@@ -1328,8 +1486,10 @@ type tickPhase struct {
 
 // legacyTickPhases is the tick, in order. tick() runs it as is.
 var legacyTickPhases = []tickPhase{
-	{name: "reconcile_pool_deaths", run: (*CityRuntime).tickReconcilePoolDeaths},
+	{name: "observe_pool_liveness", run: (*CityRuntime).tickObservePoolLiveness},
 	{name: "config_reload", run: (*CityRuntime).tickConfigReload},
+	{name: "schema_skew_hold", run: (*CityRuntime).tickSchemaSkewHold},
+	{name: "reconcile_pool_deaths", run: (*CityRuntime).tickReconcilePoolDeaths},
 	{name: "fs_pressure_gate", run: (*CityRuntime).tickFSPressureGate},
 	{name: "managed_dolt_preflight", run: (*CityRuntime).tickManagedDoltPreflight},
 	{name: "wake_orders_lane", run: (*CityRuntime).tickWakeOrdersLane},
@@ -1469,13 +1629,14 @@ func (cr *CityRuntime) completeManualReload(p *tickPass) {
 	cr.clearActiveReloadIf(p.manualReload)
 }
 
-// tickReconcilePoolDeaths detects pool instance deaths since last tick.
-// Ordered ahead of the config reload so it compares against the config the
-// deaths happened under. While the inventory lane runs it owns on_death, off
-// the tick (runtime_inventory_ondeath.go).
-func (cr *CityRuntime) tickReconcilePoolDeaths(p *tickPass) bool {
+// tickObservePoolLiveness observes pool liveness — the on_death handler set
+// and the session provider's running list, together — before this tick's
+// config reload can replace either; tickReconcilePoolDeaths acts on it after
+// the reload and the schema-skew hold. While the inventory lane runs it owns
+// on_death, off the tick (runtime_inventory_ondeath.go).
+func (cr *CityRuntime) tickObservePoolLiveness(p *tickPass) bool {
 	if cr.inventoryLane == nil {
-		cr.reconcilePoolDeaths(p.prevPoolRunning)
+		p.poolLiveness = cr.observePoolDeaths()
 	}
 	return false
 }
@@ -1522,6 +1683,41 @@ func (cr *CityRuntime) tickConfigReload(p *tickPass) bool {
 		}
 	}
 	return p.ctx.Err() != nil
+}
+
+// tickSchemaSkewHold holds the tick fail-closed when the controller store the
+// reload just opened is newer than this binary (ga-mw4dg).
+func (cr *CityRuntime) tickSchemaSkewHold(p *tickPass) bool {
+	return cr.holdForControllerStoreSchemaSkew(p.ctx)
+}
+
+// tickReconcilePoolDeaths detects pool instance deaths since last tick, on the
+// lane-less path only: while the inventory lane runs it owns on_death, off the
+// tick (runtime_inventory_ondeath.go), and this phase does nothing.
+//
+// On the lane-less path two contracts meet here. Deaths are judged by the
+// state they happened under: the check acts on the handler set and session
+// listing tickObservePoolLiveness observed before this tick's reload, so a
+// reload that removes a pool, or rediscovers an unlimited pool without its
+// dead instance, still runs that instance's on_death hook, a changed hook
+// applies only to later deaths, and a reload that swaps the session provider
+// (stopping the old provider's sessions) does not make a session that was
+// running look dead. The hooks still run only after the schema-skew hold, so a
+// controller store the reload found newer than this binary runs no on_death
+// hook (ga-mw4dg).
+//
+// That provider-swap rule is the carry's and holds only on the lane-less
+// path. On the lane path upstream's rule governs: the swap removes the old
+// provider's backend from the lane's passes, and the first pass in which every
+// backend listed completely concludes that backend's names absent
+// (InventoryPass.concludesAbsent). detectPoolDeathEdges raises their edges,
+// and executeDeathEdge re-checks each name against the current, swapped-in
+// provider and runs its on_death hook when an error-free listing omits it.
+func (cr *CityRuntime) tickReconcilePoolDeaths(p *tickPass) bool {
+	if cr.inventoryLane == nil {
+		cr.actOnPoolDeaths(p.poolLiveness, p.prevPoolRunning)
+	}
+	return false
 }
 
 func (cr *CityRuntime) tickFSPressureGate(p *tickPass) bool {
@@ -1680,31 +1876,36 @@ func (cr *CityRuntime) tickReapStaleSessionBeads(p *tickPass) bool {
 	return false
 }
 
-// tickReapClosedBeadWorktreesFn is the tick's call into the closed-bead
-// worktree reaper, a seam so tests can pin which rig stores it is handed.
-var tickReapClosedBeadWorktreesFn = reapClosedBeadWorktrees
-
 func (cr *CityRuntime) tickReapClosedBeadWorktrees(p *tickPass) bool {
 	reapEnabled := cr.cfg.Daemon.AutoReapClosedBeadWorktreesEnabled()
 	reapDryRun := cr.cfg.Daemon.AutoReapClosedBeadWorktreesDryRunEnabled()
 	if reapEnabled || reapDryRun {
+		// The closed-bead worktree reaper (and, under real reaping, the
+		// agent-home cleanup) runs OFF the tick on a single-flight background
+		// lane: this only triggers a pass and never waits on one. A pass
+		// wedged in a context-free rig-store call once held this tick — and
+		// with it the next tick's order dispatch — for 45 minutes (ga-yuiof4
+		// item 3). A trigger that finds a pass still running skips and says
+		// so in this phase record (skipped_inflight, inflight_age_ms). Real
+		// removal supersedes dry-run when both flags are set, as before. See
+		// worktree_reaper_lane.go for what is snapshotted here and why the
+		// liveness gate stays honest when the pass runs off-tick.
 		phaseStart := time.Now()
-		// Cross-check the liveness gate against the current open-session set in
-		// addition to the authoritative /proc cwd scan. Real removal supersedes
-		// dry-run when both flags are set.
-		liveSessionDirs := liveSessionWorktreeDirs(p.sessionBeads)
-		report := tickReapClosedBeadWorktreesFn(cr.cityPath, cr.cfg, withoutSuspendedRigs(cr.cityPath, cr.cfg, cr.rigBeadStores()), liveSessionDirs, !reapEnabled, cr.rec, cr.reapSkips, cr.stderr)
-		p.recordPhase(TraceSiteControllerTickPhase, "reap_closed_bead_worktrees", phaseStart, map[string]any{
-			"reaped":    len(report.Reaped),
-			"protected": len(report.Protected),
-			"dry_run":   !reapEnabled,
-		})
-		// Agent-home worktree cleanup performs real removals, so it runs only
-		// when real reaping is enabled — never under dry-run.
-		if reapEnabled {
-			phaseStart = time.Now()
-			agentHomesReset := cleanupClosedBeadAgentHomeWorktrees(cr.cityPath, cr.cfg, withoutSuspendedRigs(cr.cityPath, cr.cfg, cr.rigBeadStores()), cr.stderr)
-			p.recordPhase(TraceSiteControllerTickPhase, "cleanup_agent_home_worktrees", phaseStart, map[string]any{"reset": agentHomesReset})
+		reapTrigger := cr.triggerWorktreeReaperPass(p.ctx, cr.cfg, reapEnabled, p.sessionBeads)
+		p.recordPhase(TraceSiteControllerTickPhase, "reap_closed_bead_worktrees", phaseStart, reapTrigger.fields())
+	}
+	if cr.cfg.Daemon.AutoReapStoppedAgentHomesEnabled() {
+		phaseStart := time.Now()
+		if sessionErr := p.sessionBeads.LoadError(); sessionErr != nil {
+			fmt.Fprintf(cr.stderr, "reapStoppedAgentHomes: skipping pass: session snapshot degraded: %v\n", sessionErr) //nolint:errcheck
+		} else {
+			candidateSessions, historyErr := loadConfiguredStoppedAgentHomeHistory(cr.cfg, cr.cityBeadStore())
+			if historyErr != nil {
+				fmt.Fprintf(cr.stderr, "reapStoppedAgentHomes: skipping pass: session history unavailable: %v\n", historyErr) //nolint:errcheck
+			} else {
+				agentHomesReaped := reapStoppedAgentHomeWorktrees(cr.cityPath, cr.cfg, cr.cityBeadStore(), cr.rigBeadStores(), cr.sp, cr.rec, cr.stderr, false, candidateSessions, activeSessionBeads(p.sessionBeads.OpenInfos())) // residency:allow — fail-closed safety census over every rig store (unreachable rig or open assigned work keeps the home), the same enumeration the closed-bead reaper lane's fencedReaperStores wraps for cleanupClosedBeadAgentHomeWorktrees (worktree_reaper_lane.go); resolves no residency
+				p.recordPhase(TraceSiteControllerTickPhase, "reap_stopped_agent_homes", phaseStart, map[string]any{"reaped": agentHomesReaped})
+			}
 		}
 	}
 	return p.ctx.Err() != nil
@@ -2518,6 +2719,24 @@ func (cr *CityRuntime) reloadConfigTraced(
 	if configName == "" {
 		configName = cr.cityName
 	}
+	// A store preflight failure other than schema skew refuses the reload only
+	// after the config parse: opening the city store reads city.toml, so an
+	// unparsable city.toml fails the preflight too, and its store error would
+	// hide the parse error the operator has to fix.
+	var preflightFailure error
+	if cr.cs != nil {
+		diag, preflightErr := cr.cs.preflightCityStoreReload()
+		if preflightErr != nil {
+			preflightFailure = fmt.Errorf("config reload: preflight city bead store: %w", preflightErr)
+		}
+		if diag != nil && beads.IsSchemaSkewDiagnostic(*diag) {
+			cr.preserveSessionsOnShutdown()
+			err := fmt.Errorf("config reload blocked by native store schema mismatch: %s", diag.PreflightReason)
+			fmt.Fprintf(cr.stderr, "%s: %v; preserving sessions\n", cr.logPrefix, err) //nolint:errcheck
+			telemetry.RecordConfigReload(ctx, "", string(source), string(reloadOutcomeFailed), len(warnings), err)
+			return reloadControlReply{Outcome: reloadOutcomeFailed, Error: err.Error(), Warnings: warnings}
+		}
+	}
 	result, err := cr.loadReloadCandidate(configName, cityRoot)
 	if err != nil {
 		if errors.Is(err, errConfigTransactionInProgress) {
@@ -2545,6 +2764,10 @@ func (cr *CityRuntime) reloadConfigTraced(
 			Error:    err.Error(),
 			Warnings: warnings,
 		}
+	}
+	if preflightFailure != nil {
+		telemetry.RecordConfigReload(ctx, "", string(source), string(reloadOutcomeFailed), len(warnings), preflightFailure)
+		return reloadControlReply{Outcome: reloadOutcomeFailed, Error: preflightFailure.Error(), Warnings: warnings}
 	}
 	for _, warning := range result.Warnings {
 		appendWarning(warning)
@@ -2607,6 +2830,9 @@ func (cr *CityRuntime) reloadConfigTraced(
 			if !cr.cs.updateFromRuntime(result.Cfg, cr.sp, result.Revision) {
 				return rejectSuperseded("during same-revision metadata publication")
 			}
+			// The reap status memo may hold verdicts read from the replaced
+			// backends; a same-named rig can now be a different store.
+			cr.worktreeReaperLaneOf().invalidateStatusCache()
 			message := fmt.Sprintf("Config reloaded: bead store metadata changed (rev %s)", shortRev(result.Revision))
 			if ordersChanged {
 				message = fmt.Sprintf("Config reloaded: bead store metadata changed; orders reloaded: %s (rev %s)", orderSummary, shortRev(result.Revision))
@@ -2684,6 +2910,10 @@ func (cr *CityRuntime) reloadConfigTraced(
 	nextDops := cr.dops
 	providerChanged := false
 	providerSwapSummary := ""
+	// nextSpPublished is set once a replacement provider has been handed to a
+	// consumer (the controller state, or cr.sp). Until then no one can hold a
+	// handle on it, so a failed reload drops its fence registration.
+	nextSpPublished := false
 
 	// Detect session provider change. A pack-declared runtime binds its
 	// command into the provider at construction time, so a changed (or
@@ -2709,6 +2939,18 @@ func (cr *CityRuntime) reloadConfigTraced(
 		} else {
 			providerChanged = true
 			nextSp = newSp
+			// Fence the replacement provider before it is published to the
+			// controller state (and so to in-process API wakes). If this
+			// reload fails before publishing it, nothing holds it: drop the
+			// registration on the way out (only one this call added).
+			if cr.startFenceActive && cr.registerSessionStartFence(nextSp) {
+				unpublishedSp := nextSp
+				defer func() {
+					if !nextSpPublished {
+						cr.unregisterSessionStartFence(unpublishedSp)
+					}
+				}()
+			}
 			nextDops = newDrainOps(nextSp)
 			pendingProviderName = newProviderName
 		}
@@ -2845,6 +3087,14 @@ func (cr *CityRuntime) reloadConfigTraced(
 		// restarts or frees them as after any other death. A failed stop
 		// aborts before publication, while the old provider still reaches it.
 		if len(stops) > 0 {
+			// The publishing open below is the authoritative schema gate
+			// (ga-mw4dg), but these stops come first and cannot be undone: run
+			// that open now, so a store newer than this binary fails the reload
+			// closed and preserves sessions before any is stopped.
+			if diag := cr.probePublishingOpenSchemaSkew(nextCfg); diag != nil {
+				cr.preserveSessionsOnShutdown()
+				return swapFailed(fmt.Errorf("blocked by native store schema mismatch before stopping %d agent(s): %s", len(stops), diag.PreflightReason))
+			}
 			fmt.Fprintf(cr.stdout, "Provider changed (%s), stopping %d agent(s) the new provider cannot reach...\n", //nolint:errcheck
 				providerSwapSummary, len(stops))
 			if err := stopProviderSwapRuntimes(stops, cr.cfg, cr.sessionsBeadStore().Store, cr.rec, cr.stdout, cr.stderr); err != nil {
@@ -2852,13 +3102,29 @@ func (cr *CityRuntime) reloadConfigTraced(
 			}
 		}
 	}
-
 	// Publish to the controller state first and to the loop only if it
 	// accepts, so the tick loop never runs a config the API rejected. On
 	// rejection nothing below runs: the order dispatcher is neither staged
 	// nor installed, so the lane keeps the controller's generation.
 	if !cr.publishRuntimeConfig(nextCfg, nextSp, nextDops, result.Revision) {
 		return rejectSuperseded("during runtime publication")
+	}
+	// From here the controller state (and so the in-process API server) may
+	// hand out handles on nextSp; its fence registration must stay.
+	nextSpPublished = true
+	if cr.startFenceActive {
+		// Idempotent. The replaced provider's registration is deliberately
+		// kept until run() returns (see run()).
+		cr.registerSessionStartFence(nextSp)
+	}
+	// The publishing store open is the authoritative schema gate (ga-mw4dg):
+	// a controller store newer than this binary fails the reload closed and
+	// preserves sessions instead of running against a schema it cannot read.
+	if diag := cr.controllerStoreSchemaSkewDiagnostic(); diag != nil {
+		cr.preserveSessionsOnShutdown()
+		err := fmt.Errorf("config reload blocked by native store schema mismatch: %s", diag.PreflightReason)
+		telemetry.RecordConfigReload(ctx, result.Revision, string(source), string(reloadOutcomeFailed), len(warnings), err)
+		return reloadControlReply{Outcome: reloadOutcomeFailed, Error: err.Error(), Revision: result.Revision, Warnings: warnings}
 	}
 	if providerChanged {
 		cr.rec.Record(events.Event{
@@ -2901,7 +3167,10 @@ func (cr *CityRuntime) reloadConfigTraced(
 	cr.mat = buildMaxSessionAgeTracker(nextCfg, cr.cityName, nextSp)
 	cr.adt = buildAssignedWorkDeferTracker(nextCfg, cr.cityName, nextSp)
 
-	cr.wg = newWispGCForConfig(nextCfg)
+	// Carry the cadence position: a rebuilt tracker with lastRun=0 re-arms
+	// an immediate in-tick sweep on every applied reload (ga-q17a2k's ~76%
+	// run amplifier).
+	cr.wg = carryWispGCLastRun(cr.wg, newWispGCForConfig(nextCfg))
 
 	// The new config was published above (publishRuntimeConfig), BEFORE
 	// this stage. The stage bumps the order-set generation under the lane's
@@ -2950,6 +3219,9 @@ func (cr *CityRuntime) reloadConfigTraced(
 		// The city store was refreshed before the swap; rebuild the rig stores
 		// for the published config.
 		cr.setStandaloneStores(cr.standaloneCityStore, buildStandaloneRigStores(nextCfg, cr.cityPath, cr.stderr))
+		// Rebuilt stores invalidate the reap status memo (see the cs.update
+		// branch above).
+		cr.worktreeReaperLaneOf().invalidateStatusCache()
 	}
 
 	// Rebuild convergence scopes against the reloaded config so rigs added,
@@ -2964,7 +3236,7 @@ func (cr *CityRuntime) reloadConfigTraced(
 		cr.sessionDrains = newDrainTracker()
 		cr.providerHealthGate = newProviderHealthGate()
 	}
-	cr.configRev = result.Revision
+	cr.adoptConfigRevision(result.Revision)
 	cr.watchTargets = config.WatchTargets(result.Prov, nextCfg, cityRoot)
 	cr.restartConfigWatcher()
 	if trace != nil {
@@ -2978,9 +3250,10 @@ func (cr *CityRuntime) reloadConfigTraced(
 	// filter), so a skill added/removed via a live config reload was
 	// advertised in the catalog and prompt appendix but never materialized
 	// into (or pruned from) the vendor sink until a full supervisor
-	// restart (#3459). Idempotent — a converged pass creates nothing new;
-	// per-agent errors are logged to stderr internally and never abort
-	// the reload.
+	// restart (#3459). Idempotent — a converged pass creates nothing new.
+	// A sink it cannot reconcile never aborts the reload: the pass logs it
+	// to stderr and returns it, and it becomes a reload warning so the
+	// caller sees the sink was left as it was.
 	//
 	// Match the start/supervisor invariant: validate skill collisions
 	// before materializing so a colliding live-reload config can't write
@@ -2990,8 +3263,10 @@ func (cr *CityRuntime) reloadConfigTraced(
 	// warning rather than aborting the reload.
 	if err := checkSkillCollisions(nextCfg, cr.cityPath); err != nil {
 		appendWarning(fmt.Sprintf("skill collision; skipping materialization: %v", err))
-	} else {
-		_ = runStage1SkillMaterialization(cr.cityPath, nextCfg, cr.stderr)
+	} else if err := runStage1SkillMaterialization(cr.cityPath, nextCfg, cr.stderr); err != nil {
+		for _, sinkErr := range stage1UnreconciledSinks(err) {
+			appendWarning(sinkErr.Error())
+		}
 	}
 
 	message := fmt.Sprintf("Config reloaded: %s (rev %s)",
@@ -3268,7 +3543,7 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, sw *SeatWork, resu
 	if poolDesired == nil {
 		phaseStart = time.Now()
 		openInfos := sessionBeads.OpenInfos()
-		poolWorkBeads := filterAssignedWorkBeadsForPoolDemand(cr.cfg, cr.cityPath, store, openInfos, assignedWorkBeads, assignedWorkStoreRefs)
+		poolWorkBeads := filterAssignedWorkBeadsForPoolDemand(cr.cfg, cr.cityPath, store, openInfos, assignedWorkBeads, assignedWorkStoreRefs, result.PoolWakeReadiness)
 		poolDecisionTime := time.Now()
 		poolDesired = retainScaleCheckPartialPoolDesired(
 			cr.cfg,
@@ -3378,6 +3653,7 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, sw *SeatWork, resu
 		// instead of re-deriving a work ledger from gc.routed_to, which on a
 		// split city does not hold the graph-class row at all (ga-b0o6a).
 		withAssignedWorkStores(awakeAssignedStores),
+		withAssignedWorkStoreRefs(awakeAssignedStoreRefs),
 		// Warm-bind claim nudge: deliver a pool slot's claim instruction to an
 		// already-running, idle slot that had on-demand work bound to it after it
 		// last Started (bindPoolSessionTriggerBead), which cold Start's nudge cannot
@@ -3392,6 +3668,12 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, sw *SeatWork, resu
 		withWarmClaimProbe(cr.warmClaimTriggerProbe(triggerResolver)),
 		// The launch-time opt_* lookup reads a pool slot's trigger bead through the same residency reader.
 		withTriggerBeadResolver(triggerResolver),
+		// Every runtime start this reconcile launches — sync or async, and
+		// async ones outlive the tick — runs inside the session-start fence the
+		// worktree reaper lane removes under (sessionStartFence, ga-yuiof4
+		// item 3), so a pass never removes a tree a session started in after
+		// its liveness scan began.
+		withSessionStartFence(cr.sessionStartFenceOf()),
 	}
 	if bootReconcile {
 		// #3288: skip the per-session orphan/failed-create session-bead closes on
@@ -3554,9 +3836,6 @@ func (cr *CityRuntime) recordReconcileTraceInputs(
 		return
 	}
 	phaseStart := time.Now()
-	templateNames := make(map[string]struct{})
-	openCounts := make(map[string]int)
-	desiredCounts := make(map[string]int)
 	// Pre-tick baseline: openInfos is the tick's input row feed projected to Info,
 	// captured before the reconciler runs, so these reads are the pre-tick values
 	// (byte-equivalent to the raw open-bead read they replace).
@@ -3565,42 +3844,15 @@ func (cr *CityRuntime) recordReconcileTraceInputs(
 		if template == "" {
 			continue
 		}
-		templateNames[template] = struct{}{}
-		openCounts[template]++
 		trace.RecordSessionBaseline(template, info.SessionNameMetadata, map[string]any{
 			"state":        info.MetadataState,
 			"sleep_reason": info.SleepReason,
 		})
 	}
-	for _, tp := range desiredState {
-		if tp.TemplateName == "" {
-			continue
-		}
-		templateNames[tp.TemplateName] = struct{}{}
-		desiredCounts[tp.TemplateName]++
-	}
-	for template := range poolDesired {
-		templateNames[template] = struct{}{}
-	}
-	for template := range workSet {
-		templateNames[template] = struct{}{}
-	}
-	for template := range traceWorkRequested {
-		templateNames[template] = struct{}{}
-	}
-	for _, template := range traceSetStrings(templateNames) {
-		status := TraceEvaluationEligible
-		reason := TraceReasonRetained
-		if desiredCounts[template] == 0 && poolDesired[template] == 0 && openCounts[template] == 0 {
-			status = TraceEvaluationSkipped
-			reason = TraceReasonNoDemand
-		}
-		trace.RecordTemplateSummary(template, "", status, reason, map[string]any{
-			"desired_count":  desiredCounts[template],
-			"open_count":     openCounts[template],
-			"pool_desired":   poolDesired[template],
-			"work_requested": traceWorkRequested[template],
-		})
+	templateNames, summaries := buildTemplateTickSummaries(cr.cfg, openInfos, desiredState, poolDesired, workSet, traceWorkRequested)
+	for _, template := range templateNames {
+		sum := summaries[template]
+		trace.RecordTemplateSummary(template, "", sum.status, sum.reason, sum.fields)
 	}
 	trace.RecordCycleInputSnapshot(map[string]any{
 		"desired_session_count":               len(desiredState),
@@ -4189,7 +4441,7 @@ func (cr *CityRuntime) controlDispatcherTick(ctx context.Context) {
 	filteredRows := filterReconcileRowsByName(updated, reconcileNames)
 	filteredSnap := newSessionBeadSnapshotFromReconcileRows(filteredRows)
 	openInfos := filterSessionInfosByName(updated, reconcileNames)
-	poolWorkBeads := filterAssignedWorkBeadsForPoolDemand(filteredCfg, cr.cityPath, cr.cityBeadStore(), openInfos, wfcResult.AssignedWorkBeads, wfcResult.AssignedWorkStoreRefs)
+	poolWorkBeads := filterAssignedWorkBeadsForPoolDemand(filteredCfg, cr.cityPath, cr.cityBeadStore(), openInfos, wfcResult.AssignedWorkBeads, wfcResult.AssignedWorkStoreRefs, wfcResult.PoolWakeReadiness)
 	poolDecisionTime := time.Now()
 	poolDesired := retainScaleCheckPartialPoolDesired(
 		filteredCfg,
@@ -4237,6 +4489,10 @@ func (cr *CityRuntime) controlDispatcherTick(ctx context.Context) {
 		withEndpointCapacityGuard(cr.ensureEndpointCapacityGuard()),
 		withOnDeathGate(cr.onDeathGate()),
 		withPrepareBudget(defaultStartPrepareBudget),
+		// Its Manager starts are already fenced through the provider
+		// registration; the option also fences its reconciler starts that
+		// bypass a Manager and its launch-drift Relaunch (ga-yuiof4 item 3).
+		withSessionStartFence(cr.sessionStartFenceOf()),
 	)
 	cr.requestDeferredDrainFollowUpTick()
 }
@@ -4605,7 +4861,7 @@ func (cr *CityRuntime) loadDemandSnapshot(
 			openSessionInfos = sessionBeads.OpenInfos()
 		}
 		subPhaseStart := trace.demandNow()
-		poolWorkBeads := filterAssignedWorkBeadsForPoolDemand(cr.cfg, cr.cityPath, cr.cityBeadStore(), openSessionInfos, result.AssignedWorkBeads, result.AssignedWorkStoreRefs)
+		poolWorkBeads := filterAssignedWorkBeadsForPoolDemand(cr.cfg, cr.cityPath, cr.cityBeadStore(), openSessionInfos, result.AssignedWorkBeads, result.AssignedWorkStoreRefs, result.PoolWakeReadiness)
 		poolDecisionTime := time.Now()
 		result.PoolDesiredCounts = retainScaleCheckPartialPoolDesired(
 			cr.cfg,
@@ -5327,4 +5583,14 @@ func (cr *CityRuntime) preserveSessionsOnShutdown() {
 
 func (cr *CityRuntime) forceStopRequested() bool {
 	return cr != nil && cr.forceStopShutdown != nil && cr.forceStopShutdown.Load()
+}
+
+// adoptConfigRevision records rev as the configuration this runtime runs. A
+// changed revision resets the claim-loop guard: the new config may have fixed
+// what held claims were failing on.
+func (cr *CityRuntime) adoptConfigRevision(rev string) {
+	if rev != cr.configRev {
+		cr.claimLoopGuardOf().configChanged()
+	}
+	cr.configRev = rev
 }

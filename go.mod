@@ -1,6 +1,6 @@
 module github.com/gastownhall/gascity
 
-go 1.26.9
+go 1.26.10
 
 require (
 	github.com/BurntSushi/toml v1.6.0
@@ -253,3 +253,11 @@ require (
 	sigs.k8s.io/structured-merge-diff/v6 v6.3.0 // indirect
 	sigs.k8s.io/yaml v1.6.0 // indirect
 )
+
+// The beads module resolves to the fleet build of the quickserve-ai fork:
+// upstream v1.3.1 plus the carries the fleet runs on (gc-1c2b). The
+// require line above stays upstream's, so this is a redirect and not a
+// different dependency -- every import path, every other bd pin and the
+// module graph itself still reason about github.com/steveyegge/beads.
+// scripts/beads_fleet_replace_test.go checks the two stay in step.
+replace github.com/steveyegge/beads => github.com/quickserve-ai/beads v1.3.1-fleet.20261005.1

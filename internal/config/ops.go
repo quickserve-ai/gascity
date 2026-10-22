@@ -45,15 +45,29 @@ type OpsConfig struct {
 	LifecycleMode string `toml:"lifecycle,omitempty" jsonschema:"default=off,enum=off,enum=auto,enum=require"`
 	// Authoritative lists the op kinds the conversation lane executes instead
 	// of their legacy path. The default is empty, and message is not on by
-	// default anywhere yet. This build accepts message only. Experimental: no
-	// request surface writes lane ops yet, so listing a kind changes no
-	// request's delivery in this build. The city's controller, standalone
-	// or supervisor-hosted, runs the lane host that delivers lane ops, and
-	// gc doctor reports a listed kind as an error when no lane host serves
-	// the city. A keystroke-mode runtime (tmux) takes delivery at an idle
-	// boundary, a protocol-mode runtime (t3bridge) at its turn boundary.
+	// default anywhere yet. This build accepts message only. Experimental:
+	// listing message switches on the producers that write lane ops, whose
+	// messages the lane host then delivers: the API's POST
+	// /v0/city/{cityName}/session/{id}/ops (a T3 Code environment or an
+	// operator proposing a message) and, for sessions a lane host can type
+	// into (a keystroke-mode runtime, or one a box host serves), the
+	// controller's planner notices (drain reminders, the nudge backstop) and
+	// gc session nudge. gc session nudge delivers inline what its delivery
+	// mode allows now, where it can type into the session: wait-idle only at
+	// an idle boundary; immediate there too, or into a running turn when the
+	// runtime can steer it, else at the next boundary. It leaves the rest to
+	// the controller's lane host, and the content gate no longer governs it.
+	// The API's submit and messages, gc session submit, mail --notify, sling
+	// --nudge and wait nudges keep their legacy delivery in this build. Under
+	// session_reconciler = "v2", do not list message yet (gc doctor warns).
+	// The city's controller, standalone or supervisor-hosted, runs the lane
+	// host that delivers lane ops, and gc doctor reports a listed kind as an
+	// error when no lane host serves the city. A keystroke-mode runtime (tmux)
+	// takes a boundary delivery at an idle boundary, a protocol-mode runtime
+	// (t3bridge) at its turn boundary.
 	// A listed kind needs a sessions store with guarded batches. A change
-	// takes effect at the next controller start.
+	// takes effect at the controller's next start; gc session nudge reads it
+	// at once.
 	Authoritative []string `toml:"authoritative,omitempty" jsonschema:"enum=message"`
 }
 

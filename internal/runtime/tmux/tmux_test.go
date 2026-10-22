@@ -50,6 +50,28 @@ func privateSocketName(tag string) string {
 	return fmt.Sprintf("gctest-%d-%s%d", os.Getpid(), tag, time.Now().UnixNano()%1e9)
 }
 
+// seedServerGlobalEnv starts tm's tmux server with a holder session and sets
+// key=value in the server's GLOBAL environment, the environment every pane
+// shell inherits. A value exported by the test process cannot get there by
+// inheritance: the client that founds a server on a named socket runs with
+// secret-named variables scrubbed (ga-fhbnmz). The withholding proofs need the
+// value present in the server, or they pass without exercising the control.
+func seedServerGlobalEnv(t *testing.T, tm *Tmux, key, value string) {
+	t.Helper()
+	const holder = "gc-test-global-env-holder"
+	if _, err := tm.run("new-session", "-d", "-s", holder, "sleep 300"); err != nil {
+		t.Fatalf("starting holder session: %v", err)
+	}
+	t.Cleanup(func() { _ = tm.KillSession(holder) })
+	if _, err := tm.run("set-environment", "-g", key, value); err != nil {
+		t.Fatalf("seeding %s into the server global environment: %v", key, err)
+	}
+	got, err := tm.run("show-environment", "-g", key)
+	if err != nil || !strings.Contains(got, value) {
+		t.Fatalf("server global environment does not carry %s after seeding: %q, %v", key, got, err)
+	}
+}
+
 // testTmux returns a Tmux instance that uses an isolated test socket.
 func testTmux() *Tmux {
 	cfg := DefaultConfig()
@@ -190,6 +212,11 @@ func TestAttachSessionNoStartServerDoesNotSelfRebindAfterProbe(t *testing.T) {
 		var originalServer, replacementServer processTarget
 		var replacementSocket os.FileInfo
 		replacement := NewTmuxWithConfig(cfg)
+		// The replacement deliberately founds a second server beside the live
+		// original after unlinking its socket: the case new-session's orphan
+		// revival (ga-46jb3c) refuses. An injected observer opts this fixture
+		// out of revival; the production observer keeps its verdict real.
+		replacement.serverSocketObserver = observeNamedSocket
 		t.Cleanup(func() {
 			if err := replacement.KillServer(); err != nil && !errors.Is(err, ErrNoServer) {
 				t.Errorf("stop explicit replacement server: %v", err)
@@ -2532,7 +2559,7 @@ func TestSendKeysLiteralWithRetryFallsBackToPasteBufferOnCommandTooLong(t *testi
 		errs: []error{errors.New("command too long")},
 	}
 	tm := NewTmuxWithConfig(DefaultConfig())
-	tm.exec = fe
+	tm.exec = guardIdleExecutor{fe} // the guard's reads are not this test's subject
 
 	err := tm.sendKeysLiteralWithRetry(context.Background(), "%1", "large startup prompt", time.Second)
 	if err != nil {
@@ -2559,7 +2586,7 @@ func TestSendKeysLiteralWithRetryFallsBackToPasteBufferOnCommandTooLong(t *testi
 func TestSendKeysLiteralWithRetryUsesPasteBufferForLargeText(t *testing.T) {
 	fe := &fakeExecutor{}
 	tm := NewTmuxWithConfig(DefaultConfig())
-	tm.exec = fe
+	tm.exec = guardIdleExecutor{fe} // the guard's reads are not this test's subject
 
 	err := tm.sendKeysLiteralWithRetry(context.Background(), "%1", strings.Repeat("x", maxSendKeysLiteralLen+1), time.Second)
 	if err != nil {
@@ -2662,7 +2689,7 @@ func TestSendStartupKeysLiteralWithRetryDoesNotRepeatCompletedCopilotChunks(t *t
 	errs[3] = errors.New("not in a mode")
 	fe := &fakeExecutor{errs: errs}
 	tm := NewTmuxWithConfig(DefaultConfig())
-	tm.exec = fe
+	tm.exec = guardIdleExecutor{fe} // the guard's reads are not this test's subject
 
 	text := strings.Repeat("x", copilotMaxPasteBytes*2)
 	if err := tm.sendStartupKeysLiteralWithRetry(context.Background(), "%1", text, "copilot", 3*time.Second); err != nil {
@@ -3380,7 +3407,7 @@ func TestWaitForCodexInterruptBoundary(t *testing.T) {
 		_, _ = f.WriteString(`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<turn_aborted>\nThe user interrupted the previous turn on purpose.\n</turn_aborted>"}]}}` + "\n")
 	}()
 
-	if err := waitForCodexInterruptBoundary(context.Background(), codexHome, since, 2*time.Second); err != nil {
+	if err := waitForCodexInterruptBoundary(context.Background(), transcript, since, 2*time.Second); err != nil {
 		t.Fatalf("waitForCodexInterruptBoundary: %v", err)
 	}
 }
@@ -4395,12 +4422,13 @@ func TestNewSessionWithCommandAndEnvWithholdsEmptyVarFromPaneChild(t *testing.T)
 	)
 	t.Setenv(tokenVar, token)
 
-	// A socket unique to this test, so the server it starts forks from THIS
-	// process and its global environment carries the token. The package socket
-	// would hand back a server started by an earlier test, which never saw it.
+	// A socket unique to this test, whose server global environment carries
+	// the token: the state a controller-started server is in. The package
+	// socket would hand back a server started by an earlier test.
 	cfg := DefaultConfig()
 	cfg.SocketName = privateSocketName("tp")
 	tm := NewTmuxWithConfig(cfg)
+	seedServerGlobalEnv(t, tm, tokenVar, token)
 
 	dir := t.TempDir()
 	report := filepath.Join(dir, "child-token")
@@ -4424,4 +4452,27 @@ func TestNewSessionWithCommandAndEnvWithholdsEmptyVarFromPaneChild(t *testing.T)
 	if strings.Contains(string(got), token) {
 		t.Fatalf("pane child received the controller token: %s", got)
 	}
+}
+
+// guardIdleExecutor answers the human-prompt guard's own reads -- the pane
+// capture and the attached-client count -- as an idle, detached pane, and
+// passes every other call to inner. Tests of the key senders' retry and paste
+// mechanics use it so their call-sequence assertions see only the sender's
+// calls; the guard itself is tested in this file.
+type guardIdleExecutor struct{ inner *fakeExecutor }
+
+func (g guardIdleExecutor) execute(args []string) (string, error) {
+	switch {
+	case tmuxArgsContain(args, "capture-pane"):
+		return idleComposerFixture, nil
+	case tmuxArgsContain(args, clientCountProbe):
+		return countAnswer(args, "0"), nil
+	case tmuxArgsContain(args, "show-environment") && tmuxArgsContain(args, sessionReadyPromptEnvKey):
+		return "", errors.New("unknown variable: " + sessionReadyPromptEnvKey)
+	}
+	return g.inner.execute(args)
+}
+
+func (g guardIdleExecutor) executeCtx(_ context.Context, args []string) (string, error) {
+	return g.execute(args)
 }

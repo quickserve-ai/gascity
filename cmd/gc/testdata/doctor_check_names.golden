@@ -12,10 +12,12 @@ v2-workspace-name
 v2-prompt-template-suffix
 provider-catalog
 provider-catalog-local-readiness
+claude-account-declaration
 expanded-config-load
 implicit-import-cache
 deprecated-attachment-fields
 nudge-unconfirmed
+dolt-servers
 dolt-topology
 dolt-drift
 config-valid
@@ -38,6 +40,7 @@ builtin-pack-family
 config-semantics
 duration-range
 provider-parity
+provider-readiness
 formula-requirements
 named-always-min-conflict
 instructions-file
@@ -46,6 +49,7 @@ skill-collision
 skill-dangling-sink
 order-firing-current
 order-outcome-healthy
+order-exec-target
 codex-hooks-drift
 rig-pack-coverage
 pack-runtimes
@@ -67,6 +71,8 @@ controller
 supervisor-http-api
 supervisor-unit-ownership
 supervisor-binary
+supervisor-build-drift
+beads-cache-reconcile
 agent-sessions
 zombie-sessions
 orphan-sessions
@@ -85,6 +91,7 @@ work-option-metadata-migration
 backlog-depth
 order-tracking-retention
 session-model
+cloud-wake-bindings
 startup-health-episodes
 ownerless-runtimes
 gate-sandbox-reads
@@ -96,6 +103,7 @@ dolt-journal-size
 dolt-log-size
 dolt-config
 dolt-version
+city:dolt-local-only-remote
 events-log
 events-log-size
 bd-backup-size

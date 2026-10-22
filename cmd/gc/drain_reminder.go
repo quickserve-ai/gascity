@@ -57,6 +57,7 @@ package main
 // and is tracked as its own fix rather than papered over here.
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -508,7 +509,11 @@ func drainReminderQuietHold(sp runtime.Provider, store beads.Store, info session
 // never replay an unbounded stream. A nudge error still spends the attempt
 // (the write-ahead is what bounds the loop, and unwinding it would let a
 // permanently input-dead pane re-send forever) and records that nothing
-// ARRIVED, so the escalation reports what actually happened.
+// ARRIVED, so the escalation reports what actually happened. The one
+// exception is a deferral (runtime.ErrSessionBusy): the runtime typed nothing
+// because the session was running a turn its submit keys would have
+// interrupted, so nothing was attempted and the marker is restored to what it
+// held, under the busy hold.
 func deliverDrainReminder(sp runtime.Provider, store beads.Store, info sessions.Info, name string, due drainReminderDue, stdout io.Writer) drainReminderOutcome {
 	failed := due.failed
 	journalPrior := func() {}
@@ -532,8 +537,14 @@ func deliverDrainReminder(sp runtime.Provider, store beads.Store, info sessions.
 	if !writeDrainReminderMarker(store, info, due.row, due.drainID, due.attempts+1, failed, due.attempts+1, due.now, stdout) {
 		return drainReminderSkipped
 	}
+	err := nudgeDrainReminder(sp, name, info)
+	if errors.Is(err, runtime.ErrSessionBusy) {
+		writeDrainReminderMarker(store, info, due.row, due.drainID, due.attempts, due.failed, due.settled, due.last, stdout)
+		noteDrainReminderHold(store, info, drainReminderHoldBusy)
+		return drainReminderHeld
+	}
 	journalPrior()
-	if err := nudgeDrainReminder(sp, name, info); err != nil {
+	if err != nil {
 		// A nil return is not proof of delivery: the seam adapter answers nil when
 		// it cannot attach, so some failures are invisible here and counted as
 		// delivered. That is the best knowledge available at this boundary, and it

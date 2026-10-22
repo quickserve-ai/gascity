@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -50,6 +51,7 @@ type Provider struct {
 	// sender is the calling session, already resolved by the command; see
 	// PinSender.
 	sender *session.Info
+	now    func() time.Time
 }
 
 type sessionInfoCache struct {
@@ -161,6 +163,15 @@ func (p *Provider) Send(from, to, subject, body string) (mail.Message, error) {
 	return p.sendWithExtraMetadata(from, to, subject, body, nil)
 }
 
+// SendWithMetadata implements [mail.MetadataSender]: Send, with metadata
+// stamped on the message bead when it is created.
+func (p *Provider) SendWithMetadata(from, to, subject, body string, metadata map[string]string) (mail.Message, error) {
+	if to == "" {
+		return mail.Message{}, fmt.Errorf("beadmail send: recipient is required")
+	}
+	return p.sendWithExtraMetadata(from, to, subject, body, metadata)
+}
+
 // sendWithExtraMetadata is the shared body of Send and SendDeduped: resolve
 // the sender route, derive title and thread label, merge extra metadata (the
 // dedup key), and create the message bead.
@@ -212,6 +223,13 @@ func (p *Provider) sendWithExtraMetadata(from, to, subject, body string, extra m
 // matches: the dedup horizon is the previous message's live lifetime by design
 // (see [mail.DedupSender]).
 func (p *Provider) SendDeduped(from, to, subject, body, key string) (mail.Message, bool, error) {
+	return p.SendDedupedWithMetadata(from, to, subject, body, key, nil)
+}
+
+// SendDedupedWithMetadata implements [mail.MetadataSender]: SendDeduped, with
+// metadata stamped on a newly created message. A suppressed send creates
+// nothing and stamps nothing.
+func (p *Provider) SendDedupedWithMetadata(from, to, subject, body, key string, metadata map[string]string) (mail.Message, bool, error) {
 	key = strings.TrimSpace(key)
 	if key == "" {
 		return mail.Message{}, false, fmt.Errorf("beadmail send: dedup key is required")
@@ -235,7 +253,12 @@ func (p *Provider) SendDeduped(from, to, subject, body, key string) (mail.Messag
 			return beadToMessage(b), true, nil
 		}
 	}
-	msg, err := p.sendWithExtraMetadata(from, to, subject, body, map[string]string{mail.DedupKeyMetadataKey: key})
+	extra := make(map[string]string, len(metadata)+1)
+	for k, v := range metadata {
+		extra[k] = v
+	}
+	extra[mail.DedupKeyMetadataKey] = key
+	msg, err := p.sendWithExtraMetadata(from, to, subject, body, extra)
 	if err != nil {
 		return mail.Message{}, false, err
 	}
@@ -255,8 +278,8 @@ func (p *Provider) SendHandoff(intent mail.HandoffIntent) (mail.Message, error) 
 	if err != nil {
 		return mail.Message{}, fmt.Errorf("beadmail handoff: %w", err)
 	}
-	labels := make([]string, 0, 1+len(intent.ExtraLabels))
-	labels = append(labels, "thread:"+intent.ThreadID)
+	labels := make([]string, 0, 2+len(intent.ExtraLabels))
+	labels = append(labels, mail.HandoffLabel, "thread:"+intent.ThreadID)
 	labels = append(labels, intent.ExtraLabels...)
 
 	b, err := p.createMessageBead(intent.Subject, intent.Body, from, intent.To, labels, metadata)
@@ -271,7 +294,7 @@ func (p *Provider) SendHandoff(intent mail.HandoffIntent) (mail.Message, error) 
 // funnels its already-resolved fields through here so the bead shape stays in
 // one place.
 func (p *Provider) createMessageBead(title, body, from, to string, labels []string, metadata map[string]string) (beads.Bead, error) {
-	return p.store.Create(beads.Bead{
+	b, err := p.store.Create(beads.Bead{
 		Title:       title,
 		Description: body,
 		Type:        messageBeadType,
@@ -281,6 +304,109 @@ func (p *Provider) createMessageBead(title, body, from, to string, labels []stri
 		Metadata:    metadata,
 		Ephemeral:   true,
 	})
+	if err != nil {
+		return b, err
+	}
+	// Read-after-write. Neither store Create verifies: BdStore returns a bead
+	// parsed from bd's own response and NativeDoltStore returns the issue it
+	// constructed in memory, so a write that did not durably land is reported
+	// as success all the way up to "Sent message <id> to <addr>" and exit 0.
+	// Mail is ephemeral (the wisps table), which skips DOLT_COMMIT and is
+	// dolt_ignore'd, so a lost message leaves no version, no diff and no log —
+	// nothing to recover it from and no way to prove it ever existed. That is
+	// why this channel gets verification the other bead classes can go without
+	// (ga-0ejdbv).
+	if err := p.verifyMessageBeadPersisted(b.ID); err != nil {
+		return b, err
+	}
+	return b, nil
+}
+
+// ErrNotPersisted reports a message bead that was VERIFIED ABSENT after the
+// store said the create succeeded. The message did not land; the caller should
+// re-send.
+var ErrNotPersisted = errors.New("message bead was not persisted")
+
+// ErrUnconfirmed reports a message bead whose existence could NOT be
+// established either way — the verification lookup itself did not complete.
+// The message may or may not have landed, so the caller should CHECK before
+// re-sending rather than blindly duplicating control-channel traffic. Kept
+// distinct from ErrNotPersisted because the two want different operator
+// actions.
+var ErrUnconfirmed = errors.New("message bead could not be confirmed")
+
+// verifyDisabled lets a deployment whose store cannot read back a freshly
+// written wisp turn the guard off rather than lose mail entirely.
+// Verification is ON unless this is explicitly set to "0" or "false".
+func verifyDisabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("GC_MAIL_VERIFY"))) {
+	case "0", "false", "no", "off":
+		return true
+	}
+	return false
+}
+
+// messageVerifyBackoff is the delay before each retry after the first attempt.
+// The retry absorbs read-visibility LAG, which a backing that is briefly behind
+// recovers from within a few short waits. It does NOT prove lag has ended: a
+// write that stays invisible past the budget below is still reported as lost.
+// That residual is deliberate — the alternative is never reporting loss at all.
+var messageVerifyBackoff = []time.Duration{
+	50 * time.Millisecond,
+	150 * time.Millisecond,
+}
+
+// messageVerifyBudget caps the WALL CLOCK spent verifying, not just the sleeps.
+// A verification read is not necessarily cheap: on the bd-backed store a wisp
+// lookup is two subprocesses, and a bd query can sit on its own multi-second
+// timeout. Without this, three retries of a timing-out lookup would add minutes
+// to an interactive send under exactly the load that triggers it. Retries stop
+// once the budget is spent; the verdict is then formed from what we have.
+var messageVerifyBudget = 10 * time.Second
+
+func (p *Provider) verifyMessageBeadPersisted(id string) error {
+	if verifyDisabled() || p.store == nil {
+		return nil
+	}
+	if strings.TrimSpace(id) == "" {
+		// A create that reported success without an ID cannot be verified and
+		// must not pass silently — that is the same exit-0-with-nothing-behind-it
+		// shape this guard exists to close.
+		return fmt.Errorf("%w: store returned no bead ID", ErrUnconfirmed)
+	}
+	// Read through the LIVE handle. A CachingStore's own Get can serve the bead
+	// its Create just absorbed into the cache — including one absorbed after an
+	// unverified create (see CachingStore.createWith) — which would let the
+	// cache confirm a write that never reached storage. HandlesFor is identity
+	// for a plain store, so this costs nothing on the CLI path.
+	reader := beads.HandlesFor(p.store).Live
+	started := time.Now()
+	var lastErr error
+	for attempt := 0; attempt <= len(messageVerifyBackoff); attempt++ {
+		if attempt > 0 {
+			if time.Since(started) >= messageVerifyBudget {
+				break
+			}
+			time.Sleep(messageVerifyBackoff[attempt-1])
+		}
+		_, err := reader.Get(id)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+	}
+	// Classify on the FINAL reading. A definitive not-found means we looked and
+	// the row is absent. Anything else — an indeterminate wisp lookup, or a
+	// transport error — means we never got a trustworthy answer, and claiming
+	// loss on that would fail healthy sends under exactly the load that causes
+	// it.
+	// An ID collision (bd resolved a DIFFERENT bead for our fresh ID) is not
+	// proof of absence either: it says only that the lookup did not answer for
+	// this ID, so reporting it as lost would duplicate a message that exists.
+	if errors.Is(lastErr, beads.ErrVerifyIndeterminate) || errors.Is(lastErr, beads.ErrIDCollision) || !errors.Is(lastErr, beads.ErrNotFound) {
+		return fmt.Errorf("%w: %w", ErrUnconfirmed, &mail.DeliveryUnconfirmedError{ID: id, Cause: lastErr})
+	}
+	return fmt.Errorf("%w: %s", ErrNotPersisted, id)
 }
 
 // PinSender records the calling session, which the command has already
@@ -426,7 +552,11 @@ func (p *Provider) MarkRead(id string) error {
 	})
 }
 
-// MarkUnread marks a message as unread (removes "read" label).
+// MarkUnread marks a message as unread (removes "read" label). A closed
+// message bead (e.g. one closed by the mail retention sweep) is reopened
+// first: mark-unread exists to resurface a message, and a closed bead is
+// invisible to every inbox surface, so removing the label alone would
+// silently change nothing (ga-1kor).
 func (p *Provider) MarkUnread(id string) error {
 	b, err := p.store.Get(id)
 	if err != nil {
@@ -434,6 +564,11 @@ func (p *Provider) MarkUnread(id string) error {
 	}
 	if isRemovedMessageBead(b) {
 		return beadmailError("mark-unread", beads.ErrNotFound)
+	}
+	if b.Status == "closed" {
+		if err := p.store.Reopen(id); err != nil {
+			return fmt.Errorf("beadmail mark-unread: reopening closed message: %w", err)
+		}
 	}
 	return p.store.Update(id, beads.UpdateOpts{
 		RemoveLabels: []string{"read"},
@@ -485,8 +620,8 @@ func (p *Provider) Archive(id string) error {
 // ArchiveCandidates returns open messages that match filter without archiving
 // them.
 func (p *Provider) ArchiveCandidates(filter ArchiveFilter) ([]mail.Message, error) {
-	routes := p.recipientRoutesForAll(filter.Recipients)
-	candidates, err := p.messageCandidatesForRoutes(routes)
+	mailbox := p.inboxRoutesForAll(filter.Recipients)
+	candidates, err := p.messageCandidatesForRoutes(mailbox.routes)
 	if err != nil {
 		return nil, fmt.Errorf("beadmail archive matching: %w", err)
 	}
@@ -495,7 +630,7 @@ func (p *Provider) ArchiveCandidates(filter ArchiveFilter) ([]mail.Message, erro
 		if b.Status != "open" {
 			continue
 		}
-		if len(routes) > 0 && !matchesRecipientRoute(routes, b.Assignee) {
+		if !mailbox.admits(b) {
 			continue
 		}
 		msg := beadToMessage(b)
@@ -767,6 +902,9 @@ func (p *Provider) Reply(id, from, subject, body string) (mail.Message, error) {
 	if to == "" {
 		return mail.Message{}, fmt.Errorf("beadmail reply: original message %s has no sender to reply to", id)
 	}
+	if mail.IsOrderSender(to) {
+		return mail.Message{}, fmt.Errorf("beadmail reply: message %s: %w", id, mail.OrderNoMailboxError(to))
+	}
 	toDisplay := strings.TrimSpace(original.Metadata[fromDisplayMetadataKey])
 	if toDisplay == "" {
 		toDisplay = strings.TrimSpace(original.From)
@@ -792,16 +930,11 @@ func (p *Provider) Reply(id, from, subject, body string) (mail.Message, error) {
 
 	labels := []string{"thread:" + threadID, "reply-to:" + id}
 
-	b, err := p.store.Create(beads.Bead{
-		Title:       deriveReplyTitle(subject, original.Title, body),
-		Description: body,
-		Type:        messageBeadType,
-		Assignee:    to, // reply goes back to sender
-		From:        from,
-		Labels:      labels,
-		Metadata:    metadata,
-		Ephemeral:   true,
-	})
+	// Reply used to build its own message bead here, which meant it skipped the
+	// confined edge its neighbors use — so the read-after-write guard did not
+	// cover replies, and createMessageBead's "every mail-creating method funnels
+	// through here" was not true. "to" is the sender we are replying back to.
+	b, err := p.createMessageBead(deriveReplyTitle(subject, original.Title, body), body, from, to, labels, metadata)
 	if err != nil {
 		return mail.Message{}, fmt.Errorf("beadmail reply: %w", err)
 	}
@@ -813,7 +946,19 @@ func (p *Provider) Reply(id, from, subject, body string) (mail.Message, error) {
 // so a beadmail not-found does not leak beads.ErrNotFound to mail-layer callers.
 // This confinement is intentional and differs from the exec seam, which chains
 // both errors; callers above beadmail must key on mail.ErrNotFound.
+//
+// Only a PROVEN absence is not-found. A lookup that did not finish
+// (beads.ErrVerifyIndeterminate), or that bd answered with a different bead
+// (beads.ErrIDCollision), is mail.ErrLookupIndeterminate instead: it does not
+// satisfy errors.Is(err, mail.ErrNotFound), so a queued nudge is not withdrawn
+// as "mail-missing" and the API does not answer 404 on a read that merely
+// failed. The text still says absence is unproven, for the operator deciding
+// whether to re-send an unconfirmed message (ga-0ejdbv round 4); the cause
+// goes in as text, not %w, so no beads sentinel leaks.
 func beadmailError(operation string, err error) error {
+	if errors.Is(err, beads.ErrVerifyIndeterminate) || errors.Is(err, beads.ErrIDCollision) {
+		return fmt.Errorf("beadmail %s: %w: %s", operation, mail.ErrLookupIndeterminate, err.Error())
+	}
 	if errors.Is(err, beads.ErrNotFound) {
 		err = mail.ErrNotFound
 	}
@@ -941,8 +1086,8 @@ func (p *Provider) CountRecipients(recipients []string) (int, int, error) {
 	if len(recipients) == 0 {
 		return 0, 0, nil
 	}
-	routes := p.recipientRoutesForAll(recipients)
-	candidates, err := p.messageCandidatesForRoutes(routes)
+	mailbox := p.inboxRoutesForAll(recipients)
+	candidates, err := p.messageCandidatesForRoutes(mailbox.routes)
 	if err != nil {
 		return 0, 0, fmt.Errorf("listing messages: %w", err)
 	}
@@ -951,7 +1096,7 @@ func (p *Provider) CountRecipients(recipients []string) (int, int, error) {
 		if b.Status != "open" {
 			continue
 		}
-		if len(routes) > 0 && !matchesRecipientRoute(routes, b.Assignee) {
+		if !mailbox.admits(b) {
 			continue
 		}
 		total++
@@ -969,10 +1114,12 @@ func (p *Provider) filterMessages(recipient string, includeRead bool) ([]mail.Me
 }
 
 // filterMessagesForRecipients returns open message beads assigned to any
-// recipient route represented by recipients. Empty recipients mean all routes.
+// recipient route represented by recipients, plus a named seat's recent mail
+// left on its own closed sessions (see inboxRoutes). Empty recipients mean all
+// routes.
 func (p *Provider) filterMessagesForRecipients(recipients []string, includeRead bool) ([]mail.Message, error) {
-	routes := p.recipientRoutesForAll(recipients)
-	candidates, err := p.messageCandidatesForRoutes(routes)
+	mailbox := p.inboxRoutesForAll(recipients)
+	candidates, err := p.messageCandidatesForRoutes(mailbox.routes)
 	if err != nil {
 		return nil, fmt.Errorf("beadmail: listing beads: %w", err)
 	}
@@ -981,7 +1128,7 @@ func (p *Provider) filterMessagesForRecipients(recipients []string, includeRead 
 		if b.Status != "open" {
 			continue
 		}
-		if len(routes) > 0 && !matchesRecipientRoute(routes, b.Assignee) {
+		if !mailbox.admits(b) {
 			continue
 		}
 		if !includeRead && hasLabel(b.Labels, "read") {
@@ -1051,7 +1198,7 @@ const RetentionSweepCloseReason = "mail gc-swept: read mail bead past gc retenti
 // handling: listErr is the fatal candidate-listing failure (no beads were
 // swept), while closeErrs holds the per-bead metadata/close failures that do not
 // abort the sweep. Returns the number of beads closed.
-func SweepReadMessagesBefore(store beads.MailStore, cutoff time.Time, limit int, closeReason string) (closed int, closeErrs []error, listErr error) {
+func SweepReadMessagesBefore(store beads.MailStore, cutoff, handoffCutoff time.Time, limit int, closeReason string) (closed int, closeErrs []error, listErr error) {
 	candidates, err := readMessagesBefore(store.Store, cutoff, limit)
 	if err != nil {
 		return 0, nil, err
@@ -1061,6 +1208,9 @@ func SweepReadMessagesBefore(store beads.MailStore, cutoff time.Time, limit int,
 			break
 		}
 		if b.Status != "open" {
+			continue
+		}
+		if hasLabel(b.Labels, mail.HandoffLabel) && b.CreatedAt.After(handoffCutoff) {
 			continue
 		}
 		if err := store.SetMetadata(b.ID, "close_reason", closeReason); err != nil {
@@ -1080,7 +1230,7 @@ func SweepReadMessagesBefore(store beads.MailStore, cutoff time.Time, limit int,
 // would close for the same cutoff and limit, without mutating any bead. It is the
 // dry-run twin of the sweep and shares its candidate query and limit semantics so
 // the two stay in lockstep.
-func CountReadMessagesBefore(store beads.MailStore, cutoff time.Time, limit int) (int, error) {
+func CountReadMessagesBefore(store beads.MailStore, cutoff, handoffCutoff time.Time, limit int) (int, error) {
 	candidates, err := readMessagesBefore(store.Store, cutoff, limit)
 	if err != nil {
 		return 0, err
@@ -1091,6 +1241,9 @@ func CountReadMessagesBefore(store beads.MailStore, cutoff time.Time, limit int)
 			break
 		}
 		if b.Status != "open" {
+			continue
+		}
+		if hasLabel(b.Labels, mail.HandoffLabel) && b.CreatedAt.After(handoffCutoff) {
 			continue
 		}
 		count++
@@ -1333,44 +1486,51 @@ func restoreMessageWispDeps(store beads.Store, downDeps, upDeps []beads.Dep) err
 // recipient, so mail lands where it was addressed instead of in one of two
 // mailboxes chosen by lookup order.
 func (p *Provider) recipientRoutes(recipient string) []string {
+	routes, _, _ := p.recipientMailbox(recipient)
+	return routes
+}
+
+// recipientMailbox is recipientRoutes that also returns the live session owning
+// the mailbox when the live pass resolved one; live is false otherwise.
+func (p *Provider) recipientMailbox(recipient string) (routes []string, owner session.Info, live bool) {
 	recipient = strings.TrimSpace(recipient)
 	if recipient == "" {
-		return nil
+		return nil, session.Info{}, false
 	}
-	routes := make([]string, 0, 4)
+	routes = make([]string, 0, 4)
 	routes = appendRecipientRoute(routes, recipient)
 	if recipient == "human" || p.sessions == nil {
-		return routes
+		return routes, session.Info{}, false
 	}
 
 	info, err := p.sessions.ResolveMailboxAddress(recipient, false)
 	switch {
 	case err == nil:
-		return appendSessionRecipientRoutes(routes, info)
+		return appendSessionRecipientRoutes(routes, info), info, true
 	case errors.Is(err, session.ErrAmbiguous):
-		return []string{recipient}
+		return []string{recipient}, session.Info{}, false
 	case !errors.Is(err, session.ErrSessionNotFound):
 		log.Printf("beadmail: resolving current session route %q: %v", recipient, err)
-		return routes
+		return routes, session.Info{}, false
 	}
 
 	info, err = p.sessions.ResolveMailboxAddress(recipient, true)
 	switch {
 	case err == nil:
-		return appendSessionRecipientRoutes(routes, info)
+		return appendSessionRecipientRoutes(routes, info), session.Info{}, false
 	case errors.Is(err, session.ErrAmbiguous):
-		return []string{recipient}
+		return []string{recipient}, session.Info{}, false
 	case !errors.Is(err, session.ErrSessionNotFound):
 		log.Printf("beadmail: resolving closed session route %q: %v", recipient, err)
-		return routes
+		return routes, session.Info{}, false
 	}
 
 	all, err := p.cachedSessionBeads()
 	if err != nil {
 		log.Printf("beadmail: listing sessions for historical recipient route %q: %v", recipient, err)
-		return routes
+		return routes, session.Info{}, false
 	}
-	return recipientRoutesByHistoricalAlias(all, recipient, routes)
+	return recipientRoutesByHistoricalAlias(all, recipient, routes), session.Info{}, false
 }
 
 func appendSessionRecipientRoutes(routes []string, info session.Info) []string {

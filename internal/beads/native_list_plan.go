@@ -17,7 +17,8 @@ import (
 // is unset. The store unions their rows by id and ApplyListQuery then applies
 // the whole query exactly, so a plan only decides how many rows cross from the
 // backend, never which rows the caller receives: every predicate it pushes is
-// exact or a superset of the query's.
+// exact or a superset of the query's. The one exception is a Live "open", which
+// is pushed as bd's raw status (nativeListPushesRawOpen).
 //
 // A plural Assignees set fans out into one request per distinct assignee, each
 // with that assignee pushed, however many there are: a keyed request reads one
@@ -48,7 +49,7 @@ func nativeListPlan(query ListQuery, pushableTypes map[string]bool) []issueops.L
 	base := nativeListRequestFromListQuery(query, pushableTypes)
 	assignees := nativeListFanOutAssignees(query)
 	if len(assignees) == 0 {
-		return []issueops.ListRequest{base}
+		return nativeListIDChunks(base, query.IDs)
 	}
 	plan := make([]issueops.ListRequest, 0, len(assignees))
 	for _, assignee := range assignees {
@@ -57,6 +58,33 @@ func nativeListPlan(query ListQuery, pushableTypes map[string]bool) []issueops.L
 		plan = append(plan, req)
 	}
 	return plan
+}
+
+// nativeListIDChunks pushes an id set as IDFilter, one request per
+// nativeServerEdgeAnchorCap ids (the id count a served backend is known to
+// accept on one call). Without it a ListQuery naming ids listed the whole
+// ledger and filtered in Go. ApplyListQuery still applies the ids exactly, so
+// the union of the chunks is a superset of nothing it should not return. A
+// backend that refuses IDFilter is handled by List (nativeListIDsRefused).
+func nativeListIDChunks(base issueops.ListRequest, ids []string) []issueops.ListRequest {
+	if len(ids) == 0 {
+		return []issueops.ListRequest{base}
+	}
+	plan := make([]issueops.ListRequest, 0, (len(ids)+nativeServerEdgeAnchorCap-1)/nativeServerEdgeAnchorCap)
+	for start := 0; start < len(ids); start += nativeServerEdgeAnchorCap {
+		req := base
+		req.IDFilter = strings.Join(ids[start:min(start+nativeServerEdgeAnchorCap, len(ids))], ",")
+		plan = append(plan, req)
+	}
+	return plan
+}
+
+// nativeListIDsRefused reports a backend refusing IDFilter on a listing: an
+// http-native IssueReader does so client-side, before any round trip, with an
+// error that unwraps to *beadslib.ErrUnsupported.
+func nativeListIDsRefused(err error) bool {
+	var unsupported *beadslib.ErrUnsupported
+	return errors.As(err, &unsupported)
 }
 
 // nativeListFanOutAssignees returns the distinct assignees a plan fans out
@@ -85,6 +113,48 @@ func nativeListFanOutAssignees(query ListQuery) []string {
 // bd status. mapBdStatus folds every other bd status into gc's "open".
 func nativeListPushableStatus(status string) bool {
 	return status == "in_progress" || status == "closed"
+}
+
+// nativeListPushesRawOpen reports whether query's "open" is pushed to the
+// backing as bd's raw status rather than answered as gc's folded "open".
+//
+// A Live read is a lifecycle gate asking for the backing's own answer, and
+// every other backing gives the RAW status for Live Status:"open": BdStore
+// passes --status=open to bd, while SQLiteStore, DoltliteReadStore and MemStore
+// match the stored status exactly. The callers are written against that
+// answer: the controller's demand reads; the seat-work gates (config-drift
+// deferral, max session age, slot-freeable, the drain-ack close gate); route
+// recovery; and the orphan sweep. To them a blocked or deferred bead is
+// parked, not work (gc-4zb/#4395, EB-42o8/gc-nz5i). Before this, only native
+// cities answered with the folded "open", so every one of those gates counted
+// parked beads as live work. A seat holding only a blocked bead never drained,
+// never took a config change, and was re-offered the bead on every wake.
+//
+// The readers that move or flag a session's work read the same answer, so
+// parked work is left assigned where it is: the retirement reassignments
+// (cmd/gc session_beads.go, internal/api session_resolution.go), the
+// stranded-repair unclaim through SeatWork, and the identity-residue doctor;
+// a seat the close gate lets go with only parked work keeps it too. That is
+// BdStore's behavior, accepted here as parity; ga-7uf6c7 tracks moving parked
+// work as well.
+//
+// A non-Live read keeps the folded answer while CachingStore serves it from
+// the cache: PrimeActive lists without Live, so the cache holds blocked rows
+// as "open". The cache's fallback re-issues the read Live, though, so a cold
+// or degraded cache, more than dirtyOverlayMaxGets dirty rows, or a failed
+// overlay read returns the raw answer (ga-4w9wpf). Count declines the open
+// shape (nativeDoltCountSupported); callers keep the folded answer through the
+// List fallback, or the raw one when that List is Live.
+//
+// CachingStore's Live stale-row sweep (staleLiveCacheIDs) skips a cached row
+// whose SourceStatus is another status, so the parked rows this leaves out
+// cost no read.
+//
+// This is the one plan predicate that is not a superset of the query: it
+// leaves out rows that ApplyListQuery's folded "open" would keep. That is
+// deliberate, and it applies only under Live.
+func nativeListPushesRawOpen(query ListQuery) bool {
+	return query.Live && query.Status == "open"
 }
 
 // nativeTypesInfraConfigKey is the workspace setting naming the types bd treats
@@ -156,7 +226,14 @@ func nativeReadListPushableTypes(ctx context.Context, storage beadslib.Storage) 
 // type at all: a type the server classifies as infra would lose durable rows,
 // and only the server's own setting says which types those are.
 func (s *NativeDoltStore) loadListPushableTypes(ctx context.Context) {
-	pushable, err := nativeReadListPushableTypes(ctx, s.storage)
+	storage, release, err := s.acquireStorage()
+	if err != nil {
+		s.listLogger().Warn("native bead store: cannot read the scope's types.infra setting; listing without type pushdown for this store",
+			"prefix", s.idPrefix, "err", err)
+		return
+	}
+	defer release()
+	pushable, err := nativeReadListPushableTypes(ctx, storage)
 	if err != nil {
 		s.listLogger().Warn("native bead store: cannot read the scope's types.infra setting; listing without type pushdown for this store",
 			"prefix", s.idPrefix, "err", err)
@@ -178,6 +255,7 @@ func nativeListTypeRefused(err error) bool {
 // the list-request tripwire counts.
 func NativeListRequestKeyed(req issueops.ListRequest) bool {
 	return req.ParentID != "" ||
+		req.IDFilter != "" ||
 		req.Assignee != "" ||
 		len(req.Labels) > 0 ||
 		len(req.MetadataFields) > 0 ||

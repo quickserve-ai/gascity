@@ -97,9 +97,18 @@ func startPasswordedDoltServer(t *testing.T, repoDir string, setupQueries ...str
 	return startRealDoltServer(t, repoDir, "secret", setupQueries...)
 }
 
+// startUnpasswordedDoltServer starts a Dolt sql-server whose root carries no
+// password — the managed local server's shape (root@localhost, empty).
+func startUnpasswordedDoltServer(t *testing.T, repoDir string, setupQueries ...string) (string, int, int, func()) {
+	t.Helper()
+	return startRealDoltServer(t, repoDir, "", setupQueries...)
+}
+
 // startRealDoltServer starts a real dolt sql-server in repoDir and exports
 // password as GC_DOLT_PASSWORD. A non-empty password is set on root@'%'; an
-// empty one leaves dolt's passwordless root in place.
+// empty one leaves dolt's passwordless root in place and exports an empty
+// GC_DOLT_PASSWORD, clearing any ambient one so the readiness probe dials the
+// way gc's managed-local path does.
 func startRealDoltServer(t *testing.T, repoDir, password string, setupQueries ...string) (string, int, int, func()) {
 	t.Helper()
 	skipSlowCmdGCTest(t, "requires a real Dolt server; run make test-cmd-gc-process for full coverage")
@@ -349,5 +358,35 @@ func TestProjectIdentityL3AdapterContractAndManagedComposition(t *testing.T) {
 	}
 	if !l1OK || !l3OK || l1 != "composition-id" || l2 != "composition-id" || l3 != "composition-id" {
 		t.Fatalf("composition state = (L1:%q/%v L2:%q L3:%q/%v), want composition-id in all layers", l1, l1OK, l2, l3, l3OK)
+	}
+}
+
+// TestManagedDoltOpenDatabaseDeclinesForeignAmbientPasswordAgainstLocalServer
+// reproduces the field failure behind gc-49ho against a real server. After the
+// 2026-08-27 qcore hub flip every crew session carried the hub's credentials
+// (GC_DOLT_HOST/PORT/PASSWORD for 100.71.23.94:3307) while the managed LOCAL
+// server's root has no password. The native-store identity probe dialed the
+// local server as root presenting the hub password — Error 1045 — and every
+// city-store open degraded off the native store with "database project_id
+// could not be confirmed". The ambient identity travels with the ambient
+// endpoint: a password bound to a different endpoint is not presented here.
+func TestManagedDoltOpenDatabaseDeclinesForeignAmbientPasswordAgainstLocalServer(t *testing.T) {
+	repoDir := filepath.Join(t.TempDir(), "hq")
+	_, port, _, cleanup := startUnpasswordedDoltServer(t, repoDir)
+	defer cleanup()
+
+	t.Setenv("GC_DOLT_HOST", "100.71.23.94")
+	t.Setenv("GC_DOLT_PORT", "3307")
+	t.Setenv("GC_DOLT_PASSWORD", "hub-secret")
+
+	db, err := managedDoltOpenDatabase("127.0.0.1", fmt.Sprintf("%d", port), "root", "hq")
+	if err != nil {
+		t.Fatalf("managedDoltOpenDatabase: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatalf("PingContext(local server, hub-bound ambient password in env) = %v, want the foreign password declined and root connecting passwordless", err)
 	}
 }

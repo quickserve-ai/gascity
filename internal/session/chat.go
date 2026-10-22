@@ -244,14 +244,15 @@ func freshStartCommandFromMetadata(metadata map[string]string, fallback string) 
 }
 
 func (m *Manager) clearStaleResumeMetadata(id string, b *beads.Bead) error {
-	if err := m.store.SetMetadata(id, "session_key", ""); err != nil {
-		return fmt.Errorf("clearing stale resume metadata session_key: %w", err)
+	patch := MetadataPatch{
+		"session_key":                "",
+		"started_config_hash":        "",
+		resumeSeededKey:              "",
+		"continuation_reset_pending": "true",
 	}
-	if err := m.store.SetMetadata(id, "started_config_hash", ""); err != nil {
-		return fmt.Errorf("clearing stale resume metadata started_config_hash: %w", err)
-	}
-	if err := m.store.SetMetadata(id, "continuation_reset_pending", "true"); err != nil {
-		return fmt.Errorf("clearing stale resume metadata continuation_reset_pending: %w", err)
+	StampPriorSessionKey(patch, b.Metadata)
+	if err := m.store.SetMetadataBatch(id, patch); err != nil {
+		return fmt.Errorf("clearing stale resume metadata: %w", err)
 	}
 	// Priming markers share started_config_hash's lifetime (S19 Stage 2): this
 	// stale-resume clear forces a fresh start, so the markers reset with it.
@@ -261,7 +262,10 @@ func (m *Manager) clearStaleResumeMetadata(id string, b *beads.Bead) error {
 		}
 	}
 	if b.Metadata == nil {
-		b.Metadata = make(map[string]string)
+		b.Metadata = make(map[string]string, len(patch))
+	}
+	for k, v := range patch {
+		b.Metadata[k] = v
 	}
 	b.Metadata["session_key"] = ""
 	b.Metadata["started_config_hash"] = ""
@@ -472,7 +476,10 @@ func (m *Manager) retryFreshStartAfterStaleKey(
 		}
 		cfg.Env = mergeEnv(cfg.Env, next.Env())
 	}
-	if err := m.sp.Start(ctx, sessName, cfg); err != nil {
+	if err := func() error {
+		defer bracketStart(m.startFence, m.sp)() // the session-start fence (start_fence.go)
+		return m.sp.Start(ctx, sessName, cfg)
+	}(); err != nil {
 		switch {
 		case inc == nil:
 		case m.launchedUnder(sessName, cfg.ProcessNames, next):
@@ -941,7 +948,10 @@ func (m *Manager) ensureRunningOn(ctx context.Context, by Actor, id string, b be
 		}
 		inc, provisional = &minted, true
 		cfg = startConfig(cfg, b, minted)
-		if err := m.sp.Start(ctx, sessName, cfg); err != nil {
+		if err := func() error {
+			defer bracketStart(m.startFence, m.sp)() // the session-start fence (start_fence.go)
+			return m.sp.Start(ctx, sessName, cfg)
+		}(); err != nil {
 			switch {
 			// A capacity refusal is also a startup death, but the endpoint
 			// refused the launch: that says nothing about the resume key, so
@@ -1199,7 +1209,10 @@ func (m *Manager) ensureRunningRuntimeOnly(ctx context.Context, by Actor, id str
 		}
 		return fmt.Errorf("pre-start orphan cleanup: %w", orphanErr)
 	}
-	if err := m.sp.Start(ctx, sessName, cfg); err != nil {
+	if err := func() error {
+		defer bracketStart(m.startFence, m.sp)() // the session-start fence (start_fence.go)
+		return m.sp.Start(ctx, sessName, cfg)
+	}(); err != nil {
 		switch {
 		// A capacity refusal says nothing about the resume key; it takes the
 		// plain failure path, not the stale-key recovery (see ensureRunning).
@@ -1351,8 +1364,10 @@ func (m *Manager) nudgeSession(ctx context.Context, sessName, message string, im
 
 // nudgeContent delivers content, passing the delivery key ctx carries (see
 // runtime.WithNudgeDeliveryKey) to a provider that deduplicates keyed
-// deliveries. Immediate delivery through an ImmediateNudgeProvider goes out
-// unkeyed: NudgeNow takes no key.
+// deliveries, immediate delivery included: such a provider's keyed send
+// starts the turn without an idle wait (runtime.NudgeWithReceipt). Only an
+// unkeyed immediate delivery, or one to a provider that keeps no keyed
+// deliveries, goes out through NudgeNow, which takes no key.
 //
 // Under an input fence in ctx (runtime.WithInputFence) the runtime delivers
 // only to the incarnation it names, or refuses.
@@ -1479,13 +1494,15 @@ func (m *Manager) markStartupDialogsVerifiedLocked(id string, b *beads.Bead) {
 
 // sendLocked delivers message, starting or resuming the runtime as by
 // allows; a row it may not resume, or whose agent is dead in a pane still
-// up, gets the message queued (reports true).
-func (m *Manager) sendLocked(ctx context.Context, by Actor, id string, b beads.Bead, sessName, message, resumeCommand string, hints runtime.Config, immediate bool) (bool, error) {
+// up, gets the message queued (reports true). So does a live session the
+// runtime would not type into because it is running a turn the submit keys
+// would interrupt (runtime.ErrSessionBusy): the queue delivers it later.
+func (m *Manager) sendLocked(ctx context.Context, by Actor, id string, b beads.Bead, sessName, message, resumeCommand string, hints runtime.Config, immediate bool, queueSource string) (bool, error) {
 	if err := m.ensureDeliverable(ctx, by, id, b, sessName, resumeCommand, hints); err != nil {
 		if !errors.Is(err, ErrResumeHeld) && !errors.Is(err, ErrAgentDead) {
 			return false, err
 		}
-		return true, m.enqueueDeferredSubmitLocked(b, sessName, message)
+		return true, m.enqueueDeferredSubmitLocked(b, sessName, message, queueSource)
 	}
 	verifyDeferredDialogs := needsDeferredStartupDialogVerification(b)
 	if verifyDeferredDialogs {
@@ -1495,6 +1512,9 @@ func (m *Manager) sendLocked(ctx context.Context, by Actor, id string, b beads.B
 		return false, err
 	}
 	if err := m.nudgeSession(ctx, sessName, message, immediate); err != nil {
+		if errors.Is(err, runtime.ErrSessionBusy) {
+			return true, m.enqueueDeferredSubmitLocked(b, sessName, message, queueSource)
+		}
 		return false, err
 	}
 	if verifyDeferredDialogs && m.dismissKnownDialogsLocked(ctx, sessName, codexDeferredDialogDelay) {
@@ -1513,7 +1533,7 @@ func (m *Manager) send(ctx context.Context, by Actor, id, message, resumeCommand
 		if err != nil {
 			return err
 		}
-		outcome.Queued, err = m.sendLocked(ctx, by, id, b, sessName, message, resumeCommand, hints, immediate)
+		outcome.Queued, err = m.sendLocked(ctx, by, id, b, sessName, message, resumeCommand, hints, immediate, deferredNudgeSource)
 		outcome.Deferred = outcome.Queued
 		return err
 	})
@@ -1649,7 +1669,13 @@ func (m *Manager) TryWaitIdleNudgeLiveOnly(ctx context.Context, id, source, mess
 // it waits for the session to return to an idle prompt before returning.
 // Claude Code puts a prompt interrupted before its first response chunk back
 // into its input box, so for Claude StopTurn also clears the input box when
-// the runtime can do a verified clear (see clearRestoredInputLocked).
+// the runtime can do a verified clear (see clearRestoredInputLocked). Codex
+// keeps running an interrupted turn's commands in background terminals, and
+// Claude a command the model ran in the background, so for both StopTurn also
+// has the runtime stop them once the interrupt boundary is reached and any
+// restored prompt is cleared (see stopBackgroundWorkLocked). That stops ALL
+// of the session's background work, including what earlier turns started: a
+// stop stops the session's work. An interrupt_now submit does not do this.
 // A runtime that interrupts turns by protocol (runtime.TurnInterruptProtocol)
 // gets its Interrupt for every provider and no keys. A runtime that can
 // interrupt neither way gets nothing sent and StopTurn returns
@@ -1756,6 +1782,11 @@ func (m *Manager) StopTurnIf(ctx context.Context, id string, still func() error)
 			if _, err := m.clearRestoredInputLocked(ctx, sessName); err != nil {
 				log.Printf("session: stopped the turn of %q but %v", sessName, err)
 			}
+		}
+		// After the restored prompt is cleared: Claude's background shells
+		// are stopped from an empty input box.
+		if stopsBackgroundWork(b) {
+			m.stopBackgroundWorkLocked(context.Background(), sessName)
 		}
 		return nil
 	})

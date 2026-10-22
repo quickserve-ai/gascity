@@ -230,7 +230,7 @@ func TestFilterAssignedWorkBeadsForPoolDemandKeepsDirectAssigneeAfterTemplateFal
 		Metadata: map[string]string{},
 	}}
 
-	got := filterAssignedWorkBeadsForPoolDemand(cfg, "", nil, sessionInfosFromBeads(sessions), work, []string{""})
+	got := filterAssignedWorkBeadsForPoolDemand(cfg, "", nil, sessionInfosFromBeads(sessions), work, []string{""}, nil)
 
 	if len(got) != 1 || got[0].ID != "direct-assigned" {
 		t.Fatalf("filtered work = %#v, want direct-assigned work preserved through template fallback", got)
@@ -253,7 +253,7 @@ func TestFilterAssignedWorkBeadsForPoolDemandKeepsLegacyWorkflowRunTarget(t *tes
 		},
 	}}
 
-	got := filterAssignedWorkBeadsForPoolDemand(cfg, "", nil, nil, work, []string{""})
+	got := filterAssignedWorkBeadsForPoolDemand(cfg, "", nil, nil, work, []string{""}, nil)
 
 	if len(got) != 1 || got[0].ID != "legacy-workflow-root" {
 		t.Fatalf("filtered work = %#v, want legacy workflow root preserved through run_target fallback", got)
@@ -289,7 +289,7 @@ func TestFilterAssignedWorkBeadsForPoolDemandKeepsPersistedBoundRoute(t *testing
 		},
 	}}
 
-	got := filterAssignedWorkBeadsForPoolDemand(cfg, cityPath, nil, sessionInfosFromBeads(sessions), work, []string{"gascity-packs"})
+	got := filterAssignedWorkBeadsForPoolDemand(cfg, cityPath, nil, sessionInfosFromBeads(sessions), work, []string{"gascity-packs"}, nil)
 
 	if len(got) != 1 || got[0].ID != "gp-qx0o" {
 		t.Fatalf("filtered work = %#v, want persisted bound route preserved", got)
@@ -313,7 +313,7 @@ func TestFilterAssignedWorkBeadsForPoolDemandNormalizesInstanceSuffixedRouteTarg
 		},
 	}}
 
-	got := filterAssignedWorkBeadsForPoolDemand(cfg, "", nil, nil, work, []string{""})
+	got := filterAssignedWorkBeadsForPoolDemand(cfg, "", nil, nil, work, []string{""}, nil)
 
 	if len(got) != 1 || got[0].ID != "instance-routed" {
 		t.Fatalf("filtered work = %#v, want instance-suffixed route target normalized to the base template and kept", got)
@@ -337,7 +337,7 @@ func TestFilterAssignedWorkBeadsForPoolDemandLeavesUnmatchedInstanceSuffixAlone(
 		},
 	}}
 
-	got := filterAssignedWorkBeadsForPoolDemand(cfg, "", nil, nil, work, []string{""})
+	got := filterAssignedWorkBeadsForPoolDemand(cfg, "", nil, nil, work, []string{""}, nil)
 
 	if len(got) != 0 {
 		t.Fatalf("filtered work = %#v, want out-of-range instance suffix left unmatched and dropped", got)
@@ -375,7 +375,7 @@ func TestFilterAssignedWorkBeadsForPoolDemandDropsDeferredRoutedBead(t *testing.
 		},
 	}
 
-	got := filterAssignedWorkBeadsForPoolDemand(cfg, "", nil, nil, work, []string{"", ""})
+	got := filterAssignedWorkBeadsForPoolDemand(cfg, "", nil, nil, work, []string{"", ""}, nil)
 
 	if len(got) != 1 || got[0].ID != "live-routed-work" {
 		t.Fatalf("filtered work = %#v, want only live-routed-work (deferred anchor dropped)", got)
@@ -401,7 +401,7 @@ func TestFilterAssignedWorkBeadsForPoolDemandKeepsElapsedDeferRoutedBead(t *test
 		DeferUntil: &past,
 	}}
 
-	got := filterAssignedWorkBeadsForPoolDemand(cfg, "", nil, nil, work, []string{""})
+	got := filterAssignedWorkBeadsForPoolDemand(cfg, "", nil, nil, work, []string{""}, nil)
 
 	if len(got) != 1 || got[0].ID != "elapsed-defer-work" {
 		t.Fatalf("filtered work = %#v, want elapsed-defer bead preserved as demand", got)
@@ -433,7 +433,7 @@ func TestFilterAssignedWorkBeadsForPoolDemandDropsDirectAssigneeFromUnreachableS
 		Metadata: map[string]string{},
 	}}
 
-	got := filterAssignedWorkBeadsForPoolDemand(cfg, cityPath, nil, sessionInfosFromBeads(sessions), work, []string{"riga"})
+	got := filterAssignedWorkBeadsForPoolDemand(cfg, cityPath, nil, sessionInfosFromBeads(sessions), work, []string{"riga"}, nil)
 
 	if len(got) != 0 {
 		t.Fatalf("filtered work = %#v, want unreachable rig-store direct assignment dropped", got)
@@ -1033,5 +1033,68 @@ func TestResolveTaskWorkDirPrefersCreatorWorkDirOverStampedCanonical(t *testing.
 
 	if got := resolveTaskWorkDir("", store, "worker-session"); got != creatorDir {
 		t.Fatalf("resolveTaskWorkDir = %q, want creator work_dir %q (not stamped %q)", got, creatorDir, observedDir)
+	}
+}
+
+// inProgressTaskWithWorkDir files an in-progress task for assignee whose
+// work_dir names another worker's checkout.
+func inProgressTaskWithWorkDir(t *testing.T, store beads.Store, assignee, workDir string) {
+	t.Helper()
+	task, err := store.Create(beads.Bead{
+		Title:    "work a pool worker started",
+		Type:     "task",
+		Assignee: assignee,
+		Metadata: map[string]string{"work_dir": workDir},
+	})
+	if err != nil {
+		t.Fatalf("Create task: %v", err)
+	}
+	inProgress := "in_progress"
+	if err := store.Update(task.ID, beads.UpdateOpts{Status: &inProgress}); err != nil {
+		t.Fatalf("mark task in progress: %v", err)
+	}
+}
+
+// TestResolvePreparedTaskWorkDir_ConfiguredNamedSessionIgnoresTaskWorkDir pins
+// that a configured named session never launches in the work_dir of a task it
+// is assigned. Such a task is often one a pool worker started, and its
+// work_dir is that worker's worktree: a named seat launched there runs its git
+// commands in a checkout it does not own (ga-5iu30d).
+func TestResolvePreparedTaskWorkDir_ConfiguredNamedSessionIgnoresTaskWorkDir(t *testing.T) {
+	poolWorktree := t.TempDir()
+	store := beads.NewMemStore()
+	inProgressTaskWithWorkDir(t, store, "rig/seat", poolWorktree)
+	candidate := startCandidate{info: sessionpkg.Info{
+		ID:                     "sess-1",
+		Alias:                  "rig/seat",
+		SessionNameMetadata:    "rig--seat",
+		ConfiguredNamedSession: true,
+	}}
+	// Both legs that can name a task work dir: the live lookup of the seat's
+	// in-progress tasks, and the snapshot resolver that answers ahead of it.
+	if got := resolvePreparedTaskWorkDir(candidate, "", nil, store, nil); got != "" {
+		t.Fatalf("resolvePreparedTaskWorkDir = %q from the task lookup for a configured named session, want no task work dir", got)
+	}
+	resolver := func(startCandidate, *config.City) string { return poolWorktree }
+	if got := resolvePreparedTaskWorkDir(candidate, "", nil, beads.NewMemStore(), resolver); got != "" {
+		t.Fatalf("resolvePreparedTaskWorkDir = %q from the resolver for a configured named session, want no task work dir", got)
+	}
+}
+
+// TestResolvePreparedTaskWorkDir_PoolSessionKeepsTaskWorkDir pins the other
+// half: a session that is not a configured named session still launches in
+// its assigned task's work_dir.
+func TestResolvePreparedTaskWorkDir_PoolSessionKeepsTaskWorkDir(t *testing.T) {
+	poolWorktree := t.TempDir()
+	store := beads.NewMemStore()
+	inProgressTaskWithWorkDir(t, store, "rig/polecat-1", poolWorktree)
+	candidate := startCandidate{info: sessionpkg.Info{
+		ID:                  "sess-2",
+		Alias:               "rig/polecat-1",
+		SessionNameMetadata: "rig--polecat-1",
+	}}
+
+	if got := resolvePreparedTaskWorkDir(candidate, "", nil, store, nil); got != poolWorktree {
+		t.Fatalf("resolvePreparedTaskWorkDir = %q for a pool session, want its task work_dir %q", got, poolWorktree)
 	}
 }

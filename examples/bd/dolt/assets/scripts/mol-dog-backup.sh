@@ -15,6 +15,9 @@ PACK_DIR="${GC_PACK_DIR:-$(CDPATH= cd -- "$(dirname "${BASH_SOURCE[0]}")/../.." 
 : "${GC_CITY_PATH:?GC_CITY_PATH must be set}"
 # shellcheck disable=SC1091
 . "$PACK_DIR/assets/scripts/_bounded.sh"
+# _backup_stamp.sh carries write_local_backup_sync_stamp (ga-g3p5rm): the
+# local-backup freshness stamp mol-dog-doctor.sh dates.
+. "$PACK_DIR/assets/scripts/_backup_stamp.sh"
 # shellcheck disable=SC1091
 . "$PACK_DIR/assets/scripts/_notify.sh"
 
@@ -384,6 +387,10 @@ $db
     sync_failure_detail=""
     if sync_failure_detail=$(sync_scope); then
         SYNCED=$((SYNCED + 1))
+        # Stamp ONLY on exit 0 (ga-g3p5rm). The doctor dog dates each database's
+        # local backup from this stamp and never from an artifact mtime, because
+        # a killed sync writes chunk files on the failure path too.
+        write_local_backup_sync_stamp "$db" "$BACKUP_ARTIFACT_DIR"
     else
         append_failed_db "$db(sync failed)"
         append_failed_detail "$db" "$sync_failure_detail"

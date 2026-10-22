@@ -123,7 +123,9 @@ func TestDrainAckFollowUpTickOverAConsumedHoldIsRefused(t *testing.T) {
 	if env.dt.get(snapshot.ID) != nil {
 		t.Fatal("the void drain is still tracked")
 	}
-	if ack, _ := env.sp.GetMeta("worker", "GC_DRAIN_ACK"); ack == "1" {
+	// Carry (gc-hzj5): the reconciler's ack is its own marker, never
+	// GC_DRAIN_ACK (the agent's key); isDrainAcked reads either writer.
+	if acked, _ := newDrainOps(env.sp).isDrainAcked("worker"); acked {
 		t.Fatal("the void drain's ack is still set")
 	}
 }
@@ -146,8 +148,10 @@ func idleRespawnDrainAcked(t *testing.T) (*reconcilerTestEnv, beads.Bead, beads.
 	if ds == nil || ds.reason != idleRespawnDrainReason {
 		t.Fatalf("idle-respawn drain = %+v; stderr %q", ds, env.stderr.String())
 	}
-	if ack, err := env.sp.GetMeta("worker", "GC_DRAIN_ACK"); err != nil || ack != "1" {
-		t.Fatalf("drain acknowledgement = %q, %v; want 1", ack, err)
+	// Carry (gc-hzj5): the reconciler publishes its own ack marker and never
+	// GC_DRAIN_ACK, the agent's key; isDrainAcked reads either writer.
+	if acked, err := newDrainOps(env.sp).isDrainAcked("worker"); err != nil || !acked {
+		t.Fatalf("drain acknowledgement = %v, %v; want acknowledged", acked, err)
 	}
 	// The attempt the drain recorded is in its basis: the row as stored.
 	if got := ds.basis.Info().IdleRespawnAttempts; got != "1" {
@@ -227,14 +231,15 @@ func TestDrainTimeoutOverAConsumedHoldIsRefused(t *testing.T) {
 		if env.dt.get(snapshot.ID) != nil {
 			t.Fatalf("agent %v: the void drain is still tracked", agent)
 		}
-		ack, _ := env.sp.GetMeta("worker", "GC_DRAIN_ACK")
 		if agent {
-			if ack != "1" {
+			if ack, _ := env.sp.GetMeta("worker", "GC_DRAIN_ACK"); ack != "1" {
 				t.Fatal("the void drain erased the agent's own ack")
 			}
 			continue
 		}
-		if ack == "1" {
+		// Carry (gc-hzj5): the reconciler's ack is its own marker, never
+		// GC_DRAIN_ACK; isDrainAcked reads either writer.
+		if acked, _ := newDrainOps(env.sp).isDrainAcked("worker"); acked {
 			t.Fatal("the void drain's ack is still set")
 		}
 		// The next tick reads the provider's ack through the production drain ops.
@@ -484,8 +489,11 @@ func TestUnreadableAckSourceDefers(t *testing.T) {
 				t.Fatal("the drain was dropped on an unreadable ack source")
 			}
 			delete(env.sp.GetMetaErrors, "worker")
-			if ack, _ := env.sp.GetMeta("worker", "GC_DRAIN_ACK"); ack != "1" {
-				t.Fatal("the ack was cleared on an unreadable source")
+			// Carry (gc-hzj5): the fixture's controller ack is the
+			// reconciler's own marker, never GC_DRAIN_ACK; isDrainAcked reads
+			// either writer.
+			if acked, err := newDrainOps(env.sp).isDrainAcked("worker"); err != nil || !acked {
+				t.Fatalf("the ack was cleared on an unreadable source (acked=%v, err=%v)", acked, err)
 			}
 		})
 	}

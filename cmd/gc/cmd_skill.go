@@ -11,6 +11,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/materialize"
 	"github.com/spf13/cobra"
 )
@@ -27,6 +28,8 @@ Output includes:
   - Imported pack shared skills (binding-qualified, e.g. ops.code-review)
   - Compatibility bootstrap skills, when legacy implicit imports still exist
   - With --agent/--session: that agent's agents/<name>/skills/ catalog
+    and the opt-in skills its opt_in_skills selects (a pack's
+    skills/opt-in/<name>/, binding-qualified)
 
 The listing is a diagnostic view of what's *available*. It does not
 collapse precedence, filter to agents whose provider has a vendor
@@ -196,6 +199,25 @@ func discoverImportedSkillEntries(catalogs []config.DiscoveredSkillCatalog) []vi
 	}
 	sortVisibilityEntries(out)
 	return out
+}
+
+// discoverOptInSkillEntries lists the opt-in skills agent selects
+// (opt_in_skills), each once, under its binding-qualified name. Path is
+// the absolute SKILL.md path, as for imported shared skills.
+func discoverOptInSkillEntries(cfg *config.City, agent *config.Agent) ([]visibilityEntry, error) {
+	skills, err := config.AgentOptInSkills(fsys.OSFS{}, cfg, agent)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]visibilityEntry, 0, len(skills))
+	for _, s := range skills {
+		out = append(out, visibilityEntry{
+			Name:   s.Name,
+			Source: s.Origin,
+			Path:   filepath.ToSlash(filepath.Join(s.Dir, "SKILL.md")),
+		})
+	}
+	return out, nil
 }
 
 func discoverAgentSkillEntries(root, agentName, source string) []visibilityEntry {

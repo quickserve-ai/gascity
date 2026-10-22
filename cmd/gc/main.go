@@ -416,6 +416,7 @@ func newRootCmdWithOptions(stdout, stderr io.Writer, options rootCommandOptions)
 		newDoltCleanupCmd(stdout, stderr),
 		newDoltConfigCmd(stdout, stderr),
 		newDoltStateCmd(stdout, stderr),
+		newWorktreeGCCmd(stdout, stderr),
 		newShellCmd(stdout, stderr),
 		newAnalyzeCmd(stdout, stderr),
 		newCostsCmd(stdout, stderr),
@@ -1758,7 +1759,7 @@ func openStoreResultAtForCityWithAuthority(storePath, cityPath string, modeOverr
 var openStoreFactoryForCity = beads.OpenStoreAtForCity
 
 func openStoreResultAtForCityWithConfig(storePath, cityPath string, cfg *config.City, modeOverride gate.Mode, haveMode, authoritative, longLived bool, nativeOverride *beads.NativeTransportMode) (beads.StoreOpenResult, error) {
-	return openStoreResultAtForCityScoped(storePath, cityPath, cfg, modeOverride, haveMode, authoritative, longLived, false, nativeOverride)
+	return openStoreResultAtForCityScoped(storePath, cityPath, cfg, modeOverride, haveMode, authoritative, longLived, false, true, nativeOverride)
 }
 
 // openOneShotStoreAtForCityWithConfig is openStoreAtForCityWithConfig for a
@@ -1776,17 +1777,26 @@ func openStoreResultAtForCityWithConfig(storePath, cityPath string, cfg *config.
 // Nothing enforces that cfg is fresh; the one-shot entry points
 // (openCityStoreAtWithConfig, oneShotRigStoreOpener) are the only callers.
 func openOneShotStoreAtForCityWithConfig(storePath, cityPath string, cfg *config.City) (beads.Store, error) {
-	result, err := openStoreResultAtForCityScoped(storePath, cityPath, cfg, gate.ModeUnset, false, false, false, true, nil)
+	result, err := openStoreResultAtForCityScoped(storePath, cityPath, cfg, gate.ModeUnset, false, false, false, true, true, nil)
 	if err != nil {
 		return nil, err
 	}
 	return result.Store, nil
 }
 
+// openStoreResultAtForCityWithConfigOptions is openStoreResultAtForCityWithConfig
+// with the builtin-cache readiness pass made optional. ensureAssets=false is
+// for the controller's reload schema preflight, which must decide whether to
+// hold reconciliation without first mutating pack artifacts (ga-mw4dg).
+func openStoreResultAtForCityWithConfigOptions(storePath, cityPath string, cfg *config.City, modeOverride gate.Mode, haveMode, authoritative, longLived, ensureAssets bool) (beads.StoreOpenResult, error) {
+	return openStoreResultAtForCityScoped(storePath, cityPath, cfg, modeOverride, haveMode, authoritative, longLived, false, ensureAssets, nil)
+}
+
 // openStoreResultAtForCityScoped is the shared open body. oneShotConfig
 // reports that cfg is this one-shot invocation's own fresh load, which lets
 // the bd city-scope open reuse it; see openOneShotStoreAtForCityWithConfig.
-func openStoreResultAtForCityScoped(storePath, cityPath string, cfg *config.City, modeOverride gate.Mode, haveMode, authoritative, longLived, oneShotConfig bool, nativeOverride *beads.NativeTransportMode) (beads.StoreOpenResult, error) {
+// ensureAssets=false skips the builtin-cache readiness pass (ga-mw4dg preflight).
+func openStoreResultAtForCityScoped(storePath, cityPath string, cfg *config.City, modeOverride gate.Mode, haveMode, authoritative, longLived, oneShotConfig, ensureAssets bool, nativeOverride *beads.NativeTransportMode) (beads.StoreOpenResult, error) {
 	runtimeCityPath := cityPath
 	if runtimeCityPath == "" {
 		runtimeCityPath = cityForStoreDir(storePath)
@@ -1824,10 +1834,12 @@ func openStoreResultAtForCityScoped(storePath, cityPath string, cfg *config.City
 			return beads.StoreOpenResult{}, err
 		}
 		cfg = loaded
-	} else {
+	} else if ensureAssets {
 		// Loading the config would have run the builtin-cache readiness pass.
 		// Reusing one must not skip that self-heal for a city this process has
-		// never readied.
+		// never readied. The reload schema preflight is the one exception: that
+		// safety probe must not mutate pack artifacts before deciding whether
+		// reconciliation must be held.
 		_ = ensureBuiltinRuntimeAssetsForSuppliedConfig(runtimeCityPath, io.Discard)
 	}
 	switch strings.TrimSpace(provider) {
@@ -1924,8 +1936,9 @@ func openStoreResultAtForCityScoped(storePath, cityPath string, cfg *config.City
 		},
 	})
 	if err != nil {
-		return beads.StoreOpenResult{}, err
+		return result, err
 	}
+	lv := sessionLivenessFor(runtimeCityPath, scopeRoot)
 	if observeOpenedStore != nil {
 		result.Store = observeOpenedStore(scopeRoot, result.Store)
 	}
@@ -1935,9 +1948,10 @@ func openStoreResultAtForCityScoped(storePath, cityPath string, cfg *config.City
 		memoEntry.cfg = cfg
 		memoEntry.mode = mode
 		memoEntry.nativeTransport = nativeTransport
+		memoEntry.lv = lv
 		return memoEntry.borrow(cfg), nil
 	}
-	result.Store = wrapStoreWithBeadPolicies(result.Store, cfg)
+	result.Store = wrapStoreWithBeadPolicies(result.Store, cfg, lv)
 	return result, nil
 }
 

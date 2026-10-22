@@ -1,6 +1,7 @@
 package orders
 
 import (
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -29,8 +30,11 @@ type Override struct {
 	Pool         *string
 	Timeout      *string
 	CheckTimeout *string
-	Idempotent   *bool
-	Env          map[string]string
+	// RunStaleAfter overrides the order wisp watchdog's report threshold for
+	// the order's runs.
+	RunStaleAfter *string
+	Idempotent    *bool
+	Env           map[string]string
 }
 
 // ApplyOverrides applies each override to the matching order in aa.
@@ -45,30 +49,39 @@ type Override struct {
 //     regardless of rig.
 //   - otherwise:     matches only the order with that exact rig.
 //
-// Returns an error if an override targets a nonexistent order (following
-// the agent override pattern where unmatched targets are errors, not
-// silent no-ops).
+// Returns an error if an override has no name or targets a nonexistent
+// order (following the agent override pattern where unmatched targets are
+// errors, not silent no-ops). A bad override never stops the others: every
+// valid override is applied and the returned error joins one entry per bad
+// one, so a caller that tolerates the error (the order dispatcher does) still
+// runs with every valid override in effect. Returning at the first miss
+// silently dropped every enabled = false listed after it.
 func ApplyOverrides(aa []Order, overrides []Override) error {
+	var errs []error
 	for i, ov := range overrides {
 		if ov.Name == "" {
-			return fmt.Errorf("orders.overrides[%d]: name is required", i)
+			errs = append(errs, fmt.Errorf("orders.overrides[%d]: name is required", i))
+			continue
 		}
 		found := false
 		for j := range aa {
-			if aa[j].Name != ov.Name {
-				continue
-			}
-			if !rigMatches(ov.Rig, aa[j].Rig) {
+			if !ov.Matches(&aa[j]) {
 				continue
 			}
 			applyOverride(&aa[j], &ov)
 			found = true
 		}
 		if !found {
-			return notFoundError(i, ov, aa)
+			errs = append(errs, notFoundError(i, ov, aa))
 		}
 	}
-	return nil
+	return errors.Join(errs...)
+}
+
+// Matches reports whether ov targets a under the matching rules documented on
+// ApplyOverrides.
+func (ov *Override) Matches(a *Order) bool {
+	return a.Name == ov.Name && rigMatches(ov.Rig, a.Rig)
 }
 
 func rigMatches(ovRig, orderRig string) bool {
@@ -155,6 +168,9 @@ func applyOverride(a *Order, ov *Override) {
 	}
 	if ov.CheckTimeout != nil {
 		a.CheckTimeout = *ov.CheckTimeout
+	}
+	if ov.RunStaleAfter != nil {
+		a.RunStaleAfter = *ov.RunStaleAfter
 	}
 	if ov.Idempotent != nil {
 		a.Idempotent = *ov.Idempotent

@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
+	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -51,25 +53,81 @@ var (
 	// deadlines shorter than it.
 	supervisorLaunchdStopTimeout      = 45 * time.Second
 	supervisorLaunchdStopPollInterval = 250 * time.Millisecond
-	supervisorLaunchctlRun            = func(args ...string) error {
-		return exec.Command("launchctl", args...).Run()
+	// supervisorLaunchdUnknownProbeBudget bounds how long an unload wait keeps
+	// polling a job it has NEVER seen loaded while the probe itself fails
+	// (launchctl absent, a non-service error, the acceptance harness's exit-1
+	// shim). Three polls is enough to ride out a transient launchctl error;
+	// a probe that cannot see launchd at all learns nothing more on the 300th
+	// poll than on the 3rd, and every darwin `gc init` used to pay the full
+	// launchdRefreshWaitTimeout for it (gc-pk1x). A job the probe has
+	// confirmed LOADED keeps the whole deadline, which must outlast
+	// supervisorLaunchdExitTimeout. A var so tests can shorten it.
+	supervisorLaunchdUnknownProbeBudget = 3 * supervisorLaunchdStopPollInterval
+	// launchdRefreshWaitTimeout bounds each wait inside a launchd refresh:
+	// a booted-out job leaving launchd, and the refreshed supervisor proving
+	// it serves the new build.
+	launchdRefreshWaitTimeout = 90 * time.Second
+	// supervisorPlistValidationTimeout bounds each plist preflight probe
+	// (plutil lint, plutil convert, gc version). The preflight runs before
+	// any bootout, so patience costs nothing on a healthy box, while a 2s
+	// bound failed the install exactly when the box was loaded: a healthy
+	// gc version took 2.98-5.66s at load average 58 (ga-jgwpjg).
+	supervisorPlistValidationTimeout = 30 * time.Second
+	// supervisorLaunchdExitTimeout is the plist's ExitTimeOut: how long
+	// launchd waits between the SIGTERM of a bootout and its SIGKILL. With
+	// no key launchd uses 5s, which equals a city's default stop grace, so
+	// a stop that needed its grace was killed before it finished
+	// (ga-2jjk51). It covers ONE city's worst-case destructive stop at
+	// default settings: 5s grace, 25s forced phase, then the bead
+	// provider's stop (30s plus a 2s WaitDelay), 62s in all, plus the
+	// supervisor's own teardown after that. A preserve-mode stop needs
+	// 30s. Several slow cities, or a larger shutdown_timeout, can still
+	// exceed it. It stays below launchdRefreshWaitTimeout so a refresh
+	// still sees the job unload.
+	supervisorLaunchdExitTimeout = 75 * time.Second
+	// supervisorStopWaitTimeout is how long gc waits for a supervisor it
+	// asked to stop. It must outlast supervisorLaunchdExitTimeout, or a
+	// stop that launchd is still allowing reads as a failed stop. It also
+	// matches systemd's default TimeoutStopSec.
+	supervisorStopWaitTimeout     = 90 * time.Second
+	supervisorLaunchdProbeTimeout = time.Second
+	supervisorLaunchctlTimeout    = 10 * time.Second
+	supervisorLaunchctlRun        = func(args ...string) error {
+		timeout := supervisorLaunchctlTimeoutFor(args)
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		err := exec.CommandContext(ctx, "launchctl", args...).Run()
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return fmt.Errorf("launchctl %s timed out after %s", strings.Join(args, " "), timeout)
+		}
+		return err
 	}
+	// supervisorLaunchdPID reports the pid launchd holds for a label and
+	// whether the job is registered at all (see launchdJobPID).
+	supervisorLaunchdPID = launchdJobPID
 	// supervisorLaunchdLoaded probes whether a launchd job is still
 	// registered. It is deliberately tri-state: a failing `launchctl
 	// print` is not proof the job is gone. Absence is reported only on a
 	// positive not-found signal; any other failure returns
-	// (false, false), meaning "unknown".
+	// (false, false), meaning "unknown". It reads the same bounded probe
+	// as supervisorLaunchdPID, so the stop verification and the refresh's
+	// bootout wait share one definition of "gone".
 	supervisorLaunchdLoaded = func(label string) (loaded bool, absent bool, detail string) {
-		out, err := exec.Command("launchctl", "print", supervisorLaunchdServiceTarget(label)).CombinedOutput()
-		detail = strings.TrimSpace(string(out))
-		if err == nil {
-			return true, false, detail
+		pid, loaded, err := supervisorLaunchdPID(label)
+		switch {
+		case err != nil:
+			return false, false, err.Error()
+		case !loaded:
+			return false, true, ""
+		case pid > 0:
+			return true, false, "pid = " + strconv.Itoa(pid)
+		default:
+			return true, false, ""
 		}
-		return false, launchdPrintReportsNotFound(err, detail), detail
 	}
 	supervisorLaunchdActive = func(label string) bool {
-		out, err := exec.Command("launchctl", "print", supervisorLaunchdServiceTarget(label)).Output()
-		return err == nil && launchdPrintReportsRunning(out)
+		pid, _, err := supervisorLaunchdPID(label)
+		return err == nil && pid > 0
 	}
 	// supervisorLaunchdDisabled reports whether launchd holds a persistent
 	// disable override for the label. `gc supervisor stop` writes one with
@@ -92,7 +150,9 @@ var (
 		if supervisorRuntimeGOOS != "darwin" {
 			return ""
 		}
-		out, err := exec.Command("launchctl", "getenv", key).Output()
+		ctx, cancel := context.WithTimeout(context.Background(), supervisorLaunchdProbeTimeout)
+		defer cancel()
+		out, err := exec.CommandContext(ctx, "launchctl", "getenv", key).Output()
 		if err != nil {
 			return ""
 		}
@@ -1272,6 +1332,113 @@ func supervisorLaunchdPlistGCPath(plist string) string {
 	return r.Replace(raw)
 }
 
+// launchdJobPID reports the pid launchd holds for label and whether the job
+// is registered. Absence — (0, false, nil) — is reported only on the positive
+// not-found signal launchdPrintReportsNotFound accepts; a probe that fails for
+// any other reason, including supervisorLaunchdProbeTimeout, returns its
+// error, never absence.
+func launchdJobPID(label string) (int, bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), supervisorLaunchdProbeTimeout)
+	defer cancel()
+	target := supervisorLaunchdServiceTarget(label)
+	out, err := exec.CommandContext(ctx, "launchctl", "print", target).CombinedOutput()
+	if err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return 0, false, fmt.Errorf("launchctl print %s timed out after %s", target, supervisorLaunchdProbeTimeout)
+		}
+		message := strings.TrimSpace(string(out))
+		if launchdPrintReportsNotFound(err, message) {
+			return 0, false, nil
+		}
+		return 0, false, fmt.Errorf("launchctl print %s: %w: %s", target, err, message)
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 3 && fields[0] == "pid" && fields[1] == "=" {
+			pid, parseErr := strconv.Atoi(fields[2])
+			if parseErr != nil {
+				return 0, true, fmt.Errorf("launchctl print %s returned invalid pid %q", target, fields[2])
+			}
+			return pid, true, nil
+		}
+	}
+	return 0, true, nil
+}
+
+func validateSupervisorLaunchdPlist(path, label, expectedGCPath string) error {
+	lintCtx, cancelLint := context.WithTimeout(context.Background(), supervisorPlistValidationTimeout)
+	lintOutput, lintErr := exec.CommandContext(lintCtx, "plutil", "-lint", "--", path).CombinedOutput()
+	lintTimedOut := errors.Is(lintCtx.Err(), context.DeadlineExceeded)
+	cancelLint()
+	if lintErr != nil {
+		if lintTimedOut {
+			return fmt.Errorf("plutil validation timed out after %s", supervisorPlistValidationTimeout)
+		}
+		return fmt.Errorf("plutil validation failed: %w: %s", lintErr, strings.TrimSpace(string(lintOutput)))
+	}
+	var parsed struct {
+		Label            string   `json:"Label"`
+		ProgramArguments []string `json:"ProgramArguments"`
+	}
+	convertCtx, cancelConvert := context.WithTimeout(context.Background(), supervisorPlistValidationTimeout)
+	out, err := exec.CommandContext(convertCtx, "plutil", "-convert", "json", "-o", "-", "--", path).Output()
+	convertTimedOut := errors.Is(convertCtx.Err(), context.DeadlineExceeded)
+	cancelConvert()
+	if err != nil {
+		if convertTimedOut {
+			return fmt.Errorf("plutil JSON conversion timed out after %s", supervisorPlistValidationTimeout)
+		}
+		return fmt.Errorf("plutil JSON conversion: %w", err)
+	}
+	if err := json.Unmarshal(out, &parsed); err != nil {
+		return fmt.Errorf("decode plist JSON: %w", err)
+	}
+	if parsed.Label != label {
+		return fmt.Errorf("launchd label = %q, want %q", parsed.Label, label)
+	}
+	if len(parsed.ProgramArguments) != 3 {
+		return fmt.Errorf("ProgramArguments length = %d, want 3", len(parsed.ProgramArguments))
+	}
+	gcPath := parsed.ProgramArguments[0]
+	if expectedGCPath == "" || !supervisorSameBinary(gcPath, expectedGCPath) {
+		return fmt.Errorf("gc executable = %q, want path or inode matching %q", gcPath, expectedGCPath)
+	}
+	if parsed.ProgramArguments[1] != "supervisor" || parsed.ProgramArguments[2] != "run" {
+		return fmt.Errorf("ProgramArguments = %q, want [gc supervisor run]", parsed.ProgramArguments)
+	}
+	info, err := os.Stat(gcPath)
+	if err != nil {
+		return fmt.Errorf("gc executable %q: %w", gcPath, err)
+	}
+	if info.IsDir() || info.Mode().Perm()&0o111 == 0 {
+		return fmt.Errorf("gc executable %q is not executable", gcPath)
+	}
+	versionCtx, cancelVersion := context.WithTimeout(context.Background(), supervisorPlistValidationTimeout)
+	versionStarted := time.Now()
+	versionOutput, err := exec.CommandContext(versionCtx, gcPath, "version").CombinedOutput()
+	versionElapsed := time.Since(versionStarted).Round(time.Millisecond)
+	versionTimedOut := errors.Is(versionCtx.Err(), context.DeadlineExceeded)
+	cancelVersion()
+	if err != nil {
+		if versionTimedOut {
+			return fmt.Errorf("gc executable %q version check timed out after %s", gcPath, supervisorPlistValidationTimeout)
+		}
+		return fmt.Errorf("gc executable %q failed execution check after %s: %w", gcPath, versionElapsed, err)
+	}
+	if len(versionOutput) == 0 {
+		return fmt.Errorf("gc executable %q returned empty output from version check", gcPath)
+	}
+	return nil
+}
+
+// waitSupervisorLaunchdUnloaded waits up to timeout for launchd to positively
+// report label absent. It is the refresh path's bounded form of
+// waitForSupervisorLaunchdAbsent: a probe that cannot confirm absence keeps
+// polling and never reads as unloaded.
+func waitSupervisorLaunchdUnloaded(label string, timeout time.Duration) error {
+	return waitForSupervisorLaunchdAbsent(label, supervisorLaunchdServiceTarget(label), time.Now().Add(timeout))
+}
+
 // supervisorSameBinary reports whether path a and path b refer to the same
 // gc binary. It first compares cleaned string paths (handles both pointing
 // at the same location), then falls back to inode comparison (handles one
@@ -1439,6 +1606,8 @@ func verifySupervisorServiceStopped(deadline time.Time) error {
 func waitForSupervisorLaunchdAbsent(label, target string, deadline time.Time) error {
 	var lastDetail string
 	var lastLoaded bool
+	var seenLoaded bool
+	var unknownSince time.Time
 	for {
 		loaded, absent, detail := supervisorLaunchdLoaded(label)
 		if absent {
@@ -1448,7 +1617,24 @@ func waitForSupervisorLaunchdAbsent(label, target string, deadline time.Time) er
 		if detail != "" {
 			lastDetail = detail
 		}
-		if !time.Now().Before(deadline) {
+		// Neither loaded nor absent: the probe failed. Until the job has been
+		// seen loaded there is no unload to wait for, so the failing probe
+		// gets supervisorLaunchdUnknownProbeBudget, not the unload deadline.
+		// Once loaded has been observed the deadline stands: a transient
+		// probe error during a real unload must not abort the refresh.
+		unknownExpired := false
+		switch {
+		case loaded:
+			seenLoaded = true
+			unknownSince = time.Time{}
+		case seenLoaded:
+		default:
+			if unknownSince.IsZero() {
+				unknownSince = time.Now()
+			}
+			unknownExpired = time.Since(unknownSince) >= supervisorLaunchdUnknownProbeBudget
+		}
+		if unknownExpired || !time.Now().Before(deadline) {
 			var err error
 			if lastLoaded {
 				err = fmt.Errorf("launchd target %s is still loaded after stop", target)
@@ -1581,13 +1767,22 @@ starts on login.`,
 	}
 	cmd.Flags().BoolVar(&supervisorInstallForce, "force", false,
 		"overwrite an existing service unit even if it references a different gc binary")
+	cmd.Flags().StringVar(&supervisorAcknowledgeFreeze, "acknowledge-freeze", "",
+		"consciously supersede a standing deploy-freeze marker by its bead id (ga-rfdkxp)")
 	return cmd
 }
+
+// supervisorAcknowledgeFreeze is set by --acknowledge-freeze on
+// 'gc supervisor install'; see checkDeployFreeze.
+var supervisorAcknowledgeFreeze string
 
 func doSupervisorInstall(stdout, stderr io.Writer) int {
 	if err := refuseSupervisorOnWorkerSite(); err != nil {
 		fmt.Fprintf(stderr, "gc supervisor install: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
+	}
+	if rc := checkDeployFreeze(deployFreezePath(), supervisorAcknowledgeFreeze, stdout, stderr); rc != 0 {
+		return rc
 	}
 	delegation, delegated, err := supervisorSystemdDelegation()
 	if err != nil {
@@ -1811,8 +2006,20 @@ var supervisorServiceEnvKeys = map[string]bool{
 	// retry chain, not a per-I/O deadline. Keep these keys out of
 	// nativeDoltOpenEnvKeys: that projection unsets a listed key whenever
 	// the open's env map omits it, as it omits these.
-	"BEADS_DOLT_POOL_READ_TIMEOUT":             true,
-	"BEADS_DOLT_POOL_WRITE_TIMEOUT":            true,
+	"BEADS_DOLT_POOL_READ_TIMEOUT":  true,
+	"BEADS_DOLT_POOL_WRITE_TIMEOUT": true,
+	// bd's documented schema-skew escape hatch. The controller's own bd
+	// calls see only the service env, so during a fleet schema-skew window
+	// the key must survive plist regeneration or `gc start` dies at rig
+	// beads init (ga-v2yrs4).
+	"BD_IGNORE_SCHEMA_SKEW": true,
+	// bd spawns a detached send-metrics flusher (POST to the metrics
+	// endpoint) on every invocation unless disabled. Metrics are off by
+	// user config here, but the controller's per-op bd spawns must not
+	// depend on that config file surviving — allowlist the env override so
+	// the off state is durable in the service env (ga, cross-town hardening
+	// from the beads owner).
+	"BD_DISABLE_METRICS":                       true,
 	"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": true,
 	"CLAUDE_CODE_EFFORT_LEVEL":                 true,
 	"CLAUDE_CODE_OAUTH_TOKEN":                  true,
@@ -1999,6 +2206,7 @@ func supervisorServiceExplicitEnvKeys(raw string) []string {
 
 const (
 	defaultSupervisorLaunchdLabel = "com.gascity.supervisor"
+	legacyGastownLaunchdLabel     = "com.gastown.daemon"
 	defaultSupervisorSystemdUnit  = "gascity-supervisor.service"
 )
 
@@ -2046,6 +2254,8 @@ const supervisorLaunchdTemplate = `<?xml version="1.0" encoding="UTF-8"?>
     </array>
     <key>RunAtLoad</key>
     <true/>
+    <key>ExitTimeOut</key>
+    <integer>{{launchdExitTimeoutSeconds}}</integer>
     <key>KeepAlive</key>
     <dict>
         <key>Crashed</key>
@@ -2127,8 +2337,25 @@ func supervisorSystemdQuotePath(s string) string {
 	return s
 }
 
+// supervisorLaunchctlTimeoutFor bounds one launchctl call. A legacy
+// "unload" of a running job blocks until the process exits, which launchd
+// allows to take up to the plist's ExitTimeOut; bounding it at the general
+// 10s would report a stop that is still in progress as failed. Every other
+// subcommand returns promptly (bootout signals and returns).
+func supervisorLaunchctlTimeoutFor(args []string) time.Duration {
+	if len(args) > 0 && args[0] == "unload" {
+		return supervisorLaunchdExitTimeout + supervisorLaunchctlTimeout
+	}
+	return supervisorLaunchctlTimeout
+}
+
 func renderSupervisorTemplate(tmplStr string, data *supervisorServiceData) (string, error) {
-	funcMap := template.FuncMap{"xmlesc": xmlEscape, "systemdenv": systemdEnv, "systemdpath": supervisorSystemdQuotePath}
+	funcMap := template.FuncMap{
+		"xmlesc":                    xmlEscape,
+		"systemdenv":                systemdEnv,
+		"systemdpath":               supervisorSystemdQuotePath,
+		"launchdExitTimeoutSeconds": func() int { return int(supervisorLaunchdExitTimeout / time.Second) },
+	}
 	tmpl, err := template.New("service").Funcs(funcMap).Parse(tmplStr)
 	if err != nil {
 		return "", err
@@ -2176,13 +2403,53 @@ func supervisorLaunchdServiceTarget(label string) string {
 	return supervisorLaunchdDomain() + "/" + label
 }
 
+func bootoutSupervisorLaunchdJob(label string) error {
+	target := supervisorLaunchdServiceTarget(label)
+	bootoutErr := supervisorLaunchctlRun("bootout", target)
+	if errors.Is(bootoutErr, exec.ErrNotFound) {
+		// No launchctl on PATH at all: nothing to poll, report the unknown
+		// state now so the caller's bare-start fallback runs at once.
+		return fmt.Errorf("launchd job %s state is unknown after bootout (%w)", target, bootoutErr)
+	}
+	if waitErr := waitSupervisorLaunchdUnloaded(label, launchdRefreshWaitTimeout); waitErr != nil {
+		// Split on bootoutErr rather than formatting it unconditionally: bootout
+		// can SUCCEED (nil error) while the unload wait still times out, and a
+		// nil error rendered into the message adds nothing an operator can act
+		// on. When both failed, both are wrapped so errors.Is/As reaches either.
+		if bootoutErr != nil {
+			return fmt.Errorf("launchd job %s state is unknown after bootout (%w): %w", target, bootoutErr, waitErr)
+		}
+		return fmt.Errorf("launchd job %s state is unknown after bootout: %w", target, waitErr)
+	}
+	return nil
+}
+
+// loadAndStartSupervisorLaunchd registers the plist as a fresh launchd job
+// and starts it. It boots out any existing registration first: a kickstart
+// alone keeps launchd's cached launch constraints across a binary swap
+// (ga-l8pur). The job is enabled before bootstrap because `gc supervisor
+// stop` disables it (#5334) and launchd refuses to bootstrap a disabled
+// service.
 func loadAndStartSupervisorLaunchd(path, label string) error {
+	if legacyGastownLaunchdPlistPresent() {
+		// Only a machine that ever installed the legacy gastown agent has a
+		// job to boot out; on every other machine the bootout is a launchctl
+		// call plus an unload wait for a label launchd never saw (gc-pk1x).
+		// A loaded legacy job with no plist is left to the drift path, which
+		// boots it out unconditionally.
+		if err := bootoutSupervisorLaunchdJob(legacyGastownLaunchdLabel); err != nil {
+			return err
+		}
+	}
+	if err := bootoutSupervisorLaunchdJob(label); err != nil {
+		return err
+	}
 	target := supervisorLaunchdServiceTarget(label)
 	if err := supervisorLaunchctlRun("enable", target); err != nil {
 		return fmt.Errorf("enable %s: %w", target, err)
 	}
-	if err := supervisorLaunchctlRun("load", path); err != nil {
-		return fmt.Errorf("load %s: %w", path, err)
+	if err := supervisorLaunchctlRun("bootstrap", supervisorLaunchdDomain(), path); err != nil {
+		return fmt.Errorf("bootstrap %s: %w", path, err)
 	}
 	if err := supervisorLaunchctlRun("kickstart", "-p", target); err != nil {
 		return fmt.Errorf("kickstart -p %s: %w", target, err)
@@ -2190,25 +2457,24 @@ func loadAndStartSupervisorLaunchd(path, label string) error {
 	return nil
 }
 
-func loadAndStartSupervisorLaunchdForRollback(path, label string, stderr io.Writer) error {
-	target := supervisorLaunchdServiceTarget(label)
-	if err := supervisorLaunchctlRun("enable", target); err != nil {
-		warnSupervisorLaunchdRollback(stderr, "enable %s: %v", target, err)
-	}
-	if err := supervisorLaunchctlRun("load", path); err != nil {
-		return fmt.Errorf("load %s: %w", path, err)
-	}
-	if err := supervisorLaunchctlRun("kickstart", "-p", target); err != nil {
-		warnSupervisorLaunchdRollback(stderr, "kickstart -p %s: %v", target, err)
-	}
-	return nil
+// loadAndStartSupervisorLaunchdForRollback restores a previous registration
+// with the same sequence as loadAndStartSupervisorLaunchd. Every failure is
+// returned: a rollback that could not restart the previous service must say
+// so rather than report a restored install.
+func loadAndStartSupervisorLaunchdForRollback(path, label string, _ io.Writer) error {
+	return loadAndStartSupervisorLaunchd(path, label)
 }
 
-func warnSupervisorLaunchdRollback(stderr io.Writer, format string, args ...any) {
-	if stderr == nil {
-		return
+// legacyGastownLaunchdPlistPresent reports whether the legacy gastown launchd
+// agent's plist exists for this user, the cheapest positive signal that the
+// legacy job may be loaded. A var so tests can force either answer.
+var legacyGastownLaunchdPlistPresent = func() bool {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return false
 	}
-	fmt.Fprintf(stderr, "gc supervisor install: warning: restoring launchd service: "+format+"\n", args...) //nolint:errcheck // best-effort stderr
+	_, statErr := os.Stat(filepath.Join(home, "Library", "LaunchAgents", legacyGastownLaunchdLabel+".plist"))
+	return statErr == nil
 }
 
 func legacySupervisorLaunchdPlistPath() string {
@@ -2382,7 +2648,7 @@ func unloadLegacySupervisorLaunchd(remove bool) error {
 	if samePath(path, supervisorLaunchdPlistPath()) || !legacySupervisorTargetsCurrentHome(path) {
 		return nil
 	}
-	_ = supervisorLaunchctlRun("unload", path)
+	_ = supervisorLaunchctlRun("bootout", supervisorLaunchdServiceTarget(defaultSupervisorLaunchdLabel))
 	if remove {
 		_ = supervisorLaunchctlRun("disable", supervisorLaunchdServiceTarget(defaultSupervisorLaunchdLabel))
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
@@ -2390,6 +2656,33 @@ func unloadLegacySupervisorLaunchd(remove bool) error {
 		}
 	}
 	return nil
+}
+
+func stopLegacySupervisorLaunchdForMigration(label string) error {
+	return bootoutSupervisorLaunchdJob(label)
+}
+
+func rollbackLegacySupervisorLaunchdMigration(path string, hadCurrent bool, previousContent []byte, legacyLabel string, stderr io.Writer) error {
+	var errs []error
+	if err := bootoutSupervisorLaunchdJob(supervisorLaunchdLabel()); err != nil {
+		return err
+	}
+	if hadCurrent {
+		if err := writeSupervisorServiceFile(path, previousContent); err != nil {
+			errs = append(errs, fmt.Errorf("restoring previous current plist %s: %w", path, err))
+		}
+	} else if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		errs = append(errs, fmt.Errorf("removing failed current plist %s: %w", path, err))
+	}
+	legacyPath := filepath.Join(filepath.Dir(path), legacyLabel+".plist")
+	if _, err := os.Stat(legacyPath); err == nil {
+		if err := loadAndStartSupervisorLaunchdForRollback(legacyPath, legacyLabel, stderr); err != nil {
+			errs = append(errs, fmt.Errorf("restoring legacy plist %s: %w", legacyPath, err))
+		}
+	} else if !os.IsNotExist(err) {
+		errs = append(errs, fmt.Errorf("checking legacy plist %s: %w", legacyPath, err))
+	}
+	return errors.Join(errs...)
 }
 
 func unloadLegacySupervisorSystemd(remove bool) error {
@@ -2409,7 +2702,7 @@ func unloadLegacySupervisorSystemd(remove bool) error {
 
 func rollbackNewSupervisorLaunchdInstall(path string, restoreLegacy bool, stderr io.Writer) error {
 	var errs []error
-	_ = supervisorLaunchctlRun("unload", path)
+	_ = supervisorLaunchctlRun("bootout", supervisorLaunchdServiceTarget(supervisorLaunchdLabel()))
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		errs = append(errs, fmt.Errorf("removing failed plist %s during rollback: %w", path, err))
 	}
@@ -2423,7 +2716,7 @@ func rollbackNewSupervisorLaunchdInstall(path string, restoreLegacy bool, stderr
 
 func restorePreviousSupervisorLaunchdInstall(path string, previousContent []byte, stderr io.Writer) error {
 	var errs []error
-	_ = supervisorLaunchctlRun("unload", path)
+	_ = supervisorLaunchctlRun("bootout", supervisorLaunchdServiceTarget(supervisorLaunchdLabel()))
 	if err := writeSupervisorServiceFile(path, previousContent); err != nil {
 		errs = append(errs, fmt.Errorf("restoring previous plist %s: %w", path, err))
 	} else if err := loadAndStartSupervisorLaunchdForRollback(path, supervisorLaunchdLabel(), stderr); err != nil {
@@ -2489,7 +2782,6 @@ func installSupervisorLaunchd(data *supervisorServiceData, stdout, stderr io.Wri
 	legacyPresent := legacySupervisorTargetsCurrentHome(legacySupervisorLaunchdPlistPath())
 	existing, err := os.ReadFile(path)
 	hadCurrent := err == nil
-	contentUnchanged := hadCurrent && string(existing) == content
 	if err != nil && !os.IsNotExist(err) {
 		fmt.Fprintf(stderr, "gc supervisor install: reading existing plist: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -2498,40 +2790,146 @@ func installSupervisorLaunchd(data *supervisorServiceData, stdout, stderr io.Wri
 		!checkSupervisorInstallBinaryGuard("plist", path, supervisorLaunchdPlistGCPath(string(existing)), data.GCPath, stdout, stderr) {
 		return 1
 	}
-	if contentUnchanged && supervisorAliveHook() != 0 {
-		fmt.Fprintf(stdout, "Installed launchd service: %s\n", path) //nolint:errcheck // best-effort stdout
-		return 0
+	legacyOwnerLabel := ""
+	livePID := supervisorAliveHook()
+	if livePID != 0 {
+		launchdPID, loaded, err := supervisorLaunchdPID(data.LaunchdLabel)
+		if err != nil {
+			fmt.Fprintf(stderr, "gc supervisor install: checking launchd job: %v\n", err) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+		if !loaded || launchdPID != livePID {
+			if legacyPresent {
+				legacyPID, legacyLoaded, legacyErr := supervisorLaunchdPID(defaultSupervisorLaunchdLabel)
+				if legacyErr == nil && legacyLoaded && legacyPID == livePID {
+					legacyOwnerLabel = defaultSupervisorLaunchdLabel
+				}
+			}
+			if legacyOwnerLabel == "" {
+				legacyPID, legacyLoaded, legacyErr := supervisorLaunchdPID(legacyGastownLaunchdLabel)
+				if legacyErr == nil && legacyLoaded && legacyPID == livePID {
+					legacyOwnerLabel = legacyGastownLaunchdLabel
+				}
+			}
+			if legacyOwnerLabel == "" {
+				fmt.Fprintf(stderr, "gc supervisor install: supervisor pid %d is not owned by launchd job %s (launchd pid=%d); stop it with 'gc supervisor stop', then rerun 'gc supervisor install'\n", livePID, data.LaunchdLabel, launchdPID) //nolint:errcheck // best-effort stderr
+				return 1
+			}
+		}
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		fmt.Fprintf(stderr, "gc supervisor install: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
+	var installBaseURL string
+	var installOldBuildID string
+	if livePID != 0 {
+		installBaseURL, err = supervisorAPIBaseURLHook()
+		if err != nil {
+			fmt.Fprintf(stderr, "gc supervisor install: resolving supervisor API: %v\n", err) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), driftVerifyProbeTimeout)
+		oldStatus, statusErr := newHTTPSupervisorClient(installBaseURL).Status(ctx)
+		cancel()
+		if statusErr != nil {
+			fmt.Fprintf(stderr, "gc supervisor install: reading supervisor build before refresh: %v\n", statusErr) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+		installOldBuildID = oldStatus.BuildID
+	}
 	if err := ensureSupervisorServiceLogDir(data.LogPath); err != nil {
 		fmt.Fprintf(stderr, "gc supervisor install: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	preflight, err := os.CreateTemp(filepath.Dir(path), ".gascity-supervisor-preflight-*.plist")
+	if err != nil {
+		fmt.Fprintf(stderr, "gc supervisor install: creating plist preflight: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	preflightPath := preflight.Name()
+	defer os.Remove(preflightPath) //nolint:errcheck // best-effort temp cleanup
+	if _, err := preflight.WriteString(content); err != nil {
+		_ = preflight.Close()
+		fmt.Fprintf(stderr, "gc supervisor install: writing plist preflight: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	if err := preflight.Close(); err != nil {
+		fmt.Fprintf(stderr, "gc supervisor install: closing plist preflight: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	if err := validateSupervisorLaunchdPlist(preflightPath, data.LaunchdLabel, data.GCPath); err != nil {
+		fmt.Fprintf(stderr, "gc supervisor install: plist preflight: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
 	if err := writeSupervisorServiceFile(path, []byte(content)); err != nil {
 		fmt.Fprintf(stderr, "gc supervisor install: writing plist: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	if err := unloadLegacySupervisorLaunchd(false); err != nil {
+	if legacyOwnerLabel != "" {
+		if err := stopLegacySupervisorLaunchdForMigration(legacyOwnerLabel); err != nil {
+			if hadCurrent {
+				_ = writeSupervisorServiceFile(path, existing)
+			} else {
+				_ = os.Remove(path)
+			}
+			fmt.Fprintf(stderr, "gc supervisor install: %v; refusing to start a second supervisor\n", err) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+	} else if err := unloadLegacySupervisorLaunchd(false); err != nil {
 		fmt.Fprintf(stderr, "gc supervisor install: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
 
-	_ = supervisorLaunchctlRun("unload", path)
-	if err := loadAndStartSupervisorLaunchd(path, data.LaunchdLabel); err != nil {
-		var rollbackErr error
-		if hadCurrent {
-			rollbackErr = restorePreviousSupervisorLaunchdInstall(path, existing, stderr)
+	if livePID != 0 {
+		var err error
+		if legacyOwnerLabel != "" {
+			err = loadAndStartSupervisorLaunchd(path, data.LaunchdLabel)
 		} else {
-			rollbackErr = rollbackNewSupervisorLaunchdInstall(path, legacyPresent, stderr)
+			err = restartSupervisor(restartSpec{
+				LaunchdManaged:   true,
+				LaunchdLabel:     data.LaunchdLabel,
+				LaunchdPlistPath: path,
+				LaunchdGCPath:    data.GCPath,
+			}, defaultRestartHelpers())
 		}
-		if rollbackErr != nil {
-			fmt.Fprintf(stderr, "gc supervisor install: rollback after launchctl failure: %v\n", rollbackErr) //nolint:errcheck // best-effort stderr
+		if err == nil {
+			if msg := pollLaunchdRestartVerifiedHook(installBaseURL, livePID, installOldBuildID, commit, launchdRefreshWaitTimeout); msg != "" {
+				err = &launchdRestartError{err: errors.New(msg), rollbackSafe: true}
+			}
 		}
-		fmt.Fprintf(stderr, "gc supervisor install: launchctl %v\n", err) //nolint:errcheck // best-effort stderr
-		return 1
+		if err != nil {
+			if legacyOwnerLabel != "" || launchdRestartRollbackSafe(err) {
+				var rollbackErr error
+				switch {
+				case legacyOwnerLabel != "":
+					rollbackErr = rollbackLegacySupervisorLaunchdMigration(path, hadCurrent, existing, legacyOwnerLabel, stderr)
+				case hadCurrent:
+					rollbackErr = restorePreviousSupervisorLaunchdInstall(path, existing, stderr)
+				default:
+					rollbackErr = rollbackNewSupervisorLaunchdInstall(path, legacyPresent, stderr)
+				}
+				if rollbackErr != nil {
+					fmt.Fprintf(stderr, "gc supervisor install: rollback after launchd refresh failure: %v\n", rollbackErr) //nolint:errcheck // best-effort stderr
+				}
+			}
+			fmt.Fprintf(stderr, "gc supervisor install: launchd refresh: %v\n", err) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+	} else {
+		if err := loadAndStartSupervisorLaunchd(path, data.LaunchdLabel); err != nil {
+			var rollbackErr error
+			if hadCurrent {
+				rollbackErr = restorePreviousSupervisorLaunchdInstall(path, existing, stderr)
+			} else {
+				rollbackErr = rollbackNewSupervisorLaunchdInstall(path, legacyPresent, stderr)
+			}
+			if rollbackErr != nil {
+				fmt.Fprintf(stderr, "gc supervisor install: rollback after launchctl failure: %v\n", rollbackErr) //nolint:errcheck // best-effort stderr
+			}
+			fmt.Fprintf(stderr, "gc supervisor install: launchctl %v\n", err) //nolint:errcheck // best-effort stderr
+			return 1
+		}
 	}
 	if err := unloadLegacySupervisorLaunchd(true); err != nil {
 		fmt.Fprintf(stderr, "gc supervisor install: warning: %v\n", err) //nolint:errcheck // best-effort stderr
@@ -2549,7 +2947,7 @@ func uninstallSupervisorLaunchd(_ *supervisorServiceData, stdout, stderr io.Writ
 		// Socket-protocol stop, never the delegated redirect: uninstall is
 		// cleaning up gc's OWN service and must not stop an operator's
 		// delegated unit (or require systemctl on darwin) as a side effect.
-		if code := stopSupervisorViaSocket(stdout, stderr, true, 30*time.Second); code != 0 {
+		if code := stopSupervisorViaSocket(stdout, stderr, true, supervisorStopWaitTimeout); code != 0 {
 			return code
 		}
 	} else if active {
@@ -2819,7 +3217,7 @@ func uninstallSupervisorSystemd(_ *supervisorServiceData, stdout, stderr io.Writ
 		// Socket-protocol stop, never the delegated redirect: uninstall is
 		// cleaning up gc's OWN unit and must not stop an operator's
 		// delegated unit as a side effect.
-		if code := stopSupervisorViaSocket(stdout, stderr, true, 30*time.Second); code != 0 {
+		if code := stopSupervisorViaSocket(stdout, stderr, true, supervisorStopWaitTimeout); code != 0 {
 			return code
 		}
 	}

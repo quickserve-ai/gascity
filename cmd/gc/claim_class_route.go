@@ -66,15 +66,29 @@ package main
 // resolve — and claimHookWorkWithRunner is what hands the route the leg set
 // (hookClaimOps.ClassRoute).
 //
-// # The escalation signal is the existing one, unwidened
+// # The escalation signal is a proven absence, never a guess
 //
-// beads.ErrNotFound is the ONLY error that proves the bead is not in the store
-// the write ran against (hookClaimBeadIsElsewhere), and it opens the escalation
-// only together with ok=false. A write timeout, store contention or a
-// controller-socket flap leaves ownership unresolved on a bead the session may
-// already own, and must keep failing closed — so those are returned unchanged
-// and never retried against a second store. This file consumes that predicate;
-// it does not widen it.
+// beads.ErrNotFound from the write proves the bead is not in the store the
+// write ran against (hookClaimBeadIsElsewhere), and it opens the escalation only
+// together with ok=false. Any other write error proves nothing on its own word:
+// a write timeout, store contention or a controller-socket flap leaves ownership
+// unresolved on a bead the session may already own there, so such an error is
+// never retried against a second store because of what it says.
+//
+// It does not prove the bead IS there either, and treating it as if it did is
+// how one lane strands every binding-resident bead: a work store whose write
+// spells its miss in a shape the predicate does not recognize answers every
+// claim of a binding-resident bead with an error nobody classifies, the claim
+// never reaches the binding the reader served the bead from, and the controller
+// spawns a seat for it every tick (ga-ylpbsy.30: a remote work store's wire
+// not_found). So an unrecognized write error is settled by the READ question
+// instead (legProvedAbsent) — the question the federated reader that served the
+// candidate already asked this leg. A read that answers not-found proves the leg
+// holds no row, and no write can have landed on a row that does not exist; a
+// read that finds the bead, or that fails, proves nothing, and the work store's
+// own error stands. Readiness and claimability therefore rest on the same answer
+// from the same leg, whatever shape that leg's write errors take, and the read
+// is paid only on a claim that already failed.
 //
 // ok=true is the same refusal for the same reason. hookClaimThroughStore returns
 // (claimed, true, err) for exactly one shape — the CAS COMMITTED and the
@@ -105,7 +119,8 @@ package main
 // If a refusal reaches a claim anyway (a forwarding wrapper carries the method
 // its leaf lacks, so it passes the door and refuses per bead with
 // beads.ErrClaimUnsupported), it is a per-BEAD skip and not a terminal
-// tick: the escalation only ran because a work store returned not-found, which
+// tick: the escalation only ran because the work store was proved not to hold
+// the bead (its not-found, or a not-found from reading the same leg), which
 // proves this session owns nothing there and that no mutation is outstanding
 // anywhere (the capability refusal is returned before any write). That is the
 // same proof the work-side not-found carries, so it earns the same skip —
@@ -268,6 +283,16 @@ func claimRouteTopology(bindings []storeref.ClassBinding, refused error) storere
 	return assembleResidencyTopology(nil, newUnprobedWorkResidual(), nil, bindings, refused)
 }
 
+// hookClaimClassesRelocated reports whether a class-route resolution found a
+// city that relocates its coordination classes: a route opened, or a binding
+// that cannot claim, which degrades the route to nil (hookClaimRouteVerdict)
+// but still holds the relocated beads. The started key must not take a
+// degraded city's leg for an adoption's proven residence unless its readback
+// found the bead there (hookStartedKeyFor).
+func hookClaimClassesRelocated(opened *hookClaimClassRoute, err error) bool {
+	return opened != nil || errors.Is(err, errClaimRouteBindingCannotClaim)
+}
+
 // hookClaimRouteVerdict turns one class-route resolution into the claim ops the
 // invocation runs with, and reports whether `gc hook --claim` may proceed.
 //
@@ -402,6 +427,16 @@ func (r *hookClaimClassRoute) knownResident(id string) bool {
 // work-shaped id. The census is taken to retire exactly this read, and this seam
 // was paying it once per escalated bead while the by-id door had already stopped.
 func (r *hookClaimClassRoute) holds(id string) (bool, error) {
+	return r.holdsWithin(context.Background(), id)
+}
+
+// holdsWithin is holds with the binding probe bounded by ctx (qc-z0fmn0n
+// round 4): the probe takes no context of its own, and on the claim path it
+// runs inside the claim window. Only the probe runs under the deadline; the
+// memo is written here, on the caller's goroutine, so a probe abandoned at the
+// deadline never touches it. A probe cut off by ctx is a failed read, not
+// absence, and is not memoized.
+func (r *hookClaimClassRoute) holdsWithin(ctx context.Context, id string) (bool, error) {
 	id = strings.TrimSpace(id)
 	if r == nil || id == "" {
 		return false, nil
@@ -409,7 +444,10 @@ func (r *hookClaimClassRoute) holds(id string) (bool, error) {
 	if known, ok := r.resident[id]; ok {
 		return known, nil
 	}
-	_, resident, err := byIDBindingOwnerForTopology(r.topology, id)
+	resident, err := runWithDeadline(ctx, func() (bool, error) {
+		_, resident, err := byIDBindingOwnerForTopology(r.topology, id)
+		return resident, err
+	})
 	if err != nil {
 		return false, fmt.Errorf("reading %q from the relocated class binding: %w", id, err)
 	}
@@ -417,26 +455,66 @@ func (r *hookClaimClassRoute) holds(id string) (bool, error) {
 	return resident, nil
 }
 
-// routes reports whether a claim-time write for id must run against the binding
+// routes reports whether a claim-time WRITE for id must run against the binding
 // instead of the work store, given the error the work-scope write returned.
 //
-// workErr is the ONLY thing that can open the escalation: nil, or anything other
-// than the not-found that proves the bead is not in the store that answered,
-// means the work store's answer is the answer.
+// Only a proven absence from the leg the write ran against opens the
+// escalation (legProvedAbsent): nil, or an error that leaves the bead's
+// residence there unproven, means the work store's answer is the answer.
 //
-// The not-found must come from the whole WORK fan-out, not from the one leg that
+// The absence must hold for the whole WORK fan-out, not for the one leg that
 // answered. from is the leg the write ran against; every OTHER leg is read for
 // the same id first, and a leg that holds it closes the escalation — the work
 // store's own answer stands, the federated loop drops this leg, and the leg that
 // holds the bead claims it on the next turn of the same invocation.
 func (r *hookClaimClassRoute) routes(ctx context.Context, from hookStore, id, assignee string, workErr error) (bool, error) {
-	if r == nil || !hookClaimBeadIsElsewhere(workErr) {
+	if r == nil || !r.legProvedAbsent(ctx, from, id, assignee, workErr) {
 		return false, nil
 	}
+	return r.escalates(ctx, from, id, assignee)
+}
+
+// routesRead is routes for a claim-time READ. The read's own not-found is the
+// proof legProvedAbsent would otherwise ask for, so an unrecognized read error
+// is never re-read: it is the answer.
+func (r *hookClaimClassRoute) routesRead(ctx context.Context, from hookStore, id, assignee string, readErr error) (bool, error) {
+	if r == nil || !hookClaimBeadIsElsewhere(readErr) {
+		return false, nil
+	}
+	return r.escalates(ctx, from, id, assignee)
+}
+
+// escalates finishes the decision once the leg that answered is proved not to
+// hold id: no other work leg may hold it, and the binding must.
+func (r *hookClaimClassRoute) escalates(ctx context.Context, from hookStore, id, assignee string) (bool, error) {
 	if r.anotherWorkLegHolds(ctx, from, id, assignee) {
 		return false, nil
 	}
-	return r.holds(id)
+	return r.holdsWithin(ctx, id)
+}
+
+// legProvedAbsent reports whether from, the leg a claim-time write for id ran
+// against, is proved not to hold the bead, given the error the write returned.
+//
+// The write's own not-found is the proof. Any other error is settled by reading
+// the same leg through the caller's read seam (the package comment says why): a
+// not-found there proves it, and a read that finds the bead or fails proves
+// nothing. Three errors skip the read because they already answer it: a named
+// wisp refusal is the leg saying it HOLDS the bead; a store that did not answer
+// (workQueryStoreUnavailable: a timeout, a refused connection, contention) would
+// only be asked again while it is struggling; and a context that is done cannot
+// carry a read that would mean anything.
+func (r *hookClaimClassRoute) legProvedAbsent(ctx context.Context, from hookStore, id, assignee string, workErr error) bool {
+	switch {
+	case workErr == nil:
+		return false
+	case hookClaimBeadIsElsewhere(workErr):
+		return true
+	case r.readLeg == nil, hookClaimBeadIsAWisp(workErr), ctx.Err() != nil, workQueryStoreUnavailable(workErr):
+		return false
+	}
+	_, err := r.readLeg(ctx, from.dir, from.env, id, assignee)
+	return hookClaimBeadIsElsewhere(err)
 }
 
 // anotherWorkLegHolds reports whether some work leg OTHER than the one that
@@ -609,20 +687,39 @@ func classRoutedHookClaimOps(ops hookClaimOps, route *hookClaimClassRoute) hookC
 		}
 	}
 
+	// The binding's Get takes no context, and this seam is also the
+	// closed-root guard's root read, which runs inside the claim window; bound
+	// it by ctx like the teardown query below (qc-z0fmn0n round 4).
+	readRelocated := func(ctx context.Context, beadID string) (beads.Bead, error) {
+		return runWithDeadline(ctx, func() (beads.Bead, error) { return route.graph.Get(beadID) })
+	}
 	ops.ReadWorkMeta = func(ctx context.Context, dir string, env []string, beadID, assignee string) (beads.Bead, error) {
 		if route.knownResident(beadID) {
-			return route.graph.Get(beadID)
+			return readRelocated(ctx, beadID)
 		}
 		bead, err := base.ReadWorkMeta(ctx, dir, env, beadID, assignee)
-		routed, probeErr := route.routes(ctx, hookStore{dir: dir, env: env}, beadID, assignee, err)
+		routed, probeErr := route.routesRead(ctx, hookStore{dir: dir, env: env}, beadID, assignee, err)
 		switch {
 		case probeErr != nil:
 			return beads.Bead{}, probeErr
 		case routed:
-			return route.graph.Get(beadID)
+			return readRelocated(ctx, beadID)
 		default:
 			return bead, err
 		}
+	}
+
+	// The closed-root guard's teardown tail lives with the root: a root the
+	// route already proved binding-resident has its subtree read there.
+	ops.TeardownTail = func(ctx context.Context, dir string, env []string, rootID, assignee string) (func(beads.Bead) bool, error) {
+		if route.knownResident(rootID) {
+			// The binding takes no context; bound the call anyway so a slow
+			// binding cannot hold the claim past its window.
+			return runWithDeadline(ctx, func() (func(beads.Bead) bool, error) {
+				return hookClaimTeardownTail(route.class, rootID)
+			})
+		}
+		return base.TeardownTail(ctx, dir, env, rootID, assignee)
 	}
 
 	// A continuation LIST is the one claim-time call with no not-found to
@@ -718,6 +815,19 @@ func classRoutedHookClaimOps(ops hookClaimOps, route *hookClaimClassRoute) hookC
 			return
 		}
 		route.emitExecutionStepStarted(step)
+	}
+
+	// The workflow stop gate reads a step's ancestry, and closes a stranded
+	// step, in the ledger the step lives in. Like the emission above it routes
+	// on the MEMO alone: before a claim nothing is known resident, so a graph
+	// step's pre-claim read finds nothing in the work store and fails open, and
+	// the post-claim re-check — after the route memoized the step — reads the
+	// binding.
+	ops.WorkflowStore = func(ctx context.Context, dir string, env []string, beadID, actor string) beads.Store {
+		if route.knownResident(beadID) {
+			return route.class
+		}
+		return base.WorkflowStore(ctx, dir, env, beadID, actor)
 	}
 
 	return ops

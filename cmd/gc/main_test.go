@@ -193,8 +193,13 @@ var testTempRootAliveSentinel *os.File
 var tmuxSocketAliveSentinel *os.File
 
 type cleanupTestingM struct {
-	m     testscript.TestingM
-	paths []string
+	m testscript.TestingM
+	// tmuxSocketRoots are TMUX_TMPDIR roots whose servers must be killed
+	// after the run. Deleting the socket directory alone orphans the tmux
+	// server processes (ga-utvl), so servers are reaped before paths are
+	// removed.
+	tmuxSocketRoots []string
+	paths           []string
 }
 
 // noCityGuardTestingM fails the run on a start or stop refused for want of a
@@ -207,6 +212,13 @@ func (m noCityGuardTestingM) Run() int {
 
 func (m cleanupTestingM) Run() int {
 	code := sessionpkg.FailOnKeyViolations(m.m.Run(), os.Stderr) // a guard panic a recover() swallowed still fails
+	// Reap before removing: once a socket directory is gone, a server still
+	// bound to it is beyond every socket-addressed sweep (ga-3qlrnv). The
+	// tmuxtest reaper escalates a server that outlives kill-server to an
+	// identity-fenced SIGKILL and names every outcome on stderr.
+	for _, root := range m.tmuxSocketRoots {
+		tmuxtest.KillTmuxServersUnder(root, os.Stderr)
+	}
 	for _, path := range m.paths {
 		if path != "" {
 			_ = os.RemoveAll(path)
@@ -224,6 +236,9 @@ func testscriptGC() {
 
 func TestMain(m *testing.M) {
 	maybeRunHostedBeadsCredentialProvider()
+	// Startup-prompt argv bounds depend on the host OS; tests assert the Linux
+	// ones everywhere, and the darwin branch has its own tests (ga-alb76h).
+	promptArgvHostOS = "linux"
 	maybeRunProductMetricsDirectChildEnvSpy()
 	maybeRunFakeDoltSQLServer()
 
@@ -336,8 +351,13 @@ func TestMain(m *testing.M) {
 	// -L test-city have exit-empty off and outlive their sessions forever).
 	testRunner = newTmuxLeakGuardedTestingM(testRunner, tmuxSocketRoot)
 	testRunner = noCityGuardTestingM{m: testRunner}
-	if tmuxSocketCleanupRoot != "" {
-		testRunner = cleanupTestingM{m: testRunner, paths: []string{tmuxSocketCleanupRoot}}
+	// cleanupTestingM wraps unconditionally: the leak guard above is a
+	// passthrough off Linux, so this is the only end-of-run reaper there, and
+	// it must run even when no socket parent is removed here (ga-utvl).
+	testRunner = cleanupTestingM{
+		m:               testRunner,
+		tmuxSocketRoots: []string{tmuxSocketRoot},
+		paths:           []string{tmuxSocketCleanupRoot},
 	}
 	testscript.Main(testRunner, map[string]func(){
 		"gc": testscriptGC,
@@ -8086,5 +8106,169 @@ func TestRunBufferedJSONFailureRecordWriteFailureIsReportedOnStderr(t *testing.T
 	}
 	if got := stderr.String(); !strings.Contains(got, "writing JSON output") || !strings.Contains(got, "write failed") {
 		t.Fatalf("stderr = %q, want the stdout write error named", got)
+	}
+}
+
+// TestDoPrimeStrictMissingFragmentFails verifies --strict fails loud when a
+// configured append_fragments name resolves to no registered template
+// (ga-14a: silent-skip meant a governance fragment could silently not
+// exist). Non-strict keeps the best-effort render.
+func TestDoPrimeStrictMissingFragmentFails(t *testing.T) {
+	t.Setenv("GC_ALIAS", "")
+	t.Setenv("GC_AGENT", "")
+	t.Setenv("GC_RIG", "")
+
+	dir := t.TempDir()
+	t.Setenv("GC_CITY", dir)
+	if err := os.MkdirAll(filepath.Join(dir, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "prompts"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "prompts", "mayor.template.md"), []byte("mayor body\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	toml := `[workspace]
+name = "test-city"
+
+[[agent]]
+name = "mayor"
+prompt_template = "prompts/mayor.template.md"
+append_fragments = ["ghost-law"]
+`
+	if err := os.WriteFile(filepath.Join(dir, "city.toml"), []byte(toml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	orig, _ := os.Getwd()
+	t.Cleanup(func() { _ = os.Chdir(orig) })
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doPrimeWithMode([]string{"mayor"}, &stdout, &stderr, false, true)
+	if code == 0 {
+		t.Fatalf("doPrimeWithMode(strict, missing fragment) = 0, want non-zero; stderr: %s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `fragment "ghost-law" not found`) {
+		t.Errorf("stderr = %q, want missing-fragment error", stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = doPrimeWithMode([]string{"mayor"}, &stdout, &stderr, false, false)
+	if code != 0 {
+		t.Fatalf("doPrimeWithMode(non-strict, missing fragment) = %d, want 0 (best-effort)", code)
+	}
+	if !strings.Contains(stdout.String(), "mayor body") {
+		t.Errorf("non-strict stdout = %q, want rendered body", stdout.String())
+	}
+}
+
+// TestDoPrimeStrictRawFragmentResolves verifies the ga-14a fix end-to-end:
+// a raw (no {{define}}) city-root template-fragments/ file resolves by base
+// name, renders into the prompt, and passes --strict.
+func TestDoPrimeStrictRawFragmentResolves(t *testing.T) {
+	t.Setenv("GC_ALIAS", "")
+	t.Setenv("GC_AGENT", "")
+	t.Setenv("GC_RIG", "")
+
+	dir := t.TempDir()
+	t.Setenv("GC_CITY", dir)
+	if err := os.MkdirAll(filepath.Join(dir, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "prompts"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "template-fragments"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "prompts", "mayor.template.md"), []byte("mayor body\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "template-fragments", "city-law.template.md"), []byte("# City Law\nalways verify\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	toml := `[workspace]
+name = "test-city"
+
+[[agent]]
+name = "mayor"
+prompt_template = "prompts/mayor.template.md"
+append_fragments = ["city-law"]
+`
+	if err := os.WriteFile(filepath.Join(dir, "city.toml"), []byte(toml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	orig, _ := os.Getwd()
+	t.Cleanup(func() { _ = os.Chdir(orig) })
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doPrimeWithMode([]string{"mayor"}, &stdout, &stderr, false, true)
+	if code != 0 {
+		t.Fatalf("doPrimeWithMode(strict, raw fragment) = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "# City Law") {
+		t.Errorf("stdout = %q, want raw fragment rendered", stdout.String())
+	}
+}
+
+// TestDoPrimeStrictUnknownTemplateVariableFails verifies --strict fails on
+// template references outside the SDK field set + agent env (ga-80ij: they
+// render as silent empty strings otherwise). Non-strict stays permissive.
+func TestDoPrimeStrictUnknownTemplateVariableFails(t *testing.T) {
+	t.Setenv("GC_ALIAS", "")
+	t.Setenv("GC_AGENT", "")
+	t.Setenv("GC_RIG", "")
+
+	dir := t.TempDir()
+	t.Setenv("GC_CITY", dir)
+	if err := os.MkdirAll(filepath.Join(dir, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "prompts"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "prompts", "mayor.template.md"), []byte("Rig: {{ .Rgi }}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	toml := `[workspace]
+name = "test-city"
+
+[[agent]]
+name = "mayor"
+prompt_template = "prompts/mayor.template.md"
+`
+	if err := os.WriteFile(filepath.Join(dir, "city.toml"), []byte(toml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	orig, _ := os.Getwd()
+	t.Cleanup(func() { _ = os.Chdir(orig) })
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doPrimeWithMode([]string{"mayor"}, &stdout, &stderr, false, true)
+	if code == 0 {
+		t.Fatalf("doPrimeWithMode(strict, unknown var) = 0, want non-zero; stderr: %s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "unknown template variable {{ .Rgi }}") {
+		t.Errorf("stderr = %q, want unknown-variable error", stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = doPrimeWithMode([]string{"mayor"}, &stdout, &stderr, false, false)
+	if code != 0 {
+		t.Fatalf("doPrimeWithMode(non-strict, unknown var) = %d, want 0 (permissive render)", code)
 	}
 }
