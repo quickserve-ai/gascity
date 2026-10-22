@@ -150,6 +150,83 @@ func TestRecentRunsAllOpenRunsUseLiveTier(t *testing.T) {
 		t.Fatalf("OpenRuns(): %v", err)
 	}
 	assertAllLive(t, "OpenRuns", spy.queries)
+
+	// The two SWEEP readers are the ones that were NOT Live (ga-v5vnyp): they read
+	// through the controller's CachingStore, whose city-scope snapshot had been
+	// frozen for 43h and never contained the dispatcher-written tracking beads at
+	// all. They returned zero rows every 30s, silently, while the Live open-work
+	// gate saw the same beads and held the orders shut.
+	spy.queries = nil
+	if _, err := st.StaleOpenRuns(time.Now()); err != nil {
+		t.Fatalf("StaleOpenRuns(): %v", err)
+	}
+	assertAllLive(t, "StaleOpenRuns", spy.queries)
+	assertOldestFirst(t, "StaleOpenRuns", spy.queries)
+
+	spy.queries = nil
+	if _, err := st.OrphanedOpenRuns(); err != nil {
+		t.Fatalf("OrphanedOpenRuns(): %v", err)
+	}
+	assertAllLive(t, "OrphanedOpenRuns", spy.queries)
+	assertOldestFirst(t, "OrphanedOpenRuns", spy.queries)
+}
+
+// assertOldestFirst pins the close-budget ordering. Both sweep readers feed a
+// bounded close budget (orderTrackingSweepCloseBudget), so the order the rows
+// come back in decides WHICH stale beads get closed. Anything but oldest-first
+// lets a genuinely jammed old bead be starved indefinitely by newer ones.
+func assertOldestFirst(t *testing.T, name string, queries []beads.ListQuery) {
+	t.Helper()
+	if len(queries) == 0 {
+		t.Fatalf("%s issued no List query", name)
+	}
+	for i, q := range queries {
+		if q.Sort != beads.SortCreatedAsc {
+			t.Fatalf("%s query[%d].Sort = %v, want SortCreatedAsc (budgeted closes must drain oldest-first)", name, i, q.Sort)
+		}
+	}
+}
+
+// TestStaleOpenRunsKeepsInProgressAndExcludesClosed pins the two status
+// semantics the Live rewrite had to preserve. The pre-fix read passed no Status
+// filter, so an in_progress tracking bead was returned; adding Status:"open"
+// would have silently narrowed the sweep and left in_progress beads gating their
+// orders forever — a regression in the same direction as the bug being fixed.
+func TestStaleOpenRunsKeepsInProgressAndExcludesClosed(t *testing.T) {
+	store := beads.NewMemStore()
+	mk := func(title, status string) beads.Bead {
+		b, err := store.Create(beads.Bead{Title: title, Labels: []string{"order-run:digest", "order-tracking"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status != "open" {
+			if err := store.Update(b.ID, beads.UpdateOpts{Status: &status}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return b
+	}
+	openBead := mk("order:digest open", "open")
+	inProgress := mk("order:digest running", "in_progress")
+	closedBead := mk("order:digest done", "closed")
+
+	runs, err := NewStore(beads.OrdersStore{Store: store}).StaleOpenRuns(time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("StaleOpenRuns(): %v", err)
+	}
+	got := make(map[string]bool, len(runs))
+	for _, r := range runs {
+		got[r.ID] = true
+	}
+	if !got[openBead.ID] {
+		t.Errorf("open tracking bead %s missing from StaleOpenRuns", openBead.ID)
+	}
+	if !got[inProgress.ID] {
+		t.Errorf("in_progress tracking bead %s missing from StaleOpenRuns — a Status:\"open\" filter would strand it", inProgress.ID)
+	}
+	if got[closedBead.ID] {
+		t.Errorf("closed tracking bead %s must not be swept", closedBead.ID)
+	}
 }
 
 func assertAllLive(t *testing.T, name string, queries []beads.ListQuery) {
@@ -431,5 +508,71 @@ func TestClosedRunsForRetentionBestEffortName(t *testing.T) {
 	}
 	if len(runs) != 2 {
 		t.Fatalf("ClosedRunsForRetention() returned %d runs, want 2 (including the unresolvable-name bead)", len(runs))
+	}
+}
+
+// TestOpenWorkNamesTheGatingBead proves OpenWork returns the bead HasOpenWork
+// counts, so a caller naming the blocker (gc doctor's order-firing check)
+// names the one the gate refuses on. The newer root, listed first, is one the
+// predicate rejects: it must be skipped rather than named.
+func TestOpenWorkNamesTheGatingBead(t *testing.T) {
+	now := time.Now()
+	gating := beads.Bead{
+		ID:        "gc-1",
+		Title:     "wisp: digest",
+		Type:      "molecule",
+		Status:    "open",
+		CreatedAt: now.Add(-time.Hour),
+		Labels:    []string{"order-run:digest"},
+	}
+	finished := beads.Bead{
+		ID:        "gc-2",
+		Title:     "finished molecule",
+		Type:      "task",
+		Status:    "open",
+		CreatedAt: now,
+		Labels:    []string{"order-run:digest"},
+	}
+	ordersLeg := beads.NewMemStore()
+	graphLeg := beads.NewMemStoreFrom(2, []beads.Bead{gating, finished}, nil)
+	st := NewStoreWithGraph(beads.OrdersStore{Store: ordersLeg}, beads.GraphStore{Store: graphLeg})
+	moleculeIsOpenWork := func(_ beads.Store, root beads.Bead) (bool, error) {
+		return beads.IsMoleculeType(root.Type), nil
+	}
+
+	got, found, err := st.OpenWork("digest", moleculeIsOpenWork)
+	if err != nil {
+		t.Fatalf("OpenWork(): %v", err)
+	}
+	if !found || got.ID != gating.ID {
+		t.Fatalf("OpenWork() = %q, %v; want %q, true", got.ID, found, gating.ID)
+	}
+	if open, err := st.HasOpenWork("digest", moleculeIsOpenWork); err != nil || !open {
+		t.Fatalf("HasOpenWork() = %v, %v; want true, nil (the two must agree)", open, err)
+	}
+}
+
+// TestOpenWorkReportsNothingWhenUngated covers the not-found half: no open
+// order-run bead means found is false and HasOpenWork agrees.
+func TestOpenWorkReportsNothingWhenUngated(t *testing.T) {
+	mem := beads.NewMemStore()
+	closed, err := mem.Create(beads.Bead{Title: "order:digest", Labels: []string{"order-run:digest", "order-tracking"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mem.Close(closed.ID); err != nil {
+		t.Fatal(err)
+	}
+	st := NewStore(beads.OrdersStore{Store: mem})
+
+	got, found, err := st.OpenWork("digest", nil)
+	if err != nil {
+		t.Fatalf("OpenWork(): %v", err)
+	}
+	if found || got.ID != "" {
+		t.Fatalf("OpenWork() = %q, %v; want nothing", got.ID, found)
+	}
+	if open, err := st.HasOpenWork("digest", nil); err != nil || open {
+		t.Fatalf("HasOpenWork() = %v, %v; want false, nil", open, err)
 	}
 }

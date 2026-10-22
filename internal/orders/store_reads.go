@@ -146,7 +146,22 @@ func (s *Store) StaleOpenRuns(cutoff time.Time) ([]OrderRun, error) {
 	if s.store.Store == nil {
 		return nil, nil
 	}
-	all, err := s.store.ListByLabel(labelOrderTracking, 0, beads.WithBothTiers)
+	// LIVE, for the same cache-bypass reason as RecentRunsAll/OpenRuns, and this
+	// one is load-bearing: tracking beads are created and closed through the
+	// dispatcher's OWN uncached handle, so a cached read never observes them at
+	// all. Reading non-Live here made the stale-tracking watchdog return zero rows
+	// every 30s for 43h against a frozen city cache while the (Live) open-work
+	// gate saw the very same beads and held the orders shut — ga-v5vnyp.
+	// Sort oldest-first so the caller's close budget drains the oldest jam rather
+	// than an arbitrary slice of it (the wrapper drops Sort, leaving Go map order).
+	// IncludeClosed stays false and there is deliberately no Status filter, so
+	// in_progress tracking beads are still returned exactly as before.
+	all, err := beads.HandlesFor(s.store.Store).Live.List(beads.ListQuery{
+		Label:         labelOrderTracking,
+		IncludeClosed: false,
+		Sort:          beads.SortCreatedAsc,
+		TierMode:      beads.TierBoth,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -171,7 +186,15 @@ func (s *Store) OrphanedOpenRuns() ([]OrderRun, error) {
 	if s.store.Store == nil {
 		return nil, nil
 	}
-	all, err := s.store.ListByLabel(labelOrderTracking, 0, beads.WithBothTiers)
+	// LIVE for the same reason as StaleOpenRuns: the startup sweep exists to clean
+	// up after a controller that died holding tracking beads, and a cache primed by
+	// the very process doing the sweeping cannot be trusted to contain them.
+	all, err := beads.HandlesFor(s.store.Store).Live.List(beads.ListQuery{
+		Label:         labelOrderTracking,
+		IncludeClosed: false,
+		Sort:          beads.SortCreatedAsc,
+		TierMode:      beads.TierBoth,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -528,6 +551,18 @@ func (s *Store) Cursor(name string) EventCursor {
 // controller (the wisp-subtree traversal is graph residual). Only the boolean
 // verdict escapes the edge.
 func (s *Store) HasOpenWork(scoped string, wispHasOpenWork func(store beads.Store, root beads.Bead) (bool, error)) (bool, error) {
+	_, found, err := s.OpenWork(scoped, wispHasOpenWork)
+	return found, err
+}
+
+// OpenWork returns the bead holding the scoped order's single-flight gate: the
+// newest open order-tracking bead, or the newest open wisp/molecule root that
+// wispHasOpenWork judges still open, on the first leg that has one. found is
+// false when nothing holds the gate. It is the evidence form of HasOpenWork,
+// for callers that must NAME the blocker rather than only learn that one
+// exists (gc doctor's order-firing check). HasOpenWork delegates here, so the
+// two cannot disagree about whether a gate is held.
+func (s *Store) OpenWork(scoped string, wispHasOpenWork func(store beads.Store, root beads.Bead) (bool, error)) (beads.Bead, bool, error) {
 	label := labelOrderRunPrefix + scoped
 	for _, store := range s.mixedLegStores() {
 		results, err := beads.HandlesFor(store).Live.List(beads.ListQuery{
@@ -536,26 +571,26 @@ func (s *Store) HasOpenWork(scoped string, wispHasOpenWork func(store beads.Stor
 			TierMode: beads.TierBoth,
 		})
 		if err != nil {
-			return false, fmt.Errorf("listing order work beads: %w", err)
+			return beads.Bead{}, false, fmt.Errorf("listing order work beads: %w", err)
 		}
 		for _, b := range results {
 			if b.Status == "closed" || !IsRunRecord(b) { // a plain bead carrying the label is no run (mc-v8g4p)
 				continue
 			}
 			if beadLabelsContain(b.Labels, labelOrderTracking) {
-				return true, nil
+				return b, true, nil
 			}
 			if wispHasOpenWork == nil {
 				continue
 			}
 			open, err := wispHasOpenWork(store, b)
 			if err != nil {
-				return false, err
+				return beads.Bead{}, false, err
 			}
 			if open {
-				return true, nil
+				return b, true, nil
 			}
 		}
 	}
-	return false, nil
+	return beads.Bead{}, false, nil
 }

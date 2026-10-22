@@ -97,6 +97,38 @@ var contractAsyncCases = []contractAsyncCase{
 			expectStatus(t, "maintenance status", status, err, http.StatusOK, http.StatusServiceUnavailable)
 		},
 	},
+	// The carry's ga-nee27h (fork #174): send and reply answer 202 when the
+	// store reported the write but its read-back could not confirm it. This
+	// harness's store confirms every write, so the rows drive the confirmed
+	// path; the 202 body, its kept Idempotency-Key and its replay are owned by
+	// internal/api's unconfirmed-write tests named in each row.
+	{
+		operationID: "send-mail",
+		terminal:    "confirmed write: 201 with the message, readable by id (the unconfirmed 202 — message ID in the body, Idempotency-Key kept, a same-key retry replays the 202 without a second write, no mail.sent — is owned by internal/api TestMailSendUnconfirmedReturns202AndReplaysWithoutResend)",
+		run: func(t *testing.T, h *contractHarness) {
+			h.sendAsyncMail(t)
+		},
+	},
+	{
+		operationID: "reply-mail",
+		terminal:    "confirmed write: 201 with the reply, in its thread (the unconfirmed 202 and its replay are owned by internal/api TestMailReplyUnconfirmedReturns202AndReplaysWithoutResend)",
+		run: func(t *testing.T, h *contractHarness) {
+			msg := h.sendAsyncMail(t)
+			reply, err := h.client.ReplyMailWithResponse(h.ctx, contractCityName, msg.Id, &genclient.ReplyMailParams{XGCRequest: contractCSRF},
+				genclient.ReplyMailJSONRequestBody{From: ptr(h.asyncMailbox), Body: ptr("async reply")})
+			expectStatus(t, "reply mail", reply, err, http.StatusCreated)
+			replyMsg := mustJSON(t, "reply mail", reply.JSON201, reply)
+			threadID := msg.Id
+			if msg.ThreadId != nil && *msg.ThreadId != "" {
+				threadID = *msg.ThreadId
+			}
+			thread, err := h.client.GetV0CityByCityNameMailThreadByIdWithResponse(h.ctx, contractCityName, threadID, nil)
+			expectStatus(t, "mail thread", thread, err, http.StatusOK)
+			if !strings.Contains(string(thread.Body), replyMsg.Id) {
+				t.Fatalf("thread %s missing reply %s: %s", threadID, replyMsg.Id, thread.Body)
+			}
+		},
+	},
 	{
 		operationID: "post-v0-city",
 		terminal:    "explicit refusal: a single-city controller mux has no city initializer, so create answers the documented 501 (the supervisor path is owned by TestGCLiveContract_BeadsAndEvents)",
@@ -117,6 +149,22 @@ var contractAsyncCases = []contractAsyncCase{
 			expectStatus(t, "city after refused unregister", city, err, http.StatusOK)
 		},
 	},
+}
+
+// sendAsyncMail sends one message to a mailbox of the async rows' own and
+// checks the confirmed write is readable by id.
+func (h *contractHarness) sendAsyncMail(t *testing.T) genclient.Message {
+	t.Helper()
+	if h.asyncMailbox == "" {
+		h.asyncMailbox = h.createAgentSession(t, "async mailbox").SessionName
+	}
+	sent, err := h.client.SendMailWithResponse(h.ctx, contractCityName, &genclient.SendMailParams{XGCRequest: contractCSRF},
+		genclient.SendMailJSONRequestBody{To: h.asyncMailbox, From: ptr("human"), Subject: "async hello", Body: ptr("async")})
+	expectStatus(t, "send mail", sent, err, http.StatusCreated)
+	msg := mustJSON(t, "send mail", sent.JSON201, sent)
+	got, err := h.client.GetV0CityByCityNameMailByIdWithResponse(h.ctx, contractCityName, msg.Id, nil)
+	expectStatus(t, "get sent mail", got, err, http.StatusOK)
+	return *msg
 }
 
 // contractAsyncFamily checks the table covers exactly the spec's 202

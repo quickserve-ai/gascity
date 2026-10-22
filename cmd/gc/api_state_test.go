@@ -200,6 +200,52 @@ func (f *failAgentTomlRenameOSFS) Rename(oldpath, newpath string) error {
 	return f.OSFS.Rename(oldpath, newpath)
 }
 
+func TestNewControllerStateSchemaSkewSkipsCachingAndRigStores(t *testing.T) {
+	fallback := beads.NewMemStore()
+	previousOpen := newControllerStateOpenCityStore
+	newControllerStateOpenCityStore = func(string, gate.Mode, beads.NativeTransportMode) (beads.StoreOpenResult, error) {
+		return beads.StoreOpenResult{Store: fallback, Diagnostic: beads.BeadsDiagnostic{
+			Store: beads.BeadsStoreNameBdStore, PreflightGate: "native_open",
+			PreflightReason: "schema version mismatch: database is at v55, binary knows up to v54 (1 migration ahead)",
+		}}, nil
+	}
+	t.Cleanup(func() { newControllerStateOpenCityStore = previousOpen })
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}, Rigs: []config.Rig{{Name: "rig1", Path: t.TempDir()}}}
+
+	cs := newControllerState(context.Background(), cfg, runtime.NewFake(), events.NewFake(), "test-city", t.TempDir())
+
+	if got := cs.CityBeadStore(); got != fallback {
+		t.Fatalf("CityBeadStore = %T, want unwrapped fallback store while schema-skewed", got)
+	}
+	if got := len(cs.beadStores); got != 0 {
+		t.Fatalf("rig stores = %d, want 0 while schema-skewed", got)
+	}
+	if cs.cityMailProv != nil || cs.extmsgSvc != nil {
+		t.Fatal("mail/external-message services enabled while schema-skewed")
+	}
+}
+
+func TestNewControllerStateSchemaSkewWinsOverFallbackOpenFailure(t *testing.T) {
+	previousOpen := newControllerStateOpenCityStore
+	newControllerStateOpenCityStore = func(string, gate.Mode, beads.NativeTransportMode) (beads.StoreOpenResult, error) {
+		return beads.StoreOpenResult{Diagnostic: beads.BeadsDiagnostic{
+			Store: beads.BeadsStoreNameBdStore, PreflightGate: "native_open",
+			PreflightReason: "schema version mismatch: database is at v55, binary knows up to v54 (1 migration ahead)",
+		}}, errors.New("fallback executable unavailable")
+	}
+	t.Cleanup(func() { newControllerStateOpenCityStore = previousOpen })
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}, Rigs: []config.Rig{{Name: "rig1", Path: t.TempDir()}}}
+
+	cs := newControllerState(context.Background(), cfg, runtime.NewFake(), events.NewFake(), "test-city", t.TempDir())
+
+	if diag := cs.CityBeadsDiagnostic(); diag == nil || !beads.IsSchemaSkewDiagnostic(*diag) {
+		t.Fatalf("CityBeadsDiagnostic = %#v, want schema skew", diag)
+	}
+	if got := len(cs.beadStores); got != 0 {
+		t.Fatalf("rig stores = %d, want 0 while schema-skewed", got)
+	}
+}
+
 func TestControllerStateReadAccess(t *testing.T) {
 	t.Setenv("GC_BEADS", "file")
 
@@ -2271,7 +2317,7 @@ func TestWrapWithCachingStoreCachesNonBdStore(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 
-	store := wrapWithCachingStore(context.Background(), backing, nil, true)
+	store := wrapWithCachingStore(context.Background(), backing, nil, true, t.TempDir(), "city")
 	cached, ok := store.(*beads.CachingStore)
 	if !ok {
 		t.Fatalf("store type = %T, want *beads.CachingStore", store)
@@ -2290,7 +2336,7 @@ func TestWrapWithCachingStoreCachesNonBdStore(t *testing.T) {
 }
 
 func TestWrapWithCachingStoreReturnsNilStore(t *testing.T) {
-	if got := wrapWithCachingStore(context.Background(), nil, nil, true); got != nil {
+	if got := wrapWithCachingStore(context.Background(), nil, nil, true, t.TempDir(), "city"); got != nil {
 		t.Fatalf("wrapWithCachingStore(nil) = %#v, want nil", got)
 	}
 }
@@ -2310,7 +2356,7 @@ func TestWrapWithCachingStoreNoBackgroundRefresh(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	store := wrapWithCachingStore(ctx, backing, nil, false)
+	store := wrapWithCachingStore(ctx, backing, nil, false, t.TempDir(), "city")
 	cached, ok := store.(*beads.CachingStore)
 	if !ok {
 		t.Fatalf("store type = %T, want *beads.CachingStore", store)
@@ -3036,7 +3082,7 @@ provider = "file"
 	}
 
 	cs := &controllerState{cityPath: cityDir, cfg: cfg}
-	stores := cs.buildStores(cfg)
+	stores := cs.buildStores(cfg, nil)
 	store, ok := stores["frontend"]
 	if !ok {
 		t.Fatal("buildStores() missing frontend store")
@@ -3103,7 +3149,7 @@ provider = "file"
 	}
 
 	cs := &controllerState{cityPath: cityDir, cfg: cfg}
-	stores := cs.buildStores(cfg)
+	stores := cs.buildStores(cfg, nil)
 
 	if !factoryCalled {
 		t.Fatal("buildStores did not route bd-backed rig through store factory")
@@ -3148,7 +3194,7 @@ provider = "file"
 	}
 
 	cs := &controllerState{cityPath: cityDir, cfg: cfg}
-	stores := cs.buildStores(cfg)
+	stores := cs.buildStores(cfg, nil)
 	rigStore, ok := stores["frontend"]
 	if !ok {
 		t.Fatal("buildStores() missing frontend store")
@@ -4152,7 +4198,7 @@ func TestBuildStores_ExecProviderSetsPerRigEnv(t *testing.T) {
 	}
 
 	cs := &controllerState{cityPath: cityDir}
-	stores := cs.buildStores(cfg)
+	stores := cs.buildStores(cfg, nil)
 
 	if len(stores) != 2 {
 		t.Fatalf("buildStores returned %d stores, want 2", len(stores))
@@ -4270,7 +4316,7 @@ func TestBuildStoresBdProviderUsesPassedConfigForRigEnv(t *testing.T) {
 		cityPath: cityDir,
 	}
 
-	stores := cs.buildStores(nextCfg)
+	stores := cs.buildStores(nextCfg, nil)
 	if stores["alpha"] == nil {
 		t.Fatal("buildStores did not create alpha store")
 	}
@@ -4368,6 +4414,67 @@ func TestPrimeThenStartReconcilerSkipsReconcilerOnShutdown(t *testing.T) {
 	}
 }
 
+// fullScanHangingStore blocks every full-scan List until released, while
+// letting status-filtered List calls (PrimeActive) through — a backing store
+// whose full prime never returns, which is what ga-yc0chj measured on the city
+// rig. It is deliberately distinct from fullScanFailingStore: a prime that
+// FAILS already fell through to StartReconciler, a prime that HANGS did not.
+type fullScanHangingStore struct {
+	beads.Store
+	release chan struct{}
+}
+
+func (s *fullScanHangingStore) List(query beads.ListQuery) ([]beads.Bead, error) {
+	if query.AllowScan {
+		<-s.release
+	}
+	return s.Store.List(query)
+}
+
+// TestPrimeThenStartReconcilerArmsReconcilerWhenPrimeHangs asserts the
+// watchdog reconciler is armed even when the async full prime never returns.
+// CachingStore.Prime blocks inside backing.List, which takes no context, so
+// neither ctx cancellation nor a deadline on ctx can interrupt it — the bound
+// has to live at this call site. Without it the controller reconciled nothing
+// for 3h31m (ga-yc0chj) while still serving its partial cache, which silently
+// disabled every consumer that reads non-Live.
+func TestPrimeThenStartReconcilerArmsReconcilerWhenPrimeHangs(t *testing.T) {
+	backing := &fullScanHangingStore{Store: beads.NewMemStore(), release: make(chan struct{})}
+	cs := beads.NewCachingStore(backing, nil)
+	cs.SetPrimeRetryDelayForTest(func(int) time.Duration { return 0 })
+	if err := cs.PrimeActive(); err != nil {
+		t.Fatalf("PrimeActive: %v", err)
+	}
+
+	prev := primeArmBound
+	primeArmBound = 50 * time.Millisecond
+	defer func() { primeArmBound = prev }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	returned := make(chan struct{})
+	go func() {
+		primeThenStartReconciler(ctx, cs, "armed")
+		close(returned)
+	}()
+
+	select {
+	case <-returned:
+	case <-time.After(10 * time.Second):
+		close(backing.release)
+		t.Fatal("primeThenStartReconciler never returned while the prime was hung; a hung prime still disables reconciliation")
+	}
+
+	// "armed" is the FNV stagger for this agent ID; a non-zero value can
+	// only have been written by StartReconciler.
+	got := cs.Stats().StaggerOffsetMs
+	close(backing.release) // let the hung prime finish so its goroutine exits
+	if got <= 0 {
+		t.Fatalf("StaggerOffsetMs = %d, want > 0 (reconciler must arm when the prime hangs)", got)
+	}
+}
+
 // TestRigStoreBackgroundRefreshUsesEffectiveSuspension asserts the
 // background-refresh gate consults the EFFECTIVE rig suspension — the
 // runtime suspend/resume override layered over the rig's committable
@@ -4408,6 +4515,42 @@ func TestRigStoreBackgroundRefreshUsesEffectiveSuspension(t *testing.T) {
 // suspend/resume flip invalidates runtimeUpdateCanReuseCurrentStores and
 // the next config reload rebuilds stores with the correct
 // background-refresh gate.
+// A running rig whose installed store was built cold forces a rebuild even
+// when the store-metadata signature reads armed (it is rewritten only when the
+// city store reopens), and an armed one lets the stores be reused (ga-r5ppfi).
+func TestColdStoreForRunningRigDefeatsReuseWhateverTheSignatureSays(t *testing.T) {
+	cityDir := t.TempDir()
+	cfg := &config.City{Rigs: []config.Rig{{Name: "rig1", Path: t.TempDir()}}}
+	cs := &controllerState{
+		cityPath:               cityDir,
+		cfg:                    cfg,
+		cityBeadStore:          beads.NewMemStore(),
+		beadStores:             map[string]beads.Store{"rig1": beads.NewMemStore()},
+		storeMetadataSignature: storeMetadataSignature(cityDir, cfg), // rig1 running: refresh=true
+	}
+
+	cs.rigStoreRefresh = map[string]bool{"rig1": true}
+	if cs.storeMetadataChanged(cfg) || !cs.runtimeUpdateCanReuseCurrentStores(cfg) {
+		t.Fatal("an armed store for a running rig was not left to reuse")
+	}
+
+	cs.rigStoreRefresh = map[string]bool{"rig1": false} // built while suspended; the signature never caught up
+	if !cs.storeMetadataChanged(cfg) {
+		t.Fatal("same-revision reload sees no change for a running rig on a cold store; it would skip the rebuild")
+	}
+	if cs.runtimeUpdateCanReuseCurrentStores(cfg) {
+		t.Fatal("a running rig's cold store was reused; the retry would loop without re-arming")
+	}
+
+	suspended := true // while the rig is suspended its store is meant to be cold
+	if err := suspensionstate.SetRigSuspended(fsys.OSFS{}, cityDir, "rig1", &suspended); err != nil {
+		t.Fatal(err)
+	}
+	if cs.coldStoreForRunningRig(cfg) {
+		t.Fatal("a suspended rig's cold store was taken for a running rig's")
+	}
+}
+
 func TestStoreMetadataSignatureChangesOnRigSuspensionFlip(t *testing.T) {
 	cityDir := t.TempDir()
 	rigDir := t.TempDir()

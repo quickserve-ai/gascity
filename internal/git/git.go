@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
 // Worktree represents a single git worktree entry.
@@ -153,7 +155,26 @@ func (g *Git) remoteNamesOriginFirst() []string {
 
 // CheckoutDetach switches the working tree to a detached HEAD at ref.
 func (g *Git) CheckoutDetach(ref string) error {
-	if _, err := g.run("checkout", "--detach", ref); err != nil {
+	return g.CheckoutDetachCtx(context.Background(), ref)
+}
+
+// CheckoutDetachCtx is CheckoutDetach bounded by ctx (see runBounded).
+func (g *Git) CheckoutDetachCtx(ctx context.Context, ref string) error {
+	return g.checkoutDetach(ctx, nil, ref)
+}
+
+// CheckoutDetachNoHooksCtx is CheckoutDetachCtx with every hook disabled
+// (core.hooksPath=/dev/null), for a caller that must not run repo-supplied
+// code — a post-checkout hook can block on services the caller cannot bound.
+func (g *Git) CheckoutDetachNoHooksCtx(ctx context.Context, ref string) error {
+	return g.checkoutDetach(ctx, []string{"-c", "core.hooksPath=/dev/null"}, ref)
+}
+
+func (g *Git) checkoutDetach(ctx context.Context, gitConfig []string, ref string) error {
+	args := make([]string, 0, len(gitConfig)+3)
+	args = append(args, gitConfig...)
+	args = append(args, "checkout", "--detach", ref)
+	if _, err := g.runBounded(ctx, args...); err != nil {
 		return fmt.Errorf("checkout --detach %s: %w", ref, err)
 	}
 	return nil
@@ -162,13 +183,27 @@ func (g *Git) CheckoutDetach(ref string) error {
 // WorktreeRemove removes a worktree. If force is true, removes even with
 // uncommitted changes.
 func (g *Git) WorktreeRemove(path string, force bool) error {
+	return g.WorktreeRemoveCtx(context.Background(), path, force)
+}
+
+// WorktreeRemoveCtx is WorktreeRemove bounded by ctx (see runBounded).
+func (g *Git) WorktreeRemoveCtx(ctx context.Context, path string, force bool) error {
 	args := []string{"worktree", "remove", path}
 	if force {
 		args = append(args, "--force")
 	}
-	_, err := g.run(args...)
+	_, err := g.runBounded(ctx, args...)
 	if err != nil {
 		return fmt.Errorf("removing worktree %q: %w", path, err)
+	}
+	return nil
+}
+
+// WorktreeMove atomically relocates a registered worktree through Git so its
+// administrative path is updated with the filesystem move.
+func (g *Git) WorktreeMove(oldPath, newPath string) error {
+	if _, err := g.run("worktree", "move", oldPath, newPath); err != nil {
+		return fmt.Errorf("moving worktree %q to %q: %w", oldPath, newPath, err)
 	}
 	return nil
 }
@@ -193,8 +228,8 @@ func (g *Git) HasUncommittedWork() bool {
 	return strings.TrimSpace(out) != ""
 }
 
-// HasUnpushedCommits reports whether HEAD has commits not reachable from
-// any remote tracking branch. Used as a safety check before removing a
+// HasUnpushedCommits reports whether HEAD has commits that no ref which exists
+// on a remote RIGHT NOW reaches. Used as a safety check before removing a
 // worktree — unpushed commits represent completed work that would be lost.
 // If the probe fails, it returns true to fail closed.
 func (g *Git) HasUnpushedCommits() bool {
@@ -207,12 +242,120 @@ func (g *Git) HasUnpushedCommits() bool {
 
 // HasUnpushedCommitsResult is like HasUnpushedCommits but preserves git
 // probe errors for callers that need to expose the precise failure reason.
+//
+// CREDIT ONLY LIVE REMOTE TIPS (ga-hdedew). The probe used to be
+// `git log HEAD --not --remotes`, which credits every LOCAL remote-tracking
+// ref. A tracking ref outlives its branch: when the branch is deleted on the
+// remote, or a re-clone narrows the refspec, the stale ref still reads as
+// "pushed", and the reaper removes a checkout whose commits exist nowhere off
+// this disk. The next `fetch --prune`, or deleting the repo, loses them.
+// Measured 2026-09-23: brett-gate's tip was "contained" by
+// origin/brett/qc-idnhyya-residue-gate while ls-remote had no such branch.
+//
+// So HEAD is checked against the tips `git ls-remote` reports now, in the
+// namespaces that are durable copies: refs/heads/*, refs/tags/* (peeled), and
+// refs/rescue/* (the credited salvage namespace). Tips whose objects this repo
+// does not have are ignored, which can only make the answer more conservative.
+// A repo with no remote has nothing pushed. If a remote exists but none
+// answers, that is an ERROR: never credit a remote you cannot see.
 func (g *Git) HasUnpushedCommitsResult() (bool, error) {
-	out, err := g.run("log", "HEAD", "--oneline", "--not", "--remotes")
+	commonDir, err := g.run("rev-parse", "--path-format=absolute", "--git-common-dir")
 	if err != nil {
 		return false, fmt.Errorf("checking unpushed commits: %w", err)
 	}
-	return strings.TrimSpace(out) != "", nil
+	remotesOut, err := g.run("remote")
+	if err != nil {
+		return false, fmt.Errorf("checking unpushed commits: listing remotes: %w", err)
+	}
+	remotes := strings.Fields(remotesOut)
+	if len(remotes) == 0 {
+		return true, nil
+	}
+	tips, err := g.liveRemoteTips(strings.TrimSpace(commonDir), remotes)
+	if err != nil {
+		return false, fmt.Errorf("checking unpushed commits: %w", err)
+	}
+	var stdin strings.Builder
+	for _, sha := range tips {
+		stdin.WriteString("^" + sha + "\n")
+	}
+	out, err := g.runStdin(stdin.String(), "rev-list", "--count", "--ignore-missing", "--stdin", "HEAD")
+	if err != nil {
+		return false, fmt.Errorf("checking unpushed commits: %w", err)
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(out))
+	if err != nil {
+		return false, fmt.Errorf("checking unpushed commits: parsing rev-list count %q: %w", strings.TrimSpace(out), err)
+	}
+	return n > 0, nil
+}
+
+// liveRemoteTipsTTL bounds how long one ls-remote answer is reused. Reapers and
+// doctor probe many worktrees of ONE repository in a single pass; without the
+// cache each would pay a network round trip. Failures are cached too, so an
+// offline host pays at most one lsRemoteTimeout per repository per TTL instead
+// of one per worktree per tick.
+var (
+	liveRemoteTipsTTL = 60 * time.Second
+	lsRemoteTimeout   = 20 * time.Second
+	liveTipsMu        sync.Mutex
+	liveTipsCache     = map[string]liveTipsEntry{}
+)
+
+type liveTipsEntry struct {
+	at   time.Time
+	tips []string
+	err  error
+}
+
+// creditedRemoteRefPrefixes are the ref namespaces whose presence on a remote
+// counts as an off-disk copy. refs/pull/* is deliberately absent: it is the
+// forge's, not ours, and says nothing about a branch we can recover from.
+var creditedRemoteRefPrefixes = []string{"refs/heads/", "refs/tags/", "refs/rescue/"}
+
+func (g *Git) liveRemoteTips(commonDir string, remotes []string) ([]string, error) {
+	key := commonDir + "\x00" + strings.Join(remotes, ",")
+	liveTipsMu.Lock()
+	if e, ok := liveTipsCache[key]; ok && time.Since(e.at) < liveRemoteTipsTTL {
+		liveTipsMu.Unlock()
+		return e.tips, e.err
+	}
+	liveTipsMu.Unlock()
+
+	var tips []string
+	answered := 0
+	var lastErr error
+	for _, remote := range remotes {
+		ctx, cancel := context.WithTimeout(context.Background(), lsRemoteTimeout)
+		out, err := g.runCtx(ctx, "ls-remote", remote)
+		cancel()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		answered++
+		for _, line := range strings.Split(out, "\n") {
+			sha, ref, ok := strings.Cut(strings.TrimSpace(line), "\t")
+			if !ok {
+				continue
+			}
+			for _, p := range creditedRemoteRefPrefixes {
+				if strings.HasPrefix(ref, p) {
+					tips = append(tips, sha)
+					break
+				}
+			}
+		}
+	}
+	var err error
+	if answered == 0 {
+		err = fmt.Errorf("no remote answered ls-remote (%s): %w", strings.Join(remotes, ","), lastErr)
+		tips = nil
+	}
+	liveTipsMu.Lock()
+	liveTipsCache[key] = liveTipsEntry{at: time.Now(), tips: tips, err: err}
+	liveTipsMu.Unlock()
+	return tips, err
 }
 
 // HasUnreachableCommits reports whether HEAD has commits that no ref reaches.
@@ -489,16 +632,56 @@ func sanitizeGitEnv(environ []string) []string {
 // run executes a git command in the working directory. Git environment
 // variables from the parent process are stripped to prevent interference
 // (e.g., when called from a pre-commit hook context).
+// runStdin is run with the given text on the command's standard input.
+func (g *Git) runStdin(stdin string, args ...string) (string, error) {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = g.workDir
+	cmd.Env = sanitizeGitEnv(os.Environ())
+	cmd.Stdin = strings.NewReader(stdin)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("git %s: %s: %w", strings.Join(args, " "), strings.TrimSpace(string(out)), err)
+	}
+	return string(out), nil
+}
+
 func (g *Git) run(args ...string) (string, error) {
 	return g.runCtx(context.Background(), args...)
 }
 
 // runCtx executes a git command with a context for cancellation/timeout.
 func (g *Git) runCtx(ctx context.Context, args ...string) (string, error) {
+	return g.runCtxWait(ctx, 0, args...)
+}
+
+// boundedWaitDelay is the WaitDelay runBounded gives a cancellable ctx.
+const boundedWaitDelay = 5 * time.Second
+
+// runBounded is runCtx for a caller whose ctx must actually bound the call.
+// Killing git when ctx fires is not enough on its own: a grandchild (a hook's
+// `bd`, say) that inherited the output pipe keeps CombinedOutput reading until
+// the grandchild exits, however long that is. WaitDelay closes the pipe
+// boundedWaitDelay after ctx fires or git exits, so Wait returns.
+//
+// It is not set in runCtx for every caller: WaitDelay also turns a git that
+// exited 0 while a detached grandchild still holds the pipe (an ssh
+// ControlPersist master under ls-remote, say) into exec.ErrWaitDelay, a failure
+// those callers never saw. A context.Background() ctx gets no WaitDelay here
+// either, so a ctx-less method delegating through this path is unchanged.
+func (g *Git) runBounded(ctx context.Context, args ...string) (string, error) {
+	var wait time.Duration
+	if ctx.Done() != nil {
+		wait = boundedWaitDelay
+	}
+	return g.runCtxWait(ctx, wait, args...)
+}
+
+func (g *Git) runCtxWait(ctx context.Context, waitDelay time.Duration, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = g.workDir
 	// Build clean env: inherit everything except git-specific vars.
 	cmd.Env = sanitizeGitEnv(os.Environ())
+	cmd.WaitDelay = waitDelay
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("git %s: %s: %w", strings.Join(args, " "), strings.TrimSpace(string(out)), err)

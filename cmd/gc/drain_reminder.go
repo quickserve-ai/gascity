@@ -57,6 +57,7 @@ package main
 // and is tracked as its own fix rather than papered over here.
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -129,6 +130,7 @@ const (
 	drainReminderHoldUnreadable    = "activity_unreadable"
 	drainReminderHoldExhausted     = "attempts_exhausted"
 	drainReminderHoldAckUnknown    = "ack_unreadable"
+	drainReminderHoldContentHeld   = "content_held"
 )
 
 // drainReminderLabel prefixes this pass's journal lines so they are greppable
@@ -199,6 +201,11 @@ func maybeRemindDrainingSession(
 
 	if due.exhausted {
 		return announceDrainReminderExhausted(store, info, name, due, stdout)
+	}
+
+	if drainReminderContentHeld(due) {
+		noteDrainReminderHold(store, info, drainReminderHoldContentHeld)
+		return drainReminderHeld
 	}
 
 	if outcome, proceed := drainReminderQuietHold(sp, store, info, name, due.now); !proceed {
@@ -462,6 +469,18 @@ func settleLastDrainReminder(store beads.Store, info sessions.Info, name string,
 	return failed, true
 }
 
+// drainReminderContentHeld reports whether due's row, as loaded, holds its
+// conversation's content (session.ContentHeldInfo; SESSION-RUNTIME-027). The
+// reminder is content that hold keeps: the lane holds its notice until its
+// start_by, and a direct nudge would type past the hold. So a held row is not
+// reminded and no attempt is spent; the budget, and the drain-ack escalation
+// it paces (drainRemindersSpent), wait for the hold to clear. The gate runs
+// after the exhaustion check, so a budget spent before the hold is still
+// announced.
+func drainReminderContentHeld(due drainReminderDue) bool {
+	return sessions.ContentHeldInfo(sessionInfoFromBead(due.row))
+}
+
 // drainReminderQuietHold runs the liveness and quiet gates that can still stop a
 // due reminder before delivery: the stop finally took, a human is at the pane,
 // or the activity signal is unreadable or too recent (an agent in the middle of
@@ -508,7 +527,11 @@ func drainReminderQuietHold(sp runtime.Provider, store beads.Store, info session
 // never replay an unbounded stream. A nudge error still spends the attempt
 // (the write-ahead is what bounds the loop, and unwinding it would let a
 // permanently input-dead pane re-send forever) and records that nothing
-// ARRIVED, so the escalation reports what actually happened.
+// ARRIVED, so the escalation reports what actually happened. The one
+// exception is a deferral (runtime.ErrSessionBusy): the runtime typed nothing
+// because the session was running a turn its submit keys would have
+// interrupted, so nothing was attempted and the marker is restored to what it
+// held, under the busy hold.
 func deliverDrainReminder(sp runtime.Provider, store beads.Store, info sessions.Info, name string, due drainReminderDue, stdout io.Writer) drainReminderOutcome {
 	failed := due.failed
 	journalPrior := func() {}
@@ -532,8 +555,14 @@ func deliverDrainReminder(sp runtime.Provider, store beads.Store, info sessions.
 	if !writeDrainReminderMarker(store, info, due.row, due.drainID, due.attempts+1, failed, due.attempts+1, due.now, stdout) {
 		return drainReminderSkipped
 	}
+	err := nudgeDrainReminder(sp, name, info)
+	if errors.Is(err, runtime.ErrSessionBusy) {
+		writeDrainReminderMarker(store, info, due.row, due.drainID, due.attempts, due.failed, due.settled, due.last, stdout)
+		noteDrainReminderHold(store, info, drainReminderHoldBusy)
+		return drainReminderHeld
+	}
 	journalPrior()
-	if err := nudgeDrainReminder(sp, name, info); err != nil {
+	if err != nil {
 		// A nil return is not proof of delivery: the seam adapter answers nil when
 		// it cannot attach, so some failures are invisible here and counted as
 		// delivered. That is the best knowledge available at this boundary, and it

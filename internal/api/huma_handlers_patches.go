@@ -2,8 +2,10 @@ package api
 
 import (
 	"context"
+	"strings"
 
 	"github.com/gastownhall/gascity/internal/api/apierr"
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/config"
 )
 
@@ -77,15 +79,17 @@ func (s *Server) humaHandleAgentPatchSet(_ context.Context, input *AgentPatchSet
 	}
 
 	patch := config.AgentPatch{
-		Dir:       input.Body.Dir,
-		Rig:       input.Body.Rig,
-		Name:      input.Body.Name,
-		Provider:  input.Body.Provider,
-		WorkDir:   input.Body.WorkDir,
-		TmuxAlias: input.Body.TmuxAlias,
-		Scope:     input.Body.Scope,
-		Suspended: input.Body.Suspended,
-		Env:       input.Body.Env,
+		Dir:               input.Body.Dir,
+		Rig:               input.Body.Rig,
+		Name:              input.Body.Name,
+		Provider:          input.Body.Provider,
+		WorkDir:           input.Body.WorkDir,
+		TmuxAlias:         input.Body.TmuxAlias,
+		Scope:             input.Body.Scope,
+		Suspended:         input.Body.Suspended,
+		Env:               input.Body.Env,
+		OptInSkills:       input.Body.OptInSkills,
+		OptInSkillsAppend: input.Body.OptInSkillsAppend,
 	}
 
 	// Validate at the edge so a patch that would hard-fail the next config
@@ -174,15 +178,36 @@ func (s *Server) humaHandleRigPatchSet(_ context.Context, input *RigPatchSetInpu
 	}
 
 	patch := config.RigPatch{
-		Name:          input.Body.Name,
-		Path:          input.Body.Path,
-		Prefix:        input.Body.Prefix,
-		DefaultBranch: input.Body.DefaultBranch,
-		Suspended:     input.Body.Suspended,
+		Name:                    input.Body.Name,
+		Path:                    input.Body.Path,
+		Prefix:                  input.Body.Prefix,
+		DefaultBranch:           input.Body.DefaultBranch,
+		DefaultMergeStrategy:    input.Body.DefaultMergeStrategy,
+		Suspended:               input.Body.Suspended,
+		SuspendedOnStart:        input.Body.SuspendedOnStart,
+		FormulaVars:             input.Body.FormulaVars,
+		BeadsProxiedIdleTimeout: input.Body.BeadsProxiedIdleTimeout,
+	}
+	if input.Body.Doctor != nil {
+		patch.Doctor = &config.RigDoctorPatch{
+			CensusOwnerNamespace: input.Body.Doctor.CensusOwnerNamespace,
+		}
 	}
 
 	if patch.Name == "" {
 		return nil, apierr.InvalidRequest.Msg("name is required")
+	}
+	// Validate at the edge: SetRigPatch stores the patch without config
+	// load's rig checks, so a value that load rejects would be persisted and
+	// only fail at the next config load.
+	if s := patch.DefaultMergeStrategy; s != nil && *s != "" && !beadmeta.IsKnownMergeStrategy(*s) {
+		return nil, apierr.InvalidRequest.Msgf("default_merge_strategy %q is not one of %s",
+			*s, strings.Join(beadmeta.KnownMergeStrategies, ", "))
+	}
+	if t := patch.BeadsProxiedIdleTimeout; t != nil {
+		if _, err := config.ParseProxiedIdleTimeout(*t); err != nil {
+			return nil, apierr.InvalidRequest.Msgf("beads_proxied_idle_timeout: %v", err)
+		}
 	}
 
 	if err := sm.SetRigPatch(patch); err != nil {

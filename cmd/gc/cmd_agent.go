@@ -181,6 +181,11 @@ func emitLoadCityConfigWarnings(w io.Writer, prov *config.Provenance) {
 // [agent_defaults]/[agents] config remains strict-fatal because overlapping
 // default tables are ambiguous even after normalization.
 func isNonFatalLoadConfigWarning(warning string) bool {
+	// Non-fatal so ordinary commands keep working; `gc config --validate`
+	// still fails on it (ga-djvbvp).
+	if config.IsUnappliedPatchWarning(warning) {
+		return true
+	}
 	if config.IsRetiredKeyWarning(warning) {
 		return true
 	}
@@ -221,7 +226,35 @@ func isNonFatalLoadConfigWarning(warning string) bool {
 }
 
 func shouldEmitLoadCityConfigWarning(warning string) bool {
+	// An unapplied patch is a CONDITION OF THIS INVOCATION, not a standing
+	// configuration choice, so it prints on every command — the opposite call
+	// from the always+fresh advisory below (ga-djvbvp). A patch that silently
+	// did nothing is how a typo survives forever, and the whole reason it is
+	// now safe to skip instead of aborting is that the skip is loud.
+	//
+	// HONESTLY REDUNDANT TODAY, and kept anyway: mutation testing confirms
+	// deleting this branch changes nothing, because the fall-through to
+	// isNonFatalLoadConfigWarning already returns true for the same class. It
+	// stays because it DECOUPLES emit from fatality — if someone later makes
+	// unapplied patches strict-fatal by removing the case there, emission
+	// would otherwise stop at the same instant and the skip would go silent,
+	// which is the one outcome this design cannot tolerate.
+	if config.IsUnappliedPatchWarning(warning) {
+		return true
+	}
 	if config.IsLegacyWorkspaceFieldWarning(warning) {
+		return false
+	}
+	// The always+fresh wake_mode advisory describes a standing configuration
+	// choice, not a condition of this invocation, so emitting it inline put
+	// four unconditional stderr lines above the output of EVERY gc command in
+	// every agent's context. That is worse than untidy: an agent read the
+	// banner, read gc hook's documented exit 1 for "no ready work", connected
+	// them, and filed a config-validation failure that did not exist
+	// (ga-3upjic). It stays a warning and stays fully visible on the surfaces
+	// built to review configuration — gc config show and gc start print
+	// prov.Warnings unfiltered — but no longer decorates unrelated commands.
+	if config.IsAlwaysFreshWakeModeWarning(warning) {
 		return false
 	}
 	if strings.Contains(warning, "both [agent_defaults] and [agents] are present") {

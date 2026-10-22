@@ -23,10 +23,16 @@ import (
 //     admits no guessing: an address claimed by two sessions is ambiguous
 //     rather than won by whichever key was probed first, because delivering a
 //     message to the wrong session is worse than not delivering it.
+//
+// ListClosedByNamedIdentity answers a third question, "which earlier sessions
+// were this named seat": the closed sessions that carried one
+// configured_named_identity, found by one indexed probe rather than a scan of
+// every session.
 type AddressDirectory interface {
 	ResolveAddress(selector string, includeClosed bool) (Info, error)
 	ResolveMailboxAddress(selector string, closed bool) (Info, error)
 	ListAddresses(includeClosed bool) ([]Info, error)
+	ListClosedByNamedIdentity(identity string) ([]Info, error)
 }
 
 // ListAddresses returns the typed session records used for mailbox routing.
@@ -138,6 +144,18 @@ func mailboxMatchesByMetadata(store beads.Store, key, selector, status string) (
 	if status != "" {
 		query.Status = status
 	}
+	if status == "closed" {
+		// A closed-only probe runs on every inbox read (pl-d9lw item 1), and a
+		// backend that cannot push the metadata filter into its ephemeral leg
+		// answers it with every closed ephemeral row it holds: 5,400 closed mail
+		// messages and no session on the live city store, 2026-10-05. The
+		// session label is a filter both legs push down, and it keeps both
+		// kinds of bead the re-check below accepts that a session is ever
+		// created as: every creation path stamps the label, and a
+		// crash-damaged bead with an empty type is recognized by it. A typed
+		// bead that has lost its label is the one shape this narrows away.
+		query.Label = LabelSession
+	}
 	items, err := store.List(query)
 	if err != nil {
 		return nil, err
@@ -226,6 +244,28 @@ func RecipientRoutesFromInfo(info Info) []string {
 		add(alias)
 	}
 	return routes
+}
+
+// ListClosedByNamedIdentity returns the closed sessions whose
+// configured_named_identity is exactly identity: the earlier incarnations of a
+// named seat. Pool sessions carry no named identity, so a pool alias reused by
+// a later worker never links two sessions here. A blank identity matches
+// nothing.
+func (s *Store) ListClosedByNamedIdentity(identity string) ([]Info, error) {
+	identity = strings.TrimSpace(identity)
+	store := s.beadStore()
+	if identity == "" || store == nil {
+		return nil, nil
+	}
+	rows, err := mailboxMatchesByMetadata(store, NamedSessionIdentityMetadata, identity, "closed")
+	if err != nil {
+		return nil, newAddressDirectoryError("named identity lookup failed", err)
+	}
+	out := make([]Info, 0, len(rows))
+	for _, b := range rows {
+		out = append(out, infoFromPersistedBead(b))
+	}
+	return out, nil
 }
 
 var _ AddressDirectory = (*Store)(nil)

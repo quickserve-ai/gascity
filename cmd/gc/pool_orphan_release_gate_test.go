@@ -1,0 +1,519 @@
+package main
+
+import (
+	"context"
+	"io"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/gastownhall/gascity/internal/beadmeta"
+	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/events"
+	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/session"
+)
+
+// gateTestRig is the single rig gateTestCity declares. The store refs the tests
+// pass alongside the city ("qcore", "astro", "") are matched against it, so the
+// name is fixed here rather than threaded through every call.
+const gateTestRig = "qcore"
+
+// gateTestCity builds a city with one pool-capable agent and one rig named
+// gateTestRig, with that rig's orphan_release knob set to orphanRelease (nil
+// leaves it unset).
+func gateTestCity(orphanRelease *bool) *config.City {
+	return &config.City{
+		Agents: []config.Agent{{Name: "worker", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(2)}},
+		Rigs: []config.Rig{{
+			Name:          gateTestRig,
+			Path:          "/tmp/" + gateTestRig,
+			OrphanRelease: orphanRelease,
+		}},
+	}
+}
+
+// seedGateWork creates an in_progress pool-routed bead with a dead assignee —
+// the shape releaseOrphanedPoolAssignments exists to reopen.
+func seedGateWork(t *testing.T, store beads.Store) beads.Bead {
+	t.Helper()
+	work, err := store.Create(beads.Bead{
+		Title:    "orphaned pool work",
+		Assignee: "worker-dead",
+		Metadata: map[string]string{"gc.routed_to": "worker"},
+	})
+	if err != nil {
+		t.Fatalf("Create work bead: %v", err)
+	}
+	if err := store.Update(work.ID, beads.UpdateOpts{Status: stringPtr("in_progress")}); err != nil {
+		t.Fatalf("Set work status: %v", err)
+	}
+	reloaded, err := store.Get(work.ID)
+	if err != nil {
+		t.Fatalf("Reload work bead: %v", err)
+	}
+	return reloaded
+}
+
+// assertStillClaimed proves the hold actually preserved the claim rather than
+// merely returning an empty released slice. A gate that returns "released
+// nothing" while some other path cleared the assignee would pass a
+// release-count-only assertion, which is the failure this check exists to
+// catch.
+func assertStillClaimed(t *testing.T, store beads.Store, id string) {
+	t.Helper()
+	got, err := store.Get(id)
+	if err != nil {
+		t.Fatalf("Get work bead: %v", err)
+	}
+	if got.Status != "in_progress" {
+		t.Fatalf("status = %q, want in_progress (claim must survive the hold)", got.Status)
+	}
+	if got.Assignee != "worker-dead" {
+		t.Fatalf("assignee = %q, want worker-dead (claim must survive the hold)", got.Assignee)
+	}
+}
+
+func TestPoolOrphanReleaseGate_UnsetKnobStillReleases(t *testing.T) {
+	store := beads.NewMemStore()
+	work := seedGateWork(t, store)
+
+	released := releaseOrphanedPoolAssignmentsFromBeads(
+		store, gateTestCity(nil), "", nil,
+		[]beads.Bead{work}, nil, []string{"qcore"}, nil,
+	)
+	if len(released) != 1 || released[0].ID != work.ID {
+		t.Fatalf("released = %v, want [%s] — an unset knob must not change behavior", released, work.ID)
+	}
+	got, err := store.Get(work.ID)
+	if err != nil {
+		t.Fatalf("Get work bead: %v", err)
+	}
+	if got.Status != "open" || got.Assignee != "" {
+		t.Fatalf("status=%q assignee=%q, want open/empty", got.Status, got.Assignee)
+	}
+}
+
+func TestPoolOrphanReleaseGate_DisabledRigHoldsClaim(t *testing.T) {
+	store := beads.NewMemStore()
+	work := seedGateWork(t, store)
+
+	released := releaseOrphanedPoolAssignmentsFromBeads(
+		store, gateTestCity(boolPtr(false)), "", nil,
+		[]beads.Bead{work}, nil, []string{"qcore"}, nil,
+	)
+	if len(released) != 0 {
+		t.Fatalf("released = %v, want none — orphan_release=false must stop the sweeper", released)
+	}
+	assertStillClaimed(t, store, work.ID)
+}
+
+func TestPoolOrphanReleaseGate_ExplicitTrueStillReleases(t *testing.T) {
+	store := beads.NewMemStore()
+	work := seedGateWork(t, store)
+
+	released := releaseOrphanedPoolAssignmentsFromBeads(
+		store, gateTestCity(boolPtr(true)), "", nil,
+		[]beads.Bead{work}, nil, []string{"qcore"}, nil,
+	)
+	if len(released) != 1 {
+		t.Fatalf("released = %v, want 1 — orphan_release=true is the default posture", released)
+	}
+}
+
+// A disabled rig must not quiesce OTHER rigs. This is the blast-radius check:
+// the cutover disables one shared rig while the rest of the city keeps working.
+func TestPoolOrphanReleaseGate_DisabledRigDoesNotAffectOtherRig(t *testing.T) {
+	store := beads.NewMemStore()
+	work := seedGateWork(t, store)
+
+	cfg := gateTestCity(boolPtr(false))
+	cfg.Rigs = append(cfg.Rigs, config.Rig{Name: "astro", Path: "/tmp/astro"})
+
+	released := releaseOrphanedPoolAssignmentsFromBeads(
+		store, cfg, "", nil,
+		[]beads.Bead{work}, nil, []string{"astro"}, nil,
+	)
+	if len(released) != 1 {
+		t.Fatalf("released = %v, want 1 — disabling qcore must not stop astro", released)
+	}
+}
+
+// City-owned work carries an empty store ref and has no rig knob to consult,
+// so it keeps releasing even while a rig is disabled.
+func TestPoolOrphanReleaseGate_CityStoreWorkUnaffected(t *testing.T) {
+	store := beads.NewMemStore()
+	work := seedGateWork(t, store)
+
+	released := releaseOrphanedPoolAssignmentsFromBeads(
+		store, gateTestCity(boolPtr(false)), "", nil,
+		[]beads.Bead{work}, nil, []string{""}, nil,
+	)
+	if len(released) != 1 {
+		t.Fatalf("released = %v, want 1 — city-store work has no rig knob", released)
+	}
+}
+
+// Without store refs the rig cannot be read off the index, so the gate must
+// fall back to the bead and FAIL CLOSED while any rig is disabled. A kill
+// switch that releases whenever provenance is murky is not a kill switch.
+func TestPoolOrphanReleaseGate_NoStoreRefsFailsClosedWhenAnyRigDisabled(t *testing.T) {
+	store := beads.NewMemStore()
+	work := seedGateWork(t, store)
+
+	released := releaseOrphanedPoolAssignmentsFromBeads(
+		store, gateTestCity(boolPtr(false)), "", nil,
+		[]beads.Bead{work}, nil, nil, nil,
+	)
+	if len(released) != 0 {
+		t.Fatalf("released = %v, want none — unresolvable rig must fail closed while a rig is disabled", released)
+	}
+	assertStillClaimed(t, store, work.ID)
+}
+
+// The same missing-refs path must be bit-for-bit unchanged on the overwhelming
+// majority of cities, where nobody sets the knob at all.
+func TestPoolOrphanReleaseGate_NoStoreRefsUnchangedWhenNoRigDisabled(t *testing.T) {
+	store := beads.NewMemStore()
+	work := seedGateWork(t, store)
+
+	released := releaseOrphanedPoolAssignmentsFromBeads(
+		store, gateTestCity(nil), "", nil,
+		[]beads.Bead{work}, nil, nil, nil,
+	)
+	if len(released) != 1 {
+		t.Fatalf("released = %v, want 1 — no knob set anywhere must behave exactly as before", released)
+	}
+}
+
+// The hold must be VISIBLE. A silent kill switch reproduces the class of bug
+// the sweeper's own foreign-identity gate was written to avoid, and the cutover
+// runbook reads this line as evidence the lever took effect.
+func TestHeldByOrphanReleaseGate_SummaryNamesRigCountAndIDs(t *testing.T) {
+	var held heldByOrphanReleaseGate
+	if held.summary() != "" {
+		t.Fatalf("summary on an empty gate = %q, want empty", held.summary())
+	}
+	for _, id := range []string{"qc-1", "qc-2", "qc-3", "qc-4", "qc-5", "qc-6", "qc-7"} {
+		held.add("qcore", id)
+	}
+	held.add("", "qc-orphan")
+
+	summary := held.summary()
+	if !strings.Contains(summary, "held 8 claims across 2 rig(s)") {
+		t.Fatalf("summary = %q, want an exact claim and rig count", summary)
+	}
+	if !strings.Contains(summary, `"qcore" (7: qc-1, qc-2, qc-3, qc-4, qc-5 +2 more)`) {
+		t.Fatalf("summary = %q, want an exact count with a sampled ID list", summary)
+	}
+	if !strings.Contains(summary, `"<unresolved>" (1: qc-orphan)`) {
+		t.Fatalf("summary = %q, want the unresolved bucket named, not an empty rig", summary)
+	}
+	if held.claims() != 8 {
+		t.Fatalf("claims() = %d, want 8", held.claims())
+	}
+}
+
+func TestRigOrphanReleaseDisabled_UnknownRigAndNilConfig(t *testing.T) {
+	cfg := gateTestCity(boolPtr(false))
+	if rigOrphanReleaseDisabled(cfg, "nosuchrig") {
+		t.Fatal("an unknown rig must not be treated as disabled")
+	}
+	if rigOrphanReleaseDisabled(nil, "qcore") {
+		t.Fatal("a nil config must not be treated as disabled")
+	}
+	if !rigOrphanReleaseDisabled(cfg, "QCORE") {
+		t.Fatal("rig name match must be case-insensitive, matching the rest of rig resolution")
+	}
+	if !poolOrphanReleaseAllowed(cfg, "") {
+		t.Fatal("empty store ref means the city store and must stay allowed")
+	}
+}
+
+// TestPoolOrphanReleaseGate_DisabledRigHoldsConfirmedOrphanRelease covers the
+// SECOND release site (the ga-jrnou orphan-close tie-break): a thrown
+// orphan_release = false stops it exactly as it stops the sweep, and says so.
+// The same call with the knob unset releases the claim, so the hold is the
+// knob's doing rather than another guard's.
+func TestPoolOrphanReleaseGate_DisabledRigHoldsConfirmedOrphanRelease(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		storeRefs []string
+	}{
+		{name: "rig read off the store ref", storeRefs: []string{"repo"}},
+		{name: "rig resolved from the bead", storeRefs: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cityStore := beads.NewMemStore()
+			rigStore := beads.NewMemStore()
+			rigStores := map[string]beads.Store{"repo": rigStore}
+			cfg := foreignIdentityTestCity(t)
+			cfg.Rigs[0].OrphanRelease = boolPtr(false)
+			info := session.Info{SessionNameMetadata: "repo/worker-1"}
+			work := seedForeignIdentityWork(t, rigStore, "claim under a locally minted pool instance", "repo/worker-1")
+
+			logBuf := captureSweepLog(t)
+			released := releaseConfirmedOrphanSessionWork(cfg, cityStore, rigStores,
+				[]beads.Bead{work}, []beads.Store{rigStore}, tc.storeRefs, info)
+			if len(released) != 0 {
+				t.Fatalf("released = %v, want none — orphan_release=false must stop the orphan-close release", released)
+			}
+			got, err := rigStore.Get(work.ID)
+			if err != nil {
+				t.Fatalf("Get work bead: %v", err)
+			}
+			if got.Status != "in_progress" || got.Assignee != "repo/worker-1" {
+				t.Fatalf("claim = status %q assignee %q, want in_progress/repo/worker-1 untouched", got.Status, got.Assignee)
+			}
+			if logged := logBuf.String(); !strings.Contains(logged, `orphan_release=false held `+work.ID+` in rig "repo"`) {
+				t.Fatalf("the hold must be reported with the bead and rig:\n%s", logged)
+			}
+
+			cfg.Rigs[0].OrphanRelease = nil
+			released = releaseConfirmedOrphanSessionWork(cfg, cityStore, rigStores,
+				[]beads.Bead{work}, []beads.Store{rigStore}, tc.storeRefs, info)
+			if len(released) != 1 || released[0].ID != work.ID {
+				t.Fatalf("released = %v, want [%s] with the knob unset", released, work.ID)
+			}
+		})
+	}
+}
+
+// seedCityOwnedGateWork creates in_progress work in the city store, routed to
+// the city-level worker pool and claimed by one of its instances. Neither its
+// route nor its ID prefix names a rig, so only a store ref can say it is
+// city-owned.
+func seedCityOwnedGateWork(t *testing.T, store beads.Store, assignee string) beads.Bead {
+	t.Helper()
+	work, err := store.Create(beads.Bead{
+		Title:    "city-owned pool work",
+		Assignee: assignee,
+		Metadata: map[string]string{beadmeta.RoutedToMetadataKey: "worker"},
+	})
+	if err != nil {
+		t.Fatalf("Create city work bead: %v", err)
+	}
+	if err := store.Update(work.ID, beads.UpdateOpts{Status: stringPtr("in_progress")}); err != nil {
+		t.Fatalf("Set city work status: %v", err)
+	}
+	work, err = store.Get(work.ID)
+	if err != nil {
+		t.Fatalf("Reload city work bead: %v", err)
+	}
+	return work
+}
+
+// TestPoolOrphanReleaseGate_DisabledRigSparesCityOwnedConfirmedOrphanRelease is
+// the city-store exemption on the SECOND release site, matching the sweep's
+// (TestPoolOrphanReleaseGate_CityStoreWorkUnaffected): city-owned work carries
+// the empty store ref and no rig knob, so a rig with orphan_release = false
+// must not hold its orphan-close release. A held release leaves the orphaned
+// seat holding the work, and the close guard then refuses to close it on every
+// tick. Provenance is what earns the exemption: with no store refs this bead's
+// rig cannot be resolved, so the release still fails closed.
+func TestPoolOrphanReleaseGate_DisabledRigSparesCityOwnedConfirmedOrphanRelease(t *testing.T) {
+	cfg := foreignIdentityTestCity(t)
+	cfg.Rigs[0].OrphanRelease = boolPtr(false)
+	rigStores := map[string]beads.Store{"repo": beads.NewMemStore()}
+	info := session.Info{SessionNameMetadata: "worker-1"}
+
+	t.Run("city store ref releases", func(t *testing.T) {
+		cityStore := beads.NewMemStore()
+		work := seedCityOwnedGateWork(t, cityStore, "worker-1")
+
+		released := releaseConfirmedOrphanSessionWork(cfg, cityStore, rigStores,
+			[]beads.Bead{work}, []beads.Store{cityStore}, []string{""}, info)
+		if len(released) != 1 || released[0].ID != work.ID {
+			t.Fatalf("released = %v, want [%s] — a disabled rig must not hold city-owned work", released, work.ID)
+		}
+		got, err := cityStore.Get(work.ID)
+		if err != nil {
+			t.Fatalf("Get city work bead: %v", err)
+		}
+		if got.Status != "open" || got.Assignee != "" {
+			t.Fatalf("claim = status %q assignee %q, want open/unassigned", got.Status, got.Assignee)
+		}
+	})
+
+	t.Run("no store refs fails closed", func(t *testing.T) {
+		cityStore := beads.NewMemStore()
+		work := seedCityOwnedGateWork(t, cityStore, "worker-1")
+
+		logBuf := captureSweepLog(t)
+		released := releaseConfirmedOrphanSessionWork(cfg, cityStore, rigStores,
+			[]beads.Bead{work}, []beads.Store{cityStore}, nil, info)
+		if len(released) != 0 {
+			t.Fatalf("released = %v, want none — an unresolvable rig must fail closed while a rig is disabled", released)
+		}
+		got, err := cityStore.Get(work.ID)
+		if err != nil {
+			t.Fatalf("Get city work bead: %v", err)
+		}
+		if got.Status != "in_progress" || got.Assignee != "worker-1" {
+			t.Fatalf("claim = status %q assignee %q, want in_progress/worker-1 untouched", got.Status, got.Assignee)
+		}
+		if logged := logBuf.String(); !strings.Contains(logged, `orphan_release=false held `+work.ID+` in rig "<unresolved>"`) {
+			t.Fatalf("the fail-closed hold must be reported:\n%s", logged)
+		}
+	})
+}
+
+// TestPoolOrphanReleaseGate_DisabledRigDoesNotWedgeCityOrphanClose runs the
+// controller's bead-reconcile tick over a confirmed-orphaned CITY pool seat that
+// holds city-store work while a rig has orphan_release = false. The store ref
+// travels the production route (DesiredStateResult, the wake filter, the start
+// option, the orphan close), so the tie-break releases the work and the seat
+// closes in the same tick instead of wedging.
+func TestPoolOrphanReleaseGate_DisabledRigDoesNotWedgeCityOrphanClose(t *testing.T) {
+	cityDir := t.TempDir()
+	writeCityTOML(t, cityDir, "gate-town", "mayor")
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "gate-town"},
+		Session:   config.SessionConfig{Provider: "fake"},
+		Rigs: []config.Rig{{
+			Name:          gateTestRig,
+			Path:          filepath.Join(cityDir, gateTestRig),
+			OrphanRelease: boolPtr(false),
+		}},
+		Agents: []config.Agent{{Name: "worker", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(1)}},
+	}
+	store := beads.NewMemStore()
+	seat, err := store.Create(beads.Bead{
+		Title:  "worker",
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"session_name":       "worker-1",
+			"template":           "worker",
+			"agent_name":         "worker",
+			"state":              "asleep",
+			"generation":         "1",
+			"continuation_epoch": "1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create session bead: %v", err)
+	}
+	work := seedCityOwnedGateWork(t, store, "worker-1")
+
+	cr := &CityRuntime{
+		cityPath:            cityDir,
+		cityName:            "gate-town",
+		cfg:                 cfg,
+		sp:                  runtime.NewFake(),
+		standaloneCityStore: store,
+		standaloneRigStores: map[string]beads.Store{gateTestRig: beads.NewMemStore()},
+		sessionDrains:       newDrainTracker(),
+		rec:                 events.NewFake(),
+		logPrefix:           "gc",
+		stdout:              io.Discard,
+		stderr:              io.Discard,
+	}
+	cr.beadReconcileTick(context.Background(), newSeatWork(cr.workLegs()), DesiredStateResult{
+		State:                 map[string]TemplateParams{},
+		AssignedWorkBeads:     []beads.Bead{work},
+		AssignedWorkStores:    []beads.Store{store},
+		AssignedWorkStoreRefs: []string{""},
+	}, newSessionBeadSnapshot([]beads.Bead{seat}), nil, false)
+
+	gotWork, err := store.Get(work.ID)
+	if err != nil {
+		t.Fatalf("Get city work bead: %v", err)
+	}
+	if gotWork.Status != "open" || gotWork.Assignee != "" {
+		t.Fatalf("claim = status %q assignee %q, want open/unassigned — a disabled rig must not hold city-owned work on a confirmed orphan", gotWork.Status, gotWork.Assignee)
+	}
+	gotSeat, err := store.Get(seat.ID)
+	if err != nil {
+		t.Fatalf("Get session bead: %v", err)
+	}
+	if gotSeat.Status != "closed" {
+		t.Fatalf("session bead status = %q, want closed — once the work is released the close guard stops refusing", gotSeat.Status)
+	}
+}
+
+// v2OrphanCloseCase is a v2 close effect over a confirmed-orphaned pool row
+// (the closeCase harness) in a city with rig "repo" declared, whose work legs
+// include repoStore as that rig's store: what the effect's orphan release
+// reads its claims through.
+func v2OrphanCloseCase(t *testing.T, orphanRelease *bool, meta ...string) (c *closeCase, repoStore beads.Store) {
+	t.Helper()
+	c = newCloseCase(t, livenessGone, desireDrain, append([]string{"state", "asleep"}, meta...)...)
+	c.entry().DrainReason = drainOrphaned
+	c.cfg.Rigs = []config.Rig{{Name: "repo", Path: filepath.Join(c.w.CityPath, "repo"), OrphanRelease: orphanRelease}}
+	repoStore = beads.NewMemStore()
+	c.w.WorkLegs = testWorkLegs(c.w.CityPath, c.cfg, c.store, map[string]beads.Store{"repo": repoStore})
+	return c, repoStore
+}
+
+// assertClaim fails unless claim id in store is (status, assignee).
+func assertClaim(t *testing.T, store beads.Store, id, status, assignee, what string) {
+	t.Helper()
+	got, err := store.Get(id)
+	if err != nil {
+		t.Fatalf("get %s: %v", what, err)
+	}
+	if got.Status != status || got.Assignee != assignee {
+		t.Fatalf("%s = status %q assignee %q, want %q/%q", what, got.Status, got.Assignee, status, assignee)
+	}
+}
+
+// The v2 close effect's orphan release takes the orphan_release stop lever
+// (ga-h5435p) as the legacy tie-break does: a disabled rig holds the claim the
+// seat keeps in that rig's store, so the close refuses has-work, while the
+// seat's city-owned claim (read on the city work leg) is still released. With
+// the knob unset the same rig claim is released and the close lands.
+func TestV2OrphanCloseHonorsOrphanReleaseSwitch(t *testing.T) {
+	t.Run("disabled rig holds its claim, spares city work", func(t *testing.T) {
+		c, repoStore := v2OrphanCloseCase(t, boolPtr(false))
+		rigClaim := createWork(t, repoStore, "in_progress", c.k.ID, routedClaim())
+		cityClaim := c.work(t, "in_progress", routedClaim())
+		logBuf := captureSweepLog(t)
+		s := c.run(t, gone().tmux())
+		if s.Cause != causeHasWork || c.row(t).Status == "closed" {
+			t.Fatalf("settlement %+v row %s, want refused has-work over the held claim", s, c.row(t).Status)
+		}
+		assertClaim(t, repoStore, rigClaim.ID, "in_progress", c.k.ID, "rig claim under orphan_release=false")
+		assertClaim(t, c.store, cityClaim.ID, "open", "", "city-owned claim")
+		if logged := logBuf.String(); !strings.Contains(logged, `orphan_release=false held `+rigClaim.ID+` in rig "repo"`) {
+			t.Fatalf("the hold must be reported with the bead and rig:\n%s", logged)
+		}
+	})
+	t.Run("unset knob releases and closes", func(t *testing.T) {
+		c, repoStore := v2OrphanCloseCase(t, nil)
+		rigClaim := createWork(t, repoStore, "in_progress", c.k.ID, routedClaim())
+		if s := c.run(t, gone().tmux()); s.Outcome != settledLanded || c.row(t).Status != "closed" {
+			t.Fatalf("settlement %+v, want the close landed", s)
+		}
+		assertClaim(t, repoStore, rigClaim.ID, "open", "", "rig claim with the knob unset")
+	})
+}
+
+// The v2 close effect's orphan release takes the orphan close's roster gate
+// (#5952 carry, composed with #7763) as the legacy tie-break does: a claim
+// held under a qualified identity this city cannot observe, which the seat
+// matches only through a raw stored session_name, is protected and the close
+// refuses has-work; the seat's own alias claim, off the roster but answered
+// by the seat's record, is released.
+func TestV2OrphanCloseHonorsForeignIdentityGate(t *testing.T) {
+	c, repoStore := v2OrphanCloseCase(t, nil, "session_name", "repo/dalinar", "alias", "repo/nux")
+	// A namepool seat: its alias is a stable identity (a numeric slot's is
+	// not, and never enters the release scope); "nux" has left the namepool.
+	c.cfg.Agents[2].NamepoolNames = []string{"furiosa"}
+	if poolAssigneeIsLocallyObservable(c.cfg, "test-city", "repo/dalinar") || poolAssigneeIsLocallyObservable(c.cfg, "test-city", "repo/nux") {
+		t.Fatal("fixture: both qualified identities must fail the roster, or this test proves nothing")
+	}
+	foreign := createWork(t, repoStore, "in_progress", "repo/dalinar", routedClaim())
+	own := createWork(t, repoStore, "in_progress", "repo/nux", routedClaim())
+	logBuf := captureSweepLog(t)
+	s := c.run(t, gone().tmux())
+	if s.Cause != causeHasWork || c.row(t).Status == "closed" {
+		t.Fatalf("settlement %+v row %s, want refused has-work over the protected claim", s, c.row(t).Status)
+	}
+	assertClaim(t, repoStore, foreign.ID, "in_progress", "repo/dalinar", "foreign-shaped claim")
+	assertClaim(t, repoStore, own.ID, "open", "", "the seat's own alias claim")
+	if logged := logBuf.String(); !strings.Contains(logged, `protected "repo/dalinar" (`+foreign.ID+`)`) {
+		t.Fatalf("the gate must refuse loudly, naming the identity and claim:\n%s", logged)
+	}
+}

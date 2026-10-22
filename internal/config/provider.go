@@ -260,6 +260,13 @@ type ResolvedProvider struct {
 	// Used by ResolveDefaultArgs() to produce CLI flags and by the API to
 	// tell real-world apps what pre-selections to show.
 	EffectiveDefaults map[string]string
+	// SessionDisplayName is the owning seat's qualified identity (e.g.
+	// "woodhouse", "qcore/oversight.project-lead"), stamped at resolution
+	// time. Claude-family tmux launches append it as `--name` so the
+	// vendor /resume picker, prompt box, and cross-session messaging show
+	// the seat instead of an auto-generated summary (ga-n0rvsk). Empty for
+	// escape-hatch commands, where the user owns the whole command line.
+	SessionDisplayName string
 }
 
 const (
@@ -267,6 +274,19 @@ const (
 	SessionTransportACP = "acp"
 	// SessionTransportTmux creates sessions through the tmux-backed CLI path.
 	SessionTransportTmux = "tmux"
+)
+
+// Wake-transport selectors for Agent.WakeTransport (notification plane,
+// claudemsg-bridge-design.md §4). Distinct namespace from the session
+// transports above: a wake transport delivers notifications, it does not
+// create sessions.
+const (
+	// WakeTransportSession is the default: today's worker.Handle
+	// wait-idle/queued nudge path, unchanged.
+	WakeTransportSession = "session"
+	// WakeTransportClaudeCloud delivers wake hints into a bound Claude Code
+	// cloud session via `claude -p --cloud` (ga-bjbaui).
+	WakeTransportClaudeCloud = "claude-cloud"
 )
 
 // IsValidSessionTransport reports whether transport is a recognized explicit
@@ -278,6 +298,24 @@ func IsValidSessionTransport(transport string) bool {
 	default:
 		return false
 	}
+}
+
+// AccountFamily returns the builtin family that owns this provider's
+// account/credential semantics: the chain-derived BuiltinAncestor when set,
+// the deprecated Kind during transition, else the provider's own name (which
+// covers a raw builtin used directly). Consumers gate family-specific account
+// rules on it — e.g. processenv.RequireDeclaredClaudeAccount (ga-ai7gz2).
+func (rp *ResolvedProvider) AccountFamily() string {
+	if rp == nil {
+		return ""
+	}
+	if f := strings.TrimSpace(rp.BuiltinAncestor); f != "" {
+		return f
+	}
+	if f := strings.TrimSpace(rp.Kind); f != "" {
+		return f
+	}
+	return strings.TrimSpace(rp.Name)
 }
 
 // CommandString returns the full command line: command followed by args.
@@ -304,6 +342,23 @@ func (rp *ResolvedProvider) ACPCommandString() string {
 		return cmd
 	}
 	return cmd + " " + shellquote.Join(args)
+}
+
+// LaunchModelFromCommand extracts the effective --model value from a resolved
+// provider command. Last flag wins, matching CLI flag semantics.
+func LaunchModelFromCommand(command string) string {
+	tokens := shellquote.Split(command)
+	model := ""
+	for i := 0; i < len(tokens); i++ {
+		switch {
+		case tokens[i] == "--model" && i+1 < len(tokens):
+			model = tokens[i+1]
+			i++
+		case strings.HasPrefix(tokens[i], "--model="):
+			model = strings.TrimPrefix(tokens[i], "--model=")
+		}
+	}
+	return model
 }
 
 // DefaultSessionTransport returns the transport used for provider-backed

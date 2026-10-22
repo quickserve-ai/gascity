@@ -33,6 +33,59 @@ else
 fi
 DOLT_PROVIDER_STATE_FILE="$DOLT_STATE_DIR/dolt-provider-state.json"
 
+# Backup remote-verification stamps (qc-lu207, ga-a8w1c). One file per
+# database-and-remote PAIR under $PACK_STATE_DIR/backup-freshness/<db>@<remote>,
+# written after a push succeeds OR a fetch-and-classify proves local and remote
+# are up to date. Health reads these stamps without making its own network
+# round trip.
+#
+# SEMANTICS — a stamp means "the sync path recently proved THIS remote contains
+# the local branch", either because the push returned 0 or because a successful
+# fetch found zero commits ahead and behind. This local proxy avoids remote
+# probes in health itself, which must stay cheap and bounded when the remote is
+# down.
+#
+# WHY THE KEY CARRIES THE REMOTE (ga-3o5xrw). The stamp used to be one file per
+# DATABASE, which structurally cannot represent a database with N remotes: the
+# last writer won, so a fresh stamp could mean "the live mirror was pushed" OR
+# "the dead mirror was picked and nothing was pushed at all". qcore has two
+# configured remotes and read fresh in exactly that second case. One stamp per
+# pair makes the question health asks ("was EVERY configured remote verified
+# recently?") expressible; a single per-db stamp could only ever answer "was
+# SOMETHING verified recently?", which is not a durability claim.
+#
+# `@` is a safe separator: database names are constrained by valid_database_name
+# and remote names by valid_remote_name, and neither admits '@' or '/'.
+BACKUP_FRESHNESS_DIR="$PACK_STATE_DIR/backup-freshness"
+
+# backup_stamp_path <db> <remote> — the stamp file for one database/remote pair.
+backup_stamp_path() {
+  printf '%s/%s@%s\n' "$BACKUP_FRESHNESS_DIR" "$1" "$2"
+}
+
+# write_backup_push_stamp <db> <remote> <local_branch> <remote_branch>
+# Best-effort: a stamp failure must never fail a successful push or remote
+# verification, so every step degrades to a silent no-op. tmp+mv keeps a
+# concurrent health read from seeing a torn file.
+write_backup_push_stamp() {
+  bfs_db="$1"
+  bfs_remote="$2"
+  bfs_path=$(backup_stamp_path "$bfs_db" "$bfs_remote")
+  mkdir -p "$BACKUP_FRESHNESS_DIR" 2>/dev/null || return 0
+  {
+    printf 'pushed_at_epoch=%s\n' "$(date +%s)"
+    printf 'remote=%s\n' "$bfs_remote"
+    printf 'refspec=%s:%s\n' "$3" "$4"
+  } > "$bfs_path.tmp" 2>/dev/null || { rm -f "$bfs_path.tmp" 2>/dev/null; return 0; }
+  mv -f "$bfs_path.tmp" "$bfs_path" 2>/dev/null || return 0
+}
+
+# _backup_stamp.sh carries write_local_backup_sync_stamp (ga-g3p5rm); the
+# backup molecule sources it on its own, so it must not depend on runtime.sh.
+# Resolve it the way the sibling helpers below are resolved: the commands run
+# under POSIX sh, where `.` of a missing path is fatal and $0 is the command.
+. "${GC_PACK_DIR:-${PACK_DIR:-${GC_SYSTEM_PACKS_DIR:-$GC_CITY_PATH/.gc/system/packs}/dolt}}/assets/scripts/_backup_stamp.sh"
+
 GC_BEADS_BD_SCRIPT="$GC_CITY_PATH/.gc/scripts/gc-beads-bd.sh"
 
 # is_local_dolt_host returns 0 (true) when the argument names the local managed

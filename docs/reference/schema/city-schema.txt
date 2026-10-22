@@ -130,6 +130,14 @@
           ],
           "description": "Session overrides the session transport for this agent.\n\"\" (default) uses the city-level session provider (typically tmux).\n\"acp\" uses the Agent Client Protocol (JSON-RPC over stdio).\nThe agent's resolved provider must have supports_acp = true."
         },
+        "wake_transport": {
+          "type": "string",
+          "enum": [
+            "session",
+            "claude-cloud"
+          ],
+          "description": "WakeTransport selects this seat's notification-plane wake transport\n(claudemsg-bridge-design.md §4). \"\" and \"session\" mean today's\nworker.Handle wait-idle/queued path, byte-for-byte. \"claude-cloud\"\n(ga-bjbaui) delivers wake hints into a bound Claude Code cloud\nsession. Selection is structural per-seat configuration validated at\nload — never a runtime capability probe; a seat whose harness lacks\nthe selected transport is a config error, not a silent fallback.\n(Distinct from WakeMode, which controls resume-vs-fresh on wake.)"
+        },
         "provider": {
           "type": "string",
           "description": "Provider names the provider preset to use for this agent."
@@ -338,6 +346,13 @@
           "type": "boolean",
           "description": "InjectAssignedSkills controls whether gc appends an\n\"assigned skills\" appendix to the agent's rendered prompt. The\nappendix lists every skill visible to this agent, partitioned\ninto (assigned-to-you, shared-with-every-agent), so agents\nsharing a scope-root sink can tell which skills are their\nspecialization vs which are the city-wide set.\n\nPointer tri-state:\n  nil   -\u003e inherit: inject when the agent has a vendor sink\n  *true -\u003e explicitly inject (equivalent to the default)\n  *false -\u003e disable; the template is responsible for rendering\n            any skill guidance itself"
         },
+        "opt_in_skills": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "description": "OptInSkills names the opt-in skills this agent receives. A pack ships\nan opt-in skill under skills/opt-in/\u003cname\u003e/SKILL.md, and no agent\nreceives it unless it names it here. Names use the shared catalog's\nform: \"\u003cbinding\u003e.\u003cname\u003e\" for an imported pack's skill, \"\u003cname\u003e\" for the\ncity pack's own. A name must resolve to an opt-in skill in the agent's\nscope (the city's imports, plus its rig's imports for a rig-scoped\nagent), or config load fails. An agent whose work_dir is its scope\nroot receives its opt-ins in the scope root's skill directory, and\nevery session the provider loads that directory for sees them: for\nClaude Code, sessions started there and in plain subdirectories below\nit in the same repository, but not sessions in their own linked\nworktrees. An agent with its own work_dir receives its opt-ins in that\nwork_dir alone; that is how a seat gets an opt-in skill exclusively."
+        },
         "attach": {
           "type": "boolean",
           "description": "Attach controls whether the agent's session supports interactive\nattachment (e.g., tmux attach). When false, the agent can use a\nlighter runtime (subprocess instead of tmux). Defaults to true."
@@ -505,6 +520,10 @@
         "session": {
           "type": "string",
           "description": "Session overrides the session transport (\"acp\")."
+        },
+        "wake_transport": {
+          "type": "string",
+          "description": "WakeTransport overrides the seat's notification-plane wake transport\n(\"session\" or \"claude-cloud\"; see Agent.WakeTransport)."
         },
         "provider": {
           "type": "string",
@@ -713,6 +732,20 @@
           "type": "array",
           "description": "InjectFragmentsAppend appends to the agent's inject_fragments list."
         },
+        "opt_in_skills": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "description": "OptInSkills replaces the agent's opt_in_skills list (see\nAgent.OptInSkills). Leave it unset to keep the agent's list; set an\nempty list to clear it."
+        },
+        "opt_in_skills_append": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "description": "OptInSkillsAppend appends to the agent's opt_in_skills list."
+        },
         "max_active_sessions": {
           "type": "integer",
           "description": "MaxActiveSessions overrides the agent-level cap on concurrent sessions."
@@ -802,6 +835,10 @@
         "session": {
           "type": "string",
           "description": "Session overrides the session transport (\"acp\" or \"tmux\")."
+        },
+        "wake_transport": {
+          "type": "string",
+          "description": "WakeTransport overrides the seat's notification-plane wake transport\n(\"session\" or \"claude-cloud\"; see Agent.WakeTransport)."
         },
         "provider": {
           "type": "string",
@@ -1009,6 +1046,20 @@
           },
           "type": "array",
           "description": "InjectFragmentsAppend appends to the agent's inject_fragments list."
+        },
+        "opt_in_skills": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "description": "OptInSkills replaces the agent's opt_in_skills list (see\nAgent.OptInSkills). Leave it unset to keep the agent's list; set an\nempty list to clear it."
+        },
+        "opt_in_skills_append": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "description": "OptInSkillsAppend appends to the agent's opt_in_skills list, the way\ninject_fragments_append adds a prompt fragment."
         },
         "max_active_sessions": {
           "type": "integer",
@@ -1508,7 +1559,7 @@
         },
         "auto_reap_closed_bead_worktrees": {
           "type": "boolean",
-          "description": "AutoReapClosedBeadWorktrees controls whether the reconciler patrol\nautomatically removes per-bead git worktrees once their associated\nwork bead reaches closed status. Only worktrees with a clean working\ntree, no stashes, and no commits that removal would orphan — commits\nreachable from no branch, tag, or remote-tracking ref — are removed;\npush state is deliberately not the test, since `git worktree remove`\ndeletes the checkout and not refs/heads. Unsafe worktrees are logged\nas warnings and left in place for operator review. Session\nhome directories (agent template directories) are never touched.\nDefaults to false. Set to true to enable automated worktree cleanup.",
+          "description": "AutoReapClosedBeadWorktrees controls whether the reconciler patrol\nautomatically removes per-bead git worktrees once their associated\nwork bead reaches closed status. Only worktrees with a clean working\ntree (gc's own provisioning files do not count) and no commits that\nremoval would orphan — commits\nreachable from no branch, tag, or remote-tracking ref — are removed;\npush state is deliberately not the test, since `git worktree remove`\ndeletes the checkout and not refs/heads. Unsafe worktrees are logged\nas warnings and left in place for operator review. Session\nhome directories (agent template directories) are never touched.\nDefaults to false. Set to true to enable automated worktree cleanup.",
           "default": false
         },
         "auto_reap_closed_bead_worktrees_dry_run": {
@@ -1521,6 +1572,16 @@
           "description": "AutoReapClosedBeadWorktreesMinAgeMinutes is the minimum worktree age,\nin minutes, before a closed-bead worktree becomes eligible for reap\nclassification at all (borrow-veto scan and beyond). This quarantines\na worktree against the race between its creation and its owning\nbead's gc.work_dir/work_dir metadata being stamped by the next\nreconcile pass — without it, a just-created worktree could look\nunclaimed to the borrow-veto scan before the metadata that would\nprotect it has been written. Nil (unset) defaults to\nDefaultAutoReapClosedBeadWorktreesMinAgeMinutes. Zero disables the\nquarantine entirely (every closed-bead worktree is immediately\neligible for the rest of the gate chain, regardless of age).",
           "default": 10
         },
+        "auto_reap_closed_bead_worktrees_quiet_period_minutes": {
+          "type": "integer",
+          "description": "AutoReapClosedBeadWorktreesQuietPeriodMinutes is how long, in minutes,\na closed-bead worktree must go unused (no commit, checkout, `git add` or\nfile creation in its root) before it becomes eligible for reap\nclassification. It protects a tree a seat works in through short-lived\nshell calls, which the liveness gate cannot see, and is separate from\nthe creation-age quarantine above. Nil (unset) defaults to\nDefaultAutoReapClosedBeadWorktreesQuietPeriodMinutes. Zero disables it.",
+          "default": 360
+        },
+        "auto_reap_stopped_agent_homes": {
+          "type": "boolean",
+          "description": "AutoReapStoppedAgentHomes controls whether the reconciler removes closed,\nstopped configured named/namepool worktree homes. The reaper fails closed\nunless runtime/session and assignment snapshots are available, and requires\na clean registered worktree with no unpushed commits or nested registered\nworktrees. A repository stash is not a gate: it lives in the common repo,\nwhich removing a worktree never touches. Defaults to false.",
+          "default": false
+        },
         "start_ready_timeout": {
           "type": "string",
           "description": "StartReadyTimeout is how long `gc start` and `gc register` wait for\nthe supervisor to report the city as Running. Cities with many\nregistered or adopted sessions take longer to start because the\nper-tick wake budget (max_wakes_per_tick) throttles startup: wall\ntime to wake N sessions is roughly ceil(N / max_wakes_per_tick) *\npatrol_interval. At the defaults (5 wakes / 30s), ~40 sessions\nneed ~4 minutes. Duration string (e.g., \"5m\", \"10m\"). Defaults to\nDefaultStartReadyTimeout (5m). When set, this value replaces the\ndefault start/register budget; [session].startup_timeout may still\nextend the effective wait for a slow single session.",
@@ -1532,7 +1593,7 @@
         },
         "auto_prune_worker_dir": {
           "type": "boolean",
-          "description": "AutoPruneWorkerDir controls whether the reconciler removes a\npool-managed session's worker_dir (agent worktree) after the session\nbead is closed. Removal is gated on: path lives under the city's\n.gc/worktrees/ tree, clean working tree, no unpushed commits, no\nstashed work. Nil (unset) defaults to true so pool worktrees do not\naccumulate without bound across pool recycles. Set to false to\nretain worktrees for post-session diagnostics.",
+          "description": "AutoPruneWorkerDir controls whether the reconciler removes a\npool-managed session's worker_dir (agent worktree) after the session\nbead is closed. Removal is gated on: path lives under the city's\n.gc/worktrees/ tree, clean working tree (gc's own provisioning files\nand .worktree-stale marker do not count), no unpushed commits. A\nrepository stash is not a gate. Nil (unset) defaults to true so pool worktrees do not\naccumulate without bound across pool recycles. Set to false to\nretain worktrees for post-session diagnostics.",
           "default": true
         }
       },
@@ -2008,11 +2069,48 @@
         "unread_retention_ttl": {
           "type": "string",
           "description": "UnreadRetentionTTL is how long a never-read mail bead stays open before\nthe nudge-mail sweep closes it. Empty or \"0\" disables the unread-mail\nphase; it is opt-in so unread mail is never closed by default."
+        },
+        "crosscity": {
+          "$ref": "#/$defs/MailCrossCityConfig",
+          "description": "CrossCity enables city-qualified mail addressing (\u003ccity\u003e/\u003caddress\u003e).\nAbsent means disabled: every recipient resolves exactly as today."
         }
       },
       "additionalProperties": false,
       "type": "object",
       "description": "MailConfig holds mail provider settings."
+    },
+    "MailCrossCityConfig": {
+      "properties": {
+        "city": {
+          "type": "string",
+          "description": "City is this city's own segment in city-qualified addresses, and it is\nREQUIRED when the section is present: the CLI and the API derive the\neffective city name differently (site binding, workspace name, the\nsupervisor's registered name), so a defaulted name could stamp two\nspellings of this city on mail and strand replies. \u003cCity\u003e/\u003caddress\u003e and\n\u003caddress\u003e are one mailbox."
+        },
+        "cities": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "description": "Cities lists the peer cities addressable as \u003ccity\u003e/\u003caddress\u003e. A\nrecipient naming a listed city resolves against the roster and is never\nlooked up in the local session store."
+        },
+        "towns": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object",
+          "description": "Towns maps a listed peer city to the town whose rendered roster\n(cities/\u003ctown\u003e/agents.json) lists that city's seats. A send to a\nmapped city is refused unless the seat is in that list; a peer city\nwith no mapping keeps the city-level rules only."
+        },
+        "roster_root": {
+          "type": "string",
+          "description": "RosterRoot points at the directory holding cities/\u003ctown\u003e/agents.json\nand overrides discovery. Unset, the roster is the pack-cache clone of\nthe imported repository that ships cities/, at its packs.lock commit;\nwith no such import there is no list and sends behave exactly as\nbefore this knob existed."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "city",
+        "cities"
+      ],
+      "description": "MailCrossCityConfig enables city-qualified mail addressing: recipients of the form \u003ccity\u003e/\u003caddress\u003e, where the first path segment names a city and the remainder is that city's own address form."
     },
     "MaintenanceConfig": {
       "properties": {
@@ -2155,11 +2253,12 @@
           "items": {
             "type": "string",
             "enum": [
-              "message"
+              "message",
+              "respond"
             ]
           },
           "type": "array",
-          "description": "Authoritative lists the op kinds the conversation lane executes instead\nof their legacy path. The default is empty, and message is not on by\ndefault anywhere yet. This build accepts message only. Experimental: no\nrequest surface writes lane ops yet, so listing a kind changes no\nrequest's delivery in this build. The city's controller, standalone\nor supervisor-hosted, runs the lane host that delivers lane ops, and\ngc doctor reports a listed kind as an error when no lane host serves\nthe city. A keystroke-mode runtime (tmux) takes delivery at an idle\nboundary, a protocol-mode runtime (t3bridge) at its turn boundary.\nA listed kind needs a sessions store with guarded batches. A change\ntakes effect at the next controller start."
+          "description": "Authoritative lists the op kinds the conversation lane executes instead\nof their legacy path. The default is empty, and message is not on by\ndefault anywhere yet. This build accepts message and respond.\nExperimental: listing message switches on the producers that write lane\nops, whose messages the lane host then delivers: the API's POST\n/v0/city/{cityName}/session/{id}/ops (a T3 Code environment or an\noperator proposing a message) and, for sessions a lane host can type\ninto (a keystroke-mode runtime, or one a box host serves), the\ncontroller's planner notices (drain reminders, the nudge backstop) and\ngc session nudge. gc session nudge delivers inline what its delivery\nmode allows now, where it can type into the session: wait-idle only at\nan idle boundary; immediate there too, or into a running turn when the\nruntime can steer it, else at the next boundary. It leaves the rest to\nthe controller's lane host, and the content gate no longer governs it.\nThe API's submit and messages, gc session submit, mail --notify, sling\n--nudge and wait nudges keep their legacy delivery in this build. No\nrequest surface writes respond ops yet, so listing respond changes no\nrequest's delivery in this build. Under session_reconciler = \"v2\", do\nnot list message yet (gc doctor warns).\nThe city's controller, standalone or supervisor-hosted, runs the lane\nhost that delivers lane ops, and gc doctor reports a listed kind as an\nerror when no lane host serves the city. A keystroke-mode runtime (tmux)\ntakes a boundary delivery at an idle boundary, a protocol-mode runtime\n(t3bridge) at its turn boundary. A message the ops route proposes with\nwhen now, or the legacy interrupt, runs as one deliver-now unit: the\nlane host interrupts the session's running turn, then delivers the\nmessage at the boundary the interrupt leaves.\nA listed kind needs a sessions store with guarded batches. A change\ntakes effect at the controller's next start; gc session nudge reads it\nat once."
         }
       },
       "additionalProperties": false,
@@ -2253,6 +2352,10 @@
         "check_timeout": {
           "type": "string",
           "description": "CheckTimeout overrides the condition trigger's check-command deadline.\nGo duration string. Lets a deployment tune check_timeout for a scanned\nshared-pack order (e.g. a slow-store queue check) without editing the\npack source."
+        },
+        "run_stale_after": {
+          "type": "string",
+          "description": "RunStaleAfter overrides how long the order's formula runs may stay open\nbefore the controller reports them as stale, naming who holds each one.\nThe report closes nothing. Go duration string; default 6h. Lets a\ndeployment raise it for a scanned shared-pack order whose runs\nlegitimately take longer, without editing the pack source."
         },
         "idempotent": {
           "type": "boolean",
@@ -2760,6 +2863,10 @@
           "type": "integer",
           "description": "MaxActiveSessions is the rig-level cap on total concurrent sessions across\nall agents in this rig. Nil means inherit from workspace (or unlimited)."
         },
+        "orphan_release": {
+          "type": "boolean",
+          "description": "OrphanRelease controls whether the controller's in-process pool orphan\nsweeper (releaseOrphanedPoolAssignments) may clear assignees and reopen\nwork in THIS rig's bead store. Nil means enabled, which is the behavior\nevery city had before the knob existed; set false to stop the sweeper\nwriting to this rig without suspending it.\n\nThe lever exists for cutovers where a rig's store is shared with another\ncity and every autonomous writer has to be quiesced (ga-h5435p). It is\nrig config rather than an environment variable on purpose: the sweeper\nruns inside the long-lived supervisor, so an env knob could only be\nthrown by restarting that process, which can strand every session in the\ncity (ga-4v3ckk) — the worst possible move mid-cutover.\n\nTurning it off stops orphan RECOVERY for the rig too: work whose claimant\ndied stays claimed until the knob comes back. That is the intended\ntrade for a cutover window, not a setting to leave off indefinitely."
+        },
         "overrides": {
           "items": {
             "$ref": "#/$defs/AgentOverride"
@@ -2807,6 +2914,10 @@
         "beads_proxied_idle_timeout": {
           "type": "string",
           "description": "BeadsProxiedIdleTimeout overrides [beads] proxied_idle_timeout for this\nrig's bd-owned proxied scope. Go duration; \"0\" means never. Ignored, with\na warning, for a rig that shares the city's proxy root: one proxy serves\nevery scope on that root and carries the city's value."
+        },
+        "doctor": {
+          "$ref": "#/$defs/RigDoctorConfig",
+          "description": "Doctor holds rig-scoped gc doctor policy ([rigs.doctor])."
         }
       },
       "additionalProperties": false,
@@ -2815,6 +2926,28 @@
         "name"
       ],
       "description": "Rig defines an external project registered in the city."
+    },
+    "RigDoctorConfig": {
+      "properties": {
+        "census_owner_namespace": {
+          "type": "string",
+          "description": "CensusOwnerNamespace declares that this rig's resource-census ledger\n(test/test-resources.toml) names owner_bead values from ANOTHER\ntracker, e.g. \"gastownhall/gascity\" for a fork of Gas City whose ledger\ncomes from upstream. The census-owner-liveness check then reports an\nowner_bead missing from this city as owned in that namespace instead of\ndangling. The cost: a missing owner on this rig that is genuinely this\ncity's is not detected. Empty means every missing owner is dangling."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "description": "RigDoctorConfig holds gc doctor policy that applies to one rig."
+    },
+    "RigDoctorPatch": {
+      "properties": {
+        "census_owner_namespace": {
+          "type": "string",
+          "description": "CensusOwnerNamespace overrides Rig.Doctor.CensusOwnerNamespace; an\nempty string clears the declaration."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "description": "RigDoctorPatch overrides fields of a rig's [rigs.doctor] table."
     },
     "RigPatch": {
       "properties": {
@@ -2856,6 +2989,10 @@
         "beads_proxied_idle_timeout": {
           "type": "string",
           "description": "BeadsProxiedIdleTimeout overrides the rig's beads_proxied_idle_timeout."
+        },
+        "doctor": {
+          "$ref": "#/$defs/RigDoctorPatch",
+          "description": "Doctor overrides fields of the rig's [rigs.doctor] table."
         }
       },
       "additionalProperties": false,
@@ -3037,6 +3174,10 @@
         "remote_match": {
           "type": "string",
           "description": "RemoteMatch is a substring pattern for the hybrid provider to route\nsessions to the remote (K8s) backend. Sessions whose names contain\nthis pattern go to K8s; all others stay local (tmux).\nOverridden by the GC_HYBRID_REMOTE_MATCH env var if set."
+        },
+        "drift_wave_notify": {
+          "type": "string",
+          "description": "DriftWaveNotify is the mail recipient for config-drift wave notices:\nwhen more sessions need config-drift restarts in one tick than the\nper-tick budget allows, the reconciler mails this address once per\nwave (plus periodic reminders while the wave keeps rolling) so a\ncoordinator sees a roster-wide roll in progress. Empty disables the\nmail; the session.config_drift_wave event and stderr notice always\nfire regardless."
         }
       },
       "additionalProperties": false,

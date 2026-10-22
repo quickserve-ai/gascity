@@ -123,7 +123,8 @@ func TestMergeOracleFieldCoverage(t *testing.T) {
 		"reconcileGate": true, // reconcile-loop gate, fixed at construction
 		"now":           true, // the clock (WithClock), fixed at construction
 		"onChange":      true, "problemf": true, "problemLog": true,
-		"lastReconcileLogAt": true, "primeMu": true, "primeRunning": true,
+		"lastReconcileLogAt": true, "lastOverdueLogAt": true,
+		"primeMu": true, "primeRunning": true,
 		"primeCycle": true, "lastFullPrimeStartedAt": true, "primeRetryDelay": true,
 		"lifecycleMu": true, "lifecycleWG": true, "cancelFn": true, "stopCh": true,
 		"stopped": true, "latencyWindow": true, "latencyDriverActive": true,
@@ -145,6 +146,12 @@ func TestMergeOracleFieldCoverage(t *testing.T) {
 		// cached one, which the IncludeClosed=false scan does not do. Its
 		// exactly-once behavior is pinned by caching_store_close_event_test.go.
 		"unannouncedCloses": true, "hasUnannouncedCloses": true,
+		// unannouncedUpdates is the update-shaped twin: an announcement queue
+		// that only read refetches (announceRead) fill. The seam never queues
+		// into it; it can only drop an entry, when it installs a different row
+		// (announced by the merge's own diff) or evicts the row. Its behavior
+		// is pinned by caching_store_read_announce_test.go.
+		"unannouncedUpdates": true, "hasUnannouncedUpdates": true,
 		// closeIntents counts closing writes in flight between their backing
 		// write and their announcement claim; only those writers touch it, and
 		// the seam reads it only through trackCloseTransitionLocked's queueing
@@ -162,6 +169,31 @@ func TestMergeOracleFieldCoverage(t *testing.T) {
 		// lastScanAt is set by Prime and PrimeActive, never by the merge
 		// seam; it dates the backstop only until the first reconcile.
 		"lastScanAt": true,
+		// The delta reconcile's plan state (ga-ckbnpj): runReconciliation
+		// reads it before the backing read to choose a delta or full pass,
+		// and writes it after the merge returns; the merge neither reads nor
+		// writes it, so two merges cannot differ on it.
+		"reconcileDigest": true, "reconcileFingerprints": true, "lastFullListAt": true,
+		// Reconcile-liveness publishing (ga-yc0chj). Both are lifecycle
+		// state, not merge state: they are written once at arm time (the
+		// sink under lifecycleMu, the arm clock atomically) and only READ
+		// by the merge path — via publishReconcileHeartbeat, after c.mu is
+		// released, and via the serve-staleness gate, which reads the arm
+		// clock but never writes it. The merge oracle compares end-state
+		// the merge PRODUCES; neither field is produced by it, and the
+		// snapshot they publish is assembled from stats fields the oracle
+		// already compares.
+		// staleServeLogAtNanos is likewise not merge state: it is a
+		// rate-limiter clock for the serve-staleness refusal log, touched
+		// only by readers.
+		"heartbeatSink": true, "reconcilerArmedAtNanos": true,
+		"staleServeLogAtNanos": true,
+		// lastSyncFailureAt is the reconcile retry-backoff anchor (ga-yarqx9).
+		// It is written only by runReconciliation's FAILURE branch, before any
+		// merge, and read only by nextReconcileDelay; the merge seam never
+		// writes it (a successful merge resets syncFailures, which already
+		// disarms the anchor), so it is not merge end state.
+		"lastSyncFailureAt": true,
 	}
 	assertFieldsClassified(t, reflect.TypeOf(CachingStore{}), comparedStore, excludedStore)
 
@@ -176,6 +208,13 @@ func TestMergeOracleFieldCoverage(t *testing.T) {
 		"LastProblem": true, "State": true, "StaggerOffsetMs": true,
 		"CurrentReconcileInterval": true, "LatencyP95Ms": true, "CadenceDriver": true,
 		"ReconcileRequests": true, // counts RequestReconcile calls, not merge outcome
+		// The reconcile watchdog's own fields: ReconcilerArmedAt is stamped by
+		// StartReconciler, the other two by checkReconcileOverdue. The merge
+		// seam never writes any of them, exactly like StaggerOffsetMs above.
+		// They are deliberately separate from ProblemCount, so the overdue
+		// signal is not diluted by per-operation problems.
+		"ReconcilerArmedAt": true, "ReconcileOverdueCount": true,
+		"LastReconcileOverdueAt": true,
 	}
 	assertFieldsClassified(t, reflect.TypeOf(CacheStats{}), comparedStats, excludedStats)
 }

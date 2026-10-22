@@ -49,11 +49,74 @@ type hookStdinInput struct {
 	TranscriptPath string `json:"transcript_path"`
 }
 
+var contextWindowWarningWriter io.Writer = os.Stderr
+
 // transcriptUsage is the usage block shape inside provider transcript entries.
 type transcriptUsage struct {
 	InputTokens              int `json:"input_tokens"`
 	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
 	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	// Iterations lists the requests one turn made, when it made more than one
+	// (an advisor consult). Kept raw so an odd shape inside it can never cost
+	// the entry itself: see transcriptUsageOccupancy.
+	Iterations json.RawMessage `json:"iterations"`
+}
+
+// transcriptUsageOccupancy is the context footprint of one usage block.
+//
+// A turn that consults the advisor makes more than one request: iterations
+// holds the executor's request, the advisor's own request (another model,
+// another window) and the executor's request again, and the block's top-level
+// fields are the SUM of the executor requests. Adding them read 927k at a true
+// 464k, which is the urgent tier at half fill. The footprint is the LAST
+// executor request (type "message").
+//
+// Reading LOW is the dangerous direction, so the last iteration is trusted
+// only when the block proves the shape: every message iteration carries all
+// three fields as non-negative ints, together they add up to exactly the
+// top-level sum, and the last is not smaller than an earlier one (a context
+// only grows inside one turn). Any other shape reads the top-level sum, as
+// before this rule existed. For message and advisor shapes that sum is never
+// below the last request. It is not a bound for every shape: a turn that fell
+// back to another model lists [message, fallback_message] and its top-level
+// fields are the fallback request alone, which is the newest request and can
+// be smaller than the first.
+func transcriptUsageOccupancy(u *transcriptUsage) int {
+	top := u.InputTokens + u.CacheReadInputTokens + u.CacheCreationInputTokens
+	var iterations []json.RawMessage
+	if len(u.Iterations) == 0 || json.Unmarshal(u.Iterations, &iterations) != nil {
+		return top
+	}
+	sum, last, largest, seen := 0, 0, 0, false
+	for _, raw := range iterations {
+		var kind struct {
+			Type any `json:"type"`
+		}
+		if json.Unmarshal(raw, &kind) != nil || kind.Type != "message" {
+			continue
+		}
+		var it struct {
+			InputTokens              *int `json:"input_tokens"`
+			CacheReadInputTokens     *int `json:"cache_read_input_tokens"`
+			CacheCreationInputTokens *int `json:"cache_creation_input_tokens"`
+		}
+		if json.Unmarshal(raw, &it) != nil || it.InputTokens == nil || it.CacheReadInputTokens == nil || it.CacheCreationInputTokens == nil {
+			return top
+		}
+		if *it.InputTokens < 0 || *it.CacheReadInputTokens < 0 || *it.CacheCreationInputTokens < 0 {
+			return top
+		}
+		last = *it.InputTokens + *it.CacheReadInputTokens + *it.CacheCreationInputTokens
+		sum += last
+		if last > largest {
+			largest = last
+		}
+		seen = true
+	}
+	if !seen || sum != top || last < largest {
+		return top
+	}
+	return last
 }
 
 // contextInjectLine returns the context-usage guidance line for the session
@@ -148,7 +211,8 @@ func lastTranscriptUsage(path string) (tokens int, models []string, ok bool) {
 		}
 		// Tokens: the LAST qualifying entry is the live context size (after a
 		// compaction the newest entry reads low again).
-		tokens = u.InputTokens + u.CacheReadInputTokens + u.CacheCreationInputTokens
+		// A turn with several requests counts its last one, not their sum.
+		tokens = transcriptUsageOccupancy(u)
 		if m := entry.Message.Model; m != "" {
 			models = append(models, m)
 		}
@@ -158,15 +222,19 @@ func lastTranscriptUsage(path string) (tokens int, models []string, ok bool) {
 }
 
 // contextWindowTokensWithOverride resolves the session's context window as the
-// MAX window of any model it ran (they share one context), so a smaller-window
-// sidecar or compaction call (e.g. a 200k-window Haiku entry inside a 1M Fable
-// session) can't flip the session to the 200k default and fire the urgent tier
-// at ~20% of real usage. Per-model windows come from the shared modelwindow
-// package so this agrees with the API/session-log path; an unrecognized model
-// (window 0) floors to the conservative default. GC_CONTEXT_WINDOW_TOKENS
-// overrides first — gc-managed deployments that know the launch model should
-// pin it for determinism — then configuredWindow, the advisory policy's
-// window_tokens, when non-zero.
+// MAX window of the launch model and every model the session ran (they share
+// one context), so a smaller-window sidecar or compaction call (e.g. a
+// 200k-window Haiku entry inside a 1M Fable session) can't flip the session to
+// the 200k default and fire the urgent tier at ~20% of real usage. Per-model
+// windows come from the shared modelwindow package so this agrees with the
+// API/session-log path. GC_CONTEXT_LAUNCH_MODEL, stamped from the launch
+// command's --model (ga-pipu6), joins the transcript models: it closes the
+// launch/transcript mismatch where a CLI alias such as opus[1m] is recorded as
+// a resolved model ID without its [1m] suffix. An unrecognized model (window 0)
+// is named once on stderr and floors to the conservative default when nothing
+// else is recognized. GC_CONTEXT_WINDOW_TOKENS overrides first — gc-managed
+// deployments that know the launch model should pin it for determinism — then
+// configuredWindow, the advisory policy's window_tokens, when non-zero.
 func contextWindowTokensWithOverride(models []string, configuredWindow int) int {
 	if v := strings.TrimSpace(os.Getenv("GC_CONTEXT_WINDOW_TOKENS")); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -176,9 +244,20 @@ func contextWindowTokensWithOverride(models []string, configuredWindow int) int 
 	if configuredWindow > 0 {
 		return configuredWindow
 	}
+	allModels := make([]string, 0, len(models)+1)
+	if launchModel := strings.TrimSpace(os.Getenv("GC_CONTEXT_LAUNCH_MODEL")); launchModel != "" {
+		allModels = append(allModels, launchModel)
+	}
+	allModels = append(allModels, models...)
 	best := 0
-	for _, m := range models {
-		if w := modelwindow.Window(m); w > best {
+	warned := make(map[string]bool)
+	for _, m := range allModels {
+		w := modelwindow.Window(m)
+		if name := strings.TrimSpace(m); w == 0 && name != "" && !warned[name] {
+			warned[name] = true
+			fmt.Fprintf(contextWindowWarningWriter, "gc context: unrecognized model %q; defaulting to %d context tokens\n", name, modelwindow.Default) //nolint:errcheck // best-effort diagnostic
+		}
+		if w > best {
 			best = w
 		}
 	}
@@ -186,6 +265,15 @@ func contextWindowTokensWithOverride(models []string, configuredWindow int) int 
 		return modelwindow.Default
 	}
 	return best
+}
+
+// launchModelFromCommand extracts the effective --model value from the
+// resolved provider command (config.LaunchModelFromCommand: shellquote.Split
+// round-trips gc's own command rendering, including quoted aliases such as
+// opus[1m]; last flag wins). stampContextLaunchModel stamps it into the
+// session env as GC_CONTEXT_LAUNCH_MODEL.
+func launchModelFromCommand(command string) string {
+	return config.LaunchModelFromCommand(command)
 }
 
 func contextUsageMessageForPolicy(tokens, window int, policy config.ContextAdvisoryPolicy) string {

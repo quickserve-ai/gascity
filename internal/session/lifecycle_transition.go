@@ -96,6 +96,11 @@ func PromptHash(prompt string) string {
 // work bead. ComputeAwakeSet uses it to detect when an alive session has been
 // reassigned to a different bead — the trigger for a fresh-wake conversation
 // cycle under wake_mode=fresh.
+//
+// Usage attribution is a second consumer: the worker reads it to find the
+// formula a session's facts belong to. It is a single-valued pointer meaning
+// "the last bead the controller stamped", so it survives that bead's close and
+// a sleep.
 const CurrentBeadIDKey = "currently_processing_bead_id"
 
 var freshWakeConversationResetKeys = []string{
@@ -103,6 +108,7 @@ var freshWakeConversationResetKeys = []string{
 	"started_config_hash",
 	"started_live_hash",
 	"live_hash",
+	resumeSeededKey,
 	startupDialogVerifiedKey,
 	// Priming markers share started_config_hash's lifetime (S19 Stage 2): a
 	// fresh wake re-primes. This list and applyFreshWakeConversationReset must
@@ -113,6 +119,65 @@ var freshWakeConversationResetKeys = []string{
 	// The resume backstop's run belongs to the conversation (ClearResumeRun).
 	"resume_failures",
 	"resume_launch",
+}
+
+// ResumeSeededKey marks a session whose session_key was seeded by
+// `gc session resume` to point at a prior conversation. The next start must
+// build a resume command even when started_config_hash is empty (which
+// normally means first start) or wake_mode is fresh; the flag is consumed by
+// CommitStartedPatch once that start durably lands, and cleared by every
+// path that clears or rotates session_key so a stale seed can never force a
+// resume of a conversation that was already reset away.
+const resumeSeededKey = "resume_seeded"
+
+// ResumeSeededKey exposes the seeded-resume metadata key to the CLI layer.
+func ResumeSeededKey() string { return resumeSeededKey }
+
+// IsResumeSeeded reports whether meta carries a pending seeded resume.
+func IsResumeSeeded(meta map[string]string) bool {
+	return meta != nil && meta[resumeSeededKey] == "true"
+}
+
+// IsResumeSeededInfo is the typed session.Info form of IsResumeSeeded.
+func IsResumeSeededInfo(info Info) bool { return info.ResumeSeeded == "true" }
+
+// PriorSessionKeyMetadata records the last conversation identity a lifecycle
+// transition cleared or replaced. Read-side only (gc session history), never
+// consumed by lifecycle logic.
+const PriorSessionKeyMetadata = "prior_session_key"
+
+// StampPriorSessionKey preserves the conversation identity that patch is
+// about to destroy: when meta carries a non-empty session_key and patch sets
+// session_key to empty or to a different value, the old key is copied to
+// prior_session_key so the bead retains a pointer to the transcript it used
+// to own instead of severing the mapping (ga-oe8h).
+func StampPriorSessionKey(patch MetadataPatch, meta map[string]string) MetadataPatch {
+	if patch == nil || meta == nil {
+		return patch
+	}
+	newKey, changing := patch["session_key"]
+	if !changing {
+		return patch
+	}
+	old := strings.TrimSpace(meta["session_key"])
+	if old == "" || old == newKey {
+		return patch
+	}
+	patch[PriorSessionKeyMetadata] = old
+	return patch
+}
+
+// StampPriorSessionKeyInfo preserves the typed session's current key before a patch replaces it.
+func StampPriorSessionKeyInfo(patch MetadataPatch, info Info) MetadataPatch {
+	if patch == nil {
+		return patch
+	}
+	newKey, changing := patch["session_key"]
+	old := strings.TrimSpace(info.SessionKey)
+	if changing && old != "" && old != newKey {
+		patch[PriorSessionKeyMetadata] = old
+	}
+	return patch
 }
 
 // ResetCommittedAtKey records when a restart handoff durably committed.
@@ -150,6 +215,7 @@ func applyFreshWakeConversationReset(patch MetadataPatch) {
 	patch["started_config_hash"] = ""
 	patch["started_live_hash"] = ""
 	patch["live_hash"] = ""
+	patch[resumeSeededKey] = ""
 	patch[startupDialogVerifiedKey] = ""
 	clearPrimingMarkers(patch)
 	ClearResumeRun(patch)
@@ -405,6 +471,7 @@ func CommitStartedPatch(input CommitStartedPatchInput) MetadataPatch {
 		"started_launch_hash":        input.LaunchHash,
 		"continuation_reset_pending": "",
 		ResetCommittedAtKey:          "",
+		resumeSeededKey:              "",
 	}
 	if input.CoreBreakdown != "" {
 		patch["core_hash_breakdown"] = input.CoreBreakdown
@@ -499,6 +566,23 @@ func DrainAckStopPendingPatch(now time.Time) MetadataPatch {
 	return patch
 }
 
+// RevertDrainAckStopPendingPatch undoes DrainAckStopPendingPatch on a row
+// whose stop was never queued, restoring the lifecycle fields prior — the row
+// as read before the stop-pending mark — carried. The caller commits it
+// fenced on the stop-pending decision, so it lands only on the row that mark
+// produced and never over a later writer's state that its read sees; only a
+// store with conditional writes also refuses a writer that lands between that
+// read and the write (Store.Commit).
+func RevertDrainAckStopPendingPatch(prior Info) MetadataPatch {
+	return MetadataPatch{
+		"state":                     prior.MetadataState,
+		"state_reason":              prior.StateReason,
+		"drain_at":                  prior.DrainAt,
+		"pending_create_claim":      prior.PendingCreateClaimMetadata,
+		"pending_create_started_at": prior.PendingCreateStartedAt,
+	}
+}
+
 // SleepPatch records a non-terminal sleep/drain result. The holds are the
 // Sleep cell's (Store.ApplySleep).
 func SleepPatch(now time.Time, reason string) MetadataPatch {
@@ -585,6 +669,7 @@ func RestartRequestPatchAt(sessionKey string, now time.Time) MetadataPatch {
 	patch := MetadataPatch{
 		"restart_requested":          "",
 		"started_config_hash":        "",
+		resumeSeededKey:              "",
 		"continuation_reset_pending": "true",
 		ResetCommittedAtKey:          now.UTC().Format(time.RFC3339),
 		"last_woke_at":               "",

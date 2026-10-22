@@ -147,7 +147,20 @@ this to the **union** of:
 The materializer enumerates all three and produces the union as the
 desired symlink set for each agent. City-pack entries and implicit-bootstrap
 entries are "shared catalog" (universal across agents of the matching
-vendor); the agent-local entries are only for that one agent.
+vendor); the agent-local entries come from that one agent's catalog.
+
+"Agent-local" names the source catalog, not who can see the skill. Agents
+with the same scope root and provider sink write one sink directory, so
+stage 1 materializes each sink once, with the union of its agents' desired
+sets, and every agent reading that sink sees every agent-local skill in it.
+The sink holds one link per name: an agent-local entry that overrides a
+shared entry replaces the shared version for every agent in the sink. Two
+sources for one name in the same class (two agents' agent-local skills, or
+two shared catalogs reaching one sink, as two rigs at one path can) cannot
+both be linked. The collision validator rejects the agent-local case at
+start. A shared clash is settled when an agent-local skill in the sink
+overrides that name; otherwise the pass reports the conflict and leaves
+that sink's existing links in place until it is resolved.
 
 User-declared third-party imports' `skills/` are **not** enumerated in
 v0.15.1 (per the non-goal). The mechanism to include them later is
@@ -282,6 +295,101 @@ fields into their configs based on the published JSON schema.
 
 (The schema and reference docs are updated in v0.15.1 to mark the fields
 deprecated; they are deleted in v0.16.)
+
+### Opt-in skills
+
+"No attachment filtering" holds for the shared catalog: every agent gets
+every default skill. A pack can also ship a skill that no agent gets until
+an agent asks for it by name.
+
+**Pack side.** A skill at `skills/opt-in/<name>/SKILL.md` is an opt-in
+skill. The default catalog (`readSkillDir`) and `gc skill list` read only
+`skills/<name>/SKILL.md`. The `opt-in/` directory holds no `SKILL.md` of its
+own, so it never becomes a default skill, and `opt-in` is a reserved name
+under `skills/`: a `SKILL.md` placed directly in `skills/opt-in/` would make
+the directory a default skill every agent gets, and config load warns about
+it. An opt-in skill is named the way a default skill is: `<binding>.<name>`
+for an imported pack, `<name>` for the city pack. When a pack ships one name
+both ways, the default wins: the catalog records the opt-in copy as shadowed,
+and an agent that selects that name fails config load, with both
+directories named, rather than silently getting the default.
+
+**Seat side.** An agent selects opt-in skills with `opt_in_skills`:
+
+```toml
+# agents/rotator/agent.toml in a pack
+opt_in_skills = ["account-fleet.fleet-login"]
+
+# city.toml
+[[patches.agent]]
+name = "mayor"
+opt_in_skills_append = ["account-fleet.fleet-login", "account-fleet.account-rebalance"]
+
+[[rigs]]
+name = "fe"
+
+[[rigs.overrides]]
+agent = "polecat"
+opt_in_skills_append = ["ops.audit"]
+```
+
+On a patch or a rig override, `opt_in_skills` replaces the agent's list
+(`opt_in_skills = []` clears a pack agent's list) and `opt_in_skills_append`
+adds to it. The key is new on purpose: `skills` and `skills_append` are the
+tombstones above, and `gc doctor --fix` deletes them. It is not accepted in
+`[agent_defaults]`, because a skill every agent opts in to is a default skill.
+
+**Validation.** Config load resolves each name against the opt-in skills in
+the agent's scope: the city pack and the city's imports, plus the rig's
+imports for a rig-scoped agent. An unknown name fails the load with the
+agent, the key, the name and the opt-in skills that agent could select, and
+so does a name that a default skill in scope also has. An opt-in root that
+cannot be read is reported and skipped; the default skills are unaffected.
+The collision validator counts an agent's opted-in skills in the sink they
+are delivered to, with agent-local skills, and compares sources. Two agents
+selecting the same opt-in skill share one source and do not collide. One
+name that resolves to two directories in one sink does: an opt-in skill and
+another agent's agent-local skill, or two rigs at one path importing
+different packs under one binding name. An opt-in delivered to the agent's
+own work_dir is not counted against the scope root.
+
+**Delivery.** An opted-in skill joins that agent's shared set
+(`CityCatalog.WithOptIn`), so it materializes, fingerprints and overrides
+like any shared skill. Its source sits under the pack's `skills/` root,
+which is already an owned root, so dropping it from `opt_in_skills` prunes
+the link on the next pass. The two stages treat it differently:
+
+- Stage 1 adds an agent's opt-in skills to its scope-root sink only when the
+  agent's work_dir is that scope root, the test the prompt's skills appendix
+  also uses.
+- An agent with its own work_dir gets its opt-in skills only from the
+  per-session pass (`gc internal materialize-skills` in PreStart, so tmux
+  and herdr), in that work_dir. They stay out of the shared scope root. A
+  subprocess seat with its own work_dir gets no opt-in skills, since it has
+  no per-session pass. Agent-local skills keep their stage-1 behavior and
+  still land in the scope root.
+- The per-session pass reconciles one agent at a time. A second agent whose
+  session uses the same work_dir prunes the first agent's opted-in links, as
+  it prunes its agent-local ones; grouping that pass by sink is a known
+  follow-up.
+
+**Who sees an opt-in skill.** gc decides which skill directory an opted-in
+skill is written to; the provider decides which sessions load that
+directory. Claude Code loads `.claude/skills` from the directory a session
+starts in and from every parent up to the repository root, and in a linked
+git worktree only up to the worktree root. So an opt-in delivered to a
+scope-root sink is visible to every Claude session that loads that
+directory's skills: sessions started there, and sessions started in plain
+subdirectories below it within the same repository, but not sessions in
+their own linked worktrees. The same holds for the agent-local skills stage 1
+writes there today. A seat gets an opt-in exclusively only by having its own
+work_dir, which receives that seat's skills alone. gc's tests check which
+sink holds an opted-in skill, not which provider sessions load it: provider
+discovery is not modelled.
+
+`gc skill list --agent <name>` lists an agent's opted-in skills once each,
+under their binding-qualified names. The city-wide `gc skill list` does not
+show opt-in skills. The prompt appendix lists them under "Assigned to you".
 
 ### Per-skill fingerprint entries via `FingerprintExtra`
 
@@ -438,8 +546,8 @@ This is a **startup validator** — a new check function in the config/doctor
 layer that runs at `gc start` and at every supervisor tick before
 materialization. The validator:
 
-- For each `(scope-root, vendor)` pair, groups agents that materialize
-  into it.
+- For each `(scope-root, sink directory)` pair, groups agents that
+  materialize into it.
 - For each group, builds the multi-map
   `agent-local-skill-name → [agent-names]`.
 - Emits a hard error for any key with more than one agent in its value
@@ -472,14 +580,18 @@ scope root:
   .claude/skills/           # materialized for claude agents
     gc-work/ -> ...
     plan/ -> ...
-  .agents/skills/           # materialized for codex agents
+  .agents/skills/           # materialized for codex and pi agents
     gc-work/ -> ...
     plan/ -> ...
 ```
 
-Each sink is filled only with its vendor's desired set. The collision
-validator is scoped per `(scope-root, vendor)` pair; agents on different
-vendors don't collide even if they share an agent-local skill name.
+Each sink holds the desired sets of every agent that writes it. A sink
+is a directory, not a vendor: providers that share a sink directory
+(`codex` and `pi` both use `.agents/skills`) share the sink at a scope
+root. The collision validator is scoped per `(scope-root, sink
+directory)` pair, so agents whose providers use different sink
+directories don't collide even if they share an agent-local skill name,
+and a `codex` agent and a `pi` agent at one scope root do.
 
 Acceptance tests cover at least:
 - Mixed-provider city with one agent per vendor.
@@ -512,11 +624,16 @@ first, materialize-skills runs last (immediately before the agent command).
 
 **Concurrency note.** Stage-1 materialization writes to scope-root sinks
 (`<city>/.claude/skills/`, `<rig>/.claude/skills/`). Stage-2 materialization
-writes to per-session-worktree sinks
-(`<rig>/.gc/worktrees/<rig>/polecat-N/.claude/skills/`). These paths are
-disjoint by construction, so the supervisor-tick materializer and a
-per-session PreStart never target the same sink. No cross-stage lock is
-required.
+writes to the session's work_dir sink, typically a per-session worktree
+(`<rig>/.gc/worktrees/<rig>/polecat-N/.claude/skills/`), and runs only
+when that work_dir is not the agent's own scope root. The two stages are
+not disjoint by construction: a work_dir that is another agent's scope
+root puts a stage-2 writer and that root's stage-1 pass on one sink, and
+two sessions sharing a work_dir put two stage-2 writers on one. Each
+writer reconciles the sink for its own agents only, so in both cases
+each prunes the other's agent-local links. Until stage 2 groups writers
+by sink as stage 1 does, a session work_dir should be neither another
+agent's scope root nor shared with another session.
 
 **Pool scale-up cost.** A pool scaling from 0 to N spawns N sessions, each
 running its own `gc internal materialize-skills` invocation in PreStart —
@@ -673,7 +790,8 @@ That is not part of this release.
 **Acceptance:**
 - `test/acceptance/skill_test.go` — extend with:
   - "city skill is materialized into every agent's sink (per-vendor)."
-  - "agent-local skill is only in that agent's sink."
+  - "agent-local skill reaches only the sink its agent writes; agents
+    sharing that sink see it too."
   - "adding a skill to the city catalog drains affected agents."
   - "removing a skill cleans up the symlink on next tick."
   - "renaming a skill (delete + add) cleans up old and creates new."

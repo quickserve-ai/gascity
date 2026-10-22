@@ -46,6 +46,13 @@ type AgentPatchSetInput struct {
 		Scope     *string           `json:"scope,omitempty" doc:"Override agent scope."`
 		Suspended *bool             `json:"suspended,omitempty" doc:"Override suspended state."`
 		Env       map[string]string `json:"env,omitempty" doc:"Override environment variables."`
+		// OptInSkills is presence-aware like config.AgentPatch.OptInSkills:
+		// leaving it out inherits the underlying agent's list, [] clears it.
+		// PUT replaces the whole saved patch, so leaving it out drops any
+		// selection an earlier patch set. A JSON null decodes to nil and is
+		// treated as left out.
+		OptInSkills       *[]string `json:"opt_in_skills,omitempty" doc:"Replace the agent's opt-in skill selection (binding-qualified names of skills a pack ships under skills/opt-in/). An empty list clears it; omit the field to inherit the underlying agent's list."`
+		OptInSkillsAppend []string  `json:"opt_in_skills_append,omitempty" doc:"Opt-in skills to add to the agent's selection."`
 	}
 }
 
@@ -84,11 +91,18 @@ type RigPatchGetInput struct {
 type RigPatchSetInput struct {
 	CityScope
 	Body struct {
-		Name          string  `json:"name,omitempty" doc:"Rig name."`
-		Path          *string `json:"path,omitempty" doc:"Override filesystem path."`
-		Prefix        *string `json:"prefix,omitempty" doc:"Override bead ID prefix."`
-		DefaultBranch *string `json:"default_branch,omitempty" doc:"Override mainline branch."`
-		Suspended     *bool   `json:"suspended,omitempty" doc:"Override suspended state."`
+		Name                    string            `json:"name,omitempty" doc:"Rig name."`
+		Path                    *string           `json:"path,omitempty" doc:"Override filesystem path."`
+		Prefix                  *string           `json:"prefix,omitempty" doc:"Override bead ID prefix."`
+		DefaultBranch           *string           `json:"default_branch,omitempty" doc:"Override mainline branch."`
+		DefaultMergeStrategy    *string           `json:"default_merge_strategy,omitempty" doc:"Override the merge strategy gc sling stamps on beads routed into this rig; empty string clears it."`
+		Suspended               *bool             `json:"suspended,omitempty" doc:"Deprecated suspension override."`
+		SuspendedOnStart        *bool             `json:"suspended_on_start,omitempty" doc:"Override desired suspension state at city start."`
+		FormulaVars             map[string]string `json:"formula_vars,omitempty" doc:"Rig-scoped formula variable defaults."`
+		BeadsProxiedIdleTimeout *string           `json:"beads_proxied_idle_timeout,omitempty" doc:"Override the rig's beads_proxied_idle_timeout."`
+		Doctor                  *struct {
+			CensusOwnerNamespace *string `json:"census_owner_namespace,omitempty" doc:"Override the doctor census owner namespace; empty string clears it."`
+		} `json:"doctor,omitempty" doc:"Override rig doctor settings."`
 	}
 }
 

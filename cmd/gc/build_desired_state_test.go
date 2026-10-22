@@ -895,6 +895,50 @@ func TestDefaultScaleCheckCountsSeesExternalRoutedWorkAfterCachePrime(t *testing
 	}
 }
 
+// A hold:*-labeled bead is parked under the wait-class contract — owned and
+// waiting, not dispatchable demand. Counting it spawns pool sessions for work
+// that cannot progress (ga-uica16: two sessions consumed on a hold:cert-wait
+// park). The prefix match keeps the guard valid for classes added later.
+func TestDefaultScaleCheckDemandExcludesHoldParkedBeads(t *testing.T) {
+	const template = "gascity/workflows.codex-min"
+	store := beads.NewMemStore()
+	parked, err := store.Create(beads.Bead{
+		Title:    "parked in cert-wait",
+		Type:     "task",
+		Status:   "open",
+		Labels:   []string{"hold:cert-wait"},
+		Metadata: map[string]string{"gc.routed_to": template},
+	})
+	if err != nil {
+		t.Fatalf("create parked bead: %v", err)
+	}
+	live, err := store.Create(beads.Bead{
+		Title:    "dispatchable work",
+		Type:     "task",
+		Status:   "open",
+		Metadata: map[string]string{"gc.routed_to": template},
+	})
+	if err != nil {
+		t.Fatalf("create live bead: %v", err)
+	}
+
+	counts, demand, _, errs := defaultScaleCheckCountsAndDemand(nil, []defaultScaleCheckTarget{{
+		template: template,
+		storeKey: "rig:gascity",
+		store:    store,
+	}})
+	if len(errs) != 0 {
+		t.Fatalf("defaultScaleCheckCountsAndDemand errs = %v", errs)
+	}
+	if got := counts[template]; got != 1 {
+		t.Fatalf("counts[%q] = %d, want 1 (hold:* park must not count as demand)", template, got)
+	}
+	ids := demand[template].WorkBeadIDs
+	if len(ids) != 1 || ids[0] != live.ID {
+		t.Fatalf("demand WorkBeadIDs = %v, want exactly [%s]; parked %s must be excluded", ids, live.ID, parked.ID)
+	}
+}
+
 func TestDefaultScaleCheckDemandCarriesTriggerBeadID(t *testing.T) {
 	const template = "gascity/workflows.codex-min"
 	store := beads.NewMemStore()
@@ -7461,6 +7505,55 @@ func TestBuildDesiredState_SuspendedNamedSession_DoesNotMaterialize(t *testing.T
 	}
 	if dsResult.NamedSessionDemand["mayor"] {
 		t.Fatal("suspended named session should not record demand")
+	}
+}
+
+func TestBuildDesiredState_SuspendedAgentsExistingNamedSessionBeadIsNotRediscovered(t *testing.T) {
+	// ga-9qanni: a nudge or claim backstop materialized an on-demand named
+	// session bead for an agent patched suspended=true, and the session-bead
+	// rediscovery backfill put it back into desired state, so the reconciler
+	// STARTED it (platform/gastown.refinery, 2026-09-23 22:52:24Z). The
+	// backfill already skipped a suspended RIG; a suspended AGENT must be
+	// skipped the same way, so the reconciler stops it as "suspended".
+	for _, suspended := range []bool{true, false} {
+		t.Run(fmt.Sprintf("suspended=%v", suspended), func(t *testing.T) {
+			cityPath := t.TempDir()
+			store := beads.NewMemStore()
+			if _, err := store.Create(beads.Bead{
+				Title:  "platform/gastown.refinery",
+				Type:   sessionBeadType,
+				Labels: []string{sessionBeadLabel, "template:refinery"},
+				Metadata: map[string]string{
+					"template":                  "refinery",
+					"agent_name":                "refinery",
+					"alias":                     "refinery",
+					"session_name":              "refinery",
+					"session_origin":            "named",
+					"configured_named_session":  "true",
+					"configured_named_identity": "refinery",
+					"configured_named_mode":     "on_demand",
+					"state":                     "start-pending",
+					"pending_create_claim":      "true",
+				},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			cfg := &config.City{
+				Workspace: config.Workspace{Name: "test-city"},
+				Agents: []config.Agent{{
+					Name:              "refinery",
+					StartCommand:      "true",
+					MaxActiveSessions: intPtr(1),
+					Suspended:         suspended,
+				}},
+				NamedSessions: []config.NamedSession{{Template: "refinery", Mode: "on_demand"}},
+			}
+			dsResult := buildDesiredState("test-city", cityPath, time.Now().UTC(), cfg, runtime.NewFake(), store, io.Discard)
+			_, desired := dsResult.State["refinery"]
+			if desired == suspended {
+				t.Fatalf("existing named-session bead in desired state = %v with agent suspended=%v, want %v", desired, suspended, !suspended)
+			}
+		})
 	}
 }
 
@@ -14672,5 +14765,65 @@ func TestBuildDesiredState_APICreatedAgentSessionBeadStaysDesired(t *testing.T) 
 					sessionName, tp.ConfiguredNamedIdentity)
 			}
 		})
+	}
+}
+
+// TestBuildDesiredState_NamedSessionConflictSkipIsLogged pins ga-dfp1b's L1:
+// when a live bead holds a configured named identity's alias without being
+// its canonical session (here: a foreign-template bead with alias=agent-a),
+// the named pass must skip the identity (as before) but say so on stderr,
+// naming the conflicting bead — this class burned 4600+ silent skips. NOTE
+// the ephemeral+pool_managed backing-template shape does NOT reach this
+// branch when it is the sole template-matching holder of the identity's alias
+// (the canonical alias pass takes it, whatever the identity's shape) or when
+// L2's InfoIsAdoptablePoolShadow carve-out admits it: the builder materializes
+// the identity and the sync path adopts the shadow — see
+// named_session_adoption_test.go. A foreign template (as here) and two alias
+// holders for an identity that differs from its template
+// (TestNamedSessionAliasShadowsWithDistinctIdentityStayLoud) still skip loudly
+// through this branch.
+func TestBuildDesiredState_NamedSessionConflictSkipIsLogged(t *testing.T) {
+	cityPath := t.TempDir()
+	store := beads.NewMemStore()
+	maxOne := 1
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{{
+			Name:              "agent-a",
+			StartCommand:      "true",
+			MaxActiveSessions: &maxOne,
+		}},
+		NamedSessions: []config.NamedSession{{
+			Template: "agent-a",
+			Mode:     "always",
+		}},
+	}
+	shadow, err := store.Create(beads.Bead{
+		Type:   sessionpkg.BeadType,
+		Status: "open",
+		Labels: []string{sessionpkg.LabelSession},
+		Metadata: map[string]string{
+			"session_name":   "other-agent-1",
+			"template":       "other-agent",
+			"agent_name":     "other-agent",
+			"alias":          "agent-a",
+			"session_origin": "ephemeral",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(shadow): %v", err)
+	}
+
+	var stderr bytes.Buffer
+	dsResult := buildDesiredState("test-city", cityPath, time.Now().UTC(), cfg, runtime.NewFake(), store, &stderr)
+
+	for name, tp := range dsResult.State {
+		if tp.ConfiguredNamedIdentity == "agent-a" {
+			t.Fatalf("named identity materialized despite alias conflict: %s", name)
+		}
+	}
+	out := stderr.String()
+	if !strings.Contains(out, "blocked by conflicting session bead") || !strings.Contains(out, shadow.ID) {
+		t.Fatalf("expected conflict-skip diagnostic naming bead %s, got stderr:\n%s", shadow.ID, out)
 	}
 }

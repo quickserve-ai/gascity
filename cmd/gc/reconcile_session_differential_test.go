@@ -236,6 +236,15 @@ var parityFindings = map[string]parityEntry{
 		"C6b1, C6b2 (A20, A4; owner to add a §12.2 row)", "legacy drains a waiter to a sleep on its wait hold and, once the wait turns ready, starts it again through the idle latch and delivers the wait's nudge with the start; v2 drains and restarts it the same way, a pass or more later (drain-stop-lag)",
 		append([]string{"sleep_intent", "sleep_reason", "slept_at", "drain_at", "detached_at", "stranded_event_emitted_at", session.DrainIntentReasonKey, session.DrainIntentAtKey, session.DrainIntentIncarnationKey}, parityStartKeys...),
 	},
+
+	// The carry's legacy-only rows (the fork's CARRY.md): behavior the fleet
+	// runs under the default legacy reconciler that v2 does not implement.
+	// Each stays a finding until v2 ports it or its owner rules it away.
+	"carry-drain-ack-teardown": {
+		"carry row ga-x99xh0 (legacy only; replay OWNER NOTE at stop 427)", "a pool seat whose drain-ack stop finalizes holding claimable or in_progress work is torn down: legacy releases the work (unassigned, reopened, its route kept), closes the seat as drained and the freed demand creates a fresh seat; v2's finalize (D5) sleeps the seat with its work and resumes it, keeping open claims as continuation preassignments",
+		append([]string{"status", "close_reason", "closed_at", "slept_at", "sleep_reason", "currently_processing_bead_id", "assignee"}, parityStartKeys...),
+	},
+	"carry-drift-handoff-mail": {"carry row hq-wi4ka (legacy only)", "legacy mails a seat a handoff before a config-drift drain or in-place drift restart takes its context; v2's A14 sends none. In a store that also holds mail, the message takes the next bead ID, so a replacement seat legacy creates afterwards is numbered one higher", nil},
 }
 
 // parityUnported is legacy behavior that belongs to an arm or effect kind
@@ -631,7 +640,7 @@ func (w *legacyWorld) tick(t *testing.T, reconcile bool) {
 	}
 	poolDesired := result.PoolDesiredCounts
 	if poolDesired == nil {
-		work := filterAssignedWorkBeadsForPoolDemand(cfg, w.cityPath, w.store, open, assigned, refs)
+		work := filterAssignedWorkBeadsForPoolDemand(cfg, w.cityPath, w.store, open, assigned, refs, result.PoolWakeReadiness)
 		poolDesired = retainScaleCheckPartialPoolDesired(cfg, PoolDesiredCounts(ComputePoolDesiredStatesAt(cfg, work, open, result.ScaleCheckCounts, now)),
 			updated, effectivePoolPartialRetentionTemplates(result))
 	}
@@ -1107,6 +1116,14 @@ func parityFixtures() []parityFixture {
 	} {
 		driftDrained[k] = "drain-stop-lag"
 	}
+	// The carry's handoff mail before the drift drain (hq-wi4ka) takes the
+	// store's next bead ID, so legacy's replacement seat is gc-3.
+	driftDrainedMailed := maps.Clone(driftDrained)
+	for _, k := range []string{"row:gc-2", "provider:Start worker-gc-2", "provider:RemoveMeta worker-gc-2"} {
+		delete(driftDrainedMailed, k)
+		driftDrainedMailed[strings.ReplaceAll(k, "gc-2", "gc-3")] = "drain-stop-lag"
+	}
+	driftDrainedMailed["event:mail.sent gc-2 [rig]"] = "carry-drift-handoff-mail"
 	// explain merges the alive wanted row gc-1's standing findings with more.
 	explain := func(more map[string]string) map[string]string {
 		out := map[string]string{"row:gc-1:*policy": "sleep-policy-keys"}
@@ -1308,7 +1325,13 @@ func parityFixtures() []parityFixture {
 			// bead.
 			Name: "a stop-pending pool seat with work sleeps idle", Behaviors: []string{"DRAIN-050", "DRAIN-053", "DRAIN-054", "DRAIN-055", "SESS-035", "SESS-036"},
 			Rows: []parityRow{awake(stopPendingMeta(at(-time.Minute))...)}, Work: assigned,
-			Explain: map[string]string{"provider:RemoveMeta s-gc-1": "drain-env-clears", "row:gc-1:*policy": "sleep-policy-keys"},
+			// The carry's drain-ack teardown (ga-x99xh0) retires the seat in
+			// legacy instead: its work released, the seat closed, a fresh one
+			// started; v2 restarts the same seat with its work.
+			Explain: map[string]string{
+				"provider:RemoveMeta s-gc-1": "drain-env-clears", "row:gc-1:*teardown": "carry-drain-ack-teardown", "work:gw-1:*teardown": "carry-drain-ack-teardown",
+				"row:gc-2": "carry-drain-ack-teardown", "provider:Start s-gc-1": "carry-drain-ack-teardown", "provider:Start worker-gc-2": "carry-drain-ack-teardown", "provider:RemoveMeta worker-gc-2": "carry-drain-ack-teardown",
+			},
 		},
 		{
 			// A stop-pending named row with no work ends drained, and its
@@ -1393,10 +1416,15 @@ func parityFixtures() []parityFixture {
 		{
 			Name: "a resume voids a suspended drain (R16)",
 			Rows: []parityRow{awake()}, Work: assigned, Runtimes: []simRuntime{live}, Drains: map[string]string{"gc-1": "suspended"},
+			// Legacy's stop finalizes a pool seat holding work, which the
+			// carry's drain-ack teardown (ga-x99xh0) retires and replaces
+			// rather than restarting it in place.
 			Explain: explain(map[string]string{
 				"row:gc-1:*r16": "§12.2#3 R16", "provider:SetMeta s-gc-1": "§12.2#3 R16", "provider:Stop s-gc-1": "§12.2#3 R16",
-				"provider:Start s-gc-1": "§12.2#3 R16", "provider:RemoveMeta s-gc-1": "§12.2#3 R16", "event:session.woke worker-1 []": "§12.2#3 R16",
+				"provider:RemoveMeta s-gc-1": "§12.2#3 R16", "event:session.woke worker-1 []": "§12.2#3 R16",
 				"event:session.drain_acked_with_assigned_work worker [bead_id bead_status reason session_id template]": "§12.2#3 R16", "event:session.stopped worker [reason session_id template]": "§12.2#3 R16",
+				"row:gc-1:*teardown": "carry-drain-ack-teardown", "work:gw-1:*teardown": "carry-drain-ack-teardown", "row:gc-2": "carry-drain-ack-teardown",
+				"provider:Start worker-gc-2": "carry-drain-ack-teardown", "provider:RemoveMeta worker-gc-2": "carry-drain-ack-teardown",
 			}),
 		},
 		{
@@ -1604,7 +1632,7 @@ func parityFixtures() []parityFixture {
 			// begin; the twin runs no execution backstop, so
 			// TestDecideRowExecutionStalled pins it.
 			Name: "a drifted floor seat drains for config drift", Behaviors: []string{"SESS-550", "SESS-561", "SESS-556", "SESS-560", "NUDGE-022"}, City: floor,
-			Rows: []parityRow{awake("started_config_hash", drifted)}, Runtimes: []simRuntime{live}, Explain: driftDrained,
+			Rows: []parityRow{awake("started_config_hash", drifted)}, Runtimes: []simRuntime{live}, Explain: driftDrainedMailed,
 		},
 		{
 			Name: "an attached drifted seat records its deferral and stays", Behaviors: []string{"SESS-552", "SESS-553", "GUAR-006"}, City: floor,
@@ -1629,7 +1657,7 @@ func parityFixtures() []parityFixture {
 		{
 			Name: "a named row's drift restarts it in place", Behaviors: []string{"SESS-557"}, City: chat(false),
 			Rows: []parityRow{onDemand("configured_named_mode", "always", "started_config_hash", drifted)}, Runtimes: []simRuntime{chatLive},
-			Explain: tlMerged(chatStanding, map[string]string{"provider:RemoveMeta chat": "§12.2#38 start-meta-clears"}),
+			Explain: tlMerged(chatStanding, map[string]string{"provider:RemoveMeta chat": "§12.2#38 start-meta-clears", "event:mail.sent gc-1 [rig]": "carry-drift-handoff-mail"}),
 		},
 		{
 			Name: "an asleep named row's drift is repaired", Behaviors: []string{"SESS-566", "SESS-568"}, City: chatOnDemand,

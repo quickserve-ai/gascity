@@ -103,6 +103,8 @@ export type AgentPatch = {
     MouseMode: string | null;
     Name: string;
     Nudge: string | null;
+    OptInSkills: Array<string> | null;
+    OptInSkillsAppend: Array<string> | null;
     OptionDefaults?: {
         [key: string]: string;
     };
@@ -130,6 +132,7 @@ export type AgentPatch = {
     TmuxAlias: string | null;
     Upstream: string | null;
     WakeMode: string | null;
+    WakeTransport: string | null;
     WorkDir: string | null;
 };
 
@@ -148,6 +151,14 @@ export type AgentPatchSetInputBody = {
      * Agent name.
      */
     name?: string;
+    /**
+     * Replace the agent's opt-in skill selection (binding-qualified names of skills a pack ships under skills/opt-in/). An empty list clears it; omit the field to inherit the underlying agent's list.
+     */
+    opt_in_skills?: Array<string>;
+    /**
+     * Opt-in skills to add to the agent's selection.
+     */
+    opt_in_skills_append?: Array<string> | null;
     /**
      * Override the agent's provider.
      */
@@ -267,7 +278,7 @@ export type AnnotatedProviderResponse = {
 
 export type AsyncAcceptedBody = {
     /**
-     * City event-stream sequence captured before the async request was accepted. Pass this value as after_seq to /v0/city/{cityName}/events/stream to receive the request result without replaying unrelated historical backlog. A value of 0 can also mean no event provider is configured or the event log is empty.
+     * City event-stream sequence captured before the async request was accepted. Pass this value as after_seq to /v0/city/{cityName}/events/stream to receive the request result without replaying unrelated historical backlog, and to /v0/city/{cityName}/request/{requestId} to read its outcome. A value of 0 means the event log was empty.
      */
     event_cursor: string;
     /**
@@ -315,6 +326,7 @@ export type BackendCredentialResolvedPayload = {
 
 export type Bead = {
     assignee?: string;
+    await_type?: string;
     close_reason?: string;
     created_at: string;
     defer_until?: string;
@@ -344,6 +356,20 @@ export type BeadAssignInputBody = {
      * Assignee name.
      */
     assignee?: string;
+};
+
+export type BeadClaimFailedPayload = {
+    error: string;
+    runtime_epoch?: number;
+    session_id?: string;
+    template: string;
+};
+
+export type BeadClaimLoopHeldPayload = {
+    error: string;
+    failures: number;
+    held_until: string;
+    template: string;
 };
 
 export type BeadClaimRejectedPayload = {
@@ -737,6 +763,53 @@ export type ControlStalledPayload = {
     store_path?: string;
 };
 
+export type ConversationFact = {
+    /**
+     * When it happened: the source's time, or the observer's clock when the source gives none.
+     */
+    at: string;
+    /**
+     * How the fact is known: runtime (the provider recorded it), observed (gc inferred it) or lane. Open: a newer build may add values.
+     */
+    basis?: string;
+    /**
+     * Operations that caused the fact.
+     */
+    cause_ops?: Array<string> | null;
+    /**
+     * Session (conversation) id the fact belongs to.
+     */
+    conversation: string;
+    /**
+     * The source's own word for the occurrence, e.g. a provider stop reason.
+     */
+    detail?: string;
+    /**
+     * Session generation the fact happened in.
+     */
+    generation: number;
+    /**
+     * Fact id, keyed by the occurrence.
+     */
+    id: string;
+    /**
+     * The occurrence of an interaction.* fact.
+     */
+    interaction?: string;
+    /**
+     * Fact kind.
+     */
+    kind: 'session.started' | 'session.ended' | 'turn.started' | 'turn.ended' | 'interaction.raised' | 'interaction.resolved';
+    /**
+     * Open reason token, e.g. a turn.ended reason (completed, interrupted, superseded).
+     */
+    reason?: string;
+    /**
+     * The turn of a turn.* fact, as its runtime names it.
+     */
+    turn?: string;
+};
+
 export type ConversationGroupParticipant = {
     GroupID: string;
     Handle: string;
@@ -762,20 +835,90 @@ export type ConversationGroupRecord = {
     SchemaVersion: number;
 };
 
+export type ConversationInterruptPolicyBody = {
+    /**
+     * What the interrupt does when no boundary is observed: fail or restart.
+     */
+    on_failure?: 'fail' | 'restart';
+};
+
 /**
  * Shape of a conversation.
  */
 export type ConversationKind = 'dm' | 'room' | 'thread';
 
+export type ConversationMessagePolicyBody = {
+    /**
+     * With when now: the session generation the requester saw.
+     */
+    now_generation?: number;
+    /**
+     * With when now: the turn the requester saw.
+     */
+    now_turn?: string;
+    /**
+     * What a steer does on a runtime that cannot steer: boundary or fail.
+     */
+    on_unsupported?: 'boundary' | 'fail';
+    /**
+     * How the agent sees it: prompt (a turn of its own) or notice (a reminder).
+     */
+    role?: 'prompt' | 'notice';
+    /**
+     * Whether the message may wake its session: if_needed or live_only.
+     */
+    wake?: 'if_needed' | 'live_only';
+    /**
+     * When to deliver: boundary (the next turn boundary), after_turn (ride the next turn, never start one), interrupt, if_idle (skipped when the session is mid-turn), now (deliver now) or steer (into the running turn, where the runtime can steer).
+     */
+    when?: 'boundary' | 'after_turn' | 'interrupt' | 'if_idle' | 'now' | 'steer';
+};
+
 export type ConversationOp = {
     /**
-     * Executions after the first (an adopted orphan).
+     * The producer's actor class, an open token. Set on the op routes and op.changed only.
+     */
+    actor?: string;
+    /**
+     * When the operation last changed status. Set on the op routes and op.changed only.
+     */
+    at?: string;
+    /**
+     * How many times the operation was executed, counted by its executor. A legacy-executed operation counts executions after the first (an adopted orphan), so its first run reads 0. A lane operation counts the lane's takes, its first included, so one delivered once reads 1 and a redelivery 2; maybe_delivered says whether an earlier take may have reached the agent.
      */
     attempt?: number;
+    /**
+     * True once a cancel is recorded on an operation that was already executing; its outcome says whether the cancel won. Set on the op routes and op.changed only.
+     */
+    cancel_requested?: boolean;
+    /**
+     * What caused the operation, as the producer named it. Set on the op routes and op.changed only.
+     */
+    causation?: string;
+    /**
+     * The producer's client key: the Idempotency-Key, or the key the server minted. Set on the op routes and op.changed only.
+     */
+    client_key?: string;
+    /**
+     * The producer's own sequence number, which orders its operations of equal precedence. Set on the op routes and op.changed only.
+     */
+    client_seq?: number;
     /**
      * Session (conversation) id the operation targets.
      */
     conversation: string;
+    /**
+     * The producer's correlation id. Set on the op routes and op.changed only.
+     */
+    correlation?: string;
+    /**
+     * When the operation was proposed. Set on the op routes and op.changed only.
+     */
+    created_at?: string;
+    /**
+     * Who executes the operation: lane (the conversation lane) or a legacy path. Set on the op routes and op.changed only.
+     */
+    executor?: 'lane' | 'legacy' | 'legacy:api' | 'legacy:cli';
     /**
      * Operation id. Equals request_id on async responses.
      */
@@ -785,13 +928,70 @@ export type ConversationOp = {
      */
     kind: 'message' | 'interrupt' | 'respond' | 'create' | 'wake' | 'suspend' | 'resume' | 'restart' | 'kill' | 'close';
     /**
+     * The conversation lane's sequence number of the operation's last take. Set on the op routes and op.changed only.
+     */
+    lane_seq?: number;
+    /**
+     * The last attempt that may have reached the agent (a redelivery after an ambiguous attempt), 0 when none may have. Set on the op routes and op.changed only.
+     */
+    maybe_delivered?: number;
+    /**
      * Present when status is closed.
      */
     outcome?: ConversationOpOutcome;
     /**
+     * The producer's principal: operator, conversation:<id>, t3:<environment id>, or gc:<producer> for gc's own producers. Asserted, not authenticated. Set on the op routes and op.changed only.
+     */
+    principal?: string;
+    /**
      * Operation status. A legacy-executed operation stays submitted until it closes.
      */
     status: 'submitted' | 'accepted' | 'executing' | 'settling' | 'closed';
+};
+
+export type ConversationOpCancelBody = {
+    /**
+     * The asserted principal recorded as the canceler: operator (the default) or t3:<environment id>.
+     */
+    principal?: string;
+    /**
+     * Why the producer cancels.
+     */
+    reason?: string;
+};
+
+export type ConversationOpCancelResult = {
+    /**
+     * The operation after the cancel.
+     */
+    op: ConversationOp;
+    /**
+     * What the cancel did: closed (the operation had not started and is now closed canceled), requested (it is executing; the cancel is recorded and its outcome says who won), already_decided (it is settling; nothing was written) or already_terminal (it was closed).
+     */
+    result: 'closed' | 'requested' | 'already_decided' | 'already_terminal';
+};
+
+export type ConversationOpDelivery = {
+    /**
+     * The runtime's answer (open vocabulary, e.g. delivered, delivered_unobserved, in_band).
+     */
+    ack?: string;
+    /**
+     * The lane's clock just before the delivery's first input.
+     */
+    at?: string;
+    /**
+     * The runtime's creation time for the delivered message, when it reports one.
+     */
+    message_at?: string;
+    /**
+     * The runtime's id for the delivered message, when it reports one.
+     */
+    message_id?: string;
+    /**
+     * lane_seq of the delivery's head operation.
+     */
+    seq?: number;
 };
 
 export type ConversationOpOutcome = {
@@ -808,9 +1008,168 @@ export type ConversationOpOutcome = {
      */
     reason?: string;
     /**
+     * What a succeeded or coalesced operation produced. Set on the op routes and op.changed only.
+     */
+    result?: ConversationOpResult;
+    /**
      * How it was carried out; legacy.* in this release (legacy.delivered, legacy.queued).
      */
     via?: string;
+};
+
+export type ConversationOpPolicyBody = {
+    /**
+     * Execution guarantee: at_least_once (the default; a delivery is repeated only after an ambiguous attempt) or at_most_once (never repeated).
+     */
+    guarantee?: 'at_least_once' | 'at_most_once';
+    /**
+     * The interrupt policy.
+     */
+    interrupt?: ConversationInterruptPolicyBody;
+    /**
+     * The message policy.
+     */
+    message?: ConversationMessagePolicyBody;
+};
+
+export type ConversationOpProposeBody = {
+    /**
+     * The actor class within the principal, e.g. user, system or mcp. Defaults to operator for the operator principal; required with a t3 principal.
+     */
+    actor?: string;
+    /**
+     * An operation id of the same session this one runs after.
+     */
+    after?: string;
+    /**
+     * What caused the operation.
+     */
+    causation?: string;
+    /**
+     * The producer's idempotency key (e.g. T3's message id). The Idempotency-Key header may carry it instead; when both are set they must be equal. Minted and returned when both are absent.
+     */
+    client_key?: string;
+    /**
+     * The producer's own sequence number: it keeps two quick proposals in their order even when relayed concurrently.
+     */
+    client_seq?: number;
+    /**
+     * The producer's correlation id.
+     */
+    correlation?: string;
+    /**
+     * The deadline for the operation to finish.
+     */
+    finish_by?: string;
+    /**
+     * Operation kind. Only kinds listed in [ops] authoritative are accepted (409 kind-not-enabled otherwise).
+     */
+    kind: 'message' | 'interrupt' | 'respond' | 'create' | 'wake' | 'suspend' | 'resume' | 'restart' | 'kill' | 'close';
+    /**
+     * Do not start before this time.
+     */
+    not_before?: string;
+    /**
+     * The operation's payload: a message's text.
+     */
+    payload?: string;
+    /**
+     * The operation's policy; omitted fields take the kind's defaults.
+     */
+    policy?: ConversationOpPolicyBody;
+    /**
+     * The asserted principal: operator (the default) or t3:<environment id> for a T3 Code environment. Until the front door exists it is asserted, not authenticated, like the operator identity of every API mutation; conversation:<id> and gc:<producer> stay reserved to gc's own producers. It keys the operation with the client key, so a retry must send the same one.
+     */
+    principal?: string;
+    /**
+     * The operation's validity scope; omitted takes the kind's default.
+     */
+    scope?: ConversationOpScopeBody;
+    /**
+     * Close the operation failed if it has not started by this time.
+     */
+    start_by?: string;
+};
+
+export type ConversationOpProposeResult = {
+    /**
+     * The client key the operation is recorded under: the producer's, or the one the server minted. Retry with it to get this operation back.
+     */
+    client_key: string;
+    /**
+     * True when this request wrote the operation (201), false when it already existed (200).
+     */
+    created: boolean;
+    /**
+     * City event-stream sequence captured before the proposal. Pass it as after_seq to /v0/city/{cityName}/events/stream to receive this operation's op.changed events.
+     */
+    cursor: string;
+    /**
+     * The operation.
+     */
+    op: ConversationOp;
+    /**
+     * The operation id, derived from the session, the principal and the client key.
+     */
+    op_id: string;
+    /**
+     * The operation's status now.
+     */
+    status: 'submitted' | 'accepted' | 'executing' | 'settling' | 'closed';
+};
+
+export type ConversationOpResult = {
+    /**
+     * The operation this one was delivered with, when coalesced.
+     */
+    coalesced_into?: string;
+    /**
+     * Context epoch the operation ran in.
+     */
+    context_epoch?: number;
+    /**
+     * The conversation lane's delivery record.
+     */
+    delivery?: ConversationOpDelivery;
+    /**
+     * Session generation the operation ran in.
+     */
+    generation?: number;
+    /**
+     * The turn the operation ran in or was linked to; empty when the link is none.
+     */
+    turn?: string;
+    /**
+     * The rule that decided the turn link (open vocabulary, e.g. runtime_turn, history_diff, no_source).
+     */
+    turn_basis?: string;
+    /**
+     * Confidence of the turn link: exact when the runtime named the turn, correlated or ambiguous from observed turns, none when no turn could be linked.
+     */
+    turn_link?: 'exact' | 'correlated' | 'ambiguous' | 'none';
+};
+
+export type ConversationOpScopeBody = {
+    /**
+     * The context epoch of a context scope.
+     */
+    epoch?: number;
+    /**
+     * The session generation of a session scope.
+     */
+    generation?: number;
+    /**
+     * The interaction occurrence a respond answers.
+     */
+    interaction?: string;
+    /**
+     * conversation (any session), context (one context epoch) or session (one session generation).
+     */
+    kind: 'conversation' | 'context' | 'session';
+    /**
+     * The turn an interrupt targets.
+     */
+    turn?: string;
 };
 
 export type ConversationRef = {
@@ -941,6 +1300,13 @@ export type Dep = {
     type: string;
 };
 
+export type DoctorStruct = {
+    /**
+     * Override the doctor census owner namespace; empty string clears it.
+     */
+    census_owner_namespace?: string;
+};
+
 export type ErrorDetail = {
     /**
      * Where the error occurred, e.g. 'body.items[3].tags' or 'path.thing-id'
@@ -1013,7 +1379,7 @@ export type EventEmitRequest = {
     type: string;
 };
 
-export type EventPayload = AdapterEventPayload | BackendCredentialResolvedPayload | BeadClaimRejectedPayload | BeadClaimReleasedPayload | BeadDeadAssigneeReopenedPayload | BeadEventPayload | BeadWorktreeReapSkippedPayload | BeadWorktreeReapedPayload | BlockedRecomputedPayload | BoundEventPayload | CityCreateSucceededPayload | CityLifecyclePayload | CityUnregisterSucceededPayload | ConditionalWritesDegradedPayload | ControlDispatcherScopeGapPayload | ControlRootSettleFailedPayload | ControlStalledPayload | ExecutionClaimWindowExpiredPayload | ExecutionStepStalledPayload | GroupCreatedEventPayload | HookClaimReclaimedStalePayload | InboundEventPayload | MailEventPayload | MoleculeResolvedPayload | NoPayload | OpsRecordingDegradedPayload | OrderInapplicablePayload | OrderSkippedPayload | OrderSuppressedPayload | OutboundChannelMismatchPayload | OutboundEventPayload | ProjectIdentityStampedPayload | Record | RequestFailedPayload | RigCreateSucceededPayload | RigProvisionProgressPayload | RotatedPayload | SessionCreateSucceededPayload | SessionDemandClaimDivergencePayload | SessionDrainAckedWithAssignedWorkPayload | SessionLifecyclePayload | SessionMessageSucceededPayload | SessionPendingClearedPayload | SessionPendingPayload | SessionPoolSlotRetiredAtDrainDeadlinePayload | SessionResetStalledPayload | SessionStrandedClaimsPayload | SessionStrandedPayload | SessionSubmitSucceededPayload | SessionUnknownStatePayload | SessionWakeRefusedPayload | StorageBindingOutcomePayload | StoreDiskCriticalPayload | StoreDiskWarnPayload | StoreMaintenanceDonePayload | StoreMaintenanceFailedPayload | SupervisorFsPressureSkippedTickPayload | SupervisorRequestPayload | SupervisorShutdownPayload | SupervisorStartedPayload | UnboundEventPayload | WebhookReceivedPayload | WebhookRejectedPayload | WorkLadderPayload | WorkerOperationEventPayload;
+export type EventPayload = AdapterEventPayload | BackendCredentialResolvedPayload | BeadClaimFailedPayload | BeadClaimLoopHeldPayload | BeadClaimRejectedPayload | BeadClaimReleasedPayload | BeadDeadAssigneeReopenedPayload | BeadEventPayload | BeadWorktreeReapSkippedPayload | BeadWorktreeReapedPayload | BlockedRecomputedPayload | BoundEventPayload | CityCreateSucceededPayload | CityLifecyclePayload | CityUnregisterSucceededPayload | ConditionalWritesDegradedPayload | ControlDispatcherScopeGapPayload | ControlRootSettleFailedPayload | ControlStalledPayload | ExecutionClaimWindowExpiredPayload | ExecutionStepStalledPayload | FactRecordedPayload | GroupCreatedEventPayload | HookClaimReclaimedStalePayload | HookClaimRefusedPayload | InboundEventPayload | MailEventPayload | MoleculeResolvedPayload | NoPayload | OpChangedPayload | OpsRecordingDegradedPayload | OrderInapplicablePayload | OrderSkippedPayload | OrderSuppressedPayload | OutboundChannelMismatchPayload | OutboundEventPayload | ProjectIdentityStampedPayload | Record | RequestAcceptedPayload | RequestFailedPayload | RigCreateSucceededPayload | RigProvisionProgressPayload | RotatedPayload | SessionCreateSucceededPayload | SessionDemandClaimDivergencePayload | SessionDrainAckedWithAssignedWorkPayload | SessionLifecyclePayload | SessionMessageSucceededPayload | SessionPendingClearedPayload | SessionPendingPayload | SessionPoolSlotRetiredAtDrainDeadlinePayload | SessionReleaseDeferredPayload | SessionResetStalledPayload | SessionStrandedClaimsPayload | SessionStrandedPayload | SessionSubmitSucceededPayload | SessionUnknownStatePayload | SessionWakeRefusedPayload | StorageBindingOutcomePayload | StoreDiskCriticalPayload | StoreDiskWarnPayload | StoreMaintenanceDonePayload | StoreMaintenanceFailedPayload | SupervisorFsPressureSkippedTickPayload | SupervisorRequestPayload | SupervisorShutdownPayload | SupervisorStartedPayload | UnboundEventPayload | WebhookReceivedPayload | WebhookRejectedPayload | WorkLadderPayload | WorkerOperationEventPayload;
 
 export type EventRotateAnchor = {
     /**
@@ -1349,6 +1715,13 @@ export type ExtmsgAdapterInfo = {
     provider: string;
 };
 
+export type FactRecordedPayload = {
+    /**
+     * The recorded fact.
+     */
+    fact: ConversationFact;
+};
+
 export type FanoutPolicy = {
     AllowUntargetedPublication: boolean;
     Enabled: boolean;
@@ -1545,6 +1918,57 @@ export type HookClaimReclaimedStalePayload = {
     previous_owner: string;
 };
 
+export type HookClaimRefusedPayload = {
+    /**
+     * The runtime's GC_ALIAS, else GC_AGENT.
+     */
+    agent?: string;
+    /**
+     * The session bead's generation now, normalized as a start normalizes it (empty, zero or unparseable becomes 1), so it compares directly with runtime_epoch. A lower runtime_epoch means the generation moved on after this runtime started. Equal epochs do NOT prove the same incarnation: a start that finds no instance token mints one without bumping the generation.
+     */
+    bead_epoch?: string;
+    /**
+     * First 8 hex chars of SHA-256 of the session bead's instance token. Never the token.
+     */
+    bead_token_fingerprint?: string;
+    /**
+     * Which identity check refused: session_closed, token_superseded, bead_token_missing, state_not_claim_eligible, session_bead_not_found, not_a_session_bead, or session_id_unset.
+     */
+    detail: string;
+    /**
+     * Drain reason the refusal reported: stale_session or missing_session_registration.
+     */
+    reason: string;
+    /**
+     * The runtime's GC_RUNTIME_EPOCH: the session bead's generation when this runtime was started, with an empty, zero or unparseable generation started as 1.
+     */
+    runtime_epoch?: string;
+    /**
+     * First 8 hex chars of SHA-256 of the runtime's instance token. Never the token.
+     */
+    runtime_token_fingerprint?: string;
+    /**
+     * The runtime's GC_SESSION_ID (its session bead id); empty for session_id_unset.
+     */
+    session_id?: string;
+    /**
+     * The runtime's GC_SESSION_NAME.
+     */
+    session_name?: string;
+    /**
+     * The session bead's state when it was read.
+     */
+    state?: string;
+    /**
+     * The runtime's GC_TEMPLATE (pool membership).
+     */
+    template?: string;
+    /**
+     * Whether the runtime's instance token equals the session bead's; absent when no bead was read.
+     */
+    token_matched?: boolean;
+};
+
 export type InboundEventPayload = {
     actor: string;
     conversation_id: string;
@@ -1636,6 +2060,29 @@ export type ListBodyCityPendingEntry = {
      * The list of items.
      */
     items: Array<CityPendingEntry> | null;
+    /**
+     * Cursor for the next page of results.
+     */
+    next_cursor?: string;
+    /**
+     * True when one or more backends failed and the list is incomplete.
+     */
+    partial?: boolean;
+    /**
+     * Human-readable errors from backends that failed during aggregation.
+     */
+    partial_errors?: Array<string> | null;
+    /**
+     * Total number of items matching the query.
+     */
+    total: number;
+};
+
+export type ListBodyConversationOp = {
+    /**
+     * The list of items.
+     */
+    items: Array<ConversationOp> | null;
     /**
      * Cursor for the next page of results.
      */
@@ -2146,9 +2593,28 @@ export type OkWithIdResponseBody = {
      */
     id?: string;
     /**
+     * The key the request was recorded under: the client's Idempotency-Key, one the server minted when the request carried none, or, for a stop of a known turn, stop:<generation>:<turn>, so two stops of one turn are one operation. Retry with the Idempotency-Key to get this request's outcome instead of acting again.
+     */
+    idempotency_key?: string;
+    /**
+     * The operation the request was recorded as.
+     */
+    op?: ConversationOp;
+    /**
+     * True when this answers a retry of a request that already finished: nothing was executed again, and op carries the stored outcome. A replayed stop never interrupts a later turn.
+     */
+    replayed?: boolean;
+    /**
      * Operation result.
      */
     status: string;
+};
+
+export type OpChangedPayload = {
+    /**
+     * The operation as its row reads after the change.
+     */
+    op: ConversationOp;
 };
 
 export type OpsRecordingDegradedPayload = {
@@ -2808,6 +3274,7 @@ export type ReadinessResponse = {
 
 export type ReadyBead = {
     assignee?: string;
+    await_type?: string;
     blocked_by?: Array<ReadyBeadBlocker> | null;
     close_reason?: string;
     created_at: string;
@@ -2859,6 +3326,17 @@ export type Record = {
     source_pid?: number;
 };
 
+export type RequestAcceptedPayload = {
+    /**
+     * Which operation was accepted.
+     */
+    operation: 'session.create' | 'session.message' | 'session.submit';
+    /**
+     * Correlation ID from the 202 response.
+     */
+    request_id: string;
+};
+
 export type RequestFailedPayload = {
     /**
      * Machine-readable error code.
@@ -2884,6 +3362,25 @@ export type RequestFailedPayload = {
      * Session a failed session.create had already written, when the server could identify it, so the client can inspect or clean it up instead of retrying into a duplicate. Absence does not prove that no session was written. The event subject does not carry this ID; match the event to its request by request_id.
      */
     session_id?: string;
+};
+
+export type RequestOutcome = {
+    /**
+     * The terminal event exactly as /v0/city/{cityName}/events and the event stream deliver it: request.result.session.* for succeeded, request.failed for failed. Absent while pending and for outcome_unknown.
+     */
+    event?: TypedEventStreamEnvelope;
+    /**
+     * The operation that was accepted.
+     */
+    operation: 'session.create' | 'session.message' | 'session.submit';
+    /**
+     * The request_id from the 202 response.
+     */
+    request_id: string;
+    /**
+     * pending: the request is still running, or its terminal event is held until the city event log takes it. succeeded: its request.result.* event was recorded; event carries it. failed: its request.failed event was recorded; event carries it. outcome_unknown: the server that accepted the request stopped (or lost the terminal event) before recording an outcome, so the operation may or may not have taken effect; inspect the target resource before retrying.
+     */
+    state: 'pending' | 'succeeded' | 'failed' | 'outcome_unknown';
 };
 
 export type RigActionBody = {
@@ -2982,10 +3479,15 @@ export type RigCreateSucceededPayload = {
     rig: string;
 };
 
+export type RigDoctorPatch = {
+    CensusOwnerNamespace: string | null;
+};
+
 export type RigPatch = {
     BeadsProxiedIdleTimeout: string | null;
     DefaultBranch: string | null;
     DefaultMergeStrategy: string | null;
+    Doctor?: RigDoctorPatch;
     FormulaVars?: {
         [key: string]: string;
     };
@@ -2998,9 +3500,27 @@ export type RigPatch = {
 
 export type RigPatchSetInputBody = {
     /**
+     * Override the rig's beads_proxied_idle_timeout.
+     */
+    beads_proxied_idle_timeout?: string;
+    /**
      * Override mainline branch.
      */
     default_branch?: string;
+    /**
+     * Override the merge strategy gc sling stamps on beads routed into this rig; empty string clears it.
+     */
+    default_merge_strategy?: string;
+    /**
+     * Override rig doctor settings.
+     */
+    doctor?: DoctorStruct;
+    /**
+     * Rig-scoped formula variable defaults.
+     */
+    formula_vars?: {
+        [key: string]: string;
+    };
     /**
      * Rig name.
      */
@@ -3014,9 +3534,13 @@ export type RigPatchSetInputBody = {
      */
     prefix?: string;
     /**
-     * Override suspended state.
+     * Deprecated suspension override.
      */
     suspended?: boolean;
+    /**
+     * Override desired suspension state at city start.
+     */
+    suspended_on_start?: boolean;
 };
 
 export type RigProvisionProgressPayload = {
@@ -3132,11 +3656,30 @@ export type Run = {
     updated_at?: string;
 };
 
+export type RunCancelInterruptFailure = {
+    /**
+     * Why the interrupt failed.
+     */
+    error: string;
+    /**
+     * Session ID, or the step assignee when it could not be resolved to a session.
+     */
+    session: string;
+};
+
 export type RunCancelOutputBody = {
     /**
-     * Count of the run's beads closed by the cancel.
+     * Count of the run's beads closed by the cancel. Closing is the durable part of a cancel: no closed bead is claimed again.
      */
     closed: number;
+    /**
+     * Holders of an in-progress step the cancel closed whose current turn could not be interrupted. The cancel is durable regardless; stop or suspend these sessions directly.
+     */
+    interrupt_failures?: Array<RunCancelInterruptFailure> | null;
+    /**
+     * IDs of the sessions whose current turn was interrupted because they held an in-progress step the cancel closed. Interrupting ends the agent's turn, the same as POST /session/{id}/stop; for Codex it also closes the session's background terminals. It does not verify that every process the step started has exited, and it cannot undo effects the step already made, such as a push or a call to a remote service. The sessions are not killed; they stay up to serve other work.
+     */
+    interrupted?: Array<string> | null;
     /**
      * The canceled run.
      */
@@ -3238,7 +3781,7 @@ export type RunStep = {
      */
     kind?: string;
     /**
-     * Closed step lifecycle status.
+     * Closed step lifecycle status. Under a terminal run an unfinished step reads the status the run's wind-down closes it with (canceled for a canceled run, skipped otherwise), so it never changes from one terminal status to another; a step that executes after the run settles (the workflow finalizer, the teardown tail) reads its own status until it closes.
      */
     status: RunStepStatus;
     /**
@@ -3346,6 +3889,25 @@ export type SessionBindingRecord = {
     SessionID: string;
     SessionName: string;
     Status: BindingStatus;
+};
+
+export type SessionCommandStatusBody = {
+    /**
+     * The key the request was recorded under: the client's Idempotency-Key, or one the server minted when the request carried none. Retry with it to get this request's outcome instead of acting again.
+     */
+    idempotency_key?: string;
+    /**
+     * The operation the request was recorded as.
+     */
+    op?: ConversationOp;
+    /**
+     * True when this answers a retry of a request that already finished: nothing was executed again, and op carries the stored outcome.
+     */
+    replayed?: boolean;
+    /**
+     * Operation result.
+     */
+    status: string;
 };
 
 export type SessionCreateBody = {
@@ -3619,6 +4181,45 @@ export type SessionPoolSlotRetiredAtDrainDeadlinePayload = {
  */
 export type SessionRawMessageFrame = unknown;
 
+export type SessionReleaseDeferredPayload = {
+    /**
+     * "full" when the pre-close session bead was read, "id_only" when it could not be and only the resolved session ID is known.
+     */
+    capture: string;
+    /**
+     * True when the obligation was published through the store's compare-and-set metadata primitive, which makes the write-once guarantee hold across concurrent close processes. False means the store lacked that capability and a read-then-write fallback was used, which two simultaneous closes could race.
+     */
+    conditional_write: boolean;
+    /**
+     * Obligation generation. 1 for a first publish; higher only when a degraded ID-only obligation was later replaced by a full capture. A drain acknowledges one generation, never the key as a whole.
+     */
+    generation: number;
+    /**
+     * Every identifier under which work could be assigned to this session, captured BEFORE the close mutated them. Untruncated.
+     */
+    identities?: Array<string> | null;
+    /**
+     * Why the obligation write failed, when MarkerPersisted is false.
+     */
+    marker_error?: string;
+    /**
+     * Whether the obligation was durably written to the session bead. False means the deferred release is unrecoverable by any automated path.
+     */
+    marker_persisted: boolean;
+    /**
+     * Why the city config was unavailable, as reported at close time.
+     */
+    reason?: string;
+    /**
+     * False when rig stores could not be enumerated (the usual case here, since enumerating them needs the config that failed to load). A drain must treat false as "scope unknown", never as "no rig stores".
+     */
+    rig_stores_known: boolean;
+    /**
+     * Canonical session bead ID whose close withheld the release (also the envelope Subject).
+     */
+    session_id: string;
+};
+
 export type SessionRenameInputBody = {
     /**
      * New session title.
@@ -3660,6 +4261,18 @@ export type SessionRespondOutputBody = {
      */
     id: string;
     /**
+     * The key the request was recorded under: the client's Idempotency-Key, or one the server minted when the request carried none. Retry with it to get this request's outcome instead of a second response.
+     */
+    idempotency_key?: string;
+    /**
+     * The operation the request was recorded as.
+     */
+    op?: ConversationOp;
+    /**
+     * True when this answers a retry of a request that already finished: nothing was executed again, and op carries the stored outcome.
+     */
+    replayed?: boolean;
+    /**
      * Operation result.
      */
     status: string;
@@ -3671,9 +4284,11 @@ export type SessionResponse = {
     agent_kind?: string;
     alias?: string;
     attached: boolean;
-    configured_named_session?: boolean;
+    base_state: string;
+    configured_named_session: boolean;
     context_pct?: number;
     context_window?: number;
+    control_plane: boolean;
     created_at: string;
     display_name?: string;
     id: string;
@@ -3685,20 +4300,38 @@ export type SessionResponse = {
         [key: string]: string;
     };
     model?: string;
+    navigator_schema_version: string;
     options?: {
         [key: string]: string;
     };
     pool?: string;
+    pool_managed: boolean;
     provider: string;
     reason?: string;
     rig?: string;
+    /**
+     * Whether the session's runtime was live when this response was built, in any open state. It observes the runtime, not the agent: on tmux it is true while the session has a pane whose process has not exited, so a pane still running a launch wrapper or shell before the agent starts reads true, and a pane kept by remain-on-exit after its process exited reads false. GET /session/{id} and GET /sessions read the same probe, which tmux serves from a fleet snapshot refreshed at most every 2 s. Point-in-time: a session in a transitional state (creating, start-pending, draining) can start or stop its process right after; a client confirming quiescence should re-read after its last transition settles.
+     */
     running: boolean;
     session_name: string;
+    session_origin?: string;
     state: string;
     submission_capabilities?: SubmissionCapabilities;
     template: string;
     title: string;
+    /**
+     * The turn the session's conversation lane last observed, with the runtime's turn capabilities. Set on a single-session read while the city's conversation lane host runs with a kind of [ops] authoritative, once its observer has recorded the session's runtime row.
+     */
+    turn?: SessionTurn;
     work_dir?: string;
+};
+
+export type SessionStopBody = {
+    /**
+     * The turn to stop, as the client saw it (a turn id the session's runtime reported). Only that turn is interrupted: when another turn, or none, is running by then, nothing is sent and the request is refused with 409 turn_not_current. A runtime that does not record turn identity refuses a named turn with 501 turn_identity_unsupported. Omit it to stop whatever turn is running.
+     */
+    turn?: string;
+    [key: string]: unknown;
 };
 
 export type SessionStrandedClaimsPayload = {
@@ -4906,6 +5539,152 @@ export type SessionTranscriptStructuredResponse = {
     template: string;
 };
 
+export type SessionTurn = {
+    /**
+     * When the observer saw the current state begin.
+     */
+    at?: string;
+    /**
+     * The runtime's turn capabilities (gc.rt.turn.caps): the turn axes, then source, interrupt and replace.
+     */
+    caps?: Array<SessionTurnCapPair> | null;
+    /**
+     * The session generation the turn cells describe.
+     */
+    generation: number;
+    /**
+     * The running turn's id, as the runtime names it.
+     */
+    id?: string;
+    /**
+     * When the observer saw the last turn end.
+     */
+    last_at?: string;
+    /**
+     * Why the last turn ended (completed, interrupted, superseded, ...).
+     */
+    last_end?: string;
+    /**
+     * The last turn seen to end.
+     */
+    last_id?: string;
+    /**
+     * The observer's clock at the observation that last changed the cells.
+     */
+    observed_at?: string;
+    /**
+     * running, ended, or unknown (never observed, or the cells describe another generation). Open: a newer build may add values.
+     */
+    state: string;
+};
+
+export type SessionTurnCapPair = {
+    /**
+     * Capability name, e.g. start, end, fence, link, source, interrupt, replace.
+     */
+    key: string;
+    /**
+     * Capability value.
+     */
+    value: string;
+};
+
+export type SessionTurnCapabilities = {
+    /**
+     * How turn ends are known: recorded means every end carries its id and how it ended; inferred means some ends are inferred from the session going idle.
+     */
+    end: 'none' | 'boundary' | 'inferred' | 'recorded';
+    /**
+     * How an interrupt could be confined to a named turn: atomic means the runtime refuses to interrupt a turn that is not current; checked means the turn is re-read just before an untargeted interrupt, so a turn starting in between can still be hit; none means an interrupt cannot be aimed at a turn.
+     */
+    fence: 'none' | 'checked' | 'atomic';
+    /**
+     * How the runtime interrupts the session's turn. unsupported forces fence none.
+     */
+    interrupt: 'keystroke' | 'protocol' | 'unsupported';
+    /**
+     * How a delivery is tied to the turn it started: exact means the runtime names it; correlated means it is matched by observation.
+     */
+    link: 'none' | 'correlated' | 'exact';
+    /**
+     * Every turn since the last read can be recovered from the next one.
+     */
+    lossless: boolean;
+    /**
+     * How turn starts are known: recorded means every start carries its turn id.
+     */
+    start: 'none' | 'boundary' | 'recorded';
+};
+
+export type SessionTurnCurrent = {
+    /**
+     * The turn's id, as the source records it. Opaque; compare for equality only.
+     */
+    id: string;
+    /**
+     * When the turn started, at the source's precision; absent when unknown.
+     */
+    started_at?: string;
+};
+
+export type SessionTurnEnded = {
+    /**
+     * When the turn ended: the source's time, or, for an inferred end, the server's when the read inferred it; absent when unknown. Each read infers an end anew, so an inferred end's time can differ between reads, and a read that cannot confirm the session idle reports that turn current again.
+     */
+    ended_at?: string;
+    /**
+     * The turn's id, as the source records it. Opaque; compare for equality only.
+     */
+    id: string;
+    /**
+     * The end was inferred from the session going idle, not recorded.
+     */
+    inferred: boolean;
+    /**
+     * When the turn started, at the source's precision; absent when unknown.
+     */
+    started_at?: string;
+    /**
+     * How the turn ended: completed, cancelled or failed (the runtime's spelling); absent when the source closed it only because a newer turn started.
+     */
+    status?: string;
+};
+
+export type SessionTurnResponse = {
+    /**
+     * How far the source's answer can be trusted.
+     */
+    capabilities: SessionTurnCapabilities;
+    /**
+     * The turn in progress. Absent when no turn is running, or when the observation is not observed.
+     */
+    current?: SessionTurnCurrent;
+    /**
+     * Why the observation is not observed.
+     */
+    detail?: string;
+    /**
+     * What this read saw. observed: current and recent are this read's answer, and an absent current means no turn is running. unavailable: the source exists but could not be read now (a transcript not written yet, no conversation key yet, a runtime that did not answer); the session's turns are unknown, not idle, so retry. unsupported: the session's turns cannot be identified (no source, or a transcript that records turns without ids).
+     */
+    observation: 'observed' | 'unavailable' | 'unsupported';
+    /**
+     * When the read was made, on the server's clock. Present only when observed.
+     */
+    observed_at?: string;
+    /**
+     * Turns that ended, newest first. A transcript source reports at most 8 from a bounded window, so a turn that ends between two reads can fall out of it unless capabilities.lossless is true.
+     */
+    recent?: Array<SessionTurnEnded> | null;
+    /**
+     * The resolved session id.
+     */
+    session_id: string;
+    /**
+     * Where the session's turns are read from: protocol (the runtime observes turns itself), transcript (the provider's transcript of the session's own conversation, on this host), or none (the session's turns cannot be identified here). Fixed for the session's generation.
+     */
+    source: 'protocol' | 'transcript' | 'none';
+};
+
 export type SessionUnknownStatePayload = {
     /**
      * False on the first-sight emission; true when re-emitted after the bead has sat unrecognized past the escalation threshold.
@@ -5772,6 +6551,10 @@ export type TranscriptProvenance = 'live' | 'hydrated';
 export type TypedEventStreamEnvelope = ({
     type: 'backend.credential_resolved';
 } & TypedEventStreamEnvelopeBackendCredentialResolved) | ({
+    type: 'bead.claim_failed';
+} & TypedEventStreamEnvelopeBeadClaimFailed) | ({
+    type: 'bead.claim_loop_held';
+} & TypedEventStreamEnvelopeBeadClaimLoopHeld) | ({
     type: 'bead.claim_rejected';
 } & TypedEventStreamEnvelopeBeadClaimRejected) | ({
     type: 'bead.claim_released';
@@ -5852,6 +6635,8 @@ export type TypedEventStreamEnvelope = ({
 } & TypedEventStreamEnvelopeExtmsgOutboundChannelMismatch) | ({
     type: 'extmsg.unbound';
 } & TypedEventStreamEnvelopeExtmsgUnbound) | ({
+    type: 'fact.recorded';
+} & TypedEventStreamEnvelopeFactRecorded) | ({
     type: 'gc.store.disk_critical';
 } & TypedEventStreamEnvelopeGcStoreDiskCritical) | ({
     type: 'gc.store.disk_warn';
@@ -5862,6 +6647,8 @@ export type TypedEventStreamEnvelope = ({
 } & TypedEventStreamEnvelopeGcStoreMaintenanceFailed) | ({
     type: 'hook.claim.reclaimed_stale';
 } & TypedEventStreamEnvelopeHookClaimReclaimedStale) | ({
+    type: 'hook.claim.refused';
+} & TypedEventStreamEnvelopeHookClaimRefused) | ({
     type: 'mail.archived';
 } & TypedEventStreamEnvelopeMailArchived) | ({
     type: 'mail.deleted';
@@ -5878,6 +6665,8 @@ export type TypedEventStreamEnvelope = ({
 } & TypedEventStreamEnvelopeMailSent) | ({
     type: 'molecule.resolved';
 } & TypedEventStreamEnvelopeMoleculeResolved) | ({
+    type: 'op.changed';
+} & TypedEventStreamEnvelopeOpChanged) | ({
     type: 'ops.recording_degraded';
 } & TypedEventStreamEnvelopeOpsRecordingDegraded) | ({
     type: 'order.completed';
@@ -5896,6 +6685,8 @@ export type TypedEventStreamEnvelope = ({
 } & TypedEventStreamEnvelopeProjectIdentityStamped) | ({
     type: 'provider.swapped';
 } & TypedEventStreamEnvelopeProviderSwapped) | ({
+    type: 'request.accepted';
+} & TypedEventStreamEnvelopeRequestAccepted) | ({
     type: 'request.failed';
 } & TypedEventStreamEnvelopeRequestFailed) | ({
     type: 'request.result.city.create';
@@ -5914,6 +6705,8 @@ export type TypedEventStreamEnvelope = ({
 } & TypedEventStreamEnvelopeRigProvisionProgress) | ({
     type: 'session.cold_start_timeout';
 } & TypedEventStreamEnvelopeSessionColdStartTimeout) | ({
+    type: 'session.config_drift_wave';
+} & TypedEventStreamEnvelopeSessionConfigDriftWave) | ({
     type: 'session.conversation_reset';
 } & TypedEventStreamEnvelopeSessionConversationReset) | ({
     type: 'session.crashed';
@@ -5940,6 +6733,8 @@ export type TypedEventStreamEnvelope = ({
 } & TypedEventStreamEnvelopeSessionPoolSlotRetiredAtDrainDeadline) | ({
     type: 'session.quarantined';
 } & TypedEventStreamEnvelopeSessionQuarantined) | ({
+    type: 'session.release_deferred';
+} & TypedEventStreamEnvelopeSessionReleaseDeferred) | ({
     type: 'session.reset_stalled';
 } & TypedEventStreamEnvelopeSessionResetStalled) | ({
     type: 'session.stopped';
@@ -6018,6 +6813,42 @@ export type TypedEventStreamEnvelopeBackendCredentialResolved = {
     subject?: string;
     ts: string;
     type: 'backend.credential_resolved';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
+ * TypedEventStreamEnvelope bead.claim_failed
+ */
+export type TypedEventStreamEnvelopeBeadClaimFailed = {
+    actor: string;
+    depends_on_step_ids?: Array<string>;
+    message?: string;
+    payload: BeadClaimFailedPayload;
+    run_id?: string;
+    seq: number;
+    session_id?: string;
+    step_id?: string;
+    subject?: string;
+    ts: string;
+    type: 'bead.claim_failed';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
+ * TypedEventStreamEnvelope bead.claim_loop_held
+ */
+export type TypedEventStreamEnvelopeBeadClaimLoopHeld = {
+    actor: string;
+    depends_on_step_ids?: Array<string>;
+    message?: string;
+    payload: BeadClaimLoopHeldPayload;
+    run_id?: string;
+    seq: number;
+    session_id?: string;
+    step_id?: string;
+    subject?: string;
+    ts: string;
+    type: 'bead.claim_loop_held';
     workflow?: WorkflowEventProjection;
 };
 
@@ -6760,6 +7591,24 @@ export type TypedEventStreamEnvelopeExtmsgUnbound = {
 };
 
 /**
+ * TypedEventStreamEnvelope fact.recorded
+ */
+export type TypedEventStreamEnvelopeFactRecorded = {
+    actor: string;
+    depends_on_step_ids?: Array<string>;
+    message?: string;
+    payload: FactRecordedPayload;
+    run_id?: string;
+    seq: number;
+    session_id?: string;
+    step_id?: string;
+    subject?: string;
+    ts: string;
+    type: 'fact.recorded';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
  * TypedEventStreamEnvelope gc.store.disk_critical
  */
 export type TypedEventStreamEnvelopeGcStoreDiskCritical = {
@@ -6846,6 +7695,24 @@ export type TypedEventStreamEnvelopeHookClaimReclaimedStale = {
     subject?: string;
     ts: string;
     type: 'hook.claim.reclaimed_stale';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
+ * TypedEventStreamEnvelope hook.claim.refused
+ */
+export type TypedEventStreamEnvelopeHookClaimRefused = {
+    actor: string;
+    depends_on_step_ids?: Array<string>;
+    message?: string;
+    payload: HookClaimRefusedPayload;
+    run_id?: string;
+    seq: number;
+    session_id?: string;
+    step_id?: string;
+    subject?: string;
+    ts: string;
+    type: 'hook.claim.refused';
     workflow?: WorkflowEventProjection;
 };
 
@@ -6990,6 +7857,24 @@ export type TypedEventStreamEnvelopeMoleculeResolved = {
     subject?: string;
     ts: string;
     type: 'molecule.resolved';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
+ * TypedEventStreamEnvelope op.changed
+ */
+export type TypedEventStreamEnvelopeOpChanged = {
+    actor: string;
+    depends_on_step_ids?: Array<string>;
+    message?: string;
+    payload: OpChangedPayload;
+    run_id?: string;
+    seq: number;
+    session_id?: string;
+    step_id?: string;
+    subject?: string;
+    ts: string;
+    type: 'op.changed';
     workflow?: WorkflowEventProjection;
 };
 
@@ -7156,6 +8041,24 @@ export type TypedEventStreamEnvelopeProviderSwapped = {
 };
 
 /**
+ * TypedEventStreamEnvelope request.accepted
+ */
+export type TypedEventStreamEnvelopeRequestAccepted = {
+    actor: string;
+    depends_on_step_ids?: Array<string>;
+    message?: string;
+    payload: RequestAcceptedPayload;
+    run_id?: string;
+    seq: number;
+    session_id?: string;
+    step_id?: string;
+    subject?: string;
+    ts: string;
+    type: 'request.accepted';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
  * TypedEventStreamEnvelope request.failed
  */
 export type TypedEventStreamEnvelopeRequestFailed = {
@@ -7314,6 +8217,24 @@ export type TypedEventStreamEnvelopeSessionColdStartTimeout = {
     subject?: string;
     ts: string;
     type: 'session.cold_start_timeout';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
+ * TypedEventStreamEnvelope session.config_drift_wave
+ */
+export type TypedEventStreamEnvelopeSessionConfigDriftWave = {
+    actor: string;
+    depends_on_step_ids?: Array<string>;
+    message?: string;
+    payload: NoPayload;
+    run_id?: string;
+    seq: number;
+    session_id?: string;
+    step_id?: string;
+    subject?: string;
+    ts: string;
+    type: 'session.config_drift_wave';
     workflow?: WorkflowEventProjection;
 };
 
@@ -7548,6 +8469,24 @@ export type TypedEventStreamEnvelopeSessionQuarantined = {
     subject?: string;
     ts: string;
     type: 'session.quarantined';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
+ * TypedEventStreamEnvelope session.release_deferred
+ */
+export type TypedEventStreamEnvelopeSessionReleaseDeferred = {
+    actor: string;
+    depends_on_step_ids?: Array<string>;
+    message?: string;
+    payload: SessionReleaseDeferredPayload;
+    run_id?: string;
+    seq: number;
+    session_id?: string;
+    step_id?: string;
+    subject?: string;
+    ts: string;
+    type: 'session.release_deferred';
     workflow?: WorkflowEventProjection;
 };
 
@@ -8099,6 +9038,10 @@ export type TypedEventStreamEnvelopeWorkerOperation = {
 export type TypedTaggedEventStreamEnvelope = ({
     type: 'backend.credential_resolved';
 } & TypedTaggedEventStreamEnvelopeBackendCredentialResolved) | ({
+    type: 'bead.claim_failed';
+} & TypedTaggedEventStreamEnvelopeBeadClaimFailed) | ({
+    type: 'bead.claim_loop_held';
+} & TypedTaggedEventStreamEnvelopeBeadClaimLoopHeld) | ({
     type: 'bead.claim_rejected';
 } & TypedTaggedEventStreamEnvelopeBeadClaimRejected) | ({
     type: 'bead.claim_released';
@@ -8179,6 +9122,8 @@ export type TypedTaggedEventStreamEnvelope = ({
 } & TypedTaggedEventStreamEnvelopeExtmsgOutboundChannelMismatch) | ({
     type: 'extmsg.unbound';
 } & TypedTaggedEventStreamEnvelopeExtmsgUnbound) | ({
+    type: 'fact.recorded';
+} & TypedTaggedEventStreamEnvelopeFactRecorded) | ({
     type: 'gc.store.disk_critical';
 } & TypedTaggedEventStreamEnvelopeGcStoreDiskCritical) | ({
     type: 'gc.store.disk_warn';
@@ -8189,6 +9134,8 @@ export type TypedTaggedEventStreamEnvelope = ({
 } & TypedTaggedEventStreamEnvelopeGcStoreMaintenanceFailed) | ({
     type: 'hook.claim.reclaimed_stale';
 } & TypedTaggedEventStreamEnvelopeHookClaimReclaimedStale) | ({
+    type: 'hook.claim.refused';
+} & TypedTaggedEventStreamEnvelopeHookClaimRefused) | ({
     type: 'mail.archived';
 } & TypedTaggedEventStreamEnvelopeMailArchived) | ({
     type: 'mail.deleted';
@@ -8205,6 +9152,8 @@ export type TypedTaggedEventStreamEnvelope = ({
 } & TypedTaggedEventStreamEnvelopeMailSent) | ({
     type: 'molecule.resolved';
 } & TypedTaggedEventStreamEnvelopeMoleculeResolved) | ({
+    type: 'op.changed';
+} & TypedTaggedEventStreamEnvelopeOpChanged) | ({
     type: 'ops.recording_degraded';
 } & TypedTaggedEventStreamEnvelopeOpsRecordingDegraded) | ({
     type: 'order.completed';
@@ -8223,6 +9172,8 @@ export type TypedTaggedEventStreamEnvelope = ({
 } & TypedTaggedEventStreamEnvelopeProjectIdentityStamped) | ({
     type: 'provider.swapped';
 } & TypedTaggedEventStreamEnvelopeProviderSwapped) | ({
+    type: 'request.accepted';
+} & TypedTaggedEventStreamEnvelopeRequestAccepted) | ({
     type: 'request.failed';
 } & TypedTaggedEventStreamEnvelopeRequestFailed) | ({
     type: 'request.result.city.create';
@@ -8241,6 +9192,8 @@ export type TypedTaggedEventStreamEnvelope = ({
 } & TypedTaggedEventStreamEnvelopeRigProvisionProgress) | ({
     type: 'session.cold_start_timeout';
 } & TypedTaggedEventStreamEnvelopeSessionColdStartTimeout) | ({
+    type: 'session.config_drift_wave';
+} & TypedTaggedEventStreamEnvelopeSessionConfigDriftWave) | ({
     type: 'session.conversation_reset';
 } & TypedTaggedEventStreamEnvelopeSessionConversationReset) | ({
     type: 'session.crashed';
@@ -8267,6 +9220,8 @@ export type TypedTaggedEventStreamEnvelope = ({
 } & TypedTaggedEventStreamEnvelopeSessionPoolSlotRetiredAtDrainDeadline) | ({
     type: 'session.quarantined';
 } & TypedTaggedEventStreamEnvelopeSessionQuarantined) | ({
+    type: 'session.release_deferred';
+} & TypedTaggedEventStreamEnvelopeSessionReleaseDeferred) | ({
     type: 'session.reset_stalled';
 } & TypedTaggedEventStreamEnvelopeSessionResetStalled) | ({
     type: 'session.stopped';
@@ -8346,6 +9301,44 @@ export type TypedTaggedEventStreamEnvelopeBackendCredentialResolved = {
     subject?: string;
     ts: string;
     type: 'backend.credential_resolved';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
+ * TypedTaggedEventStreamEnvelope bead.claim_failed
+ */
+export type TypedTaggedEventStreamEnvelopeBeadClaimFailed = {
+    actor: string;
+    city: string;
+    depends_on_step_ids?: Array<string>;
+    message?: string;
+    payload: BeadClaimFailedPayload;
+    run_id?: string;
+    seq: number;
+    session_id?: string;
+    step_id?: string;
+    subject?: string;
+    ts: string;
+    type: 'bead.claim_failed';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
+ * TypedTaggedEventStreamEnvelope bead.claim_loop_held
+ */
+export type TypedTaggedEventStreamEnvelopeBeadClaimLoopHeld = {
+    actor: string;
+    city: string;
+    depends_on_step_ids?: Array<string>;
+    message?: string;
+    payload: BeadClaimLoopHeldPayload;
+    run_id?: string;
+    seq: number;
+    session_id?: string;
+    step_id?: string;
+    subject?: string;
+    ts: string;
+    type: 'bead.claim_loop_held';
     workflow?: WorkflowEventProjection;
 };
 
@@ -9129,6 +10122,25 @@ export type TypedTaggedEventStreamEnvelopeExtmsgUnbound = {
 };
 
 /**
+ * TypedTaggedEventStreamEnvelope fact.recorded
+ */
+export type TypedTaggedEventStreamEnvelopeFactRecorded = {
+    actor: string;
+    city: string;
+    depends_on_step_ids?: Array<string>;
+    message?: string;
+    payload: FactRecordedPayload;
+    run_id?: string;
+    seq: number;
+    session_id?: string;
+    step_id?: string;
+    subject?: string;
+    ts: string;
+    type: 'fact.recorded';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
  * TypedTaggedEventStreamEnvelope gc.store.disk_critical
  */
 export type TypedTaggedEventStreamEnvelopeGcStoreDiskCritical = {
@@ -9220,6 +10232,25 @@ export type TypedTaggedEventStreamEnvelopeHookClaimReclaimedStale = {
     subject?: string;
     ts: string;
     type: 'hook.claim.reclaimed_stale';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
+ * TypedTaggedEventStreamEnvelope hook.claim.refused
+ */
+export type TypedTaggedEventStreamEnvelopeHookClaimRefused = {
+    actor: string;
+    city: string;
+    depends_on_step_ids?: Array<string>;
+    message?: string;
+    payload: HookClaimRefusedPayload;
+    run_id?: string;
+    seq: number;
+    session_id?: string;
+    step_id?: string;
+    subject?: string;
+    ts: string;
+    type: 'hook.claim.refused';
     workflow?: WorkflowEventProjection;
 };
 
@@ -9372,6 +10403,25 @@ export type TypedTaggedEventStreamEnvelopeMoleculeResolved = {
     subject?: string;
     ts: string;
     type: 'molecule.resolved';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
+ * TypedTaggedEventStreamEnvelope op.changed
+ */
+export type TypedTaggedEventStreamEnvelopeOpChanged = {
+    actor: string;
+    city: string;
+    depends_on_step_ids?: Array<string>;
+    message?: string;
+    payload: OpChangedPayload;
+    run_id?: string;
+    seq: number;
+    session_id?: string;
+    step_id?: string;
+    subject?: string;
+    ts: string;
+    type: 'op.changed';
     workflow?: WorkflowEventProjection;
 };
 
@@ -9547,6 +10597,25 @@ export type TypedTaggedEventStreamEnvelopeProviderSwapped = {
 };
 
 /**
+ * TypedTaggedEventStreamEnvelope request.accepted
+ */
+export type TypedTaggedEventStreamEnvelopeRequestAccepted = {
+    actor: string;
+    city: string;
+    depends_on_step_ids?: Array<string>;
+    message?: string;
+    payload: RequestAcceptedPayload;
+    run_id?: string;
+    seq: number;
+    session_id?: string;
+    step_id?: string;
+    subject?: string;
+    ts: string;
+    type: 'request.accepted';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
  * TypedTaggedEventStreamEnvelope request.failed
  */
 export type TypedTaggedEventStreamEnvelopeRequestFailed = {
@@ -9714,6 +10783,25 @@ export type TypedTaggedEventStreamEnvelopeSessionColdStartTimeout = {
     subject?: string;
     ts: string;
     type: 'session.cold_start_timeout';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
+ * TypedTaggedEventStreamEnvelope session.config_drift_wave
+ */
+export type TypedTaggedEventStreamEnvelopeSessionConfigDriftWave = {
+    actor: string;
+    city: string;
+    depends_on_step_ids?: Array<string>;
+    message?: string;
+    payload: NoPayload;
+    run_id?: string;
+    seq: number;
+    session_id?: string;
+    step_id?: string;
+    subject?: string;
+    ts: string;
+    type: 'session.config_drift_wave';
     workflow?: WorkflowEventProjection;
 };
 
@@ -9961,6 +11049,25 @@ export type TypedTaggedEventStreamEnvelopeSessionQuarantined = {
     subject?: string;
     ts: string;
     type: 'session.quarantined';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
+ * TypedTaggedEventStreamEnvelope session.release_deferred
+ */
+export type TypedTaggedEventStreamEnvelopeSessionReleaseDeferred = {
+    actor: string;
+    city: string;
+    depends_on_step_ids?: Array<string>;
+    message?: string;
+    payload: SessionReleaseDeferredPayload;
+    run_id?: string;
+    seq: number;
+    session_id?: string;
+    step_id?: string;
+    subject?: string;
+    ts: string;
+    type: 'session.release_deferred';
     workflow?: WorkflowEventProjection;
 };
 
@@ -15328,6 +16435,10 @@ export type SendMailResponses = {
      * Created
      */
     201: Message;
+    /**
+     * Delivery unconfirmed: the store reported the message created but it could not be read back, so it may or may not have landed. The body carries its id; check storage for that id before re-sending (a blind re-send may duplicate it). A retry with the same Idempotency-Key replays this 202 without writing again.
+     */
+    202: Message;
 };
 
 export type SendMailResponse = SendMailResponses[keyof SendMailResponses];
@@ -15794,6 +16905,10 @@ export type ReplyMailResponses = {
      * Created
      */
     201: Message;
+    /**
+     * Delivery unconfirmed: the store reported the reply created but it could not be read back, so it may or may not have landed. The body carries its id; check storage for that id before re-sending (a blind re-send may duplicate it). A retry with the same Idempotency-Key replays this 202 without writing again.
+     */
+    202: Message;
 };
 
 export type ReplyMailResponse = ReplyMailResponses[keyof ReplyMailResponses];
@@ -17755,6 +18870,57 @@ export type GetV0CityByCityNameReadinessResponses = {
 
 export type GetV0CityByCityNameReadinessResponse = GetV0CityByCityNameReadinessResponses[keyof GetV0CityByCityNameReadinessResponses];
 
+export type GetRequestOutcomeData = {
+    body?: never;
+    path: {
+        /**
+         * City name.
+         */
+        cityName: string;
+        /**
+         * The request_id from an async session request's 202 response.
+         */
+        requestId: string;
+    };
+    query: {
+        /**
+         * The event_cursor from the same 202 response. The request's request.accepted marker and terminal event both follow it, so the lookup reads only the events after it.
+         */
+        after_seq: string;
+    };
+    url: '/v0/city/{cityName}/request/{requestId}';
+};
+
+export type GetRequestOutcomeErrors = {
+    /**
+     * Not Found
+     */
+    404: ErrorModel;
+    /**
+     * Unprocessable Entity
+     */
+    422: ErrorModel;
+    /**
+     * Internal Server Error
+     */
+    500: ErrorModel;
+    /**
+     * Service Unavailable
+     */
+    503: ErrorModel;
+};
+
+export type GetRequestOutcomeError = GetRequestOutcomeErrors[keyof GetRequestOutcomeErrors];
+
+export type GetRequestOutcomeResponses = {
+    /**
+     * OK
+     */
+    200: RequestOutcome;
+};
+
+export type GetRequestOutcomeResponse = GetRequestOutcomeResponses[keyof GetRequestOutcomeResponses];
+
 export type DeleteV0CityByCityNameRigByNameData = {
     body?: never;
     headers: {
@@ -18708,6 +19874,10 @@ export type PostV0CityByCityNameSessionByIdCloseData = {
          * Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.
          */
         'X-GC-Request': string;
+        /**
+         * Idempotency key for safe retries.
+         */
+        'Idempotency-Key'?: string;
     };
     path: {
         /**
@@ -18721,7 +19891,7 @@ export type PostV0CityByCityNameSessionByIdCloseData = {
     };
     query?: {
         /**
-         * Permanently delete bead after closing.
+         * Permanently delete bead after closing. Part of the request an Idempotency-Key names: a same-key retry that changes it is 422, after an API restart too while the close is recorded as an operation, and a replay never deletes. After a restart a same-key retry finds the recorded close by the session ID only: by an alias or session_name, or after a completed delete, it is 404.
          */
         delete?: boolean;
     };
@@ -18765,7 +19935,7 @@ export type PostV0CityByCityNameSessionByIdCloseResponses = {
     /**
      * OK
      */
-    200: OkResponseBody;
+    200: SessionCommandStatusBody;
 };
 
 export type PostV0CityByCityNameSessionByIdCloseResponse = PostV0CityByCityNameSessionByIdCloseResponses[keyof PostV0CityByCityNameSessionByIdCloseResponses];
@@ -18777,6 +19947,10 @@ export type PostV0CityByCityNameSessionByIdKillData = {
          * Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.
          */
         'X-GC-Request': string;
+        /**
+         * Idempotency key for safe retries.
+         */
+        'Idempotency-Key'?: string;
     };
     path: {
         /**
@@ -18788,7 +19962,12 @@ export type PostV0CityByCityNameSessionByIdKillData = {
          */
         id: string;
     };
-    query?: never;
+    query?: {
+        /**
+         * Kill even when the session has live background subagents, or past a hung holder of its runtime lease whose record expired, as gc session kill --force does.
+         */
+        force?: boolean;
+    };
     url: '/v0/city/{cityName}/session/{id}/kill';
 };
 
@@ -18901,6 +20080,250 @@ export type SendSessionMessageResponses = {
 };
 
 export type SendSessionMessageResponse = SendSessionMessageResponses[keyof SendSessionMessageResponses];
+
+export type ListSessionOpsData = {
+    body?: never;
+    path: {
+        /**
+         * City name.
+         */
+        cityName: string;
+        /**
+         * Session ID, alias, or runtime session_name.
+         */
+        id: string;
+    };
+    query?: never;
+    url: '/v0/city/{cityName}/session/{id}/ops';
+};
+
+export type ListSessionOpsErrors = {
+    /**
+     * Not Found
+     */
+    404: ErrorModel;
+    /**
+     * Conflict
+     */
+    409: ErrorModel;
+    /**
+     * Unprocessable Entity
+     */
+    422: ErrorModel;
+    /**
+     * Internal Server Error
+     */
+    500: ErrorModel;
+    /**
+     * Service Unavailable
+     */
+    503: ErrorModel;
+};
+
+export type ListSessionOpsError = ListSessionOpsErrors[keyof ListSessionOpsErrors];
+
+export type ListSessionOpsResponses = {
+    /**
+     * OK
+     */
+    200: ListBodyConversationOp;
+};
+
+export type ListSessionOpsResponse = ListSessionOpsResponses[keyof ListSessionOpsResponses];
+
+export type ProposeSessionOpData = {
+    body: ConversationOpProposeBody;
+    headers: {
+        /**
+         * Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.
+         */
+        'X-GC-Request': string;
+        /**
+         * The client key, when the body does not carry one.
+         */
+        'Idempotency-Key'?: string;
+    };
+    path: {
+        /**
+         * City name.
+         */
+        cityName: string;
+        /**
+         * Session ID, alias, or runtime session_name.
+         */
+        id: string;
+    };
+    query?: never;
+    url: '/v0/city/{cityName}/session/{id}/ops';
+};
+
+export type ProposeSessionOpErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ErrorModel;
+    /**
+     * Forbidden
+     */
+    403: ErrorModel;
+    /**
+     * Not Found
+     */
+    404: ErrorModel;
+    /**
+     * Conflict
+     */
+    409: ErrorModel;
+    /**
+     * Unprocessable Entity
+     */
+    422: ErrorModel;
+    /**
+     * Internal Server Error
+     */
+    500: ErrorModel;
+    /**
+     * Service Unavailable
+     */
+    503: ErrorModel;
+};
+
+export type ProposeSessionOpError = ProposeSessionOpErrors[keyof ProposeSessionOpErrors];
+
+export type ProposeSessionOpResponses = {
+    /**
+     * The same request was proposed before: the stored operation, with created false.
+     */
+    200: ConversationOpProposeResult;
+    /**
+     * Created
+     */
+    201: ConversationOpProposeResult;
+};
+
+export type ProposeSessionOpResponse = ProposeSessionOpResponses[keyof ProposeSessionOpResponses];
+
+export type GetSessionOpData = {
+    body?: never;
+    path: {
+        /**
+         * City name.
+         */
+        cityName: string;
+        /**
+         * Session ID, alias, or runtime session_name.
+         */
+        id: string;
+        /**
+         * Operation id.
+         */
+        op: string;
+    };
+    query?: never;
+    url: '/v0/city/{cityName}/session/{id}/ops/{op}';
+};
+
+export type GetSessionOpErrors = {
+    /**
+     * Not Found
+     */
+    404: ErrorModel;
+    /**
+     * Conflict
+     */
+    409: ErrorModel;
+    /**
+     * Unprocessable Entity
+     */
+    422: ErrorModel;
+    /**
+     * Internal Server Error
+     */
+    500: ErrorModel;
+    /**
+     * Service Unavailable
+     */
+    503: ErrorModel;
+};
+
+export type GetSessionOpError = GetSessionOpErrors[keyof GetSessionOpErrors];
+
+export type GetSessionOpResponses = {
+    /**
+     * OK
+     */
+    200: ConversationOp;
+};
+
+export type GetSessionOpResponse = GetSessionOpResponses[keyof GetSessionOpResponses];
+
+export type CancelSessionOpData = {
+    body?: ConversationOpCancelBody;
+    headers: {
+        /**
+         * Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.
+         */
+        'X-GC-Request': string;
+    };
+    path: {
+        /**
+         * City name.
+         */
+        cityName: string;
+        /**
+         * Session ID, alias, or runtime session_name.
+         */
+        id: string;
+        /**
+         * Operation id.
+         */
+        op: string;
+    };
+    query?: never;
+    url: '/v0/city/{cityName}/session/{id}/ops/{op}/cancel';
+};
+
+export type CancelSessionOpErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ErrorModel;
+    /**
+     * Forbidden
+     */
+    403: ErrorModel;
+    /**
+     * Not Found
+     */
+    404: ErrorModel;
+    /**
+     * Conflict
+     */
+    409: ErrorModel;
+    /**
+     * Unprocessable Entity
+     */
+    422: ErrorModel;
+    /**
+     * Internal Server Error
+     */
+    500: ErrorModel;
+    /**
+     * Service Unavailable
+     */
+    503: ErrorModel;
+};
+
+export type CancelSessionOpError = CancelSessionOpErrors[keyof CancelSessionOpErrors];
+
+export type CancelSessionOpResponses = {
+    /**
+     * OK
+     */
+    200: ConversationOpCancelResult;
+};
+
+export type CancelSessionOpResponse = CancelSessionOpResponses[keyof CancelSessionOpResponses];
 
 export type GetV0CityByCityNameSessionByIdPendingData = {
     body?: never;
@@ -19167,6 +20590,10 @@ export type PostV0CityByCityNameSessionByIdResetData = {
          * Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.
          */
         'X-GC-Request': string;
+        /**
+         * Idempotency key for safe retries.
+         */
+        'Idempotency-Key'?: string;
     };
     path: {
         /**
@@ -19297,7 +20724,7 @@ export type RespondSessionResponses = {
 export type RespondSessionResponse = RespondSessionResponses[keyof RespondSessionResponses];
 
 export type PostV0CityByCityNameSessionByIdStopData = {
-    body?: never;
+    body?: SessionStopBody;
     headers: {
         /**
          * Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.
@@ -19596,6 +21023,10 @@ export type PostV0CityByCityNameSessionByIdSuspendData = {
          * Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.
          */
         'X-GC-Request': string;
+        /**
+         * Idempotency key for safe retries.
+         */
+        'Idempotency-Key'?: string;
     };
     path: {
         /**
@@ -19648,7 +21079,7 @@ export type PostV0CityByCityNameSessionByIdSuspendResponses = {
     /**
      * OK
      */
-    200: OkResponseBody;
+    200: SessionCommandStatusBody;
 };
 
 export type PostV0CityByCityNameSessionByIdSuspendResponse = PostV0CityByCityNameSessionByIdSuspendResponses[keyof PostV0CityByCityNameSessionByIdSuspendResponses];
@@ -19723,6 +21154,56 @@ export type GetV0CityByCityNameSessionByIdTranscriptResponses = {
 };
 
 export type GetV0CityByCityNameSessionByIdTranscriptResponse = GetV0CityByCityNameSessionByIdTranscriptResponses[keyof GetV0CityByCityNameSessionByIdTranscriptResponses];
+
+export type GetV0CityByCityNameSessionByIdTurnData = {
+    body?: never;
+    path: {
+        /**
+         * City name.
+         */
+        cityName: string;
+        /**
+         * Session ID, alias, or runtime session_name.
+         */
+        id: string;
+    };
+    query?: never;
+    url: '/v0/city/{cityName}/session/{id}/turn';
+};
+
+export type GetV0CityByCityNameSessionByIdTurnErrors = {
+    /**
+     * Not Found
+     */
+    404: ErrorModel;
+    /**
+     * Conflict
+     */
+    409: ErrorModel;
+    /**
+     * Unprocessable Entity
+     */
+    422: ErrorModel;
+    /**
+     * Internal Server Error
+     */
+    500: ErrorModel;
+    /**
+     * Service Unavailable
+     */
+    503: ErrorModel;
+};
+
+export type GetV0CityByCityNameSessionByIdTurnError = GetV0CityByCityNameSessionByIdTurnErrors[keyof GetV0CityByCityNameSessionByIdTurnErrors];
+
+export type GetV0CityByCityNameSessionByIdTurnResponses = {
+    /**
+     * OK
+     */
+    200: SessionTurnResponse;
+};
+
+export type GetV0CityByCityNameSessionByIdTurnResponse = GetV0CityByCityNameSessionByIdTurnResponses[keyof GetV0CityByCityNameSessionByIdTurnResponses];
 
 export type PostV0CityByCityNameSessionByIdUnpinData = {
     body?: never;
@@ -19938,6 +21419,10 @@ export type CreateSessionData = {
          * Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.
          */
         'X-GC-Request': string;
+        /**
+         * Idempotency key for safe retries.
+         */
+        'Idempotency-Key'?: string;
     };
     path: {
         /**
@@ -19966,6 +21451,10 @@ export type CreateSessionErrors = {
      * Not Found
      */
     404: ErrorModel;
+    /**
+     * Conflict
+     */
+    409: ErrorModel;
     /**
      * Unprocessable Entity
      */

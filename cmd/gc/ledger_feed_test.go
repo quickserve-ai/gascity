@@ -1369,7 +1369,7 @@ func TestWrapWithCachingStoreFeedBaselinesBeforePrime(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	req := &ledgerFeedRequest{set: set, scope: ledgerFeedCityScope, mode: config.BeadsLedgerFeedAuto}
-	wrapped := wrapWithCachingStoreFeed(ctx, store, events.NewFake(), true, req)
+	wrapped := wrapWithCachingStoreFeed(ctx, store, events.NewFake(), true, "", "", req)
 	cache := wrapped.(*beads.CachingStore)
 	defer cache.StopReconciler()
 	if store.readsAtFirst.Load() == 0 {
@@ -1391,7 +1391,7 @@ func TestLedgerFeedLateBaselineForcesARescan(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	req := &ledgerFeedRequest{set: set, scope: ledgerFeedCityScope, mode: config.BeadsLedgerFeedAuto}
-	cache := wrapWithCachingStoreFeed(ctx, store, events.NewFake(), true, req).(*beads.CachingStore)
+	cache := wrapWithCachingStoreFeed(ctx, store, events.NewFake(), true, "", "", req).(*beads.CachingStore)
 	defer cache.StopReconciler()
 	_, entries := set.snapshot()
 	f := entries[0].feed
@@ -1609,7 +1609,7 @@ func TestLedgerFeedWaitsForAJournalTurnedOnLater(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	req := &ledgerFeedRequest{set: set, scope: ledgerFeedCityScope, mode: config.BeadsLedgerFeedAuto}
-	cache := wrapWithCachingStoreFeed(ctx, store, events.NewFake(), true, req).(*beads.CachingStore)
+	cache := wrapWithCachingStoreFeed(ctx, store, events.NewFake(), true, "", "", req).(*beads.CachingStore)
 	defer cache.StopReconciler()
 	_, entries := set.snapshot()
 	if len(entries) != 1 || entries[0].feed == nil {
@@ -1641,7 +1641,7 @@ func TestWrapWithCachingStoreNeverTails(t *testing.T) {
 	store := newJournalingStore()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	cache := wrapWithCachingStore(ctx, store, events.NewFake(), true).(*beads.CachingStore)
+	cache := wrapWithCachingStore(ctx, store, events.NewFake(), true, "", "").(*beads.CachingStore)
 	defer cache.StopReconciler()
 	if got := store.j.reads.Load(); got != 0 {
 		t.Fatalf("wrapWithCachingStore read the journal %d time(s)", got)
@@ -1929,7 +1929,7 @@ func TestLedgerFeedOverEmbeddedDolt(t *testing.T) {
 	set.setWake(newLegacyWake(pokeCh, ctrlCh))
 	ep := events.NewFake()
 	req := &ledgerFeedRequest{set: set, scope: ledgerFeedCityScope, mode: config.BeadsLedgerFeedAuto}
-	cache := wrapWithCachingStoreFeed(ctx, native, ep, true, req, beads.WithReconcileGate(func() bool { return false })).(*beads.CachingStore)
+	cache := wrapWithCachingStoreFeed(ctx, native, ep, true, "", "", req, beads.WithReconcileGate(func() bool { return false })).(*beads.CachingStore)
 	defer cache.StopReconciler()
 	_, entries := set.snapshot()
 	if len(entries) != 1 || entries[0].feed == nil || entries[0].feed.late {

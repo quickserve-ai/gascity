@@ -2,11 +2,26 @@ package beads
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
 	beadslib "github.com/steveyegge/beads"
 )
+
+// ErrGraphApplyBudgetExhausted marks a graph apply that returned with its own
+// derived context expired while the caller's context was still live: the
+// operation budget sized for this plan was spent.
+//
+// It states what was observed, not what a retry would do. A second attempt
+// might still succeed — the store may be faster the next minute. What the
+// marker carries is a policy: no automatic replay once an operation's own
+// budget is spent, because the budget is a function of the plan
+// (nativeGraphApplyDeadline), so an immediate identical attempt is asking the
+// same question with the same answer time and doubles the store load to find
+// out. Callers that want another attempt should decide so deliberately, under
+// a budget of their own.
+var ErrGraphApplyBudgetExhausted = errors.New("graph apply budget exhausted")
 
 // GraphApplyStore is an optional store capability for atomically creating a
 // precomputed graph of beads, dependency edges, and post-create assignments.
@@ -52,19 +67,22 @@ type EphemeralGraphApplyStore interface {
 
 // GraphApplyNode describes a single bead to create.
 type GraphApplyNode struct {
-	Key               string            `json:"key"`
-	Title             string            `json:"title"`
-	Type              string            `json:"type,omitempty"`
-	Priority          *int              `json:"priority,omitempty"`
-	Description       string            `json:"description,omitempty"`
-	Assignee          string            `json:"assignee,omitempty"`
-	AssignAfterCreate bool              `json:"assign_after_create,omitempty"`
-	From              string            `json:"from,omitempty"`
-	Labels            []string          `json:"labels,omitempty"`
-	Metadata          map[string]string `json:"metadata,omitempty"`
-	MetadataRefs      map[string]string `json:"metadata_refs,omitempty"`
-	ParentKey         string            `json:"parent_key,omitempty"`
-	ParentID          string            `json:"parent_id,omitempty"`
+	Key               string   `json:"key"`
+	Title             string   `json:"title"`
+	Type              string   `json:"type,omitempty"`
+	Priority          *int     `json:"priority,omitempty"`
+	Description       string   `json:"description,omitempty"`
+	Assignee          string   `json:"assignee,omitempty"`
+	AssignAfterCreate bool     `json:"assign_after_create,omitempty"`
+	From              string   `json:"from,omitempty"`
+	Labels            []string `json:"labels,omitempty"`
+	// AwaitType: see Bead.AwaitType — a gate node created without it is
+	// defaulted to "human" by the beads create seam and starts paging.
+	AwaitType    string            `json:"await_type,omitempty"`
+	Metadata     map[string]string `json:"metadata,omitempty"`
+	MetadataRefs map[string]string `json:"metadata_refs,omitempty"`
+	ParentKey    string            `json:"parent_key,omitempty"`
+	ParentID     string            `json:"parent_id,omitempty"`
 }
 
 // GraphApplyEdge describes a dependency edge. At least one of FromKey/FromID

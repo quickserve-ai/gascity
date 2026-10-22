@@ -1017,19 +1017,19 @@ func TestSyncSessionBeads_RetiresRemovedNamedSessionAndCreatesFreshOnReadd(t *te
 	if got := all[0].Metadata["session_name"]; got != "" {
 		t.Fatalf("session_name after removal = %q, want cleared", got)
 	}
-	for _, id := range []string{assignedOpen.ID, assignedInProgress.ID} {
-		got, err := store.Get(id)
+	// A removed named session's work is still a named agent's: it keeps its
+	// assignee and status and carries the release proposal for a judge, with no
+	// fallback route stamped (ga-9n8hjv, fence #1). It used to be unclaimed here.
+	for _, tc := range []struct {
+		id, status string
+	}{{assignedOpen.ID, "open"}, {assignedInProgress.ID, "in_progress"}} {
+		got, err := store.Get(tc.id)
 		if err != nil {
-			t.Fatalf("Get(%s): %v", id, err)
+			t.Fatalf("Get(%s): %v", tc.id, err)
 		}
-		if got.Assignee != "" {
-			t.Fatalf("work bead %s assignee = %q, want unclaimed after named session removal", id, got.Assignee)
-		}
-		if got.Metadata["gc.run_target"] != "myrig/witness" {
-			t.Fatalf("work bead %s gc.run_target = %q, want fallback route myrig/witness", id, got.Metadata["gc.run_target"])
-		}
-		if got.Metadata["gc.routed_to"] != "" {
-			t.Fatalf("work bead %s gc.routed_to = %q, want empty canonical route fallback", id, got.Metadata["gc.routed_to"])
+		assertProposedNotReleased(t, got, originalID, tc.status, "retired-session-unclaim", "removed named session work "+tc.id)
+		if got.Metadata["gc.run_target"] != "" {
+			t.Fatalf("work bead %s gc.run_target = %q, want untouched: a proposal re-routes nothing", tc.id, got.Metadata["gc.run_target"])
 		}
 	}
 	gotWait, err := store.Get(wait.ID)
@@ -1057,23 +1057,51 @@ func TestSyncSessionBeads_RetiresRemovedNamedSessionAndCreatesFreshOnReadd(t *te
 	clk.Advance(5 * time.Second)
 	syncSessionBeads("", store, ds, sp, allConfiguredDS(ds), cfgNamed, clk, &stderr, false)
 
+	// The archived bead still holds the removed seat's withheld work (ga-9n8hjv),
+	// so it is not closed on re-add; it stays open as archived history holding that
+	// work, and a FRESH canonical bead is minted beside it. Before ga-9n8hjv the
+	// work was released and the archived bead closed; with the work withheld, a
+	// refused close used to block the identity and the agent never came back.
 	all, err = store.ListByLabel(sessionBeadLabel, 0)
 	if err != nil {
 		t.Fatalf("listing beads after re-adopt: %v", err)
 	}
-	if len(all) != 1 {
-		t.Fatalf("expected only fresh open bead after re-add listing, got %d", len(all))
+	if len(all) != 2 {
+		t.Fatalf("open session beads after re-add = %d, want 2 (archived history holding withheld work + a fresh bead)", len(all))
 	}
-	fresh := all[0]
-	if fresh.ID == originalID {
-		t.Fatalf("fresh bead ID = %q, want a new bead after archived removal", fresh.ID)
+	var fresh beads.Bead
+	for _, b := range all {
+		if b.ID != originalID {
+			fresh = b
+		}
+	}
+	if fresh.ID == "" {
+		t.Fatalf("no fresh bead minted on re-add; open beads = %v", []string{all[0].ID, all[1].ID})
+	}
+	if got := fresh.Metadata["session_name"]; got != "myrig--witness" {
+		t.Fatalf("fresh bead session_name = %q, want myrig--witness", got)
+	}
+	if got := fresh.Metadata["state"]; got == "archived" {
+		t.Fatalf("fresh bead state = %q, want a live state", got)
 	}
 	historical, err := store.Get(originalID)
 	if err != nil {
 		t.Fatalf("Get(original archived bead): %v", err)
 	}
-	if historical.Status == "open" {
-		t.Fatalf("historical status = %q, want non-open", historical.Status)
+	if historical.Metadata["state"] != "archived" || historical.Metadata["continuity_eligible"] != "false" {
+		t.Fatalf("historical bead state/continuity = %q/%q, want archived/false", historical.Metadata["state"], historical.Metadata["continuity_eligible"])
+	}
+	if historical.Metadata["session_name"] != "" || historical.Metadata["alias"] != "" {
+		t.Fatalf("historical bead session_name/alias = %q/%q, want both cleared", historical.Metadata["session_name"], historical.Metadata["alias"])
+	}
+	for _, tc := range []struct {
+		id, status string
+	}{{assignedOpen.ID, "open"}, {assignedInProgress.ID, "in_progress"}} {
+		got, err := store.Get(tc.id)
+		if err != nil {
+			t.Fatalf("Get(%s) after re-add: %v", tc.id, err)
+		}
+		assertProposedNotReleased(t, got, originalID, tc.status, "retired-session-unclaim", "withheld work after re-add "+tc.id)
 	}
 	if got := fresh.Metadata[namedSessionMetadataKey]; got != "true" {
 		t.Fatalf("configured_named_session after re-adopt = %q, want true", got)
@@ -5514,7 +5542,11 @@ func TestCloseBeadReleasesWorkAssignedByBeadID(t *testing.T) {
 	}
 }
 
-func TestCloseBeadReleasesWorkAssignedByNamedIdentity(t *testing.T) {
+// TestCloseBeadProposesWorkAssignedBySuspendedNamedIdentity: a SUSPENDED named
+// agent's work used to be released on close, because its tier never claims. It
+// is still a named agent's work, so under fence #1 the close keeps assignee and
+// status and proposes the release for a judge (ga-9n8hjv).
+func TestCloseBeadProposesWorkAssignedBySuspendedNamedIdentity(t *testing.T) {
 	store := beads.NewMemStore()
 	now := time.Date(2026, 4, 18, 12, 0, 0, 0, time.UTC)
 
@@ -5543,7 +5575,10 @@ func TestCloseBeadReleasesWorkAssignedByNamedIdentity(t *testing.T) {
 		t.Fatalf("set work in_progress: %v", err)
 	}
 
-	if !closeBead(store, testSeatWork("", servingCity("worker"), store, nil), decidedSessionInfo(store, sessionBead.ID), "suspended", now, ioDiscard{}) {
+	// The close REASON cannot carry this: "suspended" appears at no non-test call
+	// site and nothing reads it. Only cfg can tell a suspended named agent from a
+	// live one, which is why this test needs one (ga-9n8hjv).
+	if !closeBead(store, testSeatWork("", servingRigsCity(namedSessionTestCfg(true), "worker"), store, nil), decidedSessionInfo(store, sessionBead.ID), "suspended", now, ioDiscard{}) {
 		t.Fatal("closeBead returned false, want true")
 	}
 
@@ -5551,11 +5586,145 @@ func TestCloseBeadReleasesWorkAssignedByNamedIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get work bead: %v", err)
 	}
-	if gotWork.Assignee != "" {
-		t.Errorf("work assignee = %q, want empty", gotWork.Assignee)
+	assertProposedNotReleased(t, gotWork, "reviewer", "in_progress", "closing-session-release", "suspended named work")
+}
+
+// namedSessionTestCfg declares "reviewer" as a [[named_session]] whose backing agent
+// is live or suspended. durableSessionIdentities reaches it through
+// isConfiguredNamedSessionIdentity, the only thing that can separate a LIVE named seat
+// (whose work must be withheld) from a SUSPENDED one (whose work must be released,
+// because the named-session tier never claims for a suspended agent).
+//
+// The fixture is CITY-SCOPED (no Dir) because that is the shape the fleet actually
+// runs: city.toml declares these seats as [[named_session]] template/scope="city",
+// and a live session bead carries the BARE identity ("katya", "woodhouse") in
+// configured_named_identity — verified against the running town 2026-09-16. A
+// dir-scoped fixture qualifies the identity ("gascity/reviewer"), the bare assignee
+// then matches nothing, and the cfg branch RELEASES a live seat — so a fixture built
+// to the wrong scope would have proved the fixture and hidden a fail-open.
+// TestCloseBeadWithholdsWorkFromLiveRigScopedNamedIdentity pins the other scope.
+func namedSessionTestCfg(suspended bool) *config.City {
+	return &config.City{
+		Agents: []config.Agent{
+			{Name: "reviewer", Suspended: suspended, MaxActiveSessions: intPtr(1)},
+		},
+		NamedSessions: []config.NamedSession{
+			{Template: "reviewer", Scope: "city", Mode: "always"},
+		},
 	}
-	if gotWork.Status != "open" {
-		t.Errorf("work status = %q, want open", gotWork.Status)
+}
+
+// namedSessionTestCfgRigScoped is the dir-qualified counterpart: a rig-scoped named
+// session whose identity is "gascity/reviewer".
+func namedSessionTestCfgRigScoped(suspended bool) *config.City {
+	return &config.City{
+		Agents: []config.Agent{
+			{Name: "reviewer", Dir: "gascity", Suspended: suspended, MaxActiveSessions: intPtr(1)},
+		},
+		NamedSessions: []config.NamedSession{
+			{Template: "reviewer", Dir: "gascity", Scope: "rig", Mode: "on_demand"},
+		},
+	}
+}
+
+// closeBeadNamedIdentityFixture builds the ga-9n8hjv shape: a session bead carrying a
+// durable configured_named_identity, plus one in_progress work bead assigned under that
+// same durable identity.
+func closeBeadNamedIdentityFixture(t *testing.T, identity string) (beads.Store, beads.Bead, beads.Bead) {
+	t.Helper()
+	store := beads.NewMemStore()
+	sessionBead, err := store.Create(beads.Bead{
+		Title:  identity,
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"session_name":              "reviewer-gm-dead",
+			"configured_named_identity": identity,
+		},
+	})
+	if err != nil {
+		t.Fatalf("create session bead: %v", err)
+	}
+	work, err := store.Create(beads.Bead{
+		Title:    "named-session work",
+		Assignee: identity,
+	})
+	if err != nil {
+		t.Fatalf("create work bead: %v", err)
+	}
+	if err := store.Update(work.ID, beads.UpdateOpts{Status: strPtr("in_progress")}); err != nil {
+		t.Fatalf("set work in_progress: %v", err)
+	}
+	return store, sessionBead, work
+}
+
+// TestCloseBeadWithholdsWorkFromLiveNamedIdentity is the ga-9n8hjv regression itself:
+// a LIVE configured named seat cycling its session must keep its whole portfolio. The
+// 2026-09-11 incident was 50 beads detached 9s after one session bead closed, 11 of them
+// reset in_progress -> open.
+func TestCloseBeadWithholdsWorkFromLiveNamedIdentity(t *testing.T) {
+	now := time.Date(2026, 4, 18, 12, 0, 0, 0, time.UTC)
+	store, sessionBead, work := closeBeadNamedIdentityFixture(t, "reviewer")
+
+	if !closeBead(store, testSeatWork("", namedSessionTestCfg(false), store, nil), decidedSessionInfo(store, sessionBead.ID), "orphaned", now, ioDiscard{}) {
+		t.Fatal("closeBead returned false, want true")
+	}
+
+	gotWork, err := store.Get(work.ID)
+	if err != nil {
+		t.Fatalf("get work bead: %v", err)
+	}
+	if gotWork.Assignee != "reviewer" {
+		t.Errorf("work assignee = %q, want %q (a live named seat keeps its portfolio across a session close)", gotWork.Assignee, "reviewer")
+	}
+	if gotWork.Status != "in_progress" {
+		t.Errorf("work status = %q, want in_progress (releasing would reset it to open and the resume check would report no work)", gotWork.Status)
+	}
+}
+
+// TestCloseBeadWithholdsWorkFromLiveRigScopedNamedIdentity is the same contract for a
+// rig-scoped seat, where both the bead's identity and the config are dir-qualified.
+func TestCloseBeadWithholdsWorkFromLiveRigScopedNamedIdentity(t *testing.T) {
+	now := time.Date(2026, 4, 18, 12, 0, 0, 0, time.UTC)
+	store, sessionBead, work := closeBeadNamedIdentityFixture(t, "gascity/reviewer")
+
+	if !closeBead(store, testSeatWork("", namedSessionTestCfgRigScoped(false), store, nil), decidedSessionInfo(store, sessionBead.ID), "orphaned", now, ioDiscard{}) {
+		t.Fatal("closeBead returned false, want true")
+	}
+
+	gotWork, err := store.Get(work.ID)
+	if err != nil {
+		t.Fatalf("get work bead: %v", err)
+	}
+	if gotWork.Assignee != "gascity/reviewer" {
+		t.Errorf("work assignee = %q, want %q (a live rig-scoped named seat keeps its portfolio too)", gotWork.Assignee, "gascity/reviewer")
+	}
+	if gotWork.Status != "in_progress" {
+		t.Errorf("work status = %q, want in_progress", gotWork.Status)
+	}
+}
+
+// TestCloseBeadWithholdsWorkFromNamedIdentityWithoutConfig pins the fail-closed branch.
+// isConfiguredNamedSessionIdentity returns false on a nil cfg, so consulting it blind
+// here would fail OPEN and strip live seats. With no cfg the durable identities are
+// withheld on metadata alone.
+func TestCloseBeadWithholdsWorkFromNamedIdentityWithoutConfig(t *testing.T) {
+	now := time.Date(2026, 4, 18, 12, 0, 0, 0, time.UTC)
+	store, sessionBead, work := closeBeadNamedIdentityFixture(t, "reviewer")
+
+	if !closeBead(store, nil, decidedSessionInfo(store, sessionBead.ID), "orphaned", now, ioDiscard{}) {
+		t.Fatal("closeBead returned false, want true")
+	}
+
+	gotWork, err := store.Get(work.ID)
+	if err != nil {
+		t.Fatalf("get work bead: %v", err)
+	}
+	if gotWork.Assignee != "reviewer" {
+		t.Errorf("work assignee = %q, want %q (no cfg must fail CLOSED, never release a durable identity)", gotWork.Assignee, "reviewer")
+	}
+	if gotWork.Status != "in_progress" {
+		t.Errorf("work status = %q, want in_progress", gotWork.Status)
 	}
 }
 
@@ -9559,7 +9728,12 @@ func TestCloseSessionBeadIfUnassignedRefusesWhenRigStoreWorkAssignedBySessionNam
 	}
 }
 
-func TestUnclaimWorkAssignedToRetiredSessionBeadClearsRigStoreSessionIdentifiers(t *testing.T) {
+// TestUnclaimWorkAssignedToRetiredSessionBeadProposesRigStoreNamedSessionWork: the
+// sweep reaches the RIG store leg for every identifier the session carries. The
+// session is a named one (configured_named_identity), so what it finds there is a
+// named agent's work and is proposed, not released (ga-9n8hjv); the proposals
+// landing in the rig store are the proof that the leg was swept.
+func TestUnclaimWorkAssignedToRetiredSessionBeadProposesRigStoreNamedSessionWork(t *testing.T) {
 	store := beads.NewMemStore()
 	rigStore := beads.NewMemStore()
 
@@ -9611,28 +9785,15 @@ func TestUnclaimWorkAssignedToRetiredSessionBeadClearsRigStoreSessionIdentifiers
 	if err != nil {
 		t.Fatalf("get session-name work: %v", err)
 	}
-	if gotBySessionName.Assignee != "" {
-		t.Fatalf("session-name assignee = %q, want empty", gotBySessionName.Assignee)
-	}
-	if gotBySessionName.Status != "open" {
-		t.Fatalf("session-name status = %q, want open", gotBySessionName.Status)
-	}
+	assertProposedNotReleased(t, gotBySessionName, "worker-1", "open", "retired-session-unclaim", "session-name work")
 
 	gotByIdentity, err := rigStore.Get(byIdentity.ID)
 	if err != nil {
 		t.Fatalf("get named-identity work: %v", err)
 	}
-	if gotByIdentity.Assignee != "" {
-		t.Fatalf("named-identity assignee = %q, want empty", gotByIdentity.Assignee)
-	}
-	if gotByIdentity.Status != "open" {
-		t.Fatalf("named-identity status = %q, want open after unclaim", gotByIdentity.Status)
-	}
-	if gotByIdentity.Metadata["gc.run_target"] != "frontend/codex-max" {
-		t.Fatalf("named-identity gc.run_target = %q, want frontend/codex-max", gotByIdentity.Metadata["gc.run_target"])
-	}
-	if gotByIdentity.Metadata["gc.routed_to"] != "" {
-		t.Fatalf("named-identity gc.routed_to = %q, want empty canonical route fallback", gotByIdentity.Metadata["gc.routed_to"])
+	assertProposedNotReleased(t, gotByIdentity, "frontend/worker", "in_progress", "retired-session-unclaim", "named-identity work")
+	if gotByIdentity.Metadata["gc.run_target"] != "" {
+		t.Fatalf("named-identity gc.run_target = %q, want untouched: a proposal re-routes nothing", gotByIdentity.Metadata["gc.run_target"])
 	}
 }
 
@@ -9703,8 +9864,11 @@ func TestReassignWorkAssignedToRetiredSessionBeadReassignsRigStoreSessionIdentif
 	if err != nil {
 		t.Fatalf("get named-identity work: %v", err)
 	}
-	if gotByIdentity.Assignee != successor.ID {
-		t.Fatalf("named-identity assignee = %q, want %q", gotByIdentity.Assignee, successor.ID)
+	// Work on the named DURABLE identity stays on it: the successor serves that
+	// identity, and re-homing it onto a session bead ID would make it releasable by
+	// the successor's next close (ga-9n8hjv).
+	if gotByIdentity.Assignee != "frontend/worker" {
+		t.Fatalf("named-identity assignee = %q, want %q left in place", gotByIdentity.Assignee, "frontend/worker")
 	}
 }
 
@@ -10605,5 +10769,58 @@ func TestFailedCreateCloseClearsTheHolds(t *testing.T) {
 		if v, ok := patch[k]; !ok || v != "" {
 			t.Errorf("%s = %q (written %v), want cleared", k, v, ok)
 		}
+	}
+}
+
+// A seat re-pointed to a provider that is its own family root (name ==
+// BuiltinAncestor, e.g. [providers.omp] base="builtin:omp") used to update
+// only "provider": the != name convention never queued kind/ancestor, so a
+// stale lineage from the PREVIOUS provider survived forever and every
+// ancestry consumer (GC_PROVIDER stamping, the context meter) kept reading
+// the dead harness (ga-vat7sn defect 1, measured live 2026-09-05:
+// provider=omp with provider_kind/builtin_ancestor=claude).
+func TestQueueChangedResolvedProviderMetadataCorrectsStaleLineageOnSelfRootedProvider(t *testing.T) {
+	existing := map[string]string{
+		"provider":         "claude-fable-kumar",
+		"provider_kind":    "claude",
+		"builtin_ancestor": "claude",
+	}
+	queued := map[string]string{}
+	queueChangedResolvedProviderSessionMetadata(existing, func(k, v string) { queued[k] = v }, &config.ResolvedProvider{
+		Name:            "omp",
+		BuiltinAncestor: "omp",
+	})
+	want := map[string]string{
+		"provider":         "omp",
+		"provider_kind":    "omp",
+		"builtin_ancestor": "omp",
+	}
+	if !reflect.DeepEqual(queued, want) {
+		t.Fatalf("queued = %v, want %v (stale claude lineage must be corrected)", queued, want)
+	}
+
+	// Unchanged self-rooted metadata queues nothing (write-if-changed holds).
+	queued = map[string]string{}
+	queueChangedResolvedProviderSessionMetadata(want, func(k, v string) { queued[k] = v }, &config.ResolvedProvider{
+		Name:            "omp",
+		BuiltinAncestor: "omp",
+	})
+	if len(queued) != 0 {
+		t.Fatalf("queued = %v on a converged bead, want no writes", queued)
+	}
+
+	// Same-family stored values are respected, not churned: an alias whose
+	// stored ancestor already names the same family stays as it is.
+	queued = map[string]string{}
+	queueChangedResolvedProviderSessionMetadata(map[string]string{
+		"provider":         "omp",
+		"provider_kind":    "pi",
+		"builtin_ancestor": "pi",
+	}, func(k, v string) { queued[k] = v }, &config.ResolvedProvider{
+		Name:            "omp",
+		BuiltinAncestor: "omp",
+	})
+	if len(queued) != 0 {
+		t.Fatalf("queued = %v for same-family stored lineage, want no writes", queued)
 	}
 }

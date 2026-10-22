@@ -29,6 +29,50 @@ func TestDoHookFiltersDeferredBeads(t *testing.T) {
 	}
 }
 
+// TestDoHookFiltersFailedPartialMoleculeBeads is the ga-033u0e regression at
+// the shared hook chokepoint. When instantiation aborts partway it marks the
+// beads it already wrote molecule_failed AND clears their gc.instantiating
+// fence — the exact shape asserted here — so the failure path used to hand
+// unworkable steps to whichever agent's hook ran next. Each such step can only
+// fail on its missing root and mail an escalation.
+func TestDoHookFiltersFailedPartialMoleculeBeads(t *testing.T) {
+	runner := func(_, _ string) (string, error) {
+		return `[
+			{"id":"partial-step","status":"open","metadata":{"molecule_failed":"true","gc.instantiating":""}},
+			{"id":"healthy-1","status":"open","metadata":{"gc.kind":"run"}}
+		]`, nil
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doHook("bd ready", ".", false, runner, &stdout, &stderr, hookVisibility{})
+	if code != 0 {
+		t.Fatalf("doHook() = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	out := stdout.String()
+	if strings.Contains(out, "partial-step") {
+		t.Errorf("step of a partially-instantiated workflow surfaced as claimable work: %s", out)
+	}
+	if !strings.Contains(out, "healthy-1") {
+		t.Errorf("healthy bead missing from hook output: %s", out)
+	}
+}
+
+// TestDoHookEmptyResultExplainsItself pins the other half of ga-3upjic: exit 1
+// means both "no ready work" and "the hook failed", and a silent empty exit is
+// indistinguishable from a crash to a caller or an agent reading its own output.
+func TestDoHookEmptyResultExplainsItself(t *testing.T) {
+	runner := func(_, _ string) (string, error) { return `[]`, nil }
+
+	var stdout, stderr bytes.Buffer
+	code := doHook("bd ready", ".", false, runner, &stdout, &stderr, hookVisibility{})
+	if code != 1 {
+		t.Fatalf("doHook() = %d, want 1 for an empty queue", code)
+	}
+	if !strings.Contains(stderr.String(), "no ready work") {
+		t.Errorf("empty exit 1 is silent — it must say it means empty, not failed; stderr=%q", stderr.String())
+	}
+}
+
 func TestDoHookFiltersDepBlockedBeads(t *testing.T) {
 	runner := func(_, _ string) (string, error) {
 		return `[

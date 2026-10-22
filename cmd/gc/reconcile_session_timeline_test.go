@@ -66,7 +66,8 @@ import (
 // TestSessionTimelineDifferential -update-golden` rewrites both goldens, and
 // the test then fails until timelineGoldenRulings admits the fixture's new
 // section, by digest, under a ruling (timelineRulingRefs, a "§12.2 row N",
-// or a merged fix, "fix #NNNN (mc-xxxx)").
+// a merged fix, "fix #NNNN (mc-xxxx)", or, in the fork, a carry ledger row,
+// "carry row xx-xxxx").
 
 var updateTimelineGolden = flag.Bool("update-golden", false, "rewrite the timeline differential's goldens from the copies' outcomes")
 
@@ -578,6 +579,10 @@ var (
 	timelineRulingRefs = []string{"O1", "O2", "O3", "O4", "O5", "O6", "O8", "O9", "O10"}
 	timelineSection122 = regexp.MustCompile(`§12\.2 row \d+\b`)
 	timelineMergedFix  = regexp.MustCompile(`\bfix #[1-9]\d* \(mc-[a-z0-9]{4,}\)`)
+	// timelineCarryRow names a row of the fork's carry ledger (CARRY.md) that
+	// changes legacy on purpose: the fork's admission for a carried legacy
+	// behavior, as a merged fix is upstream's.
+	timelineCarryRow = regexp.MustCompile(`\bcarry row [a-z]{2,}-[a-z0-9]{4,}\b`)
 )
 
 // timelineGoldenRulings admit each fixture's golden section. A change to
@@ -604,10 +609,14 @@ var timelineGoldenRulings = []goldenRuling{
 	{"a manual conversation crashes 31s after wake", timelineFingerprintV7, "2724ce744ac4"},
 	{"a live quarantined row 29s after wake", timelineGoldenBaseline, "f559e3fcf255"},
 	{"a live quarantined row 31s after wake", timelineGoldenBaseline, "25811fbce399"},
+	{"a live quarantined row 29s after wake", "carry row gc-mdh0 (#6168 replay): a live pool seat holding assigned work stays out of the timer drains, so legacy no longer begins and vetoes a drain of the quarantined holder each tick", "8987a49bd66b"},
+	{"a live quarantined row 31s after wake", "carry row gc-mdh0 (#6168 replay): a live pool seat holding assigned work stays out of the timer drains, so legacy no longer begins and vetoes a drain of the quarantined holder each tick", "af88c5e06ac3"},
 	{"a managed suspend drains, then wake", timelineGoldenBaseline, "48df08bf8396"},
 	{"a managed suspend drains, then wake", "fix #7417 (mc-esqo7)", "61f2ce80feb0"},
 	{"a managed suspend drains, then wake", "fix #7590 (mc-esqo7): the drain's sleep keeps suspended_at (the Sleep cell, NEW2-5)", "e6e0e6743019"},
 	{"a managed suspend drains, then wake", timelineFingerprintV7, "da6d33776ea5"},
+	{"a managed suspend drains, then wake", "carry row gc-hzj5 (#6178 replay): the reconciler publishes its drain ack under its own keys (source, reason, generation), never the agent's GC_DRAIN_ACK, so a legacy drain sets one runtime key fewer", "e6128868b1b4"},
+	{"a managed suspend drains, then wake", timelineFingerprintV7, "a5cc8ada7c8b"},
 	{"a manual create read between its two writes", timelineGoldenBaseline, "8c2d0f4552c4"},
 	{"a manual create read between its two writes", timelineFingerprintV7, "544ff5662fa5"},
 	{"a provider swap stops the runtime", timelineGoldenBaseline, "68a5d9d9b0ef"},
@@ -618,16 +627,25 @@ var timelineGoldenRulings = []goldenRuling{
 	{"a waiter sleeps", timelineGoldenBaseline, "6b615dd20429"},
 	{"a waiter sleeps", "fix #7590 (mc-q6x43): the sleep keeps the wait's intent (D-J 3)", "064ac1bc84b8"},
 	{"a waiter sleeps", timelineFingerprintV7, "45ab826dd96e"},
+	{"a waiter sleeps", "carry row gc-hzj5 (#6178 replay): the reconciler publishes its drain ack under its own keys (source, reason, generation), never the agent's GC_DRAIN_ACK, so a legacy drain sets one runtime key fewer; and the fork #59 row (#5561, \"Standing sleep intent survives drain completion\", re-expressed on R7): a wait-parked idle pool seat keeps its slot and claim, so neither engine reports the waiter's own work stranded", "972f3c53c903"},
+	{"a waiter sleeps", timelineFingerprintV7, "86d5a7391f65"},
 	{"an idle on-demand named session sleeps", timelineGoldenBaseline, "2752bd8f4cc4"},
+	{"an idle on-demand named session sleeps", "carry row gc-hzj5 (#6178 replay): the reconciler publishes its drain ack under its own keys (source, reason, generation), never the agent's GC_DRAIN_ACK, so a legacy drain sets one runtime key fewer", "efb8c8b8ccc5"},
 	{"an unwanted row inside, then past, the wake grace", timelineGoldenBaseline, "c4d3c5eb08a0"},
+	{"an unwanted row inside, then past, the wake grace", "carry row gc-hzj5 (#6178 replay): the reconciler publishes its drain ack under its own keys (source, reason, generation), never the agent's GC_DRAIN_ACK, so a legacy drain sets one runtime key fewer", "c26264edc56b"},
 	{"an unwanted row of a suspended agent", timelineGoldenBaseline, "90405aa55ba7"},
+	{"an unwanted row of a suspended agent", "carry row gc-hzj5 (#6178 replay): the reconciler publishes its drain ack under its own keys (source, reason, generation), never the agent's GC_DRAIN_ACK, so a legacy drain sets one runtime key fewer", "dcb257350051"},
 	{"an unwanted row woken by a clock ten minutes ahead", timelineGoldenBaseline, "27e15af2efe9"},
+	{"an unwanted row woken by a clock ten minutes ahead", "carry row gc-hzj5 (#6178 replay): the reconciler publishes its drain ack under its own keys (source, reason, generation), never the agent's GC_DRAIN_ACK, so a legacy drain sets one runtime key fewer", "d1e00d4f811b"},
 	{"an unwanted row woken by a clock two minutes ahead", timelineGoldenBaseline, "7863a5af3820"},
+	{"an unwanted row woken by a clock two minutes ahead", "carry row gc-hzj5 (#6178 replay): the reconciler publishes its drain ack under its own keys (source, reason, generation), never the agent's GC_DRAIN_ACK, so a legacy drain sets one runtime key fewer", "baa6d7a6e388"},
 	{"attach, then detach, then idle", timelineGoldenBaseline, "a8a76fb85cf8"},
 	{"drift deferrals through time", timelineGoldenBaseline, "b7bf2d092994"},
 	{"drift deferrals through time", timelineFingerprintV7, "0a780490c9ee"},
 	{"idle, then sleep, then the next pass", timelineGoldenBaseline, "df4154567a92"},
 	{"idle, then sleep, then the next pass", timelineFingerprintV7, "2cf94220b36f"},
+	{"idle, then sleep, then the next pass", "carry row gc-hzj5 (#6178 replay): the reconciler publishes its drain ack under its own keys (source, reason, generation), never the agent's GC_DRAIN_ACK, so a legacy drain sets one runtime key fewer", "3ae3afb2d511"},
+	{"idle, then sleep, then the next pass", timelineFingerprintV7, "23a49ad008ee"},
 	{"kill a seat holding a dep-blocked claim", timelineGoldenBaseline, "44f501ec9412"},
 	{"kill a seat holding a ready claim", timelineGoldenBaseline, "a6a3283ef592"},
 	{"kill a seat holding a ready claim", timelineFingerprintV7, "56f71e57af9a"},
@@ -648,7 +666,7 @@ func namesRuling(ruling string) bool {
 			return true
 		}
 	}
-	return timelineSection122.MatchString(ruling) || timelineMergedFix.MatchString(ruling)
+	return timelineSection122.MatchString(ruling) || timelineMergedFix.MatchString(ruling) || timelineCarryRow.MatchString(ruling)
 }
 
 // unruledGolden lists the sections no ruling admits and the rulings out of
@@ -666,7 +684,7 @@ func unruledGolden(sections map[string]string, rulings []goldenRuling) []string 
 		case first && r.ruling != timelineGoldenBaseline:
 			out = append(out, fmt.Sprintf("%q's first ruling %q is not the baseline", r.fixture, r.ruling))
 		case !first && (r.ruling == timelineGoldenBaseline || !namesRuling(r.ruling)):
-			out = append(out, fmt.Sprintf("ruling %q for %q names none of %v, a \"§12.2 row N\" nor a \"fix #NNNN (mc-xxxx)\"", r.ruling, r.fixture, timelineRulingRefs))
+			out = append(out, fmt.Sprintf("ruling %q for %q names none of %v, a \"§12.2 row N\", a \"fix #NNNN (mc-xxxx)\" nor a \"carry row xx-xxxx\"", r.ruling, r.fixture, timelineRulingRefs))
 		}
 		inForce[r.fixture] = r
 	}
@@ -801,6 +819,9 @@ func TestTimelineGoldenNeedsARuling(t *testing.T) {
 		{"a fix with no PR number", []goldenRuling{{"a", base, "000000000000"}, {"a", "fix 7417 (mc-esqo7)", da}, {"b", base, db}}, 1},
 		{"a fix with a malformed bead", []goldenRuling{{"a", base, "000000000000"}, {"a", "fix #7417 (esqo7)", da}, {"b", base, db}}, 1},
 		{"a fix as the first entry", []goldenRuling{{"a", "fix #7417 (mc-esqo7)", da}, {"b", base, db}}, 1},
+		// The fork's carry ledger names its own legacy changes (timelineCarryRow).
+		{"a later carry row supersedes", []goldenRuling{{"a", base, "000000000000"}, {"a", "carry row gc-mdh0 (#6168 replay)", da}, {"b", base, db}}, 0},
+		{"a carry row with no bead", []goldenRuling{{"a", base, "000000000000"}, {"a", "carry row", da}, {"b", base, db}}, 1},
 		{"a later entry naming O7", []goldenRuling{{"a", base, "000000000000"}, {"a", "O7", da}, {"b", base, db}}, 1},
 		{"a later baseline", []goldenRuling{{"a", base, "000000000000"}, {"a", base, da}, {"b", base, db}}, 1},
 		{"a later entry naming nothing", []goldenRuling{{"a", base, "000000000000"}, {"a", "looks fine", da}, {"b", base, db}}, 1},
@@ -1039,10 +1060,10 @@ func stabilityTimeline() []timelineFixture {
 			[]parityRow{row("wake_attempts", "2", "quarantined_until", tlAt(time.Hour))}, tlClaim("in_progress", "worker"), []simRuntime{tlLive("gc-1")},
 			[]parityStep{{Name: "seed", Ticks: 1, Restless: true}, {Name: "alive", At: d, Ticks: -1, Restless: true}, {Name: "settled", Ticks: 6}}, tlPol("gc-1"), per) // A7 takes its first pass: no lag
 	}
-	// drained is legacy's drain of the quarantined row, begun and vetoed in
-	// a tick and its follow-up; lagged, v2's current-bead stamp a pass after
-	// the stability clear.
-	drained := map[string]string{"provider:SetMeta s-gc-1": "drain-stop-lag", "provider:RemoveMeta s-gc-1": "drain-stop-lag"}
+	// lagged is v2's current-bead stamp a pass after the stability clear.
+	// Legacy no longer begins and vetoes a drain of the quarantined row each
+	// tick (upstream's drain-stop-lag here): the carry's gc-mdh0 keeps a live
+	// pool seat holding assigned work out of the timer drains, as v2 does.
 	lagged := map[string]string{"row:gc-1:currently_processing_bead_id": "§12.2#37 current-bead-lag"}
 	return []timelineFixture{
 		crashAfter(29*time.Second, tlRestarted()),
@@ -1050,12 +1071,8 @@ func stabilityTimeline() []timelineFixture {
 		crashAfter(5*time.Minute, tlRestarted()),
 		manualCrashAfter(29 * time.Second),
 		manualCrashAfter(31 * time.Second),
-		quarantinedAt(29*time.Second, map[string]map[string]string{
-			"seed": drained, "alive": drained, "settled": tlMerged(drained, lagged),
-		}),
-		quarantinedAt(31*time.Second, map[string]map[string]string{
-			"seed": drained, "alive": tlMerged(drained, lagged),
-		}),
+		quarantinedAt(29*time.Second, map[string]map[string]string{"settled": lagged}),
+		quarantinedAt(31*time.Second, map[string]map[string]string{"alive": lagged}),
 	}
 }
 
@@ -1399,8 +1416,12 @@ func operatorTimeline() []timelineFixture {
 	// R7b2, keeps the wait's intent (D-J 3) rather than leaving a bare
 	// wait_hold. When the wait's dependency closes, legacy wakes it through
 	// the idle latch: the wait's own intent is no explicit sleep intent
-	// (explicitSleepIntentInfo), so its claim is not stranded.
-	waitDrained := tlMerged(tlIdent(), map[string]string{"row:gc-1:*drain": "drain-stop-lag", "row:gc-1:last_woke_at": "drain-stop-lag", "row:gc-1:sleep_reason": "drain-stop-lag"}, map[string]string{"runtime:s-gc-1": "drain-stop-lag", "row:gc-1:state": "drain-stop-lag", "row:gc-1:stranded_event_emitted_at": "drain-stop-lag", "row:gc-1:detached_at": "wait-sleep-lag"})
+	// (explicitSleepIntentInfo), so its claim is not stranded. On the fork,
+	// neither engine reports it stranded while it sleeps either: a wait-parked
+	// idle seat keeps its slot and claim (carry row "Standing sleep intent
+	// survives drain completion", #5561, fork #59), where upstream's legacy
+	// stamped stranded at the drain and v2 a minute later.
+	waitDrained := tlMerged(tlIdent(), map[string]string{"row:gc-1:*drain": "drain-stop-lag", "row:gc-1:last_woke_at": "drain-stop-lag", "row:gc-1:sleep_reason": "drain-stop-lag"}, map[string]string{"runtime:s-gc-1": "drain-stop-lag", "row:gc-1:state": "drain-stop-lag", "row:gc-1:detached_at": "wait-sleep-lag"})
 	napping := func() *config.City {
 		cfg := tlCity()
 		cfg.Agents[0].SleepAfterIdle = "5m"
@@ -1441,11 +1462,9 @@ func operatorTimeline() []timelineFixture {
 				"provider:SetMeta s-gc-1": "drain-env-clears", "provider:RemoveMeta s-gc-1": "drain-env-clears", "provider:Stop s-gc-1": "drain-stop-lag",
 				`event:session.drain_acked_with_assigned_work worker {"bead_id":"gw-1","bead_status":"in_progress","reason":"drain_acked_with_assigned_work","session_id":"gc-1","template":"worker"}`: "drain-stop-lag",
 				`event:session.stopped worker {"reason":"drain acknowledged","session_id":"gc-1","template":"worker"}`:                                                                                 "drain-stop-lag",
-				`event:session.stranded gc-1 {"session_id":"gc-1","session_name":"s-gc-1","template":"worker","work_bead_ids":["gw-1"]}`:                                                               "drain-stop-lag",
 			}),
 			"the wait turns ready": tlMerged(tlIdent(), map[string]string{
 				"row:gc-1:*waitsleep": "wait-sleep-lag", "provider:RemoveMeta s-gc-1": "§12.2#38 start-meta-clears",
-				`event:session.stranded gc-1 {"session_id":"gc-1","session_name":"s-gc-1","template":"worker","work_bead_ids":["gw-1"]}`: "drain-stop-lag",
 			}, nudgeQueued),
 		})
 	return []timelineFixture{suspend, managed, kill(false), kill(true), swap, fence, waiter}

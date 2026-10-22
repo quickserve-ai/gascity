@@ -392,6 +392,13 @@ func TestLaneExecDeliveryResultMapping(t *testing.T) {
 	steered := func(ack opjournal.AckKind, degradation string) opjournal.DeliveryResult {
 		return opjournal.Delivered{Record: opjournal.DeliveryRecord{At: at, Ack: ack}, Via: laneViaSteer, Degradation: degradation}
 	}
+	receipt := runtime.DeliveryReceipt{MessageID: "m-1", MessageAt: laneT0.Add(time.Millisecond), TurnID: "turn-1"}
+	withReceipt := func(via, degradation string) opjournal.DeliveryResult {
+		return opjournal.Delivered{
+			Record: opjournal.DeliveryRecord{At: at, Ack: opjournal.AckDelivered, MessageID: receipt.MessageID, MessageAt: receipt.MessageAt, TurnID: receipt.TurnID},
+			Via:    via, Degradation: degradation,
+		}
+	}
 	someErr := errors.New("tmux exploded")
 	permissionPrompt := fmt.Errorf("%w: session %q is waiting on a permission prompt (Edit file, request tmux-1); answer it with respond (approve or deny) before sending text",
 		runtime.ErrPendingInteraction, "s")
@@ -406,6 +413,11 @@ func TestLaneExecDeliveryResultMapping(t *testing.T) {
 		wantUnknwn bool
 	}{
 		{name: "delivered", res: worker.NudgeResult{Delivered: true}, want: delivered(opjournal.AckDelivered, "")},
+		{name: "delivered with a receipt", res: worker.NudgeResult{Delivered: true, Receipt: receipt}, want: withReceipt(laneViaLive, "")},
+		{name: "replayed", res: worker.NudgeResult{Delivered: true, Replayed: true, Receipt: receipt}, want: withReceipt(laneViaReplayed, "")},
+		{name: "replayed steer", res: worker.NudgeResult{Delivered: true, Replayed: true, Receipt: receipt}, steer: true, want: withReceipt(laneViaReplayed, "")},
+		{name: "replayed with no token", res: worker.NudgeResult{Delivered: true, Replayed: true, Receipt: receipt}, unfenced: true, want: withReceipt(laneViaReplayed, opjournal.DegradationUnfencedDelivery)},
+		{name: "redelivery lookup failed", err: fmt.Errorf("looking up the earlier delivery: %w: %w", runtime.ErrNudgeNotSent, errors.New("snapshot unreadable")), transient: true},
 		{name: "delivered unfenced", res: worker.NudgeResult{Delivered: true, Unfenced: true}, want: delivered(opjournal.AckDelivered, opjournal.DegradationUnfencedDelivery)},
 		{name: "delivered with no token", res: worker.NudgeResult{Delivered: true}, unfenced: true, want: delivered(opjournal.AckDelivered, opjournal.DegradationUnfencedDelivery)},
 		{name: "unobserved", err: fmt.Errorf("submit: %w", runtime.ErrNudgeDeliveredUnobserved), want: delivered(opjournal.AckDeliveredUnobserved, laneDegradationTurnStartUnobserved)},
@@ -429,6 +441,8 @@ func TestLaneExecDeliveryResultMapping(t *testing.T) {
 		{name: "tmux re-send failed after a submit", err: fmt.Errorf("failed to send submit sequence: %w", fmt.Errorf("%w: re-send failed: %w", tmux.ErrNudgeSubmitUnconfirmed, someErr)), wantUnknwn: true},
 		{name: "server lost after fenced input", err: fmt.Errorf("%w after input was applied: %w", runtime.ErrNudgeDeliveryUnconfirmed, fmt.Errorf("x: %w", runtime.ErrRuntimeUnavailable)), wantUnknwn: true},
 		{name: "not sent", err: fmt.Errorf("%w: nudge lock timeout for session %q", runtime.ErrNudgeNotSent, "s"), transient: true},
+		{name: "deferred while a turn runs", err: fmt.Errorf("sending message to session: %w: session %q is still running a turn", runtime.ErrSessionBusy, "s"), transient: true},
+		{name: "steer deferred while a turn runs", err: fmt.Errorf("sending message to session: %w: session %q is still running a turn", runtime.ErrSessionBusy, "s"), steer: true, transient: true},
 		{name: "anything else may have delivered", err: someErr, wantUnknwn: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -449,19 +463,6 @@ func TestLaneExecDeliveryResultMapping(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-// TestLaneExecControlUnsupported proves interrupt and respond are refused
-// until their slices land.
-func TestLaneExecControlUnsupported(t *testing.T) {
-	e := &conversationLaneExec{}
-	want := opjournal.Rejected{Arm: opjournal.ArmFailed, Reason: opjournal.ReasonUnsupported}
-	if got := e.Interrupt(context.Background(), opjournal.InterruptCall{}); got != want {
-		t.Fatalf("Interrupt = %#v, want %#v", got, want)
-	}
-	if got := e.Respond(context.Background(), opjournal.RespondCall{}); got != want {
-		t.Fatalf("Respond = %#v, want %#v", got, want)
 	}
 }
 
@@ -490,8 +491,8 @@ func TestLaneExecDeliversFencedRequest(t *testing.T) {
 	req := reqs[0]
 	wantFence := runtime.InputFence{Generation: 1, Epoch: 1, Token: f.token}
 	if req.Fence != wantFence || !req.AllowUnfenced || req.Wake != worker.NudgeWakeLiveOnly ||
-		req.Delivery != worker.NudgeDeliveryDefault || req.DeliveryKey != "gc:"+got.DeliveryKey || req.Source != "" {
-		t.Fatalf("request = %+v, want fence %+v, AllowUnfenced, live_only, default, key gc:%s, no source", req, wantFence, got.DeliveryKey)
+		req.Delivery != worker.NudgeDeliveryDefault || req.DeliveryKey != opjournal.RuntimeDeliveryKey(got.DeliveryKey) || req.Source != "" || req.Redelivery {
+		t.Fatalf("request = %+v, want fence %+v, AllowUnfenced, live_only, default, key gc:%s, no source, no redelivery", req, wantFence, got.DeliveryKey)
 	}
 	if req.Text != "please run the tests" {
 		t.Fatalf("text = %q, want the prompt verbatim", req.Text)
@@ -1128,16 +1129,19 @@ func countSeams(e *conversationLaneExec, c *laneSeamCounts) {
 	}
 }
 
-// TestLaneExecBlockedProbeSkipsLooks proves a probe that a content gate or a
-// not-live runtime already decides resolves no handle and reads neither the
-// pending interaction nor the idle boundary.
+// TestLaneExecBlockedProbeSkipsLooks proves a probe of a not-live runtime
+// resolves no handle and reads neither the pending interaction nor the idle
+// boundary, and one a content gate decides reads no idle boundary: it
+// resolves the handle only to read the pending interaction, which control
+// may answer behind the gate (DES-O1 §10.5).
 func TestLaneExecBlockedProbeSkipsLooks(t *testing.T) {
 	for _, tc := range []struct {
-		name  string
-		opts  []laneFixtureOpt
-		setup func(f *laneFixture)
+		name    string
+		opts    []laneFixtureOpt
+		setup   func(f *laneFixture)
+		handles int32
 	}{
-		{name: "content block", opts: []laneFixtureOpt{func(meta map[string]string) { meta["restart_requested"] = "true" }}},
+		{name: "content block", opts: []laneFixtureOpt{func(meta map[string]string) { meta["restart_requested"] = "true" }}, handles: 1},
 		{name: "not live", setup: func(f *laneFixture) { f.sp.TurnInterruptModeValue = runtime.TurnInterruptProtocol }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1155,8 +1159,8 @@ func TestLaneExecBlockedProbeSkipsLooks(t *testing.T) {
 			if err != nil || res.Took != opjournal.TakeNone {
 				t.Fatalf("Pass = %+v, %v; want nothing taken", res, err)
 			}
-			if c.handles.Load() != 0 || c.idles.Load() != 0 {
-				t.Fatalf("handles %d idles %d, want none for a decided probe", c.handles.Load(), c.idles.Load())
+			if c.handles.Load() != tc.handles || c.idles.Load() != 0 {
+				t.Fatalf("handles %d idles %d, want %d handles and no idle read for a decided probe", c.handles.Load(), c.idles.Load(), tc.handles)
 			}
 		})
 	}

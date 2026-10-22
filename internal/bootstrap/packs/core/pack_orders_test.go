@@ -453,3 +453,270 @@ func TestCoreSQLOrdersDeclareRequiresBackendExceptHTTP(t *testing.T) {
 		}
 	}
 }
+
+// TestDetectSilentPublishedWorkOrder pins the silence detector's dispatch
+// contract: a mechanical cooldown sweep run via exec, no pool, pointing at an
+// embedded script.
+func TestDetectSilentPublishedWorkOrder(t *testing.T) {
+	assertCooldownExecOrder(t, "detect-silent-published-work.toml", "detect-silent-published-work.sh")
+}
+
+// TestDetectSilentPublishedWorkScriptContract guards the behaviors that make
+// this detector trustworthy. Its runtime failures are best-effort and its whole
+// purpose is to be believed when it says "nothing is stalled", so the load-
+// bearing elements are pinned here rather than left to review:
+//
+//   - EVIDENCE DISCIPLINE (ga-mmvpq1 08:10Z, binding): progress is established
+//     by comparing live state against a persisted OBSERVATION, never by reading
+//     a record of what a prior sweep did. The persisted keys are therefore
+//     observed_* and first_observed_in_state_at, and gate dedup/auto-resolve go
+//     through a live gate query. An action log can lose an entry for an action
+//     that succeeded or keep one for an action that never took effect, and
+//     neither is detectable from the log — so a log-based detector reports clean
+//     sweeps that never happened, which is the exact class it exists to catch.
+//   - READ-FAILURE IS NOT ABSENCE: a failed read classifies UNKNOWN and is
+//     skipped, never counted as silence (false alarm on every PR at once) and
+//     never as health (the fault, hidden by its own detector). Mirrors the
+//     refinery predicate's "refusing rather than reporting a read failure as
+//     gate-absence".
+//   - STICKY IDENTITY IS AUTHENTICATED: a bare startswith match is not enough —
+//     a read-only member can post a lookalike gate comment. The author's
+//     EFFECTIVE repo permission must be write or higher, matching the predicate.
+//   - HEALTH-BLIND: the detector must not read CI conclusions, mergeability, or
+//     review verdicts. No PR-health signal separates the four exhibits, and
+//     reading them would rank a red-but-worked PR below a green abandoned one.
+//   - NOT OBSERVE-ONLY (explicit ratification prohibition): there must be no
+//     dry-run knob. A detector that observes and does not act is
+//     indistinguishable from one that is switched off.
+//   - Portable timestamps: GNU-only `date -d` returns empty on BSD/macOS, which
+//     would fail every age check and pass the whole sweep as clean.
+//   - Loud-fail: surfacing requires a NON-ZERO exit, since the controller logs
+//     an exec order's output only on failure (#4543).
+func TestDetectSilentPublishedWorkScriptContract(t *testing.T) {
+	data, err := fs.ReadFile(PackFS, "assets/scripts/detect-silent-published-work.sh")
+	if err != nil {
+		t.Fatalf("reading detect-silent-published-work.sh: %v", err)
+	}
+	body := string(data)
+
+	for _, want := range []string{
+		"pr_published_awaiting_gate", // B1 arm (i): the published states
+		"gate_clear_awaiting_merge",
+		"first_observed_in_state_at",           // B3: the clock, anchored on observation
+		"observed_head",                        // B3: push detected by head comparison
+		"observed_marker",                      // B3: re-render detected by marker change
+		"GC_SILENT_WORK_THRESHOLD",             // B3: the one knob
+		"collaborators/",                       // B2: effective-permission authentication
+		"## Sherpa gate",                       // B2: sticky selection, predicate-identical
+		`\*\*Gate status\*\*`,                  // B2: the canonical verdict line (sed-escaped in the script)
+		`\*\*HEAD\*\*`,                         // B2: the pinned-head freshness marker (sed-escaped)
+		"silent-ungated",                       // B2: STATE 1
+		"silent-stale",                         // B2: STATE 2
+		"silent-unexecuted",                    // B2: STATE 2' (refinery as dead owner)
+		"bypass-detected",                      // A6: merged with no CLEAR gate
+		`gc bd --city "$CITY_ABS" gate create`, // B4(ii)/locality: the mint, town-pinned
+		"gc.silent_work_alarm",                 // B4(i): the bead-attached record
+		"THIS WORK EXISTS",                     // B4(i): the anti-duplication signal
+		"gh pr list",                           // B1 arm (ii): reconciliation
+		"--limit 0",                            // no silent truncation of candidates
+		"date -ju -f",                          // portable timestamps (BSD/macOS)
+		".hq != true",                          // cross-rig convention
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("detect-silent-published-work.sh missing load-bearing element %q", want)
+		}
+	}
+
+	// Health-blind by construction. If any of these ever appear, the detector
+	// has started ranking PRs by health, which demonstrably does not separate
+	// the exhibits it exists to catch.
+	for _, forbidden := range []string{
+		"mergeable",
+		"check-runs",
+		"statusCheckRollup",
+		"reviewDecision",
+	} {
+		if strings.Contains(body, forbidden) {
+			t.Errorf("detect-silent-published-work.sh reads PR health signal %q; the detector must key on absence of progress only", forbidden)
+		}
+	}
+
+	// The explicit ratification prohibition: no observe-only escape hatch.
+	for _, forbidden := range []string{"DRY_RUN", "dry_run", "--dry-run"} {
+		if strings.Contains(body, forbidden) {
+			t.Errorf("detect-silent-published-work.sh contains %q; ga-mmvpq1 ratification prohibits shipping this detector in observe-only mode", forbidden)
+		}
+	}
+
+	// Read-failure must classify UNKNOWN and skip, never fall through to a
+	// silence verdict or a health verdict.
+	if !strings.Contains(body, "UNKNOWN") {
+		t.Error("detect-silent-published-work.sh must classify read failures as UNKNOWN rather than as absence of work")
+	}
+	// The 08:10Z constraint, pinned as a mechanism rather than a comment: gate
+	// dedup and auto-resolve must ask the store what exists NOW.
+	if !strings.Contains(body, "list_episode_gates") {
+		t.Error("detect-silent-published-work.sh must resolve gate existence with a live query (08:10Z: a state query, not an action log)")
+	}
+	// Loud-fail exit contract (#4543): the controller logs an exec order's
+	// output only on a non-zero exit, so failures must exit non-zero.
+	if !strings.Contains(body, `"$FAILED" -gt 0`) {
+		t.Error("detect-silent-published-work.sh must exit non-zero when an action failed, or the loud-fail messages are never logged (#4543)")
+	}
+
+	// A BLIND SWEEP MUST NOT LOOK LIKE A CLEAN ONE. UNKNOWN reported on a zero
+	// exit is invisible to the controller, so it is indistinguishable from
+	// "nothing is stalled" — the exact confusion this order exists to prevent.
+	if !strings.Contains(body, `"$UNKNOWN" -gt 0 ] || [ "$FAILED" -gt 0`) {
+		t.Error("detect-silent-published-work.sh must exit non-zero on UNKNOWN too; a partially blind sweep that exits 0 is indistinguishable from a clean one")
+	}
+
+	// RECORD SEPARATOR. `read` with IFS=$'\t' COLLAPSES consecutive tabs,
+	// because tab is IFS-whitespace — so a record with an empty middle field
+	// (pr_number absent but pr_url present, the most common shape on the live
+	// store) shifts every later field and the detector goes UNKNOWN forever on
+	// exactly the beads it exists to find. Verified by construction; the unit
+	// separator is not IFS-whitespace and does not collapse.
+	if strings.Contains(body, `IFS="$(printf '\t')"`) {
+		t.Error("detect-silent-published-work.sh must not split records on TAB: IFS-whitespace collapses consecutive tabs and shifts fields when a middle field is empty")
+	}
+	if !strings.Contains(body, `US="$(printf '\037')"`) {
+		t.Error("detect-silent-published-work.sh must split records on the unit separator, which does not collapse")
+	}
+
+	// Gate auto-resolve must be RE-DERIVED from live state each sweep, across
+	// every case the candidate loop cannot see: a bead that changed silent
+	// class, moved to a different PR, or left the published states entirely and
+	// so vanished from the candidate query.
+	if !strings.Contains(body, "LIVE_EPISODES") {
+		t.Error("detect-silent-published-work.sh must reconcile open episode gates against the live episode set, not only resolve from inside the candidate loop")
+	}
+
+	// A rig-discovery failure is not an empty rig list: the published population
+	// lives on the rig stores, so sweeping HQ alone and exiting 0 reports
+	// "nothing is stalled" from a sweep that never looked.
+	if !strings.Contains(body, "RIG_DISCOVERY_OK") {
+		t.Error("detect-silent-published-work.sh must fail loudly when rigs cannot be enumerated rather than sweeping HQ only and exiting clean")
+	}
+
+	// Suspension is quiescence (upstream #7115): a suspended rig is left cold,
+	// because any bd read restarts its retired proxy and Dolt. The sweep's rig
+	// enumeration must skip it, as the sibling sweeps do (scope_bd.sh,
+	// orphan-sweep.sh, renudge-stale-human-gates.sh); otherwise every sweep's
+	// `gc bd list --rig` restarts the pair and the controller stops it again.
+	if !strings.Contains(body, "select(.hq != true and .suspended != true)") {
+		t.Error("detect-silent-published-work.sh must leave suspended rigs out of its rig enumeration; a read of a suspended rig restarts its retired proxy (#7115)")
+	}
+
+	// An UNKNOWN read must CARRY the prior observation forward. Dropping it
+	// restarts that bead's clock next sweep, so a flapping API would hold a real
+	// stall permanently below threshold.
+	if !strings.Contains(body, "carry_forward") {
+		t.Error("detect-silent-published-work.sh must carry a prior observation forward on UNKNOWN, or a flapping read keeps resetting the clock")
+	}
+
+	// Pruning must never write an empty state on failure: an empty state file
+	// resets every clock, which silently guarantees no alarm ever fires again.
+	if !strings.Contains(body, "keeping the unpruned state") {
+		t.Error("detect-silent-published-work.sh must keep the unpruned state when the prune fails; writing an empty state resets every clock")
+	}
+
+	// The orphan arm's mail must LATCH. It cannot dedup on a store gate — gate
+	// create requires --blocks and the orphan case is beadless, and the
+	// reconciliation phase resolves any episode the candidate loop did not
+	// re-derive — so it latches on a mailed-at state record with a re-remind
+	// interval, stamped only when the mail actually delivered. Without this
+	// the same orphans re-mail every cooldown forever (measured on the
+	// westeros deployment: nine orphans, ~108 mails/hour).
+	if !strings.Contains(body, "orphan_mailed_at") {
+		t.Error("detect-silent-published-work.sh orphan arm must latch its mail on an orphan_mailed_at state record; a gate nothing creates never dedups and the mail re-sends every cooldown")
+	}
+	if !strings.Contains(body, "ORPHAN_REMIND_S") {
+		t.Error("detect-silent-published-work.sh orphan arm must honor a re-remind interval so a latched orphan still re-surfaces instead of being silenced forever")
+	}
+
+	// ── TOWN LOCALITY (ga-g2at7f, 2026-09-22) ───────────────────────────────
+	// A paging artifact's ROUTE is a property of the STORE IT LANDS IN. On
+	// 2026-09-22 this detector minted 30 human gates on the SHARED qcore store
+	// and paged another town's human inbox with our town's detections.
+	//
+	// The mint, the dedup read and the auto-resolve must ALL be pinned to the
+	// town-local city store. `--city` and not merely the absence of `--rig`:
+	// gc bd also auto-detects the store FROM THE BEAD ID, so a bare
+	// `gate create --blocks qc-…` routes itself straight back onto the shared
+	// store. And dedup must follow the mint — a lookup left on the rig store
+	// finds nothing, reads that as "no gate exists", and re-mints every sweep,
+	// rebuilding the burst town-locally.
+	for _, want := range []string{
+		`gc bd --city "$CITY_ABS" gate list`,
+		`gc bd --city "$CITY_ABS" gate resolve`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("detect-silent-published-work.sh must pin %q to the town-local city store; dedup and auto-resolve follow the mint or every sweep re-mints", want)
+		}
+	}
+	// The CANDIDATE list is pinned too: a bare `gc bd list` on the empty scope
+	// is subject to the same GC_RIG / cwd / bead-prefix auto-detection, and an
+	// unpinned city sweep landing on a rig store hands that rig's beads to the
+	// town-local carve-out — "ours by construction" asserted about the SHARED
+	// store (codex review, 2026-09-22).
+	if !strings.Contains(body, `CP1="--city"; CP2="$CITY_ABS"`) {
+		t.Error("detect-silent-published-work.sh must pin the empty-scope candidate list to the city store; bead-prefix auto-detection otherwise re-routes it")
+	}
+	// The city partition label must not be spellable as a rig name: a rig
+	// named "hq" would share the reconciliation partition and the two sweeps
+	// would resolve each other's live gates in a mint/resolve loop.
+	if !strings.Contains(body, `SCOPE_LABEL="${scope:-@city}"`) {
+		t.Error(`detect-silent-published-work.sh must label the city scope "@city"; a rig-nameable label collides in the reconciliation partition`)
+	}
+	if strings.Contains(body, `SCOPE_LABEL="${scope:-hq}"`) {
+		t.Error(`detect-silent-published-work.sh labels the city scope "hq", which a rig can be named (partition collision)`)
+	}
+	// No gate call may carry rig-store routing. These are the exact shapes the
+	// incident shipped.
+	for _, forbidden := range []string{
+		`gate create ${RIG1`,
+		`gate list ${rig1`,
+		`gate resolve "$g_id" ${RIG1`,
+	} {
+		if strings.Contains(body, forbidden) {
+			t.Errorf("detect-silent-published-work.sh routes a gate call to a rig store (%q); every paging artifact it mints must land town-local (ga-g2at7f)", forbidden)
+		}
+	}
+	// Subject scope: a LIVE roster read, never a hardcoded seat list, and the
+	// pool sweeper's own predicate rather than a second implementation of it
+	// (ga-7dr90m / ga-8yi7ne).
+	if !strings.Contains(body, "gc agent is-foreign") {
+		t.Error("detect-silent-published-work.sh must scope the alarm leg to subjects owned by this city's LIVE roster, read through gc agent is-foreign")
+	}
+	// A failed roster read is UNKNOWN — never "not ours" and never "ours" — so
+	// the alarm leg and the auto-resolve are both skipped for the sweep.
+	if !strings.Contains(body, "ROSTER_OK") {
+		t.Error("detect-silent-published-work.sh must gate its alarm leg on a roster read that can FAIL; an unreadable roster is UNKNOWN, not a verdict")
+	}
+	// The narrowing must be counted and named. A subject-scope filter nobody
+	// can see is indistinguishable from a city with no stalled work — the exact
+	// confusion this detector exists to prevent, reproduced in its own scoping.
+	if !strings.Contains(body, "SKIPPED_NOTOURS") {
+		t.Error("detect-silent-published-work.sh must COUNT the candidates its subject scope skipped; a silent narrowing is a detector that has quietly switched itself off")
+	}
+	// The cross-store arm's mail must latch: bd gate create requires --blocks
+	// and resolves it against the store it runs in, so a town-local gate cannot
+	// block a bead on another store and there is no state query to dedup on.
+	if !strings.Contains(body, "xstore_mailed_at") {
+		t.Error("detect-silent-published-work.sh cross-store arm must latch its town-local mail on a state record; a gate cannot block a bead on another store, so nothing else dedups it")
+	}
+	// TOWN-LOCAL CARVE-OUT (katya ruling, 2026-09-22): a subject on THIS
+	// city's own store is ours by construction — the city scope bypasses the
+	// roster read (unassigned subjects included; "published work waiting on
+	// NOBODY" on our own store is the founding case), while every rig-store
+	// scope keeps the strict positive-resolution rule. The carve-out is
+	// counted separately so the read-out can see how often it fires.
+	if !strings.Contains(body, "OURS_BY_STORE") {
+		t.Error("detect-silent-published-work.sh must count the town-local ours-by-construction carve-out separately (OURS_BY_STORE); an uncounted carve-out cannot be reviewed")
+	}
+	if !strings.Contains(body, `if [ -z "$scope" ]; then
+            # TOWN-LOCAL CARVE-OUT`) {
+		t.Error("detect-silent-published-work.sh city-scope candidates must bypass the roster read (ours by construction) BEFORE the roster-blind and is-foreign branches; rig-scope candidates must still take them")
+	}
+}

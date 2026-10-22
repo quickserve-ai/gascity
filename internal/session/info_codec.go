@@ -160,6 +160,7 @@ var infoKeyCodec = []infoKeySpec{
 	{ResetCommittedAtKey, func(i *Info, v string) { i.ResetCommittedAt = v }},
 	{"generation", func(i *Info, v string) { i.Generation = v }},
 	{"started_config_hash", func(i *Info, v string) { i.StartedConfigHash = v }},
+	{resumeSeededKey, func(i *Info, v string) { i.ResumeSeeded = v }},
 	{"pin_awake", func(i *Info, v string) { i.PinAwake = v }},
 
 	// reconciler decision-read cluster (front-door Phase 5)
@@ -173,12 +174,14 @@ var infoKeyCodec = []infoKeySpec{
 	{"wake_mode", func(i *Info, v string) { i.WakeMode = v }},
 	{"drain_at", func(i *Info, v string) { i.DrainAt = v }},
 	{"sleep_intent", func(i *Info, v string) { i.SleepIntent = v }},
+	{beadmeta.LivenessReadDegradedMetadataKey, func(i *Info, v string) { i.LivenessReadDegraded = strings.TrimSpace(v) != "" }},
 	{"instance_token", func(i *Info, v string) { i.InstanceToken = v }},
 	{"detached_at", func(i *Info, v string) { i.DetachedAt = v }},
 	{CurrentBeadIDKey, func(i *Info, v string) { i.CurrentlyProcessingBeadID = v }},
 	{beadmeta.CurrentClaimBeadIDMetadataKey, func(i *Info, v string) { i.CurrentClaimBeadID = v }},
 	{WorkStartedKey, func(i *Info, v string) { i.WorkStartedRaw = v }},
 	{WorkLadderKey, func(i *Info, v string) { i.WorkLadderRaw = v }},
+	{ContentHoldKey, func(i *Info, v string) { i.ContentHoldRaw = v }},
 	{"execution_claim_started", func(i *Info, v string) { i.ExecutionClaimStarted = v }},
 	{"core_hash_breakdown", func(i *Info, v string) { i.CoreHashBreakdown = v }},
 	{"started_provision_hash", func(i *Info, v string) { i.StartedProvisionHash = v }},
@@ -227,6 +230,17 @@ var infoKeyCodec = []infoKeySpec{
 			i.WakeAttempts = 0
 		}
 	}},
+
+	// cloud-wake binding cluster (raw mirrors, single-field string setters).
+	// The claude-cloud transport and doctor read these projected fields;
+	// timestamps stay raw strings — consumers parse at the point of use.
+	{MetadataCloudWakeSessionID, func(i *Info, v string) { i.CloudWakeSessionID = v }},
+	{MetadataCloudWakeAccountDir, func(i *Info, v string) { i.CloudWakeAccountDir = v }},
+	{MetadataCloudWakeBindingSuspect, func(i *Info, v string) { i.CloudWakeBindingSuspect = v }},
+	{MetadataCloudWakeBindingSuspectAt, func(i *Info, v string) { i.CloudWakeBindingSuspectAt = v }},
+	{MetadataCloudWakeLastOutcome, func(i *Info, v string) { i.CloudWakeLastOutcome = v }},
+	{MetadataCloudWakeLastOutcomeAt, func(i *Info, v string) { i.CloudWakeLastOutcomeAt = v }},
+	{MetadataCloudWakeBoundAt, func(i *Info, v string) { i.CloudWakeBoundAt = v }},
 
 	// last_nudge_delivered_at: RFC3339 time. Reset-to-zero first (clears a
 	// carried-forward value in the patch direction; a no-op on a fresh Info).

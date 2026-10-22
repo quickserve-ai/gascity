@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "next_id": 212,
+  "next_id": 219,
   "permanent_ids": [
     {
       "name": "help",
@@ -2604,14 +2604,16 @@
       "hidden": false,
       "effective_hidden": false,
       "disable_flag_parsing": false,
-      "shape": "structural",
+      "shape": "runnable-group",
       "recording_policy": "recordable",
       "mode": "standard",
       "notice_policy": "eligible",
-      "classification": "help",
-      "canonical_target": "@help",
-      "owner": "structural",
-      "id": 1
+      "classification": "unknown",
+      "canonical_target": "@unknown",
+      "owner": "deferred",
+      "resolver": "group-dispatch",
+      "deferred_default": "unknown",
+      "id": 3
     },
     {
       "path": "gc nudge drain",
@@ -3646,6 +3648,21 @@
       "id": 140
     },
     {
+      "path": "gc session bind-cloud",
+      "aliases": [],
+      "conditional_modes": [],
+      "hidden": false,
+      "effective_hidden": false,
+      "disable_flag_parsing": false,
+      "shape": "runnable",
+      "recording_policy": "recordable",
+      "mode": "standard",
+      "notice_policy": "eligible",
+      "classification": "session-bind-cloud",
+      "owner": "immediate",
+      "id": 218
+    },
+    {
       "path": "gc session close",
       "aliases": [],
       "conditional_modes": [],
@@ -3659,6 +3676,21 @@
       "classification": "session-close",
       "owner": "immediate",
       "id": 141
+    },
+    {
+      "path": "gc session history",
+      "aliases": [],
+      "conditional_modes": [],
+      "hidden": false,
+      "effective_hidden": false,
+      "disable_flag_parsing": false,
+      "shape": "runnable",
+      "recording_policy": "recordable",
+      "mode": "standard",
+      "notice_policy": "eligible",
+      "classification": "session-history",
+      "owner": "immediate",
+      "id": 216
     },
     {
       "path": "gc session kill",
@@ -3809,6 +3841,21 @@
       "classification": "session-reset",
       "owner": "immediate",
       "id": 151
+    },
+    {
+      "path": "gc session resume",
+      "aliases": [],
+      "conditional_modes": [],
+      "hidden": false,
+      "effective_hidden": false,
+      "disable_flag_parsing": false,
+      "shape": "runnable",
+      "recording_policy": "recordable",
+      "mode": "standard",
+      "notice_policy": "eligible",
+      "classification": "session-resume",
+      "owner": "immediate",
+      "id": 212
     },
     {
       "path": "gc session submit",
@@ -4145,6 +4192,21 @@
       "canonical_target": "@help",
       "owner": "immediate",
       "id": 1
+    },
+    {
+      "path": "gc supervisor check-freeze",
+      "aliases": [],
+      "conditional_modes": [],
+      "hidden": true,
+      "effective_hidden": true,
+      "disable_flag_parsing": false,
+      "shape": "runnable",
+      "classification": "excluded",
+      "notice_policy": "ineligible",
+      "recording_policy": "excluded",
+      "owner": "excluded",
+      "mode": "hidden-private",
+      "exclusion": "hidden-private"
     },
     {
       "path": "gc supervisor install",
@@ -4701,6 +4763,36 @@
       "id": 204
     },
     {
+      "path": "gc worktree rescue",
+      "aliases": [],
+      "conditional_modes": [],
+      "hidden": false,
+      "effective_hidden": false,
+      "disable_flag_parsing": false,
+      "shape": "runnable",
+      "recording_policy": "recordable",
+      "mode": "standard",
+      "notice_policy": "eligible",
+      "classification": "worktree-rescue",
+      "owner": "immediate",
+      "id": 214
+    },
+    {
+      "path": "gc worktree teardown",
+      "aliases": [],
+      "conditional_modes": [],
+      "hidden": false,
+      "effective_hidden": false,
+      "disable_flag_parsing": false,
+      "shape": "runnable",
+      "recording_policy": "recordable",
+      "mode": "standard",
+      "notice_policy": "eligible",
+      "classification": "worktree-teardown",
+      "owner": "immediate",
+      "id": 215
+    },
+    {
       "path": "gc worktree verify",
       "aliases": [],
       "conditional_modes": [],
@@ -4714,6 +4806,21 @@
       "classification": "worktree-verify",
       "owner": "immediate",
       "id": 205
+    },
+    {
+      "path": "gc worktree-gc",
+      "aliases": [],
+      "conditional_modes": [],
+      "hidden": false,
+      "effective_hidden": false,
+      "disable_flag_parsing": false,
+      "shape": "runnable",
+      "recording_policy": "recordable",
+      "mode": "standard",
+      "notice_policy": "eligible",
+      "classification": "worktree-gc",
+      "owner": "immediate",
+      "id": 213
     }
   ],
   "synthetic": [
@@ -4767,5 +4874,11 @@
       "exclusion": "private-completion"
     }
   ],
-  "tombstones": []
+  "tombstones": [
+    {
+      "name": "agent-is-foreign-fork",
+      "id": 217,
+      "wire": "agent-is-foreign-fork"
+    }
+  ]
 }

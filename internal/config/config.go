@@ -4,6 +4,7 @@ package config
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -637,6 +638,23 @@ type Rig struct {
 	// MaxActiveSessions is the rig-level cap on total concurrent sessions across
 	// all agents in this rig. Nil means inherit from workspace (or unlimited).
 	MaxActiveSessions *int `toml:"max_active_sessions,omitempty"`
+	// OrphanRelease controls whether the controller's in-process pool orphan
+	// sweeper (releaseOrphanedPoolAssignments) may clear assignees and reopen
+	// work in THIS rig's bead store. Nil means enabled, which is the behavior
+	// every city had before the knob existed; set false to stop the sweeper
+	// writing to this rig without suspending it.
+	//
+	// The lever exists for cutovers where a rig's store is shared with another
+	// city and every autonomous writer has to be quiesced (ga-h5435p). It is
+	// rig config rather than an environment variable on purpose: the sweeper
+	// runs inside the long-lived supervisor, so an env knob could only be
+	// thrown by restarting that process, which can strand every session in the
+	// city (ga-4v3ckk) — the worst possible move mid-cutover.
+	//
+	// Turning it off stops orphan RECOVERY for the rig too: work whose claimant
+	// died stays claimed until the knob comes back. That is the intended
+	// trade for a cutover window, not a setting to leave off indefinitely.
+	OrphanRelease *bool `toml:"orphan_release,omitempty"`
 	// Overrides are per-agent patches applied after pack expansion.
 	// V2 renames this to "patches" for consistency with [[patches.agent]].
 	// Both TOML keys are accepted during migration.
@@ -677,6 +695,20 @@ type Rig struct {
 	// a warning, for a rig that shares the city's proxy root: one proxy serves
 	// every scope on that root and carries the city's value.
 	BeadsProxiedIdleTimeout *string `toml:"beads_proxied_idle_timeout,omitempty"`
+	// Doctor holds rig-scoped gc doctor policy ([rigs.doctor]).
+	Doctor RigDoctorConfig `toml:"doctor,omitempty"`
+}
+
+// RigDoctorConfig holds gc doctor policy that applies to one rig.
+type RigDoctorConfig struct {
+	// CensusOwnerNamespace declares that this rig's resource-census ledger
+	// (test/test-resources.toml) names owner_bead values from ANOTHER
+	// tracker, e.g. "gastownhall/gascity" for a fork of Gas City whose ledger
+	// comes from upstream. The census-owner-liveness check then reports an
+	// owner_bead missing from this city as owned in that namespace instead of
+	// dangling. The cost: a missing owner on this rig that is genuinely this
+	// city's is not detected. Empty means every missing owner is dangling.
+	CensusOwnerNamespace string `toml:"census_owner_namespace,omitempty"`
 }
 
 // AgentOverride modifies a pack-stamped agent for a specific rig.
@@ -710,6 +742,9 @@ type AgentOverride struct {
 	PromptTemplate *string `toml:"prompt_template,omitempty"`
 	// Session overrides the session transport ("acp").
 	Session *string `toml:"session,omitempty"`
+	// WakeTransport overrides the seat's notification-plane wake transport
+	// ("session" or "claude-cloud"; see Agent.WakeTransport).
+	WakeTransport *string `toml:"wake_transport,omitempty"`
 	// Provider overrides the provider name.
 	Provider *string `toml:"provider,omitempty"`
 	// ContextAdvisory overrides context-pressure guidance for this agent.
@@ -810,6 +845,12 @@ type AgentOverride struct {
 	MouseMode *string `toml:"mouse_mode,omitempty" jsonschema:"enum=on,enum=off"`
 	// InjectFragmentsAppend appends to the agent's inject_fragments list.
 	InjectFragmentsAppend []string `toml:"inject_fragments_append,omitempty"`
+	// OptInSkills replaces the agent's opt_in_skills list (see
+	// Agent.OptInSkills). Leave it unset to keep the agent's list; set an
+	// empty list to clear it.
+	OptInSkills *[]string `toml:"opt_in_skills,omitempty"`
+	// OptInSkillsAppend appends to the agent's opt_in_skills list.
+	OptInSkillsAppend []string `toml:"opt_in_skills_append,omitempty"`
 	// MaxActiveSessions overrides the agent-level cap on concurrent sessions.
 	MaxActiveSessions *int `toml:"max_active_sessions,omitempty"`
 	// MinActiveSessions overrides the minimum number of sessions to keep alive.
@@ -1760,6 +1801,14 @@ type SessionConfig struct {
 	// this pattern go to K8s; all others stay local (tmux).
 	// Overridden by the GC_HYBRID_REMOTE_MATCH env var if set.
 	RemoteMatch string `toml:"remote_match,omitempty"`
+	// DriftWaveNotify is the mail recipient for config-drift wave notices:
+	// when more sessions need config-drift restarts in one tick than the
+	// per-tick budget allows, the reconciler mails this address once per
+	// wave (plus periodic reminders while the wave keeps rolling) so a
+	// coordinator sees a roster-wide roll in progress. Empty disables the
+	// mail; the session.config_drift_wave event and stderr notice always
+	// fire regardless.
+	DriftWaveNotify string `toml:"drift_wave_notify,omitempty"`
 }
 
 // durationOr parses raw as a Go duration, returning def when raw is empty or
@@ -1993,6 +2042,9 @@ type MailConfig struct {
 	// the nudge-mail sweep closes it. Empty or "0" disables the unread-mail
 	// phase; it is opt-in so unread mail is never closed by default.
 	UnreadRetentionTTL string `toml:"unread_retention_ttl,omitempty"`
+	// CrossCity enables city-qualified mail addressing (<city>/<address>).
+	// Absent means disabled: every recipient resolves exactly as today.
+	CrossCity *MailCrossCityConfig `toml:"crosscity,omitempty"`
 }
 
 // RetentionTTLDuration parses RetentionTTL as a Go time.Duration. Empty or
@@ -2378,6 +2430,12 @@ type OrderOverride struct {
 	// shared-pack order (e.g. a slow-store queue check) without editing the
 	// pack source.
 	CheckTimeout *string `toml:"check_timeout,omitempty"`
+	// RunStaleAfter overrides how long the order's formula runs may stay open
+	// before the controller reports them as stale, naming who holds each one.
+	// The report closes nothing. Go duration string; default 6h. Lets a
+	// deployment raise it for a scanned shared-pack order whose runs
+	// legitimately take longer, without editing the pack source.
+	RunStaleAfter *string `toml:"run_stale_after,omitempty"`
 	// Idempotent overrides whether the order's dispatch is safe to repeat.
 	// Idempotent orders fail open when the open-work gate times out (#2893).
 	Idempotent *bool `toml:"idempotent,omitempty"`
@@ -2857,7 +2915,8 @@ type DaemonConfig struct {
 	// AutoReapClosedBeadWorktrees controls whether the reconciler patrol
 	// automatically removes per-bead git worktrees once their associated
 	// work bead reaches closed status. Only worktrees with a clean working
-	// tree, no stashes, and no commits that removal would orphan — commits
+	// tree (gc's own provisioning files do not count) and no commits that
+	// removal would orphan — commits
 	// reachable from no branch, tag, or remote-tracking ref — are removed;
 	// push state is deliberately not the test, since `git worktree remove`
 	// deletes the checkout and not refs/heads. Unsafe worktrees are logged
@@ -2892,6 +2951,21 @@ type DaemonConfig struct {
 	// quarantine entirely (every closed-bead worktree is immediately
 	// eligible for the rest of the gate chain, regardless of age).
 	AutoReapClosedBeadWorktreesMinAgeMinutes *int `toml:"auto_reap_closed_bead_worktrees_min_age_minutes,omitempty" jsonschema:"default=10"`
+	// AutoReapClosedBeadWorktreesQuietPeriodMinutes is how long, in minutes,
+	// a closed-bead worktree must go unused (no commit, checkout, `git add` or
+	// file creation in its root) before it becomes eligible for reap
+	// classification. It protects a tree a seat works in through short-lived
+	// shell calls, which the liveness gate cannot see, and is separate from
+	// the creation-age quarantine above. Nil (unset) defaults to
+	// DefaultAutoReapClosedBeadWorktreesQuietPeriodMinutes. Zero disables it.
+	AutoReapClosedBeadWorktreesQuietPeriodMinutes *int `toml:"auto_reap_closed_bead_worktrees_quiet_period_minutes,omitempty" jsonschema:"default=360"`
+	// AutoReapStoppedAgentHomes controls whether the reconciler removes closed,
+	// stopped configured named/namepool worktree homes. The reaper fails closed
+	// unless runtime/session and assignment snapshots are available, and requires
+	// a clean registered worktree with no unpushed commits or nested registered
+	// worktrees. A repository stash is not a gate: it lives in the common repo,
+	// which removing a worktree never touches. Defaults to false.
+	AutoReapStoppedAgentHomes *bool `toml:"auto_reap_stopped_agent_homes,omitempty" jsonschema:"default=false"`
 	// StartReadyTimeout is how long `gc start` and `gc register` wait for
 	// the supervisor to report the city as Running. Cities with many
 	// registered or adopted sessions take longer to start because the
@@ -2915,8 +2989,9 @@ type DaemonConfig struct {
 	// AutoPruneWorkerDir controls whether the reconciler removes a
 	// pool-managed session's worker_dir (agent worktree) after the session
 	// bead is closed. Removal is gated on: path lives under the city's
-	// .gc/worktrees/ tree, clean working tree, no unpushed commits, no
-	// stashed work. Nil (unset) defaults to true so pool worktrees do not
+	// .gc/worktrees/ tree, clean working tree (gc's own provisioning files
+	// and .worktree-stale marker do not count), no unpushed commits. A
+	// repository stash is not a gate. Nil (unset) defaults to true so pool worktrees do not
 	// accumulate without bound across pool recycles. Set to false to
 	// retain worktrees for post-session diagnostics.
 	AutoPruneWorkerDir *bool `toml:"auto_prune_worker_dir,omitempty" jsonschema:"default=true"`
@@ -2973,11 +3048,39 @@ func (d *DaemonConfig) AutoReapClosedBeadWorktreesMinAge() time.Duration {
 	return time.Duration(*d.AutoReapClosedBeadWorktreesMinAgeMinutes) * time.Minute
 }
 
+// DefaultAutoReapClosedBeadWorktreesQuietPeriodMinutes is the last-use quiet
+// period applied when AutoReapClosedBeadWorktreesQuietPeriodMinutes is unset.
+const DefaultAutoReapClosedBeadWorktreesQuietPeriodMinutes = 360
+
+// AutoReapClosedBeadWorktreesQuietPeriod returns how long a closed-bead
+// worktree must go unused before it is eligible for reap classification.
+// Defaults to DefaultAutoReapClosedBeadWorktreesQuietPeriodMinutes when unset;
+// only an explicit zero disables the gate. A negative value, or one too large
+// for a time.Duration, is an error: the gate guards against data loss, so the
+// caller protects rather than treating a bad value as "off".
+func (d *DaemonConfig) AutoReapClosedBeadWorktreesQuietPeriod() (time.Duration, error) {
+	if d.AutoReapClosedBeadWorktreesQuietPeriodMinutes == nil {
+		return time.Duration(DefaultAutoReapClosedBeadWorktreesQuietPeriodMinutes) * time.Minute, nil
+	}
+	minutes := *d.AutoReapClosedBeadWorktreesQuietPeriodMinutes
+	if minutes < 0 || int64(minutes) > math.MaxInt64/int64(time.Minute) {
+		return 0, fmt.Errorf("daemon.auto_reap_closed_bead_worktrees_quiet_period_minutes = %d: want 0 (off) or 1..%d", minutes, math.MaxInt64/int64(time.Minute))
+	}
+	return time.Duration(minutes) * time.Minute, nil
+}
+
+// AutoReapStoppedAgentHomesEnabled reports whether stopped configured
+// named/namepool homes may be reclaimed. It is opt-in because these homes are
+// longer-lived than per-bead and ordinary pool worker directories.
+func (d *DaemonConfig) AutoReapStoppedAgentHomesEnabled() bool {
+	return d.AutoReapStoppedAgentHomes != nil && *d.AutoReapStoppedAgentHomes
+}
+
 // AutoPruneWorkerDirEnabled reports whether the reconciler should remove a
 // pool-managed session's worker_dir after the session bead is closed. The
 // default is true: pool worktrees are transient by design and accumulate
 // without bound otherwise. Removal is still gated on per-worktree safety
-// probes (clean tree, no unpushed commits, no stashes).
+// probes (clean tree, no unpushed commits).
 func (d *DaemonConfig) AutoPruneWorkerDirEnabled() bool {
 	if d.AutoPruneWorkerDir == nil {
 		return true
@@ -3543,6 +3646,15 @@ type Agent struct {
 	// "acp" uses the Agent Client Protocol (JSON-RPC over stdio).
 	// The agent's resolved provider must have supports_acp = true.
 	Session string `toml:"session,omitempty" jsonschema:"enum=acp"`
+	// WakeTransport selects this seat's notification-plane wake transport
+	// (claudemsg-bridge-design.md §4). "" and "session" mean today's
+	// worker.Handle wait-idle/queued path, byte-for-byte. "claude-cloud"
+	// (ga-bjbaui) delivers wake hints into a bound Claude Code cloud
+	// session. Selection is structural per-seat configuration validated at
+	// load — never a runtime capability probe; a seat whose harness lacks
+	// the selected transport is a config error, not a silent fallback.
+	// (Distinct from WakeMode, which controls resume-vs-fresh on wake.)
+	WakeTransport string `toml:"wake_transport,omitempty" jsonschema:"enum=session,enum=claude-cloud"`
 	// Provider names the provider preset to use for this agent.
 	Provider string `toml:"provider,omitempty"`
 	// ContextAdvisory overrides context-pressure guidance for this agent.
@@ -3803,6 +3915,20 @@ type Agent struct {
 	//   *false -> disable; the template is responsible for rendering
 	//             any skill guidance itself
 	InjectAssignedSkills *bool `toml:"inject_assigned_skills,omitempty"`
+	// OptInSkills names the opt-in skills this agent receives. A pack ships
+	// an opt-in skill under skills/opt-in/<name>/SKILL.md, and no agent
+	// receives it unless it names it here. Names use the shared catalog's
+	// form: "<binding>.<name>" for an imported pack's skill, "<name>" for the
+	// city pack's own. A name must resolve to an opt-in skill in the agent's
+	// scope (the city's imports, plus its rig's imports for a rig-scoped
+	// agent), or config load fails. An agent whose work_dir is its scope
+	// root receives its opt-ins in the scope root's skill directory, and
+	// every session the provider loads that directory for sees them: for
+	// Claude Code, sessions started there and in plain subdirectories below
+	// it in the same repository, but not sessions in their own linked
+	// worktrees. An agent with its own work_dir receives its opt-ins in that
+	// work_dir alone; that is how a seat gets an opt-in skill exclusively.
+	OptInSkills []string `toml:"opt_in_skills,omitempty"`
 	// Attach controls whether the agent's session supports interactive
 	// attachment (e.g., tmux attach). When false, the agent can use a
 	// lighter runtime (subprocess instead of tmux). Defaults to true.
@@ -3882,6 +4008,7 @@ func (a Agent) Clone() Agent {
 	out.InjectFragments = append([]string(nil), a.InjectFragments...)
 	out.AppendFragments = append([]string(nil), a.AppendFragments...)
 	out.InheritedAppendFragments = append([]string(nil), a.InheritedAppendFragments...)
+	out.OptInSkills = append([]string(nil), a.OptInSkills...)
 	out.DependsOn = append([]string(nil), a.DependsOn...)
 	out.SharedSkills = append([]string(nil), a.SharedSkills...)
 	out.SharedMCP = append([]string(nil), a.SharedMCP...)
@@ -4431,6 +4558,13 @@ func ValidateAgents(agents []Agent) error {
 		default:
 			return fmt.Errorf("agent %q: wake_mode must be \"resume\", \"fresh\", or empty, got %q", a.QualifiedName(), a.WakeMode)
 		}
+		// WakeTransport enum (notification plane, ga-bjbaui).
+		switch a.WakeTransport {
+		case "", WakeTransportSession, WakeTransportClaudeCloud:
+			// valid
+		default:
+			return fmt.Errorf("agent %q: wake_transport must be %q, %q, or empty, got %q", a.QualifiedName(), WakeTransportSession, WakeTransportClaudeCloud, a.WakeTransport)
+		}
 		// MouseMode enum.
 		switch a.MouseMode {
 		case "", "on", "off":
@@ -4671,6 +4805,17 @@ func validateDependsOn(agents []Agent) error {
 	return nil
 }
 
+// OrderAddressSegment leads the mail address an order sends from
+// (order:<scope>/<name>). No rig or mail city may take it, so an address that
+// reads as an order's is never also a rig's or a city's.
+const OrderAddressSegment = "order"
+
+// IsReservedOrderAddressName reports whether name is taken by order addresses:
+// "order" itself or anything that starts "order:".
+func IsReservedOrderAddressName(name string) bool {
+	return name == OrderAddressSegment || strings.HasPrefix(name, OrderAddressSegment+":")
+}
+
 // ValidateRigs checks rig configurations for errors. It returns an error if
 // any rig is missing required fields, has duplicate names, or has colliding
 // prefixes. The hqPrefix is the city's HQ prefix for collision checks.
@@ -4700,6 +4845,9 @@ func ValidateRigs(rigs []Rig, hqPrefix string) error {
 		// token; a real rig with that name would be silently shadowed.
 		if r.Name == orders.RigWildcard {
 			return fmt.Errorf("rig[%d]: name %q is reserved as the [[orders.overrides]] wildcard", i, r.Name)
+		}
+		if IsReservedOrderAddressName(r.Name) {
+			return fmt.Errorf("rig[%d]: name %q is reserved: mail from an order is addressed %s:<scope>/<name>", i, r.Name, OrderAddressSegment)
 		}
 		if r.Path == "" {
 			return fmt.Errorf("rig %q: path is required", r.Name)

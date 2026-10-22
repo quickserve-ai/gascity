@@ -60,3 +60,33 @@ func IsDeliberateSleepReason(reason string) bool {
 		return false
 	}
 }
+
+// StandingSleepIntent returns the canonical standing-hold intent carried by a
+// raw sleep_intent marker, or "" when the marker is not a standing hold: an
+// operator suspend (user-hold) or a wait gate (wait-hold). Every other intent
+// is bookkeeping for a drain and ends with it. The carry's drain-ack teardown
+// (ga-x99xh0) keeps a seat parked by a standing hold, and the released
+// wait-hold heal (fork #59) reads it.
+func StandingSleepIntent(intent string) SleepReason {
+	switch reason := SleepReason(strings.TrimSpace(intent)); reason {
+	case SleepReasonUserHold, SleepReasonWaitHold:
+		return reason
+	default:
+		return ""
+	}
+}
+
+// StandingIntent is StandingSleepIntent read through a decoded disposition
+// (R7's projection), for a reader that must not read sleep_intent raw: an
+// operator's suspend is the user-hold intent, a wait's own intent the
+// wait-hold one.
+func StandingIntent(d Disposition) SleepReason {
+	switch {
+	case d.Operator == OperatorSuspended:
+		return SleepReasonUserHold
+	case d.WaitIntent:
+		return SleepReasonWaitHold
+	default:
+		return ""
+	}
+}

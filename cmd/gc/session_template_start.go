@@ -7,6 +7,7 @@ import (
 	"io"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
@@ -90,6 +91,29 @@ func materializeSessionForTemplateWithOptions(
 			if resolvedSpec, foundNamed := findNamedSessionSpec(cfg, cityName, found.QualifiedName()); foundNamed {
 				spec = resolvedSpec
 				hasNamed = true
+			} else if !found.SupportsMultipleSessions() {
+				// ga-e4jb: the lookup above matches only named sessions whose
+				// identity equals the agent's qualified name, which a
+				// [[named_session]] with a distinct name= never satisfies —
+				// so a raw backing-template target used to fall through to
+				// materializeSessionForAgentConfig and mint a manual session
+				// that shadowed the named identity. Collapse into the named
+				// session when exactly one backs this single-session
+				// template. Multi-session templates keep factory semantics:
+				// a raw-template target there mints sanctioned ephemeral
+				// capacity, never the named identity (phase-0 factory spec).
+				switch specs := findNamedSessionSpecsByBackingTemplate(cfg, cityName, found.QualifiedName()); len(specs) {
+				case 0:
+				case 1:
+					spec = specs[0]
+					hasNamed = true
+				default:
+					identities := make([]string, len(specs))
+					for i, s := range specs {
+						identities[i] = s.Identity
+					}
+					return "", fmt.Errorf("template %q backs multiple configured named sessions (%s) — target one named identity", found.QualifiedName(), strings.Join(identities, ", "))
+				}
 			}
 		}
 	}
@@ -127,12 +151,16 @@ func materializeSessionForTemplateWithOptions(
 		if err := validateSessionTransportAt(cityPath, resolved, sessionTransport, sp); err != nil {
 			return "", err
 		}
-		sessionCommand, err := resolvedSessionCommand(cityPath, resolved, nil, sessionTransport)
+		workDirQualifiedName := workdirutil.SessionQualifiedName(cityPath, *spec.Agent, cfg.Rigs, spec.Identity, "")
+		workDir, err := resolveWorkDirForQualifiedName(cityPath, cfg, spec.Agent, workDirQualifiedName)
 		if err != nil {
 			return "", err
 		}
-		workDirQualifiedName := workdirutil.SessionQualifiedName(cityPath, *spec.Agent, cfg.Rigs, spec.Identity, "")
-		workDir, err := resolveWorkDirForQualifiedName(cityPath, cfg, spec.Agent, workDirQualifiedName)
+		// Render a templated start_command for the named identity the way the
+		// reconciler's named-session loop does: without a controller this
+		// create starts the runtime directly (ga-b1u4yg).
+		resolved = renderResolvedCommandForNewSession(cityPath, cfg, spec.Agent, spec.Identity, spec.SessionName, workDir, resolved)
+		sessionCommand, err := resolvedSessionCommand(cityPath, resolved, nil, sessionTransport)
 		if err != nil {
 			return "", err
 		}
@@ -295,10 +323,6 @@ func materializeSessionForAgentConfig(cityPath string, cfg *config.City, store b
 	if err := validateSessionTransportAt(cityPath, resolved, sessionTransport, sp); err != nil {
 		return "", err
 	}
-	sessionCommand, err := resolvedSessionCommand(cityPath, resolved, nil, sessionTransport)
-	if err != nil {
-		return "", err
-	}
 	cityName := config.EffectiveCityName(cfg, filepath.Base(cityPath))
 	explicitName, err := sessionExplicitNameForNewSession(cityPath, cityName, cfg.Rigs, agentCfg, "")
 	if err != nil {
@@ -311,6 +335,14 @@ func materializeSessionForAgentConfig(cityPath string, cfg *config.City, store b
 		agentCfg,
 		sessionQualifiedName,
 	)
+	if err != nil {
+		return "", err
+	}
+	// Render a templated start_command for this session's own identity the
+	// way the reconciler's create path does: without a controller this create
+	// starts the runtime directly (ga-b1u4yg).
+	resolved = renderResolvedCommandForNewSession(cityPath, cfg, agentCfg, sessionQualifiedName, explicitName, workDir, resolved)
+	sessionCommand, err := resolvedSessionCommand(cityPath, resolved, nil, sessionTransport)
 	if err != nil {
 		return "", err
 	}

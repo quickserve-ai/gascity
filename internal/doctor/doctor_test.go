@@ -1118,3 +1118,98 @@ func TestDoctorBeforeFixPrecedesFixAndVerify(t *testing.T) {
 		})
 	}
 }
+
+// abandonObservingCheck blocks until the runner signals abandonment through
+// CheckContext.Done, then records what Canceled reported.
+type abandonObservingCheck struct {
+	sawCancel chan bool
+}
+
+func (c *abandonObservingCheck) Name() string { return "abandon-observer" }
+func (c *abandonObservingCheck) Run(ctx *CheckContext) *CheckResult {
+	if ctx.Canceled() {
+		c.sawCancel <- false // canceled before the timeout fired: wrong
+		return &CheckResult{Name: c.Name(), Status: StatusOK}
+	}
+	select {
+	case <-ctx.Done:
+		c.sawCancel <- ctx.Canceled()
+	case <-time.After(5 * time.Second):
+		c.sawCancel <- false
+	}
+	return &CheckResult{Name: c.Name(), Status: StatusOK}
+}
+func (c *abandonObservingCheck) CanFix() bool              { return false }
+func (c *abandonObservingCheck) Fix(_ *CheckContext) error { return nil }
+func (c *abandonObservingCheck) WarmupEligible() bool      { return false }
+
+// TestRunCheckTimeoutSignalsAbandonedCheck: when the runner abandons a check at
+// the per-check timeout it closes CheckContext.Done, so a check that issues
+// many store calls can stop issuing them instead of running on unobserved.
+func TestRunCheckTimeoutSignalsAbandonedCheck(t *testing.T) {
+	d := &Doctor{CheckTimeout: 25 * time.Millisecond}
+	check := &abandonObservingCheck{sawCancel: make(chan bool, 1)}
+	d.Register(check)
+
+	report := d.Run(&CheckContext{}, io.Discard, false)
+	if len(report.Results) != 1 || !report.Results[0].TimedOut {
+		t.Fatalf("report = %+v, want the check to time out", report)
+	}
+	select {
+	case canceled := <-check.sawCancel:
+		if !canceled {
+			t.Fatal("abandoned check did not observe cancellation through CheckContext.Done/Canceled")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("abandoned check never observed CheckContext.Done closing")
+	}
+	d.Wait()
+}
+
+// TestCheckContextCanceledNilSafe: an unbounded run leaves Done nil, and a nil
+// context is never canceled.
+func TestCheckContextCanceledNilSafe(t *testing.T) {
+	var nilCtx *CheckContext
+	if nilCtx.Canceled() {
+		t.Fatal("nil CheckContext reported canceled")
+	}
+	if (&CheckContext{}).Canceled() {
+		t.Fatal("CheckContext without Done reported canceled")
+	}
+}
+
+// deadlineCheck records the CheckContext.Deadline its Run received.
+type deadlineCheck struct {
+	got time.Time
+}
+
+func (c *deadlineCheck) Name() string { return "deadline" }
+func (c *deadlineCheck) Run(ctx *CheckContext) *CheckResult {
+	c.got = ctx.Deadline
+	return &CheckResult{Name: c.Name(), Status: StatusOK}
+}
+func (c *deadlineCheck) CanFix() bool              { return false }
+func (c *deadlineCheck) Fix(_ *CheckContext) error { return nil }
+func (c *deadlineCheck) WarmupEligible() bool      { return false }
+
+// A check doing bounded work needs to know when the runner will abandon it,
+// so it can size its own budget to return a verdict first (pl-59k).
+func TestDoctor_RunPassesTheAbandonDeadlineToTheCheck(t *testing.T) {
+	c := &deadlineCheck{}
+	d := &Doctor{CheckTimeout: 5 * time.Second}
+	d.Register(c)
+	before := time.Now()
+	d.RunCollect(&CheckContext{}, false)
+	d.Wait()
+	if c.got.Before(before.Add(5*time.Second)) || c.got.After(time.Now().Add(5*time.Second)) {
+		t.Errorf("Deadline = %v, want the per-check timeout from when the check started (~%v)", c.got, before.Add(5*time.Second))
+	}
+
+	unbounded := &deadlineCheck{}
+	d = &Doctor{}
+	d.Register(unbounded)
+	d.RunCollect(&CheckContext{}, false)
+	if !unbounded.got.IsZero() {
+		t.Errorf("Deadline = %v with no per-check timeout, want zero", unbounded.got)
+	}
+}

@@ -443,6 +443,12 @@ type startExecutionOptions struct {
 	// from gc.routed_to, which names a work ledger a binding-resident row does
 	// not live in. Nil or misaligned leaves that fallback in place.
 	assignedWorkStores []beads.Store
+	// assignedWorkStoreRefs is index-aligned with the same assignedWorkBeads:
+	// the store ref each row was read under (empty for the city store). The
+	// orphan-close tie-break reads the owning rig off it for the orphan_release
+	// stop lever, as the sweep does. Nil or misaligned falls back to resolving
+	// the rig from the bead itself.
+	assignedWorkStoreRefs []string
 	// warmClaimProbe, when set, enables the warm-bind claim nudge: it reports
 	// whether a pool slot's newly-bound trigger bead is still unclaimed, resolved
 	// through the city's residency contract (newWarmClaimTriggerResolver). Built by
@@ -461,9 +467,40 @@ type startExecutionOptions struct {
 	// onDeathGate holds names whose on_death hook is queued or running;
 	// their starts wait. Nil holds nothing.
 	onDeathGate *onDeathGate
+	// sessionStartFence, when set, brackets every runtime start (sync or
+	// async) so the worktree reaper lane never removes a tree a start began,
+	// ended or is still running in since its liveness scan started
+	// (ga-yuiof4 item 3). Nil disables the bracket.
+	sessionStartFence *sessionStartFence
 }
 
 type startExecutionOption func(*startExecutionOptions)
+
+func withSessionStartFence(fence *sessionStartFence) startExecutionOption {
+	return func(opts *startExecutionOptions) {
+		opts.sessionStartFence = fence
+	}
+}
+
+// runFencedPreparedStartCandidate is runPreparedStartCandidate inside the
+// session-start fence's bracket. Every controller start goes through here.
+func runFencedPreparedStartCandidate(
+	ctx context.Context,
+	fence *sessionStartFence,
+	item preparedStart,
+	cityPath string,
+	sp runtime.Provider,
+	store beads.Store,
+	cfg *config.City,
+	startupTimeout time.Duration,
+	stabilityWaiter startStabilityWaiter,
+	sessionStaleKeyDetectionWaiter sessionpkg.StaleKeyDetectionWaiter,
+	warmClaim warmClaimTriggerProbe,
+) startResult {
+	fence.beginStart()
+	defer fence.endStart()
+	return runPreparedStartCandidate(ctx, item, cityPath, sp, store, cfg, startupTimeout, stabilityWaiter, sessionStaleKeyDetectionWaiter, warmClaim)
+}
 
 type taskWorkDirResolver func(startCandidate, *config.City) string
 
@@ -623,6 +660,18 @@ func withReadyAssignedFlags(readyAssignedFlags []bool) startExecutionOption {
 func withAssignedWorkStores(assignedWorkStores []beads.Store) startExecutionOption {
 	return func(opts *startExecutionOptions) {
 		opts.assignedWorkStores = assignedWorkStores
+	}
+}
+
+// withAssignedWorkStoreRefs installs the index-aligned store refs for this
+// reconcile pass (DesiredStateResult.AssignedWorkStoreRefs, filtered with the
+// same rows as assignedWorkBeads). The orphan-close tie-break reads the owning
+// rig off them for the orphan_release stop lever, so city-owned work keeps the
+// city-store exemption the sweep gives it. A slice of any other length is
+// ignored in favor of resolving the rig from the bead.
+func withAssignedWorkStoreRefs(assignedWorkStoreRefs []string) startExecutionOption {
+	return func(opts *startExecutionOptions) {
+		opts.assignedWorkStoreRefs = assignedWorkStoreRefs
 	}
 }
 
@@ -1382,23 +1431,30 @@ func buildPreparedStartWithTranscript(
 			return nil, candidate.info, err
 		}
 	}
+	seededResume := sessionpkg.IsResumeSeededInfo(candidate.info)
+	firstStart = firstStart && !seededResume
+	forceFresh = forceFresh && !seededResume
 	if sk := candidate.info.SessionKey; sk != "" && tp.ResolvedProvider != nil && !tp.IsACP {
 		agentCfg.Command = resolveSessionCommand(agentCfg.Command, sk, parentSID, tp.ResolvedProvider, firstStart, forceFresh)
 		resumed = sessionCommandResumes(parentSID, tp.ResolvedProvider, firstStart, forceFresh)
 	}
+	// ga-n0rvsk: name the claude session by its gc address, on the EXECUTED
+	// command only. This runs after the coreHash/liveHash stamps above and
+	// mutates neither tp.Command (what session_beads persists as "command")
+	// nor any fingerprint input, so the display name can never re-create the
+	// ga-2pcujo config-drift restart wave — the same post-hash contract the
+	// one-shot dispatch options rely on. The identity prefers the session's
+	// addressable forms over the template-qualified SessionDisplayName so a
+	// /resume picker row is pasteable into gc session nudge / gc mail send.
+	if tp.ResolvedProvider != nil {
+		nameTransport := ""
+		if tp.IsACP {
+			nameTransport = config.SessionTransportACP
+		}
+		agentCfg.Command = config.AppendClaudeSessionNameIdentity(agentCfg.Command, tp.ResolvedProvider, nameTransport, sessionDisplayIdentity(candidate.info, tp.ResolvedProvider))
+	}
 	hasResumeKey := strings.TrimSpace(candidate.info.SessionKey) != ""
-	// S19 priming confirmation (write-only in Stage 2): a marker is stamped only
-	// when the pure delivery decision holds AND this incarnation is a fresh
-	// launch — the exact complement of the resume override below, which swaps in
-	// restartPromptNudge and delivers nothing. Reading the env marker instead
-	// would mis-stamp every resume (it is re-set to "1" for hook consumption).
 	promptDelivered := delivery.Delivered && (firstStart || forceFresh || !hasResumeKey)
-	// prompt_hash is the sha256 of the rendered startup TEMPLATE prompt (tp.Prompt)
-	// only, computed here BEFORE the one-shot initial_message is appended to the
-	// delivered payload below. The hash exists so a template/config change re-primes
-	// the session (S19 Stage 4); a fresh re-launch re-renders tp.Prompt but never
-	// replays the transient initial_message, so hashing the delivered bytes would
-	// make the stored hash never match the re-derivation and re-prime forever.
 	promptHash := sessionpkg.PromptHash(tp.Prompt)
 	if !firstStart && !forceFresh && hasResumeKey {
 		agentCfg.PromptSuffix = ""
@@ -1706,6 +1762,13 @@ func resolvePreparedTaskWorkDir(
 	store beads.Store,
 	workDirResolver taskWorkDirResolver,
 ) string {
+	// A configured named session always launches in its own work dir. A task
+	// it is assigned may have been started by a pool worker, and that task's
+	// work_dir is the worker's worktree: launched there, the seat would run its
+	// git commands in a checkout it does not own (ga-5iu30d).
+	if candidate.info.ConfiguredNamedSession {
+		return ""
+	}
 	// Prepared drain items only: the item step's copied metadata can still name
 	// the launcher checkout before prepare-worktree runs. Deliberately NOT the
 	// full resolveTaskBeadWorkDir chain — that would put the trigger bead ahead
@@ -1828,7 +1891,7 @@ func executePreparedStartWaveForCity(
 			}()
 			watched, unwatch := watchStartLease(ctx, item)
 			defer unwatch()
-			results[i] = runPreparedStartCandidate(watched, item, cityPath, sp, store, cfg, startupTimeout, stabilityWaiter, startOpts.sessionStaleKeyDetectionWaiter, startOpts.warmClaimProbe)
+			results[i] = runFencedPreparedStartCandidate(watched, startOpts.sessionStartFence, item, cityPath, sp, store, cfg, startupTimeout, stabilityWaiter, startOpts.sessionStaleKeyDetectionWaiter, startOpts.warmClaimProbe)
 		}()
 	}
 	for range prepared {
@@ -2173,6 +2236,7 @@ func enqueuePreparedStartWaveForCity(
 	stabilityWaiter startStabilityWaiter,
 	sessionStaleKeyDetectionWaiter sessionpkg.StaleKeyDetectionWaiter,
 	warmClaim warmClaimTriggerProbe,
+	startFence *sessionStartFence,
 ) []startResult {
 	if len(prepared) == 0 {
 		return nil
@@ -2202,7 +2266,7 @@ func enqueuePreparedStartWaveForCity(
 			}
 			defer releaseStart()
 			watched, unwatch := watchStartLease(ctx, item)
-			result := runPreparedStartCandidate(watched, item, cityPath, sp, store, cfg, startupTimeout, stabilityWaiter, sessionStaleKeyDetectionWaiter, warmClaim)
+			result := runFencedPreparedStartCandidate(watched, startFence, item, cityPath, sp, store, cfg, startupTimeout, stabilityWaiter, sessionStaleKeyDetectionWaiter, warmClaim)
 			unwatch()
 			// Resolve before the commit so a stale, refused, or panicking
 			// commit cannot lose the endpoint verdict.
@@ -2897,6 +2961,7 @@ func clearStaleResumeKeyMetadata(handle string, sessFront *sessionpkg.Store) map
 	patch := map[string]string{
 		"session_key":                "",
 		"started_config_hash":        "",
+		sessionpkg.ResumeSeededKey(): "",
 		"continuation_reset_pending": "true",
 		// Priming markers share started_config_hash's lifetime (S19 Stage 2):
 		// this stale-resume clear forces a first start, so they reset with it.
@@ -2906,6 +2971,9 @@ func clearStaleResumeKeyMetadata(handle string, sessFront *sessionpkg.Store) map
 	}
 	sessionpkg.ClearResumeRun(patch) // the fresh conversation's run starts anew (mc-bm1af)
 	if sessFront != nil && strings.TrimSpace(handle) != "" {
+		if info, err := sessFront.Get(handle); err == nil {
+			sessionpkg.StampPriorSessionKeyInfo(patch, info)
+		}
 		_ = sessFront.ApplyPatch(handle, patch)
 	}
 	return patch
@@ -4915,7 +4983,7 @@ func executePlannedStartsTraced(
 				return wakeCount
 			}
 			if startOpts.async {
-				results = enqueuePreparedStartWaveForCity(ctx, asyncPrepared, cityPath, sp, store, cfg, clk, rec, startupTimeout, wave, stdout, stderr, trace, startOpts.asyncFollowUp, stabilityWaiter, sessionStaleKeyDetectionWaiter, startOpts.warmClaimProbe)
+				results = enqueuePreparedStartWaveForCity(ctx, asyncPrepared, cityPath, sp, store, cfg, clk, rec, startupTimeout, wave, stdout, stderr, trace, startOpts.asyncFollowUp, stabilityWaiter, sessionStaleKeyDetectionWaiter, startOpts.warmClaimProbe, startOpts.sessionStartFence)
 				// The start goroutines own these tickets and leases now.
 				admitted = admitted[:0]
 				leases = leases[:0]
@@ -4935,6 +5003,7 @@ func executePlannedStartsTraced(
 					withStartStabilityWaiter(stabilityWaiter),
 					withSessionStaleKeyDetectionWaiter(sessionStaleKeyDetectionWaiter),
 					withWarmClaimProbe(startOpts.warmClaimProbe),
+					withSessionStartFence(startOpts.sessionStartFence),
 				)
 			}
 			for _, result := range results {
@@ -5596,4 +5665,23 @@ func stopSessionsBounded(
 	stdout, stderr io.Writer,
 ) int {
 	return stopTargetsBounded(stopTargetsForNames(names, cfg, store, stderr), cfg, store, sp, rec, actor, stdout, stderr)
+}
+
+// sessionDisplayIdentity returns the identity to display as the vendor
+// session name (ga-n0rvsk): the session's addressable identity — the form
+// `gc mail send` / `gc session nudge` accept, e.g. "qcore/mallory" — falling
+// back to the resolution's template-qualified SessionDisplayName for sessions
+// that carry no identity metadata (the two coincide for unbound agents).
+// Deliberately NOT AssigneeIdentifier: that prefers session_name, whose
+// runtime form ("qcore--mallory") is not a gc address.
+func sessionDisplayIdentity(info sessionpkg.Info, resolved *config.ResolvedProvider) string {
+	for _, v := range []string{info.ConfiguredNamedIdentity, info.Alias, info.AgentName} {
+		if v = strings.TrimSpace(v); v != "" {
+			return v
+		}
+	}
+	if resolved == nil {
+		return ""
+	}
+	return strings.TrimSpace(resolved.SessionDisplayName)
 }

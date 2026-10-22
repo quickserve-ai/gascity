@@ -18,6 +18,7 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/formula"
 	"github.com/gastownhall/gascity/internal/molecule"
+	"github.com/gastownhall/gascity/internal/prguard"
 	"github.com/gastownhall/gascity/internal/sourceworkflow"
 )
 
@@ -65,22 +66,13 @@ type ProcessOptions struct {
 	// roots. When set, workflow-finalize uses it to avoid closing a source bead
 	// while any live root in another store still references that source.
 	SourceWorkflowStores func() ([]SourceWorkflowStore, error)
-	// MemberStores is the work-class store tail probed (after the primary
-	// graph store) when a drain reads convoy membership. A control bead and
-	// its drain item-root molecules live in the graph store, but the convoy
-	// members a drain expands over are work beads that may live in a different
-	// per-class store; MemberStores supplies those additional stores to
-	// convoycore.Members so member Gets resolve across the class boundary.
-	// Empty (the default for single-store callers) collapses the probe set to
-	// the primary store, exactly matching the pre-seam single-store behavior.
+	// MemberStores is the work-class store tail probed after the graph store.
 	MemberStores []beads.Store
+	// PRCloseCheck overrides the unmerged-PR close guard. Nil uses the real checker.
+	PRCloseCheck func(metadata map[string]string) prguard.Result
 	Tracef       func(format string, args ...any)
 
-	// routeCfg lazily caches the city.toml used for attempt-time routing
-	// decisions so a single ProcessControl invocation parses it at most once
-	// (previously it was re-parsed per processed bead via loadAttemptRouteConfig,
-	// beadUsesMetadataPoolRoute, and retryPreservedAssignee). It is a pointer so
-	// the cache is shared across the by-value opts copies handed to sub-steps.
+	// routeCfg lazily caches the city.toml used for attempt-time routing.
 	routeCfg *routeConfigCache
 
 	// gateRoot is the workflow root closeOrphanedControl read for this
@@ -94,19 +86,13 @@ type ProcessOptions struct {
 	view *rootView
 }
 
-// routeConfigCache memoizes a single attempt-route config load (and its error)
-// for the lifetime of one ProcessControl invocation.
+// routeConfigCache memoizes a single attempt-route config load.
 type routeConfigCache struct {
 	once sync.Once
 	cfg  *config.City
 	err  error
 }
 
-// routeConfig returns the attempt-route config for this invocation, loading it
-// at most once. The load error is no longer swallowed: it is memoized, traced
-// once, and returned to callers so routing decisions can observe it. Callers
-// that bypass ProcessControl (direct-called sub-steps in tests) get a fresh
-// uncached load, preserving their prior behavior.
 func (opts ProcessOptions) routeConfig() (*config.City, error) {
 	cache := opts.routeCfg
 	if cache == nil {
@@ -231,6 +217,10 @@ func ProcessControl(store beads.Store, bead beads.Bead, opts ProcessOptions) (Co
 	}
 }
 
+// workflowCanceledMemberCloseReason is stamped on the open members a finalizer
+// sweeps when it settles a canceled workflow.
+const workflowCanceledMemberCloseReason = "workflow member closed: workflow canceled via run cancel"
+
 // controlRootCanceledCloseReason is stamped on a control bead closed because its
 // workflow root was canceled, distinguishing the cancellation gate from a skip
 // teardown or a missing-root orphan close.
@@ -330,9 +320,9 @@ func closeOrphanedControl(store beads.Store, bead beads.Bead, opts ProcessOption
 
 // rootCanceled reports whether a workflow root is a durable cancellation stop
 // signal: either closed with gc.outcome=canceled, or carrying the
-// gc.cancel_requested intent marker (which run cancel stamps atomically with the
-// root's own close). Control beads under such a root must not spawn or continue
-// work.
+// gc.cancel_requested intent marker (which run cancel stamps on the open run
+// root as its first write, before it closes the run). Control beads under such
+// a root must not spawn or continue work.
 func rootCanceled(root beads.Bead) bool {
 	if strings.TrimSpace(root.Metadata[beadmeta.OutcomeMetadataKey]) == beadmeta.OutcomeCanceled {
 		return true
@@ -1113,6 +1103,27 @@ func processWorkflowFinalize(store beads.Store, bead beads.Bead, opts ProcessOpt
 		}
 		return ControlResult{}, fmt.Errorf("%s: resolving workflow outcome: %w", bead.ID, err)
 	}
+	// Run cancel marks the run root canceling before it closes the run's
+	// beads, and interrupts the sessions working them while it closes. A step
+	// an interrupted agent closes as passed in that window can make this
+	// finalizer ready, and the finalizer is exempt from the canceled-root gate
+	// because it is the bead that settles the root. The workflow was canceled,
+	// so it settles as canceled, not with an outcome computed from steps that
+	// finished after the cancel, and its source bead is not closed as done. A
+	// drain item workflow under a canceled run settles the same way.
+	root, rootFound, err := finalizeRoot(store, rootID, opts)
+	if err != nil {
+		return ControlResult{}, recordWorkflowFinalizeError(store, bead, fmt.Errorf("%s: loading workflow root: %w", rootID, err))
+	}
+	if rootFound {
+		canceled, err := workflowCanceled(store, root)
+		if err != nil {
+			return ControlResult{}, recordWorkflowFinalizeError(store, bead, fmt.Errorf("%s: reading workflow cancellation: %w", rootID, err))
+		}
+		if canceled {
+			outcome = beadmeta.OutcomeCanceled
+		}
+	}
 
 	// On success, propagate the closure across the gc.source_bead_id chain so
 	// parent source beads in other stores (e.g. the city-scope "Adopt PR"
@@ -1143,7 +1154,7 @@ func processWorkflowFinalize(store beads.Store, bead beads.Bead, opts ProcessOpt
 		// PASS arm clears all three as it closes the parent
 		// (propagateSourceBeadTerminalMetadata) so a succeeded parent never
 		// carries the failure it superseded.
-		if err := annotateSourceBeadFailure(store, rootID, resolveFinalizeFailureDiagnostics(store, bead, opts), opts); err != nil {
+		if err := annotateSourceBeadFailure(store, root, resolveFinalizeFailureDiagnostics(store, bead, opts), opts); err != nil {
 			return ControlResult{}, recordWorkflowFinalizeError(store, bead, fmt.Errorf("%s: marking failed source bead: %w", rootID, err))
 		}
 	}
@@ -1184,10 +1195,17 @@ func processWorkflowFinalize(store beads.Store, bead beads.Bead, opts ProcessOpt
 	excludeFromSweep := func(member beads.Bead) bool {
 		return member.ID == bead.ID || excludeTeardown(member)
 	}
-	if _, err := molecule.CloseMembersWithMetadataExcept(store, members, map[string]string{
+	sweep := map[string]string{
 		beadmeta.OutcomeMetadataKey: beadmeta.OutcomeSkipped,
 		"close_reason":              sourceworkflow.WorkflowSkippedCloseReason,
-	}, excludeFromSweep); err != nil {
+	}
+	if outcome == beadmeta.OutcomeCanceled {
+		sweep = map[string]string{
+			beadmeta.OutcomeMetadataKey: beadmeta.OutcomeCanceled,
+			"close_reason":              workflowCanceledMemberCloseReason,
+		}
+	}
+	if _, err := molecule.CloseMembersWithMetadataExcept(store, members, sweep, excludeFromSweep); err != nil {
 		return ControlResult{}, recordWorkflowFinalizeError(store, bead, fmt.Errorf("%s: closing terminal workflow members: %w", rootID, err))
 	}
 	if outcome == beadmeta.OutcomePass {
@@ -1234,13 +1252,56 @@ func completeWorkflowRoot(store beads.Store, finalizer beads.Bead, rootID, outco
 		return beadmeta.OutcomeMissingRoot, nil
 	case errors.Is(err, errRootQuarantined):
 		opts.tracef("workflow-finalize bead=%s root=%s pass_refused reason=control_quarantined", finalizer.ID, rootID)
-		if err := annotateSourceBeadFailure(store, rootID, resolveFinalizeFailureDiagnostics(store, finalizer, opts), opts); err != nil {
+		// Read the root live: the quarantine landed after the finalizer's
+		// root view was read. A missing root is a no-op stamp.
+		root, getErr := store.Get(rootID)
+		if getErr != nil && !errors.Is(getErr, beads.ErrNotFound) {
+			return "", fmt.Errorf("%s: marking failed source bead: loading root for failure annotation: %w", rootID, getErr)
+		}
+		if err := annotateSourceBeadFailure(store, root, resolveFinalizeFailureDiagnostics(store, finalizer, opts), opts); err != nil {
 			return "", fmt.Errorf("%s: marking failed source bead: %w", rootID, err)
 		}
 		return beadmeta.OutcomeFail, nil
 	default:
 		return "", fmt.Errorf("%s: completing workflow head: %w", rootID, err)
 	}
+}
+
+// finalizeRoot returns the workflow root a finalizer settles: from the
+// invocation's root view when resolving the outcome already read it, otherwise
+// read here. A missing root is reported as not found, for the finalizer's own
+// missing-root path to handle.
+func finalizeRoot(store beads.Store, rootID string, opts ProcessOptions) (beads.Bead, bool, error) {
+	if members, ok := rootViewAll(opts, rootID); ok {
+		for _, member := range members {
+			if member.ID == rootID {
+				return member, true, nil
+			}
+		}
+	}
+	root, err := store.Get(rootID)
+	if err != nil {
+		if errors.Is(err, beads.ErrNotFound) {
+			return beads.Bead{}, false, nil
+		}
+		return beads.Bead{}, false, err
+	}
+	return root, true, nil
+}
+
+// workflowCanceled reports whether a workflow root was canceled: it carries
+// the cancel itself (rootCanceled), or it is a drain item workflow nested
+// under a run that does (molecule.StoppedWorkflowAncestor). A root that is not
+// a drain item costs no read.
+func workflowCanceled(store beads.Store, root beads.Bead) (bool, error) {
+	if rootCanceled(root) {
+		return true, nil
+	}
+	stop, err := molecule.StoppedWorkflowAncestor(store, root)
+	if err != nil {
+		return false, err
+	}
+	return stop.Canceled, nil
 }
 
 func preflightSourceBeadChain(rootStore beads.Store, rootID string, opts ProcessOptions) error {
@@ -1264,18 +1325,16 @@ func closeSourceBeadChain(rootStore beads.Store, rootID string, opts ProcessOpti
 // leaves the parent OPEN and redispatchable — no close, no gc.outcome. A
 // cross-store ref with no resolver fails LOUD rather than silently narrowing:
 // the parent would otherwise never learn its DAG failed. An empty ref
-// (same-store parent), a missing root, or a deleted parent is a traced no-op.
+// (same-store parent), a missing root (the zero root; the finalizer passes the
+// root it already read), or a deleted parent is a traced no-op.
 // The stamp must be the complete set of failure keys (see failureStamp); the
 // pass path's propagateSourceBeadTerminalMetadata is the other half of that
 // contract and clears the same set as it closes the parent.
-func annotateSourceBeadFailure(rootStore beads.Store, rootID string, failure map[string]string, opts ProcessOptions) error {
-	root, err := rootStore.Get(rootID)
-	if err != nil {
-		if errors.Is(err, beads.ErrNotFound) {
-			return nil
-		}
-		return fmt.Errorf("loading root %s for failure annotation: %w", rootID, err)
+func annotateSourceBeadFailure(rootStore beads.Store, root beads.Bead, failure map[string]string, opts ProcessOptions) error {
+	if root.ID == "" {
+		return nil // missing root
 	}
+	rootID := root.ID
 	parentID := strings.TrimSpace(root.Metadata[beadmeta.SourceBeadIDMetadataKey])
 	if parentID == "" {
 		opts.tracef("annotate-source-failure root=%s stop reason=no_source", rootID)
@@ -1395,6 +1454,17 @@ func walkSourceBeadChain(rootStore beads.Store, rootID string, opts ProcessOptio
 			if loaded.Status == "closed" {
 				opts.tracef("close-source-chain root=%s skip reason=already_closed source=%s ref=%s", rootID, nextID, sourceChainStoreLabel(effectiveRef))
 				return nil
+			}
+			// qc-p45lz invariant: a source bead whose PR is confirmed
+			// unmerged stays OPEN when its workflow completes — the open
+			// bead is what drives the merge gate. Terminal metadata was
+			// already propagated above; only the close is withheld.
+			if guard := sourceBeadPRCloseGuard(opts, loaded.Metadata); guard.Verdict == prguard.Block {
+				opts.tracef("close-source-chain root=%s skip reason=pr_unmerged source=%s ref=%s pr=%s pr_state=%s", rootID, nextID, sourceChainStoreLabel(effectiveRef), guard.PRURL, guard.State)
+				stopWalk = true
+				return nil
+			} else if guard.Note != "" {
+				opts.tracef("close-source-chain root=%s pr-guard-note source=%s ref=%s note=%q", rootID, nextID, sourceChainStoreLabel(effectiveRef), guard.Note)
 			}
 			if err := closeSourceBeadPreservingOutcome(nextStore, loaded); err != nil {
 				return fmt.Errorf("closing source bead %s in %s: %w", nextID, sourceChainStoreLabel(effectiveRef), err)
@@ -1587,6 +1657,23 @@ func sourceChainRootIDs(roots []beads.Bead) string {
 	}
 	sort.Strings(ids)
 	return strings.Join(ids, ",")
+}
+
+// sourceBeadPRCloseGuard applies the qc-p45lz unmerged-PR invariant to a
+// source bead about to be closed by workflow completion. Beads without
+// PR metadata Allow without any external call; the disabled kill switch
+// (GC_PR_CLOSE_GUARD=off) Allows everything.
+func sourceBeadPRCloseGuard(opts ProcessOptions, metadata map[string]string) prguard.Result {
+	if !prguard.Enabled() {
+		return prguard.Result{Verdict: prguard.Allow}
+	}
+	if prguard.MetadataPRURL(metadata) == "" {
+		return prguard.Result{Verdict: prguard.Allow}
+	}
+	if opts.PRCloseCheck != nil {
+		return opts.PRCloseCheck(metadata)
+	}
+	return prguard.CheckBeadClosable(metadata, nil, 5*time.Second)
 }
 
 func closeSourceBeadPreservingOutcome(store beads.Store, bead beads.Bead) error {

@@ -34,7 +34,9 @@ concurrency:
 jobs:
   runner-policy:
     name: Runner policy
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    # GitHub-hosted on the quickserve-ai fork, which has no Blacksmith
+    # runners (pl-axh9); unchanged upstream.
+    runs-on: ${{ github.repository == 'gastownhall/gascity' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     outputs:
       use_blacksmith: ${{ steps.policy.outputs.use_blacksmith }}
       reason: ${{ steps.policy.outputs.reason }}
@@ -273,7 +275,7 @@ jobs:
       - uses: ./.github/actions/go-mod-download
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y jq curl
+        run: sudo rm -f /etc/apt/sources.list.d/google-chrome* /etc/apt/sources.list.d/microsoft-prod* && sudo apt-get update && sudo apt-get install -y jq curl
 
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:

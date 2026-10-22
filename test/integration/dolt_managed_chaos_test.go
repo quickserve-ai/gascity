@@ -152,7 +152,7 @@ func TestManagedDoltMailRebindRawBDReady(t *testing.T) {
 		t.Fatalf("wait for managed pid %d exit: %v", before.PID, err)
 	}
 
-	out, err := gcDolt(h.cityDir, "mail", "send", "rig-worker", "managed-dolt-mail-rebind")
+	out, err := gcDolt(h.cityDir, "mail", "send", "--from", "human", "rig-worker", "managed-dolt-mail-rebind")
 	if err != nil {
 		t.Fatalf("gc mail send rig-worker after hard kill: %v\n%s", err, out)
 	}
@@ -288,7 +288,7 @@ func TestManagedDoltConcurrentRecoveryLeavesRawBDReady(t *testing.T) {
 		results <- opResult{name: "gc bd list", out: out, err: err}
 	}()
 	go func() {
-		out, err := gcDolt(h.cityDir, "mail", "send", "rig-worker", "managed-dolt-mail-concurrent-rebind")
+		out, err := gcDolt(h.cityDir, "mail", "send", "--from", "human", "rig-worker", "managed-dolt-mail-concurrent-rebind")
 		results <- opResult{name: "gc mail send rig-worker", out: out, err: err}
 	}()
 
@@ -620,7 +620,7 @@ func (h *managedDoltChaosHarness) randomList() (string, error) {
 func (h *managedDoltChaosHarness) sendMail(recipient string) (string, error) {
 	h.mailSeq++
 	body := fmt.Sprintf("managed-dolt-mail-%s-%02d", recipient, h.mailSeq)
-	out, err := gcDolt(h.cityDir, "mail", "send", recipient, body)
+	out, err := gcDolt(h.cityDir, "mail", "send", "--from", "human", recipient, body)
 	if err != nil {
 		return "mail send " + recipient, fmt.Errorf("gc mail send %s: %v\n%s", recipient, err, out)
 	}

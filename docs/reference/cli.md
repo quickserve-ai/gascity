@@ -89,6 +89,7 @@ gc [flags]
 | [gc wait](#gc-wait) | Inspect and manage durable session waits |
 | [gc whoami](#gc-whoami) | Show the authenticated hosted Gas City account |
 | [gc worktree](#gc-worktree) | Ensure or verify agent workspace worktrees |
+| [gc worktree-gc](#gc-worktree-gc) | Preview per-bead and stopped agent-home reclamation |
 
 ## gc agent
 
@@ -1411,15 +1412,25 @@ Cost is a list-price estimate for decision support, not an authoritative
 charge; invocations with no pricing are flagged "unpriced" and excluded from
 the cost total.
 
+With --by-formula, model usage is grouped by the formula the acting bead's run
+was compiled from instead of by run; usage with no formula appears as "-".
+Compute wall-seconds are not attributed to a formula, so that table has no
+WALL_S column.
+
 ```
-gc costs
+gc costs [flags]
 ```
 
 **Example:**
 
 ```
 gc costs
+gc costs --by-formula
 ```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--by-formula` | bool |  | group model usage by the formula each fact is attributed to instead of by run |
 
 ## gc dashboard
 
@@ -1597,7 +1608,7 @@ error is reported on stderr and the command still exits 0, so bead hooks never
 fail on it. JSON summaries report whether submission to the configured provider
 was attempted; the event bus does not acknowledge durable persistence.
 
-Two requests are refused with exit 1 and nothing is recorded. In --json mode
+Four requests are refused with exit 1 and nothing is recorded. In --json mode
 the failure object carries the code.
 
 - reserved_actor: --actor starts with "cache-", or the default actor is one
@@ -1605,6 +1616,8 @@ the failure object carries the code.
 - bead_payload_refused: --payload on bead.created, bead.updated, bead.closed
   or bead.deleted. Their payload is the bead row; use --bead-payload &lt;id&gt; so
   gc reads it from the store.
+- journal_derived_refused: op.changed or fact.recorded, which the
+  controller derives from operation-journal rows; no command records one.
 - bead_payload_not_found: --bead-payload names a bead the store it resolves
   to does not hold (bead.deleted excepted: the event is recorded with its
   subject alone). Any other failure to read it is reported on stderr and the
@@ -2026,16 +2039,14 @@ gc graph gc-42 --mermaid     # Mermaid.js diagram
 
 Convenience command for context handoff.
 
-Self-handoff (default): sends mail to self. If the current session is
-controller-restartable, requests a restart, pokes the controller for an
-immediate reconcile tick, and returns without waiting for the controller to
-act. For on-demand configured named sessions, sends mail and returns without
-requesting restart: handoff intentionally leaves the user-attended session
-running instead of restarting it out from under the user. The controller can
-restart such a session via gc runtime request-restart; handoff deliberately
-does not.
+Self-handoff (default): sends mail to self, requests a restart, pokes the
+controller for an immediate reconcile tick, and returns without waiting for the
+controller to act. This covers every session class, on-demand configured named
+sessions included (ga-cctcju): the seat asking to be cycled is the
+authorization, and the reconciler's restart consume records the reset-pending
+marker that wakes the seat fresh on the next tick without other demand.
 
-For controller-restartable sessions, equivalent to:
+Equivalent to:
 
   gc mail send $GC_ALIAS &lt;subject&gt; [message]
   gc runtime request-restart
@@ -2053,7 +2064,8 @@ the context compaction lifecycle.
 Remote handoff (--target): sends mail to a target session. If the target is
 controller-restartable, kills it so the reconciler restarts it with the handoff
 mail waiting. For on-demand configured named targets, sends mail and returns
-without killing the session.
+without killing the session: another seat does not restart a user-attended
+session out from under the user.
 
 For controller-restartable targets, equivalent to:
 
@@ -2072,6 +2084,7 @@ gc handoff [subject] [message] [flags]
 |------|------|---------|-------------|
 | `--auto` | bool |  | Send handoff mail without requesting restart (for PreCompact hooks) |
 | `--force` | bool |  | destroy a target even when it has live background subagents |
+| `--from` | string |  | sender identity for --target (default: as gc mail send; refused when none; --from human sends as the operator) |
 | `--hook-format` | string |  | format hook output for a provider |
 | `--json` | bool |  | emit JSON summary |
 | `--target` | string |  | Remote session alias or ID to handoff (kills only controller-restartable sessions) |
@@ -2089,19 +2102,30 @@ gc help [command]
 
 Finds routed work using the agent's work_query config.
 
-Without --inject: prints normalized ready-only output, exits 0 if work exists, 1 if empty.
+Without --inject: prints normalized ready-only output, exits 0 if work exists,
+1 if the queue is empty, and 2 if the work query itself failed (for example bd
+missing from PATH, a store bd could not read, or a store environment that could
+not be built); the failure is named on stderr. A suspended city, rig or agent,
+and an error before the work query is built (no agent named, a city or config
+that cannot be loaded, an unknown agent), also exit 1.
 With --inject: silent legacy Stop-hook compatibility; skips the work query and always exits 0.
-With --claim: runs the standard startup claim protocol for one work item.
+With --claim: runs the standard startup claim protocol for one work item. A
+failed work query is an error (nothing on stdout), never a drain result.
 
 A work query that gets no answer from the bead store (a connection error, a
 timeout, a killed query, a locked database, or bd's circuit breaker failing
 fast) exits 2 and prints GC_HOOK_STORE_UNAVAILABLE on stderr: the answer is
-unknown, not empty. Any other work-query failure exits 1. This applies with and
-without --claim, and neither writes a drain result. The generated default work
-query discards bd's errors in its single-store tiers, so there a store that
-fails fast still reads as no work; only a deadline overrun exits 2. Only the
-agent's own store reports: other stores the hook also searches are
-best-effort, and one that fails reads as having no work.
+unknown, not empty. This applies with and without --claim. Any other
+work-query failure exits 2 without --claim and 1 with --claim. Neither writes a
+drain result. When another store the hook searches serves work, a store that
+failed is named on stderr and the work is served; when no store has work, a
+failed read of any of them is a failed query, not an empty queue, so a rig
+store that cannot be read keeps every city-scoped agent that searches it from
+draining until it answers again. Two kinds of rig are exceptions: a suspended
+rig is not searched at all (gc ready does not read it either), and a rig whose
+managed Dolt server is not running is named on stderr but does not hold the
+answer up. A failed query is also recorded as a session.work_query_failed event,
+one per store that failed, naming it.
 
 The agent is determined from $GC_AGENT or a positional argument.
 
@@ -2242,8 +2266,12 @@ gc import add https://github.com/org/repo/tree/main/packs/review --version '^1.2
 Validate installed pack import state
 
 ```
-gc import check
+gc import check [flags]
 ```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--verify-source` | bool |  | also contact each declared source and verify it can produce the pinned commit (network, seconds per source) |
 
 ## gc import credential
 
@@ -2616,6 +2644,10 @@ List all unread messages for a session alias or human.
 Shows message ID, sender, subject, and body in a table. The recipient defaults
 to $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human". Pass a session alias to view another inbox.
 
+With --context/--city-url the inbox is read from a REMOTE city; with no
+argument it lists mail addressed to this client's remote identity
+("&lt;local city&gt;/&lt;identity&gt;") — where a far-side 'gc mail reply' lands.
+
 ```
 gc mail inbox [session] [flags]
 ```
@@ -2627,6 +2659,10 @@ gc mail inbox [session] [flags]
 ## gc mail mark-read
 
 Mark a message as read without displaying it. The message will no longer appear in inbox results.
+
+With --context/--city-url the message is marked read in a REMOTE city (the
+id is that city's message id). There is no remote mark-unread yet; the
+hub's POST /v0/city/&#123;city&#125;/mail/&#123;id&#125;/mark-unread endpoint can reverse it.
 
 ```
 gc mail mark-read <id> [flags]
@@ -2687,6 +2723,12 @@ Use --notify to request a recipient turn after replying. In a managed city,
 it can request a wake for a non-running recipient.
 Unread mail alone does not request a wake.
 Use -s/--subject for the reply subject and -m/--message for the reply body.
+The sender defaults as for gc mail send; with no identity the reply is
+refused, and --from overrides it (--from human replies as the operator).
+
+With --context/--city-url the reply is sent inside a REMOTE city (the reply
+is addressed by that city to the original sender); the sender is
+"&lt;local city&gt;/&lt;identity&gt;" and --notify is refused.
 
 ```
 gc mail reply <id> [-s subject] [-m body] [flags]
@@ -2694,6 +2736,7 @@ gc mail reply <id> [-s subject] [-m body] [flags]
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
+| `--from` | string |  | sender identity (default: as gc mail send; refused when none) |
 | `--json` | bool |  | emit JSONL result |
 | `-m`, `--message` | string |  | reply body text |
 | `--notify` | bool |  | request a recipient turn (including a managed wake if not running), even with earlier unread mail |
@@ -2704,13 +2747,18 @@ gc mail reply <id> [-s subject] [-m body] [flags]
 Send a message to a session alias or human.
 
 Creates a message bead addressed to the recipient. The sender defaults
-to $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human". Use --notify to request
+to $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or, in an order run,
+order:&lt;scope&gt;/&lt;name&gt;. With none of those and no --from the send is refused;
+--from human sends as the operator. Use --notify to request
 a recipient turn after sending. In a managed city, it can request a wake for
 a non-running recipient. Unread mail alone does not request a wake.
 Use --from to override the sender identity.
 Use --to as an alternative to the positional &lt;to&gt; argument.
 Use -s/--subject for the summary line and -m/--message for the body text.
-Use --all to broadcast to all live sessions (excluding sender and "human").
+Use --all to broadcast to every OPEN session (excluding sender and "human").
+Configured seats with no open session get nothing; --all names them on stderr
+(and in --json "unreached"). For a policy-bearing broadcast, mail those seats
+by address, which materializes them.
 
 Use --dedup &lt;key&gt; for repeating notifications (patrol and cooldown orders
 that re-detect the same condition every run): the send is suppressed while
@@ -2721,6 +2769,26 @@ alert again; senders that want a longer re-alert cadence keep their own
 last-sent state. Dedup needs a provider that can query its own message
 history. The built-in provider can; one that cannot sends normally and says
 so on stderr, because a duplicate notification beats a dropped one.
+
+With --context/--city-url the message is sent to a REMOTE city over the
+control plane (a hardened city requires the context's grant_command). The
+sender then defaults to "&lt;local city&gt;/&lt;identity&gt;" (e.g. citadel/mayor) so the
+far side knows which city to answer with 'gc --context &lt;city&gt; mail send';
+--from overrides it. The remote city stores an unknown sender literally, but
+if it has a session whose alias equals that string (a rig named after the
+sending city) the message binds to that session — do not name a rig after a
+city that mails you. --all and --notify are refused for a remote city.
+
+When [mail.crosscity] is configured, a recipient may be city-qualified:
+&lt;city&gt;/&lt;address&gt;, split on the first "/". This city's own name strips to the
+local form (&lt;city&gt;/mayor and mayor are one mailbox); a listed peer city's
+address is stored canonical as written, with no local session lookup, and the
+sender is stored city-qualified so a plain reply resolves back. --notify does
+not cross cities: the recipient's wake belongs to its own city's mail sweep.
+A peer city mapped to a town under [mail.crosscity.towns] is also checked
+against that town's rendered roster (cities/&lt;town&gt;/agents.json, read from the
+local pack cache at its pinned commit): a seat absent from the list, or a
+list that cannot be read, refuses the send before anything is stored.
 
 ```
 gc mail send [<to>] [<body>] [flags]
@@ -2741,12 +2809,14 @@ gc mail send worker -s "disk warning" --dedup "disk-warn:hq"
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--all` | bool |  | broadcast to all live sessions (excludes sender and human) |
+| `--all` | bool |  | broadcast to every open session (excludes sender and human); names configured seats it could not reach |
 | `--dedup` | string |  | suppress the send while a live message with this dedup key is in the same mailbox (provider permitting) |
-| `--from` | string |  | sender identity (default: $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human") |
+| `--from` | string |  | sender identity (default: $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or the order run; refused when none) |
 | `--json` | bool |  | emit JSONL result |
 | `-m`, `--message` | string |  | message body text |
-| `--notify` | bool |  | request a recipient turn (including a managed wake if not running), even with earlier unread mail |
+| `--no-notify` | bool |  | suppress the default recipient nudge for a direct local send |
+| `--notify` | bool |  | request a recipient turn (including a managed wake if not running), even with earlier unread mail (the default for direct local sends; see --no-notify) |
+| `--ref` | string |  | https URL (GitHub) where the actionable content lives — required when the notified recipient is a cloud-wake seat; its wake hint points here instead of the mail bead |
 | `-s`, `--subject` | string |  | message subject line |
 | `--to` | string |  | recipient address (alternative to positional argument) |
 
@@ -4319,7 +4389,9 @@ gc session
 | Subcommand | Description |
 |------------|-------------|
 | [gc session attach](#gc-session-attach) | Attach to (or resume) a chat session |
+| [gc session bind-cloud](#gc-session-bind-cloud) | Bind a seat to a Claude Code cloud session for claude-cloud wake delivery |
 | [gc session close](#gc-session-close) | Close a session permanently |
+| [gc session history](#gc-session-history) | List an agent's past conversations |
 | [gc session kill](#gc-session-kill) | Force-kill session runtime |
 | [gc session list](#gc-session-list) | List chat sessions |
 | [gc session logs](#gc-session-logs) | Show session logs for a session |
@@ -4330,6 +4402,7 @@ gc session
 | [gc session prune](#gc-session-prune) | Close old dormant sessions |
 | [gc session rename](#gc-session-rename) | Rename a session |
 | [gc session reset](#gc-session-reset) | Restart a session fresh while preserving the bead |
+| [gc session resume](#gc-session-resume) | Resume one of an agent's past conversations |
 | [gc session submit](#gc-session-submit) | Submit a message with semantic delivery intent |
 | [gc session suspend](#gc-session-suspend) | Suspend a session (save state, free resources) |
 | [gc session unpin](#gc-session-unpin) | Remove a session awake pin |
@@ -4350,6 +4423,32 @@ Accepts a session ID (e.g., gc-42) or session alias (e.g., mayor).
 gc session attach <session-id-or-alias>
 ```
 
+## gc session bind-cloud
+
+Bind a seat's session bead to a Claude Code cloud session so the
+claude-cloud wake transport (wake_transport = "claude-cloud" on the agent)
+can deliver wake hints into it.
+
+A binding is two facts stamped on the session bead: the cloud session ID
+(session_...) and the account lineage directory (CLAUDE_CONFIG_DIR) that
+owns the cloud session — sends run under that lineage only, never ambient
+auth. Re-running the command rebinds and clears any suspect marker a failed
+send left behind (rebinding IS the explicit recovery action the suspect
+state waits for). --clear removes the binding and its delivery-state facts.
+
+The binding is inert until the seat's agent config selects
+wake_transport = "claude-cloud".
+
+```
+gc session bind-cloud <session-id-or-alias> [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--account-dir` | string |  | account lineage directory (CLAUDE_CONFIG_DIR) that owns the cloud session |
+| `--clear` | bool |  | remove the cloud binding and its delivery-state facts |
+| `--cloud-id` | string |  | cloud session ID (session_...) |
+
 ## gc session close
 
 End a conversation. Stops the runtime if active and closes the bead.
@@ -4368,6 +4467,52 @@ gc session close <session-id-or-alias> [flags]
 |------|------|---------|-------------|
 | `--json` | bool |  | emit JSONL |
 | `--key` | string |  | idempotency key: while the op journal records this command (its [ops] gate is auto or require), rerunning with the same key reports the first run's outcome instead of acting again (without the first run's wait_nudges_withdrawn in --json); ignored when the gate is off (default: a new key each run) |
+
+## gc session history
+
+List the past provider conversations recorded for an agent, newest first.
+
+The filesystem is the authoritative index: claude-family providers write one
+transcript per conversation under &lt;config-dir&gt;/projects/&lt;workdir-slug&gt;/, so
+every conversation an agent ever had in its work directory is listed — including
+conversations whose session beads were closed long ago, and transcripts moved
+into ~/.claude-transcript-archive/ by the transcript reaper (marked "archived").
+
+A session whose process ran outside its work directory (in the git worktree of
+a task it was assigned) has those conversations under that cwd's slug instead.
+The conversations recorded on its session bead (session_key,
+prior_session_key) are found by id under any projects folder, and the folders
+of its bead's work dirs and of its in-progress tasks' work_dirs are listed too.
+Tasks are looked up in the city bead store and in every rig's bead store, the
+stores the reconciler reads, all under one 10 s budget; a store that fails or
+does not answer in time is named on stderr and skipped, and then a "no
+conversations found" says the search was incomplete and the JSON carries
+incomplete: true and skipped_lookups. Those folders can be shared with other agents, and so can
+a pool instance's own work dir or one under .gc/worktrees/, so from them only
+conversations whose id is on the bead are taken, plus, for a named or aliased
+session that is not a pool instance, conversations recorded under that name.
+The JSON row's found_under is the work dir of the projects folder the row was
+found under.
+
+The session id shown for each row is what "gc session resume" takes.
+
+```
+gc session history <agent> [flags]
+```
+
+**Example:**
+
+```
+gc session history lana
+gc session history qcore/lana --limit 50
+gc session history mayor --json
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--archive-root` | string |  | transcript archive root to search (default ~/.claude-transcript-archive) |
+| `--json` | bool |  | JSON output |
+| `--limit` | int | `20` | maximum conversations to list (0 = all) |
 
 ## gc session kill
 
@@ -4518,6 +4663,19 @@ equivalent to typing the message into the session's terminal.
 Accepts a session ID or session alias. Multi-word messages are
 joined automatically.
 
+When [ops] authoritative lists message, a nudge to a session a conversation
+lane can type into is recorded as a lane op instead. wait-idle delivers it
+as a prompt at an idle boundary only, never into a running turn. immediate
+delivers it as a prompt at an idle boundary or, when the session's runtime
+can steer, into its running turn; a busy session whose runtime cannot steer
+gets it at the next boundary. queue delivers it as a notice at the next
+boundary and never wakes the session. When this process can type into the
+session, wait-idle and immediate deliver at once what their mode allows
+now, with or without a running controller; otherwise the nudge is reported
+queued, and the lane host serving the session delivers it as its mode
+says. The [ops] content gate does not govern such a nudge, and one whose op
+cannot be written is refused.
+
 ```
 gc session nudge <id-or-alias> <message...> [flags]
 ```
@@ -4526,6 +4684,7 @@ gc session nudge <id-or-alias> <message...> [flags]
 |------|------|---------|-------------|
 | `--delivery` | string | `wait-idle` | delivery mode: immediate, wait-idle, or queue |
 | `--json` | bool |  | JSON output |
+| `--key` | string |  | idempotency key: while the op journal records this command (its [ops] content gate is auto or require, or [ops] authoritative lists message), rerunning with the same key reports the first run's outcome instead of acting again, except across a change to whether [ops] authoritative lists message, which refuses the rerun as a different request; ignored otherwise (default: a new key each run) |
 
 ## gc session peek
 
@@ -4625,6 +4784,55 @@ gc session reset <session-id-or-alias> [flags]
 | `--json` | bool |  | emit JSONL |
 | `--key` | string |  | idempotency key: while the op journal records this command (its [ops] gate is auto or require), rerunning with the same key reports the first run's outcome instead of acting again; ignored when the gate is off (default: a new key each run) |
 
+## gc session resume
+
+Put an agent back into a past conversation listed by "gc session history".
+
+By default this seeds the agent's session bead with the chosen conversation id
+and requests a wake, so the reconciler's normal resume path tries that exact
+conversation — including for wake_mode=fresh agents that never auto-resume, and
+for on-demand crew whose context is normally lost on idle-close. The agent must
+not be running (attach to a running agent instead, or use --print).
+
+resume never moves a live transcript. The next launch resumes the
+conversation only if the transcript is under the projects folder of that
+launch's cwd (the work_dir of an in-progress task assigned to the agent, else
+its work dir); otherwise the reconciler starts a fresh one. The output says
+which work dir the transcript was found under.
+
+--print changes no session state and prints the provider command for an
+attended dive in your own terminal, run from the work dir whose projects folder
+holds the conversation. When that work dir cannot be used (it does not exist, or which
+work dir the folder belongs to could not be determined), it prints the agent's
+work dir instead and says on stderr what it found.
+
+Selecting a transcript that the reaper moved into the archive restores it
+(copies it) into the live projects directory first, so the provider can find
+it again; --print does that restore too, and notes it on stderr so stdout
+stays the one command.
+
+session-id may be any unambiguous prefix of an id from "gc session history".
+Note: "gc session pin" (pin_awake) prevents the idle-close that loses context
+in the first place — resume is the after-the-fact escape hatch.
+
+```
+gc session resume <agent> [session-id] [flags]
+```
+
+**Example:**
+
+```
+gc session resume lana --last
+gc session resume lana 8dc18f31
+gc session resume mayor 9e82b97a --print
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--archive-root` | string |  | transcript archive root to search (default ~/.claude-transcript-archive) |
+| `--last` | bool |  | resume the most recent conversation |
+| `--print` | bool |  | print the provider resume command instead of seeding the session bead |
+
 ## gc session submit
 
 Submit a user message to a session without choosing provider transport details.
@@ -4648,11 +4856,20 @@ gc session submit mayor "stop and do this instead" --intent interrupt_now
 |------|------|---------|-------------|
 | `--intent` | string | `default` | submit intent: default, follow_up, or interrupt_now |
 | `--json` | bool |  | JSON output |
+| `--key` | string |  | idempotency key: while the op journal records this command (its [ops] gate is auto or require), rerunning with the same key reports the first run's outcome instead of acting again; ignored when the gate is off (default: a new key each run) |
 
 ## gc session suspend
 
 Suspend an active session by stopping its runtime process.
 The session bead persists and can be resumed later.
+
+The hold is durable: a suspended session that still owns assigned work stays
+asleep rather than being restarted to serve it, and its pool slot and claim are
+left alone. It comes back on `gc session wake`.
+
+Where session liveness is kept in a separate store, this holds only while that
+store can be read: a reconciler tick that cannot read it may still restart a
+held session that owns assigned work.
 
 Accepts a session ID (e.g., gc-42) or session alias (e.g., mayor).
 
@@ -4682,7 +4899,16 @@ gc session unpin <session-id-or-alias> [flags]
 
 ## gc session wait
 
-Register a dependency wait for a session
+Register a durable wait so a session is woken when the beads it depends on close.
+
+With --sleep the session takes a wait hold and drains to sleep. The hold is
+durable: a wait-held session that still owns assigned work stays asleep rather
+than being restarted to serve it, and its pool slot and claim are left alone. It
+comes back when the wait resolves, or on `gc session wake`.
+
+Where session liveness is kept in a separate store, this holds only while that
+store can be read: a reconciler tick that cannot read it may still restart a
+held session that owns assigned work.
 
 ```
 gc session wait [session-id-or-alias] [flags]
@@ -4785,6 +5011,8 @@ Output includes:
   - Imported pack shared skills (binding-qualified, e.g. ops.code-review)
   - Compatibility bootstrap skills, when legacy implicit imports still exist
   - With --agent/--session: that agent's agents/&lt;name&gt;/skills/ catalog
+    and the opt-in skills its opt_in_skills selects (a pack's
+    skills/opt-in/&lt;name&gt;/, binding-qualified)
 
 The listing is a diagnostic view of what's *available*. It does not
 collapse precedence, filter to agents whose provider has a vendor
@@ -4855,7 +5083,7 @@ gc sling [target] <bead-or-formula-or-text> [flags]
 | `--force` | bool |  | suppress warnings, allow cross-rig routing, allow formulas v2 workflow replacement, and for direct bead routes dispatch even if the bead does not resolve in the local store |
 | `-f`, `--formula` | bool |  | treat argument as formula name |
 | `--json` | bool |  | Output dispatch result in JSON format |
-| `--merge` | string |  | merge strategy: direct, mr, or local |
+| `--merge` | string |  | merge strategy: direct, pr, mr, or local |
 | `--no-convoy` | bool |  | skip auto-convoy creation |
 | `--no-formula` | bool |  | suppress default formula (route raw bead) |
 | `--nudge` | bool |  | nudge target after routing |
@@ -4996,6 +5224,17 @@ refuses such a city and names this command.
 
 --from-backup re-copies a binding whose database is gone from that backup
 instead of from the work store, which no longer holds the slice.
+
+Last, on the converged binding, each open deliver-now unit the copy carried in
+is re-lowered under the binding's id prefix: its derived interrupt is re-created
+at the id a lowering there gives it, with its state, and the old row is closed
+as a pointer to it, one all-or-nothing write per unit. A unit in flight or that
+may have run, one with more than one open derived interrupt, and one whose id
+there another row already holds are left as they are and named; their lanes run
+each one as a unit by identity. A message not yet lowered, or whose unit is
+over, is not a unit to move, and is not named. A city whose binding holds no
+lowered deliver-now message skips the step and prints nothing for it. A step
+that did not finish exits non-zero, and running this command again finishes it.
 
 The move refuses while a writer can reach the source. This binary can prove the
 absence of a controller and cannot prove the absence of anything else, so that
@@ -5171,6 +5410,7 @@ gc supervisor install [flags]
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
+| `--acknowledge-freeze` | string |  | consciously supersede a standing deploy-freeze marker by its bead id (ga-rfdkxp) |
 | `--force` | bool |  | overwrite an existing service unit even if it references a different gc binary |
 
 ## gc supervisor logs
@@ -5294,7 +5534,7 @@ gc supervisor stop [flags]
 |------|------|---------|-------------|
 | `--json` | bool |  | emit JSONL summary |
 | `--wait` | bool |  | Wait for the supervisor to finish stopping all managed cities and for its process to exit before returning |
-| `--wait-timeout` | duration | `30s` | Maximum time to wait when --wait is set, except that the supervisor process gets at least 10s to exit after its socket closes (in delegated mode, bounds the synchronous systemctl stop regardless of --wait) |
+| `--wait-timeout` | duration | `1m30s` | Maximum time to wait when --wait is set, except that the supervisor process gets at least 10s to exit after its socket closes (in delegated mode, bounds the synchronous systemctl stop regardless of --wait) |
 
 ## gc supervisor uninstall
 
@@ -5581,6 +5821,8 @@ gc worktree
 |------------|-------------|
 | [gc worktree cleanup](#gc-worktree-cleanup) | Remove an owned worktree after all safety gates pass |
 | [gc worktree ensure](#gc-worktree-ensure) | Ensure the worktree exists and satisfies all postconditions |
+| [gc worktree rescue](#gc-worktree-rescue) | Secure a linked worktree's work in a local rescue ref |
+| [gc worktree teardown](#gc-worktree-teardown) | Remove a linked worktree whose rescue was recorded |
 | [gc worktree verify](#gc-worktree-verify) | Verify the worktree satisfies all postconditions without mutating |
 
 ## gc worktree cleanup
@@ -5643,6 +5885,95 @@ gc worktree ensure [flags]
 | `--root` | string |  | configured per-rig worktree root; path must be its direct child (required) |
 | `--store-ref` | string |  | work bead store reference (required) |
 
+## gc worktree rescue
+
+Secure a linked worktree's work in a local rescue ref.
+
+Rescue snapshots everything in the worktree that is not gitignored (commits,
+staged and unstaged edits, untracked files) and makes it reachable from
+refs/rescue/&lt;bead&gt; in the repository's shared ref store, where removing the
+worktree cannot touch it. HEAD, the index, the working tree and every branch
+are left unchanged, no hook runs, and no remote is contacted.
+
+Files gc itself put in the tree are left out, but only when that is provable:
+manifest-recorded skill symlinks, skill copies byte-identical to the city's,
+AGENTS-gc.md and .worktree-stale. A failure to classify them fails the rescue.
+
+With no changes beyond HEAD the rescue is HEAD. Rerunning on an unchanged tree
+returns the same commit. An existing rescue ref is only ever advanced to a
+descendant; a divergent rescue is written beside it as
+refs/rescue/&lt;bead&gt;-&lt;sha12&gt;. Credential-shaped file names are reported as taint
+and recorded in the rescue commit's Rescue-Taint trailer.
+
+Removal also deletes everything private to the worktree, so the rescue keeps
+it reachable too: staged content that differs from both HEAD and the working
+tree (an index parent), and, through an anchor parent, every commit that only
+the worktree's own state reaches: its HEAD reflog, an in-progress rebase,
+merge, cherry-pick, revert or bisect, and refs/worktree/*. Only tags and
+other beads' rescues count as already durable: remote-tracking refs are
+dropped by fetch --prune and local branches by merged-branch cleanup. Index
+bits that make git skip real edits (assume-unchanged, skip-worktree on a
+present file) are ignored. Submodule repositories are not analyzed here;
+gc worktree teardown preserves them verbatim.
+
+Refused, because a rescue cannot carry them: a submodule with uncommitted or
+untracked changes, an untracked directory holding its own git repository,
+and another registered worktree nested inside this one.
+
+--absent-ok reports a path that does not exist (ENOENT only) as absent=true
+instead of failing, so a caller can tell "already gone" from "unreadable".
+
+```
+gc worktree rescue [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--absent-ok` | bool |  | succeed with absent=true when --path does not exist (only ENOENT; an unreadable path still fails) |
+| `--bead` | string |  | work bead the rescue ref is named for (required) |
+| `--city-path` | string |  | city directory whose synced skill copies count as gc sediment (default: $GC_CITY_PATH) |
+| `--json` | bool |  | emit the report as JSON |
+| `--path` | string |  | root of the linked worktree (required) |
+
+## gc worktree teardown
+
+Remove a linked worktree whose rescue was recorded.
+
+Teardown rescues the worktree again and removes it only if the result is
+exactly --rescue-sha, the rescue the caller recorded (normally on the work
+bead) after running gc worktree rescue. A worktree that changed in between is
+secured anew and left in place, and the error names the new rescue to record.
+
+It refuses anything that is not a registered linked worktree: a main checkout,
+a submodule checkout, a subdirectory, a symlink, or an unregistered directory.
+A locked worktree is removed. If git cannot remove the tree (one holding
+submodules), the directory is deleted only after it is proven a registered
+linked worktree again, and then only THIS worktree's admin directory is
+removed. It never runs a repo-wide worktree prune, which would drop other
+worktrees' stale registrations and the commits they still keep alive. A path
+that no longer exists succeeds.
+
+A linked worktree's submodule repositories live in its admin dir (modules/),
+which removal deletes, so before removing the tree teardown moves that
+directory, with every branch, stash, reflog and object, to
+&lt;common git dir&gt;/gc-rescued-modules/&lt;bead&gt;-&lt;rescue sha[:12]&gt; in one rename,
+and clears the dangling core.worktree in each so they open on their own.
+
+A write that lands after the final rescue is removed with the tree: the lock
+excludes other gc worktree operations, not editors or background processes.
+
+```
+gc worktree teardown [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--bead` | string |  | work bead the rescue ref is named for (required) |
+| `--city-path` | string |  | city directory whose synced skill copies count as gc sediment (default: $GC_CITY_PATH) |
+| `--json` | bool |  | emit the report as JSON |
+| `--path` | string |  | root of the linked worktree (required) |
+| `--rescue-sha` | string |  | rescue commit recorded by the caller before removal (required) |
+
 ## gc worktree verify
 
 Verify the worktree satisfies all postconditions without mutating
@@ -5666,3 +5997,11 @@ gc worktree verify [flags]
 | `--repo` | string |  | repository directory the worktree belongs to (required) |
 | `--root` | string |  | configured per-rig worktree root; path must be its direct child (required) |
 | `--store-ref` | string |  | work bead store reference (required) |
+
+## gc worktree-gc
+
+Preview both worktree reclamation classes without mutation. Per-bead cleanup is controlled by daemon.auto_reap_closed_bead_worktrees; longer-lived configured named/namepool home cleanup is separately controlled by daemon.auto_reap_stopped_agent_homes. Both require authoritative runtime, session, assignment, registration, and git-safety evidence.
+
+```
+gc worktree-gc
+```

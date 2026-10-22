@@ -56,6 +56,16 @@ func canStage1Materialize(citySessionProvider string, agent *config.Agent) bool 
 	}
 }
 
+// stage1DeliversToWorkDir reports whether stage 1 delivers the agent's
+// skills to a session whose working directory is workDir: the runtime is
+// stage-1 eligible and workDir is the agent's scope root, the directory
+// stage 1 writes. The prompt's skills appendix and stage 1's opt-in
+// delivery both decide by this one predicate.
+func stage1DeliversToWorkDir(citySessionProvider string, agent *config.Agent, workDir, cityPath string, rigs []config.Rig) bool {
+	return canStage1Materialize(citySessionProvider, agent) &&
+		canonicaliseFilePath(workDir, cityPath) == agentScopeRoot(agent, cityPath, rigs)
+}
+
 // isStage2EligibleSession reports whether skill materialization should
 // run for the given agent's session runtime. Per the skill-
 // materialization spec (§ "Stage 2 runtime gate") and the runtime
@@ -214,9 +224,10 @@ func effectiveAgentProviderFamily(agent *config.Agent, workspaceProvider string,
 }
 
 // effectiveSkillsForAgent returns the post-precedence desired skill set
-// for one agent. Returns nil when the agent's effective provider has
-// no vendor sink, when no catalog produced any entries, or when the
-// agent is nil.
+// for one agent: the shared catalog, the opt-in skills its opt_in_skills
+// selects, and its agent-local skills. Returns nil when the agent's
+// effective provider has no vendor sink, when no catalog produced any
+// entries, or when the agent is nil.
 //
 // Agent-catalog load failures are logged to stderr (matching the
 // city-catalog pattern in newAgentBuildParams) so a permissions
@@ -249,7 +260,7 @@ func effectiveSkillsForAgent(city *materialize.CityCatalog, agent *config.Agent,
 	if city != nil {
 		sharedCatalog = *city
 	}
-	desired := materialize.EffectiveSet(sharedCatalog, agentCat)
+	desired := materialize.EffectiveSet(sharedCatalog.WithOptIn(agent.OptInSkills), agentCat)
 	if len(desired) == 0 {
 		return nil
 	}
@@ -258,12 +269,15 @@ func effectiveSkillsForAgent(city *materialize.CityCatalog, agent *config.Agent,
 
 // mergeSkillFingerprintEntries adds one "skills:<name>" → content-hash
 // entry to fpExtra for each desired skill, hashed with
-// runtime.HashPathContent. The entries are NextStart
-// (runtime.FingerprintExtraChangePolicy): the core and provision
-// fingerprints leave them out, so a skill edit reaches the next start
-// without draining a running session. The diagnostic drift breakdown still
-// hashes every key, and the v6 recomputation that migrates a session
-// started before the policy hashes them too
+// runtime.HashSkillSourceContent: any byte-level change to a skill's source
+// directory changes its entry, except git-ignored artifacts and known
+// build/runtime turds, which a skill executing its own scripts may write
+// into its source dir and which must never self-trigger drift (ga-rpf2).
+// The entries are NextStart (runtime.FingerprintExtraChangePolicy): the
+// core and provision fingerprints leave them out, so a skill edit reaches
+// the next start without draining a running session. The diagnostic drift
+// breakdown still hashes every key, and the v6 recomputation that migrates
+// a session started before the policy hashes them too
 // (runtime.PrePolicyCoreFingerprint). Adding an agent's first skill or
 // removing its last can still drain it, through the stage-2
 // materialize-skills PreStart entry (resolveTemplate).
@@ -280,7 +294,7 @@ func mergeSkillFingerprintEntries(fpExtra map[string]string, desired []materiali
 		fpExtra = make(map[string]string, len(desired))
 	}
 	for _, e := range desired {
-		fpExtra["skills:"+e.Name] = runtime.HashPathContent(e.Source)
+		fpExtra["skills:"+e.Name] = runtime.HashSkillSourceContent(e.Source)
 	}
 	return fpExtra
 }
@@ -301,7 +315,9 @@ func effectiveInjectAssignedSkills(agent *config.Agent) bool {
 
 // buildAssignedSkillsPromptFragment renders a markdown appendix that
 // lists every skill the agent sees, partitioned into (assigned-to-this-
-// agent, shared-with-the-current-scope). The goal is that agents
+// agent, shared-with-the-current-scope). Assigned skills are the agent's
+// agent-local skills and the opt-in skills its opt_in_skills selects.
+// The goal is that agents
 // sharing a scope-root sink (multiple city-scoped agents, multiple
 // rig-scoped agents on the same rig) can tell which skills are their
 // specialisation vs which are the shared set — the materialiser
@@ -323,7 +339,7 @@ func buildAssignedSkillsPromptFragment(
 	if agent == nil {
 		return ""
 	}
-	var shared []materialize.SkillEntry
+	var shared, optIn []materialize.SkillEntry
 	if city != nil {
 		// Exclude entries that the agent-local catalog overrides —
 		// the agent's own entry wins precedence and will appear in
@@ -338,8 +354,16 @@ func buildAssignedSkillsPromptFragment(
 			}
 			shared = append(shared, e)
 		}
+		// The opt-in skills this agent selected are assigned to it,
+		// not shared with its scope.
+		for _, e := range city.OptedIn(agent.OptInSkills) {
+			if _, shadowed := byAgentName[e.Name]; shadowed {
+				continue
+			}
+			optIn = append(optIn, e)
+		}
 	}
-	if len(shared) == 0 && len(agentCat.Entries) == 0 {
+	if len(shared) == 0 && len(agentCat.Entries) == 0 && len(optIn) == 0 {
 		return ""
 	}
 
@@ -348,9 +372,10 @@ func buildAssignedSkillsPromptFragment(
 	fmt.Fprintf(&b, "You are `%s`. The following skills are materialized in your provider's skill directory and load automatically — you don't need to invoke anything extra.\n\n", //nolint:errcheck // fmt.Fprintf into a strings.Builder never errors
 		agent.QualifiedName())
 
-	if len(agentCat.Entries) > 0 {
+	if len(agentCat.Entries) > 0 || len(optIn) > 0 {
 		b.WriteString("### Assigned to you\n\n")
 		writeSkillBullets(&b, agentCat.Entries, "")
+		writeSkillBullets(&b, optIn, "origin")
 		b.WriteString("\n")
 	}
 

@@ -16,11 +16,14 @@
 package acceptance_test
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -58,16 +61,20 @@ type scopeOwnershipDoc struct {
 }
 
 type doctorReport struct {
-	Passed  int                 `json:"passed"`
-	Warned  int                 `json:"warned"`
-	Failed  int                 `json:"failed"`
-	Results []doctorCheckResult `json:"results"`
+	Passed         int                 `json:"passed"`
+	Warned         int                 `json:"warned"`
+	Failed         int                 `json:"failed"`
+	BlockingFailed int                 `json:"blocking_failed"`
+	Results        []doctorCheckResult `json:"results"`
 }
 
 type doctorCheckResult struct {
-	Name    string `json:"name"`
-	Status  string `json:"status"`
-	Message string `json:"message"`
+	Name     string `json:"name"`
+	Status   string `json:"status"`
+	Severity string `json:"severity"`
+	Message  string `json:"message"`
+	// TimedOut marks a check doctor abandoned: its outcome is unknown.
+	TimedOut bool `json:"timed_out,omitempty"`
 	// Details are the check's supporting lines; proxied-backup-coverage
 	// lists each scope it found backed up here.
 	Details []string `json:"details,omitempty"`
@@ -322,6 +329,443 @@ func beadsTopologyCheck(name string) bool {
 	return strings.HasPrefix(name, "custom-types")
 }
 
+// The order-firing-current detail lines that mean only "fired late", as
+// internal/doctor/checks_order_firing.go writes them, anchored at both ends
+// so an appended suffix does not match.
+var (
+	schedulerStaleLine      = regexp.MustCompile(`^\S+: last fired (\S+) ago, expected every (\S+) \(CRITICAL: stale\)$`)
+	schedulerOverdueLine    = regexp.MustCompile(`^\S+: last fired \S+ ago, expected every \S+ \(overdue\)$`)
+	schedulerCurrentLine    = regexp.MustCompile(`^(\d+) other scheduled order\(s\) current$`)
+	schedulerNeverFiredLine = regexp.MustCompile(`^(\S+): never fired since controller start (\S+) ago$`)
+	schedulerFirstCycleLine = regexp.MustCompile(`^\S+: never fired \(controller running \S+, within first cycle\)$`)
+	// schedulerInFlightLine is a never-fired line whose only gate is the
+	// order's own tracking bead (doctor does not judge its holder, so it
+	// always prints "unassigned"): the controller has reached the order and
+	// its first dispatch is running as doctor reads.
+	schedulerInFlightLine = regexp.MustCompile(`^(\S+): never fired since controller start (\S+) ago, gated on open work \S+ \((\S+) old, unassigned; order-tracking bead: a dispatch is in flight\)$`)
+)
+
+// schedulerLagOnly reports whether the run's ONLY blocking failure is the test
+// city's own order scheduler running late: order-firing-current in error, not
+// timed out, and every line it flags either an age ("last fired 3m ago,
+// expected every 1m (CRITICAL: stale)") of a 1-minute order at most
+// schedulerMaxLag old, or a first firing not yet made by a controller at most
+// schedulerColdStart old ("gate-sweep: never fired since controller start 1m
+// ago") while the same report shows the scheduler firing other orders.
+// The first is a loaded CI runner missing ticks (ga-l0b72a.9: #271 run
+// 38317797049 failed three proxied tests on "dolt-health: last fired 2m ago
+// ... CRITICAL: stale"). The second is the cold-start dispatch budget: the
+// controller dispatches at most 4 orders a tick, so the test city's ~20 orders
+// take ~5 ticks to fire once, while order-firing-current flags a never-fired
+// 30s order after 45s (run 38485422418: 8 orders fired in two ticks, and
+// gate-sweep, 11th of the rest, was not yet reached one minute in). It may be
+// read mid-dispatch, the order's tracking bead at most
+// schedulerDispatchInFlight old ("gate-sweep: never fired since controller
+// start 2m ago, gated on open work ae-wisp-b6m (0s old, unassigned;
+// order-tracking bead: a dispatch is in flight)", runs 38762309551 and
+// 38771902221).
+// A lookup timeout, a never-fired order on an older controller or with no
+// order shown firing, an unreadable history, or any other failing check is
+// NOT lag and stays fatal: those are the defects this assertion has caught
+// before (see assertDoctorGreen).
+func schedulerLagOnly(report doctorReport) bool {
+	if report.BlockingFailed != 1 {
+		return false
+	}
+	lagged := false
+	// fired records evidence in this report that the scheduler fires at all:
+	// an order with a last firing, or a non-zero count of current orders. A
+	// never-fired line is lag only beside it; without it, a scheduler that
+	// fires nothing would read as late. The count reads every retained firing,
+	// not only those since the latest controller start, so this assumes the
+	// test city's controller started once, as every caller's city does.
+	fired := false
+	neverFired := false
+	for _, r := range report.Results {
+		if r.Status != "error" || r.Severity == "advisory" {
+			continue
+		}
+		if r.Name != "order-firing-current" || r.TimedOut {
+			return false
+		}
+		// Every detail line must be one this check writes for lag, a
+		// first-cycle note, or its closing count line. Anything else,
+		// including a lag line carrying a suffix (", gated on open work ..."
+		// is a stuck item; ", open-work lookup failed: ..." is a failed store
+		// read), is not lag. The one gated line that is lag is a first
+		// dispatch caught in flight: its gate is the order's own young
+		// tracking bead, not a stuck item.
+		for _, d := range r.Details {
+			switch {
+			case schedulerStaleLine.MatchString(d):
+				if !schedulerLateNotStopped(schedulerStaleLine.FindStringSubmatch(d)) {
+					return false
+				}
+				lagged, fired = true, true
+			case schedulerNeverFiredLine.MatchString(d):
+				uptime, err := time.ParseDuration(schedulerNeverFiredLine.FindStringSubmatch(d)[2])
+				if err != nil || uptime > schedulerColdStart {
+					return false
+				}
+				lagged, neverFired = true, true
+			case schedulerInFlightLine.MatchString(d):
+				m := schedulerInFlightLine.FindStringSubmatch(d)
+				uptime, err := time.ParseDuration(m[2])
+				if err != nil || uptime > schedulerColdStart {
+					return false
+				}
+				age, err := time.ParseDuration(m[3])
+				if err != nil || age > schedulerDispatchInFlight {
+					return false
+				}
+				lagged, neverFired = true, true
+			case schedulerCurrentLine.MatchString(d):
+				if n, err := strconv.Atoi(schedulerCurrentLine.FindStringSubmatch(d)[1]); err == nil && n > 0 {
+					fired = true
+				}
+			case schedulerOverdueLine.MatchString(d):
+				fired = true
+			case schedulerFirstCycleLine.MatchString(d):
+			default:
+				return false
+			}
+		}
+	}
+	if neverFired && !fired {
+		return false
+	}
+	return lagged
+}
+
+// schedulerMaxLag is how stale a 1-minute order may be and still count as a
+// loaded runner missing ticks. The check goes CRITICAL at 3x the interval, so
+// this tolerates a few missed ticks; an order older than this has stopped, and
+// a stopped scheduler is the controller regression the assertion must catch.
+const schedulerMaxLag = 5 * time.Minute
+
+// schedulerColdStart is how old a controller may be while an order still
+// waits for its first firing and that counts as the cold-start dispatch
+// budget, not a skipped order: ~20 orders at 4 a tick is 5 ticks, 2.5m at the
+// 30s patrol interval. The check prints uptime rounded to the minute, so "3m"
+// covers up to 3m29s. A never-fired order on an older controller has been
+// skipped, which the assertion must catch.
+const schedulerColdStart = 3 * time.Minute
+
+// schedulerDispatchInFlight is how old an order's tracking bead may be while
+// its first dispatch still counts as in flight. The check prints the age
+// rounded to the minute, so "1m" covers up to 1m29s; a dispatch older than
+// that is stuck, which the assertion must catch.
+const schedulerDispatchInFlight = time.Minute
+
+// schedulerLateNotStopped judges one stale line's captured age and interval:
+// only the test city's 1-minute orders, and only up to schedulerMaxLag.
+func schedulerLateNotStopped(m []string) bool {
+	if len(m) != 3 {
+		return false
+	}
+	age, err := time.ParseDuration(m[1])
+	if err != nil {
+		return false
+	}
+	expected, err := time.ParseDuration(m[2])
+	if err != nil {
+		return false
+	}
+	return expected == time.Minute && age <= schedulerMaxLag
+}
+
+// TestSchedulerLagOnly pins which order-firing-current reports count as lag:
+// late 1-minute orders, and first firings still waiting on the cold-start
+// dispatch budget.
+// It needs no bd or dolt: it judges literal doctor reports.
+func TestSchedulerLagOnly(t *testing.T) {
+	stale := "dolt-health: last fired 2m ago, expected every 1m (CRITICAL: stale)" // #271 run 38317797049
+	report := func(blocking int, timedOut bool, details ...string) doctorReport {
+		return doctorReport{BlockingFailed: blocking, Results: []doctorCheckResult{{
+			Name: "order-firing-current", Status: "error", Severity: "blocking",
+			TimedOut: timedOut, Details: details,
+		}}}
+	}
+	for _, tc := range []struct {
+		name   string
+		report doctorReport
+		want   bool
+	}{
+		{"one stale line", report(1, false, stale), true},
+		{"stale with overdue sibling and count", report(1, false, stale,
+			"wisp-gc: last fired 90m ago, expected every 1h (overdue)", "4 other scheduled order(s) current"), true},
+		{"stale sibling gated on open work", report(1, false, stale,
+			"mol-x: last fired 3m ago, expected every 1m (CRITICAL: stale), gated on open work ga-1 (5m old, unassigned)"), false},
+		{"stale sibling whose open-work lookup failed", report(1, false, stale,
+			"mol-x: last fired 3m ago, expected every 1m (CRITICAL: stale), open-work lookup failed: dial tcp: refused"), false},
+		{"never fired on an older controller", report(1, false, stale, "mol-x: never fired since controller start 9m ago"), false},
+		{"never fired one minute in, others current", report(1, false, // run 38485422418
+			"cross-rig-deps: never fired (controller running 1m, within first cycle)",
+			"gate-sweep: never fired since controller start 1m ago",
+			"reaper: never fired (controller running 1m, within first cycle)",
+			"8 other scheduled order(s) current"), true},
+		{"never fired at the cold-start bound beside a stale line", report(1, false, stale,
+			"gate-sweep: never fired since controller start 3m ago"), true},
+		{"never fired past the cold-start bound: skipped, not waiting", report(1, false,
+			"gate-sweep: never fired since controller start 4m ago", "8 other scheduled order(s) current"), false},
+		{"several never fired one minute in, others current", report(1, false,
+			"gate-sweep: never fired since controller start 1m ago",
+			"order-tracking-sweep: never fired since controller start 1m ago",
+			"8 other scheduled order(s) current"), true},
+		{"never fired with only an overdue order as evidence", report(1, false,
+			"gate-sweep: never fired since controller start 1m ago",
+			"wisp-gc: last fired 90m ago, expected every 1h (overdue)"), true},
+		{"never fired gated on open work", report(1, false,
+			"gate-sweep: never fired since controller start 1m ago, gated on open work ga-1 (1m old, unassigned)",
+			"8 other scheduled order(s) current"), false},
+		{"first dispatch in flight, others current", report(1, false, // runs 38762309551, 38771902221
+			"dolt-health: last fired 1m ago, expected every 1m (overdue)",
+			"gate-sweep: never fired since controller start 2m ago, gated on open work ae-wisp-b6m (0s old, unassigned; order-tracking bead: a dispatch is in flight)",
+			"order-tracking-sweep: never fired since controller start 2m ago",
+			"reaper: never fired (controller running 2m, within first cycle)",
+			"10 other scheduled order(s) current"), true},
+		{"dispatch in flight at the in-flight bound", report(1, false,
+			"gate-sweep: never fired since controller start 3m ago, gated on open work ae-wisp-b6m (1m old, unassigned; order-tracking bead: a dispatch is in flight)",
+			"10 other scheduled order(s) current"), true},
+		{"dispatch in flight past the in-flight bound: stuck", report(1, false,
+			"gate-sweep: never fired since controller start 2m ago, gated on open work ae-wisp-b6m (2m old, unassigned; order-tracking bead: a dispatch is in flight)",
+			"10 other scheduled order(s) current"), false},
+		{"dispatch in flight of unknown age", report(1, false,
+			"gate-sweep: never fired since controller start 2m ago, gated on open work ae-wisp-b6m (age unknown, unassigned; order-tracking bead: a dispatch is in flight)",
+			"10 other scheduled order(s) current"), false},
+		{"dispatch in flight on an older controller", report(1, false,
+			"gate-sweep: never fired since controller start 4m ago, gated on open work ae-wisp-b6m (0s old, unassigned; order-tracking bead: a dispatch is in flight)",
+			"10 other scheduled order(s) current"), false},
+		{"tracking bead with a holder", report(1, false,
+			"gate-sweep: never fired since controller start 2m ago, gated on open work ae-wisp-b6m (0s old, gc-1; order-tracking bead: a dispatch is in flight)",
+			"10 other scheduled order(s) current"), false},
+		{"gated on a run whose holder check failed", report(1, false,
+			"gate-sweep: never fired since controller start 2m ago, gated on open work ae-wisp-b6m (0s old, unassigned; holder check failed: boom)",
+			"10 other scheduled order(s) current"), false},
+		{"dispatch in flight with nothing shown firing", report(1, false,
+			"gate-sweep: never fired since controller start 2m ago, gated on open work ae-wisp-b6m (0s old, unassigned; order-tracking bead: a dispatch is in flight)"), false},
+		{"never fired with nothing shown firing", report(1, false,
+			"gate-sweep: never fired since controller start 1m ago"), false},
+		{"never fired with zero orders current", report(1, false,
+			"gate-sweep: never fired since controller start 1m ago", "0 other scheduled order(s) current"), false},
+		{"never fired, start predates the logs", report(1, false,
+			"gate-sweep: never fired; controller start predates the active event log and every retained archive (no first-cycle grace)",
+			"8 other scheduled order(s) current"), false},
+		{"first-cycle notes alone", report(1, false,
+			"reaper: never fired (controller running 1m, within first cycle)", "8 other scheduled order(s) current"), false},
+		{"unreadable history", report(1, false, stale, "mol-x: cannot read order history: boom"), false},
+		{"unknown line", report(1, false, stale, "something new"), false},
+		{"overdue only", report(1, false, "wisp-gc: last fired 2h ago, expected every 1h (overdue)"), false},
+		{"stale at the lag bound", report(1, false,
+			"dolt-health: last fired 5m ago, expected every 1m (CRITICAL: stale)"), true},
+		{"stale past the lag bound: stopped, not late", report(1, false,
+			"dolt-health: last fired 45m ago, expected every 1m (CRITICAL: stale)"), false},
+		{"stale on a longer interval", report(1, false,
+			"wisp-gc: last fired 3h ago, expected every 1h (CRITICAL: stale)"), false},
+		{"timed out", report(1, true, stale), false},
+		{"a second blocking failure", report(2, false, stale), false},
+	} {
+		if got := schedulerLagOnly(tc.report); got != tc.want {
+			t.Errorf("%s: schedulerLagOnly = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+	t.Run("never-fired orders", testNeverFiredOrders)
+}
+
+// testNeverFiredOrders pins which orders the deferred first-firing assertion
+// waits on, and when it stops waiting. It runs as a subtest of
+// TestSchedulerLagOnly: rules_go shards top-level tests round-robin in source
+// order, and a new top-level test would move the heavy tests the shard guard
+// keeps apart.
+func testNeverFiredOrders(t *testing.T) {
+	report := func(details ...string) doctorReport {
+		return doctorReport{Results: []doctorCheckResult{{
+			Name:    "order-firing-current",
+			Message: "scheduled orders are stale", Details: details,
+		}}}
+	}
+	got := neverFiredOrders(report(
+		"gate-sweep: never fired since controller start 1m ago",
+		"reaper: never fired (controller running 1m, within first cycle)",
+		"8 other scheduled order(s) current"))
+	if len(got) != 1 || got[0] != "gate-sweep" {
+		t.Errorf("neverFiredOrders = %v, want [gate-sweep]", got)
+	}
+	got = neverFiredOrders(report(
+		"gate-sweep: never fired since controller start 2m ago, gated on open work ae-wisp-b6m (0s old, unassigned; order-tracking bead: a dispatch is in flight)",
+		"10 other scheduled order(s) current"))
+	if len(got) != 1 || got[0] != "gate-sweep" {
+		t.Errorf("in-flight line: neverFiredOrders = %v, want [gate-sweep]", got)
+	}
+	orders := []string{"gate-sweep"}
+	if still := stillNeverFired(report("gate-sweep: never fired since controller start 2m ago"), orders); len(still) != 1 {
+		t.Errorf("flagged line: stillNeverFired = %v, want [gate-sweep]", still)
+	}
+	if still := stillNeverFired(report("gate-sweep: never fired since controller start 2m ago, gated on open work ae-wisp-b6m (0s old, unassigned; order-tracking bead: a dispatch is in flight)"), orders); len(still) != 1 {
+		t.Errorf("in-flight line: stillNeverFired = %v, want [gate-sweep]", still)
+	}
+	if still := stillNeverFired(report("gate-sweep: never fired (controller running 2m, within first cycle)"), orders); len(still) != 1 {
+		t.Errorf("first-cycle line: stillNeverFired = %v, want [gate-sweep]", still)
+	}
+	if still := stillNeverFired(report("9 other scheduled order(s) current"), orders); len(still) != 0 {
+		t.Errorf("fired: stillNeverFired = %v, want none", still)
+	}
+	if still := stillNeverFired(report("gate-sweep-2: never fired since controller start 2m ago"), orders); len(still) != 0 {
+		t.Errorf("a different order with a shared prefix: stillNeverFired = %v, want none", still)
+	}
+	if still := stillNeverFired(report("gate-sweep: cannot read order history: boom"), orders); len(still) != 1 {
+		t.Errorf("unreadable history: stillNeverFired = %v, want [gate-sweep]", still)
+	}
+	// Reads that judged nothing are no evidence of a firing.
+	for name, r := range map[string]doctorReport{
+		"timed out": {Results: []doctorCheckResult{{
+			Name: "order-firing-current", Status: "error",
+			Severity: "advisory", TimedOut: true,
+		}}},
+		"early error": {Results: []doctorCheckResult{{
+			Name: "order-firing-current", Status: "error",
+			Message: "read order firing events: boom",
+		}}},
+		"no result": {},
+	} {
+		if still := stillNeverFired(r, orders); len(still) != 1 {
+			t.Errorf("%s: stillNeverFired = %v, want [gate-sweep]", name, still)
+		}
+	}
+	green := doctorReport{Results: []doctorCheckResult{{
+		Name: "order-firing-current", Status: "ok",
+		Message: "all scheduled orders are current", Details: []string{"20 other scheduled order(s) current"},
+	}}}
+	if still := stillNeverFired(green, orders); len(still) != 0 {
+		t.Errorf("green read: stillNeverFired = %v, want none", still)
+	}
+}
+
+// doctorJSONAllowingSchedulerLag runs `gc doctor --json` and fails the test on
+// a non-zero exit unless schedulerLagOnly says the only blocking failure is the
+// test city's scheduler running late, which it logs. It returns the parsed
+// report and the raw output.
+func doctorJSONAllowingSchedulerLag(t *testing.T, city *helpers.City, label string) (doctorReport, string) {
+	t.Helper()
+	return doctorRunAllowingSchedulerLag(t, label, func() (string, error) { return city.GC("doctor", "--json") })
+}
+
+// doctorRunAllowingSchedulerLag is doctorJSONAllowingSchedulerLag for a caller
+// that runs doctor its own way (another env, or scoped checks): run is called
+// for the first read and again for every deferred first-firing read.
+func doctorRunAllowingSchedulerLag(t *testing.T, label string, run func() (string, error)) (doctorReport, string) {
+	t.Helper()
+	out, err := run()
+	var report doctorReport
+	lastJSONLine(t, out, &report)
+	if err != nil {
+		if !schedulerLagOnly(report) {
+			t.Fatalf("gc doctor --json exited non-zero on %s: %v\n%s", label, err, out)
+		}
+		for _, r := range report.Results {
+			if r.Name == "order-firing-current" {
+				t.Logf("tolerated on %s: order-firing-current %s (%s): the test city's scheduler ran late on this runner, not a topology fault",
+					label, r.Message, strings.Join(r.Details, "; "))
+			}
+		}
+		if pending := neverFiredOrders(report); len(pending) > 0 {
+			awaitFirstFirings(t, run, label, pending)
+		}
+	}
+	return report, out
+}
+
+// neverFiredOrders names the orders an order-firing-current result flags as
+// never fired since controller start.
+func neverFiredOrders(report doctorReport) []string {
+	var names []string
+	for _, r := range report.Results {
+		if r.Name != "order-firing-current" {
+			continue
+		}
+		for _, d := range r.Details {
+			if m := schedulerNeverFiredLine.FindStringSubmatch(d); m != nil {
+				names = append(names, m[1])
+			} else if m := schedulerInFlightLine.FindStringSubmatch(d); m != nil {
+				names = append(names, m[1])
+			}
+		}
+	}
+	return names
+}
+
+// awaitFirstFirings turns a tolerated never-fired line into a deferred
+// assertion: the evidence that other orders fired proves only that the
+// scheduler runs, not that this order was merely waiting its turn. It re-reads
+// `gc doctor --json` until a read that judged every order no longer reports a
+// named order as never fired, and fails the test if that has not happened
+// within schedulerColdStart of the tolerated read (so up to ~6.5m from
+// controller start): an order that long unfired was skipped, not late. Each
+// poll is a `gc doctor` run, so it also counts in any bd-call tally taken
+// around this helper.
+//
+// `gc doctor` is a black-box boundary with no completion signal for an order's
+// first firing, so this polls it (TESTING.md: a context-aware ticker, failing
+// with the last observed state). Boundary owner: this helper.
+func awaitFirstFirings(t *testing.T, run func() (string, error), label string, orders []string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), schedulerColdStart)
+	defer cancel()
+	tick := time.NewTicker(15 * time.Second)
+	defer tick.Stop()
+	for {
+		out, _ := run()
+		var report doctorReport
+		lastJSONLine(t, out, &report)
+		still := stillNeverFired(report, orders)
+		if len(still) == 0 {
+			t.Logf("on %s: %s fired after the tolerated doctor read", label, strings.Join(orders, ", "))
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("on %s: %s still never fired %s after the tolerated doctor read: a skipped order, not scheduler lag\nlast doctor read:\n%s",
+				label, strings.Join(still, ", "), schedulerColdStart, out)
+		case <-tick.C:
+		}
+	}
+}
+
+// orderFiringJudged lists the order-firing-current messages written only after
+// the check classified every scheduled order (internal/doctor/
+// checks_order_firing.go). Any other message, a timed-out result, or no result
+// at all judged nothing, so it is no evidence that an order fired.
+var orderFiringJudged = map[string]bool{
+	"all scheduled orders are current": true,
+	"scheduled orders are overdue":     true,
+	"scheduled orders are stale":       true,
+}
+
+// stillNeverFired returns the orders not yet shown to have fired: every one of
+// them when the read judged nothing, else each one whose line still says never
+// fired (flagged or first-cycle form) or that its history could not be read.
+func stillNeverFired(report doctorReport, orders []string) []string {
+	var result *doctorCheckResult
+	for i := range report.Results {
+		if report.Results[i].Name == "order-firing-current" {
+			result = &report.Results[i]
+		}
+	}
+	if result == nil || result.TimedOut || !orderFiringJudged[result.Message] {
+		return orders
+	}
+	var still []string
+	for _, name := range orders {
+		for _, d := range result.Details {
+			if strings.HasPrefix(d, name+": never fired") || strings.HasPrefix(d, name+": cannot") {
+				still = append(still, name)
+				break
+			}
+		}
+	}
+	return still
+}
+
 // assertDoctorGreen runs the real `gc doctor --json` front door and requires
 // exit 0, zero failures anywhere, and zero warnings from any check whose
 // subject is the bead store's topology.
@@ -338,12 +782,7 @@ func beadsTopologyCheck(name string) bool {
 // a doctor report nobody can get to zero is a doctor report nobody reads.
 func assertDoctorGreen(t *testing.T, city *helpers.City, label string) {
 	t.Helper()
-	out, err := city.GC("doctor", "--json")
-	var report doctorReport
-	lastJSONLine(t, out, &report)
-	if err != nil {
-		t.Fatalf("gc doctor --json exited non-zero on %s: %v\n%s", label, err, out)
-	}
+	report, _ := doctorJSONAllowingSchedulerLag(t, city, label)
 	topologyWarnings := 0
 	for _, r := range report.Results {
 		if r.Status == "ok" {
@@ -354,9 +793,13 @@ func assertDoctorGreen(t *testing.T, city *helpers.City, label string) {
 			topologyWarnings++
 		}
 	}
-	if report.Failed != 0 || topologyWarnings != 0 {
+	failed := report.Failed
+	if schedulerLagOnly(report) {
+		failed-- // the one tolerated order-firing-current result, logged by the helper
+	}
+	if failed != 0 || topologyWarnings != 0 {
 		t.Fatalf("gc doctor on %s reported %d failure(s) and %d bead-topology warning(s), want none",
-			label, report.Failed, topologyWarnings)
+			label, failed, topologyWarnings)
 	}
 	for _, r := range report.Results {
 		switch r.Name {
@@ -403,12 +846,7 @@ func assertDoctorGreen(t *testing.T, city *helpers.City, label string) {
 func assertDoctorReportsBdOwnedProxiedStore(t *testing.T, city *helpers.City, label string) {
 	t.Helper()
 	const proxiedProviderStoreMessage = "bd-owned proxied store (bd CLI front door)"
-	out, err := city.GC("doctor", "--json")
-	if err != nil {
-		t.Fatalf("gc doctor --json exited non-zero on %s: %v\n%s", label, err, out)
-	}
-	var report doctorReport
-	lastJSONLine(t, out, &report)
+	report, _ := doctorJSONAllowingSchedulerLag(t, city, label)
 	for _, r := range report.Results {
 		if r.Name != "beads-store" {
 			continue
@@ -452,12 +890,7 @@ func readBeadsStorePayloadWith(t *testing.T, env *helpers.Env, cityRoot, label s
 	for _, check := range checks {
 		args = append(args, "--check", check)
 	}
-	out, err := helpers.RunGC(env, cityRoot, args...)
-	if err != nil {
-		t.Fatalf("gc doctor --json exited non-zero on %s: %v\n%s", label, err, out)
-	}
-	var report doctorReport
-	lastJSONLine(t, out, &report)
+	report, _ := doctorRunAllowingSchedulerLag(t, label, func() (string, error) { return helpers.RunGC(env, cityRoot, args...) })
 	for _, r := range report.Results {
 		if r.Name != "beads-store" {
 			continue
@@ -535,12 +968,7 @@ func assertCheckOK(t *testing.T, city *helpers.City, name, label string) {
 
 func assertProxiedBackupAdvisory(t *testing.T, city *helpers.City, label string, want bool, wantScopes ...string) {
 	t.Helper()
-	out, err := city.GC("doctor", "--json")
-	if err != nil {
-		t.Fatalf("gc doctor --json exited non-zero on %s: %v\n%s", label, err, out)
-	}
-	var report doctorReport
-	lastJSONLine(t, out, &report)
+	report, _ := doctorJSONAllowingSchedulerLag(t, city, label)
 
 	var found *doctorCheckResult
 	for i := range report.Results {
@@ -949,9 +1377,7 @@ func TestBeadsProxiedDefaultInit(t *testing.T) {
 		// attributable rather than cumulative. `gc doctor --json` on a healthy
 		// proxied city is the read-only shape PR2's budget is stated against.
 		bdCalls.Reset()
-		if out, err := p.city.GC("doctor", "--json"); err != nil {
-			t.Fatalf("gc doctor --json: %v\n%s", err, out)
-		}
+		doctorJSONAllowingSchedulerLag(t, p.city, "a 0-rig proxied city")
 		t.Logf("gc doctor --json on a 0-rig proxied city: %d bd fork(s), %d ping(s)\n%s",
 			bdCalls.Count(), bdCalls.Count("ping"), bdCalls.Describe())
 	})
@@ -1427,31 +1853,6 @@ func assertProxiedNativePerfHeadroom(t *testing.T, label string, wall, target ti
 	}
 }
 
-// bestOfGCSide returns the smallest gc-side time over n samples of one
-// measurement.
-//
-// The minimum, not the mean: what is being measured is a fixed cost, and every
-// sample is that cost plus whatever else this shared box was doing during it.
-// The mean of a fixed cost plus one-sided noise is a measure of the noise. The
-// minimum is the closest any sample got to the quantity, and a regression that
-// really did add work to gc's side raises every sample, including the best one.
-//
-// Each sample returns its gc-side time already attributed. It used to return
-// (wall, child) and clamp a negative difference to zero here, and under an
-// upper bound zero passes: over-reported child time made the gate pass
-// whatever gc did (round3 review, completeness). A sample that cannot be
-// attributed now fails the row where it is measured (helpers.PassthroughGCSide).
-func bestOfGCSide(t *testing.T, n int, sample func() time.Duration) time.Duration {
-	t.Helper()
-	best := time.Duration(-1)
-	for i := 0; i < n; i++ {
-		if gcSide := sample(); best < 0 || gcSide < best {
-			best = gcSide
-		}
-	}
-	return best
-}
-
 // describeProxiedAccount renders the store open's own account of the proxied
 // lane for a failure message.
 func describeProxiedAccount(payload beadsStorePayloadDoc) string {
@@ -1623,11 +2024,18 @@ func runProxiedNativeLaneGates(t *testing.T, bdPath, doltPath string) {
 		// (round3 review, completeness): a sample whose children cannot be
 		// attributed fails, and so does a floor that stopped being one — see
 		// helpers.PassthroughGCSide and helpers.MarginalOverFloor.
-		floor := bestOfGCSide(t, 5, func() time.Duration {
+		//
+		// The floor is sampled beside the command, one floor before each
+		// command sample, and a round that misses the budget is measured
+		// again: a loaded CI runner failed this row three times in ~64 runs
+		// with the floor flat and every command sample inflated
+		// (ga-l0b72a.9). helpers.GateMarginalOverFloor says why a regression
+		// still fails.
+		floor := func() time.Duration {
 			start := time.Now()
 			helpers.RunGC(lane, cityRoot, "--help") //nolint:errcheck // the exit status of --help is not the measurement
 			return time.Since(start)
-		})
+		}
 
 		trace := helpers.NewBDTrace(t)
 		traced := lane.Clone().With(helpers.BDTraceEnv, trace.Path)
@@ -1636,7 +2044,7 @@ func runProxiedNativeLaneGates(t *testing.T, bdPath, doltPath string) {
 			lastRecords int
 			describe    string
 		)
-		gcSide := bestOfGCSide(t, 5, func() time.Duration {
+		gcSide := func() time.Duration {
 			trace.Reset()
 			bdCalls.Reset()
 			start := time.Now()
@@ -1658,22 +2066,22 @@ func runProxiedNativeLaneGates(t *testing.T, bdPath, doltPath string) {
 				t.Fatalf("gc bd list --json: %v\n%s", err, describe)
 			}
 			return sampleGCSide
-		})
+		}
 
-		marginal, err := helpers.MarginalOverFloor(gcSide, floor, proxiedNativeGCSideBudget)
+		gate, err := helpers.GateMarginalOverFloor(3, 5, proxiedNativeGCSideBudget,
+			func() { time.Sleep(5 * time.Second) }, floor, gcSide)
 		if err != nil {
-			t.Fatalf("gc bd list --json, best of 5: %v", err)
+			t.Fatalf("gc bd list --json: %v\n%s", err, gate.Describe())
 		}
 		// The artifact: bd-bound and machine-bound, recorded so the delta is
 		// reproducible, never asserted. The 0.4s figure in the bead is a
 		// stretch target for a future in-process arm and is NOT a PR2 gate.
-		t.Logf("gc bd list --json, flag ON (best of 5): gc-side %s = process floor %s + marginal %s; last sample had %d traced call(s) totalling %s\n%s",
-			gcSide.Round(time.Millisecond), floor.Round(time.Millisecond), marginal.Round(time.Millisecond),
-			lastRecords, lastChild.Round(time.Millisecond), describe)
-		if marginal > proxiedNativeGCSideBudget {
-			t.Errorf("marginal gc-side time for `gc bd list --json` = %s, want <= %s (best-of-5 gc-side %s minus this box's %s process floor)",
-				marginal.Round(time.Millisecond), proxiedNativeGCSideBudget,
-				gcSide.Round(time.Millisecond), floor.Round(time.Millisecond))
+		t.Logf("gc bd list --json, flag ON: cumulative marginal %s over %d round(s) of 5 interleaved samples; last sample had %d traced call(s) totalling %s\n%s\n%s",
+			gate.Marginal.Round(time.Millisecond), len(gate.Rounds),
+			lastRecords, lastChild.Round(time.Millisecond), gate.Describe(), describe)
+		if !gate.Pass {
+			t.Errorf("marginal gc-side time for `gc bd list --json` = %s, want <= %s, after %d rounds (min gc side minus min `gc --help` floor over every interleaved sample taken)\n%s",
+				gate.Marginal.Round(time.Millisecond), proxiedNativeGCSideBudget, len(gate.Rounds), gate.Describe())
 		}
 	})
 

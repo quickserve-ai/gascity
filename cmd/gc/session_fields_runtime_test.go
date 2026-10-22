@@ -121,8 +121,11 @@ func TestSessionFieldsFlowsWriteTheirKeys(t *testing.T) {
 		sites []string // the registry sites ("file:Func") the step runs
 		run   func(t *testing.T, rec *sessionKeyRecorder)
 	}
+	// resume_seeded in a want below is the carry's seeded-resume latch (gc
+	// session resume, ga-oe8h): the start's commit and every conversation
+	// reset clear it with the key it names (its Clears in the registry).
 	steps := []step{
-		{"legacy tick: start and wake", "awake_started_at continuation_epoch continuation_reset_pending core_hash_breakdown creation_complete_at detached_at effective_sleep_after_idle generation instance_token last_woke_at live_hash pending_create_started_at requested_sleep_after_idle reset_committed_at runtime_lease_epoch runtime_lease_expires_at runtime_lease_flock runtime_lease_holder runtime_lease_ttl sleep_capability sleep_policy_fingerprint sleep_policy_source sleep_reason started_config_hash started_launch_hash started_live_hash started_provision_hash state state_reason wake_request wake_requested_at", []string{"internal/session/lifecycle_transition.go:PreWakePatch", "internal/session/lifecycle_transition.go:CommitStartedPatch", "cmd/gc/session_sleep.go:persistSleepPolicyMetadataInfo", "cmd/gc/session_sleep.go:reconcileDetachedAtInfo", "internal/session/runtime_lease.go:RuntimeLease.acquireRecord"}, func(t *testing.T, rec *sessionKeyRecorder) {
+		{"legacy tick: start and wake", "awake_started_at continuation_epoch continuation_reset_pending core_hash_breakdown creation_complete_at detached_at effective_sleep_after_idle generation instance_token last_woke_at live_hash pending_create_started_at requested_sleep_after_idle reset_committed_at resume_seeded runtime_lease_epoch runtime_lease_expires_at runtime_lease_flock runtime_lease_holder runtime_lease_ttl sleep_capability sleep_policy_fingerprint sleep_policy_source sleep_reason started_config_hash started_launch_hash started_live_hash started_provision_hash state state_reason wake_request wake_requested_at", []string{"internal/session/lifecycle_transition.go:PreWakePatch", "internal/session/lifecycle_transition.go:CommitStartedPatch", "cmd/gc/session_sleep.go:persistSleepPolicyMetadataInfo", "cmd/gc/session_sleep.go:reconcileDetachedAtInfo", "internal/session/runtime_lease.go:RuntimeLease.acquireRecord"}, func(t *testing.T, rec *sessionKeyRecorder) {
 			env := newReconcilerTestEnv(t)
 			env.store = rec
 			env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
@@ -186,7 +189,7 @@ func TestSessionFieldsFlowsWriteTheirKeys(t *testing.T) {
 			}
 			rec.keys = a7Rec.keys
 		}},
-		{"v2 A14 drift repair", "attached_config_drift_deferred_at attached_config_drift_deferred_key config_drift_deferred_at config_drift_deferred_key continuation_reset_pending last_woke_at live_hash pending_create_claim pending_create_started_at primed_at priming_attempted_at prompt_hash restart_requested resume_failures resume_launch session_key started_config_hash started_live_hash startup_dialog_verified state", []string{"internal/session/lifecycle_transition.go:ConfigDriftAsleepResetPatch", "cmd/gc/reconcile_arms_drift.go:rowFacts.driftRepair"}, func(t *testing.T, rec *sessionKeyRecorder) {
+		{"v2 A14 drift repair", "attached_config_drift_deferred_at attached_config_drift_deferred_key config_drift_deferred_at config_drift_deferred_key continuation_reset_pending last_woke_at live_hash pending_create_claim pending_create_started_at primed_at priming_attempted_at prompt_hash restart_requested resume_failures resume_launch resume_seeded session_key started_config_hash started_live_hash startup_dialog_verified state", []string{"internal/session/lifecycle_transition.go:ConfigDriftAsleepResetPatch", "cmd/gc/reconcile_arms_drift.go:rowFacts.driftRepair"}, func(t *testing.T, rec *sessionKeyRecorder) {
 			withoutA7(t)
 			named := []string{"configured_named_session", "true", "configured_named_identity", "worker", "configured_named_mode", "always"}
 			c, _ := baselineCase(t, livenessGone, desireKeep, nil, append([]string{
@@ -283,10 +286,10 @@ func TestSessionFieldsFlowsWriteTheirKeys(t *testing.T) {
 		{"operator set state", "state state_reason", []string{"internal/session/store.go:Store.SetState"}, func(t *testing.T, rec *sessionKeyRecorder) {
 			must(t, sessionFrontDoor(rec).SetState(id, session.StateAsleep, "test"))
 		}},
-		{"operator restart request (the legacy patch)", "continuation_reset_pending last_woke_at pending_create_claim pending_create_started_at primed_at priming_attempted_at prompt_hash reset_committed_at restart_requested resume_failures resume_launch session_key started_config_hash", []string{"internal/session/lifecycle_transition.go:RestartRequestPatch"}, func(t *testing.T, rec *sessionKeyRecorder) {
+		{"operator restart request (the legacy patch)", "continuation_reset_pending last_woke_at pending_create_claim pending_create_started_at primed_at priming_attempted_at prompt_hash reset_committed_at restart_requested resume_failures resume_launch resume_seeded session_key started_config_hash", []string{"internal/session/lifecycle_transition.go:RestartRequestPatch"}, func(t *testing.T, rec *sessionKeyRecorder) {
 			must(t, sessionFrontDoor(rec).ApplyPatch(id, session.RestartRequestPatch("key-3", now)))
 		}},
-		{"operator config-drift reset (the legacy patch)", "continuation_reset_pending last_woke_at live_hash pending_create_claim pending_create_started_at primed_at priming_attempted_at prompt_hash restart_requested resume_failures resume_launch session_key started_config_hash started_live_hash startup_dialog_verified state", []string{"internal/session/lifecycle_transition.go:ConfigDriftResetPatch"}, func(t *testing.T, rec *sessionKeyRecorder) {
+		{"operator config-drift reset (the legacy patch)", "continuation_reset_pending last_woke_at live_hash pending_create_claim pending_create_started_at primed_at priming_attempted_at prompt_hash restart_requested resume_failures resume_launch resume_seeded session_key started_config_hash started_live_hash startup_dialog_verified state", []string{"internal/session/lifecycle_transition.go:ConfigDriftResetPatch"}, func(t *testing.T, rec *sessionKeyRecorder) {
 			must(t, sessionFrontDoor(rec).ApplyPatch(id, session.ConfigDriftResetPatch(session.StateAsleep, "key-4", now)))
 		}},
 	}...)
@@ -392,7 +395,7 @@ func TestSessionFieldsClearSitesClear(t *testing.T) {
 		"internal/session/lifecycle_transition.go:PreWakePatch": {
 			[]string{
 				"wake_request", "explicit", "wake_requested_at", ago(time.Minute), "detached_at", ago(time.Hour), "sleep_intent", "idle-stop-pending",
-				"started_config_hash", "v6:core", "started_live_hash", "v6:live", "live_hash", "v6:live", "resume_failures", "2", "resume_launch", "true",
+				"started_config_hash", "v6:core", "started_live_hash", "v6:live", "live_hash", "v6:live", "resume_failures", "2", "resume_launch", "true", "resume_seeded", "true",
 			},
 			patchSite(func(session.Info) session.MetadataPatch { // a fresh wake, which clears the baseline too
 				return session.PreWakePatch(session.PreWakePatchInput{Generation: 4, InstanceToken: "tok-4", Now: now, FreshWake: true})
@@ -428,8 +431,19 @@ func TestSessionFieldsClearSitesClear(t *testing.T) {
 				return fieldBead(t, m, id).Metadata
 			},
 		},
+		"internal/session/content_hold.go:Store.ClearContentHold": { // a resume releases the hold it read
+			[]string{session.ContentHoldKey, "operator@2026-03-08T12:00:00Z"},
+			func(t *testing.T, meta []string) map[string]string {
+				m, _ := stampedMem(t, gate.Require)
+				id := fieldRow(t, m, meta...)
+				if cleared, standing, err := sessionFrontDoor(m).ClearContentHold(id, pairs(meta)[session.ContentHoldKey]); err != nil || !cleared {
+					t.Fatalf("ClearContentHold = %t, %q, %v", cleared, standing, err)
+				}
+				return fieldBead(t, m, id).Metadata
+			},
+		},
 		"internal/session/lifecycle_transition.go:CommitStartedPatch": {
-			[]string{"continuation_reset_pending", "true", session.ResetCommittedAtKey, ago(time.Minute)},
+			[]string{"continuation_reset_pending", "true", session.ResetCommittedAtKey, ago(time.Minute), "resume_seeded", "true"},
 			patchSite(func(session.Info) session.MetadataPatch {
 				return session.CommitStartedPatch(session.CommitStartedPatchInput{CoreHash: "h", Now: now})
 			}),
@@ -462,13 +476,13 @@ func TestSessionFieldsClearSitesClear(t *testing.T) {
 			},
 		},
 		"internal/session/lifecycle_transition.go:ConfigDriftResetPatch": {
-			[]string{"restart_requested", "true", "resume_failures", "2", "resume_launch", "true"},
+			[]string{"restart_requested", "true", "resume_failures", "2", "resume_launch", "true", "resume_seeded", "true"},
 			patchSite(func(session.Info) session.MetadataPatch {
 				return session.ConfigDriftResetPatch(session.StateAsleep, "key", now)
 			}),
 		},
 		"internal/session/lifecycle_transition.go:ConfigDriftAsleepResetPatch": {
-			[]string{"restart_requested", "true", "resume_failures", "2", "resume_launch", "true"},
+			[]string{"restart_requested", "true", "resume_failures", "2", "resume_launch", "true", "resume_seeded", "true"},
 			patchSite(func(session.Info) session.MetadataPatch {
 				return session.ConfigDriftAsleepResetPatch("key")
 			}),
@@ -542,7 +556,7 @@ func TestSessionFieldsClearSitesClear(t *testing.T) {
 			},
 		},
 		"internal/session/lifecycle_transition.go:RestartRequestPatch": {
-			[]string{"restart_requested", "true", "resume_failures", "2", "resume_launch", "true"},
+			[]string{"restart_requested", "true", "resume_failures", "2", "resume_launch", "true", "resume_seeded", "true"},
 			patchSite(func(session.Info) session.MetadataPatch { return session.RestartRequestPatch("key", now) }),
 		},
 		"cmd/gc/reconcile_arms_heals.go:armClaimClear": {
@@ -614,22 +628,22 @@ func TestSessionFieldsClearSitesClear(t *testing.T) {
 			[]string{
 				"state", "active", "session_key", "k", "started_config_hash", "h",
 				session.PrimedAtMetadataKey, ago(time.Hour), session.PrimingAttemptedAtMetadataKey, ago(time.Hour), session.PromptHashMetadataKey, "p",
-				"resume_failures", "2", "resume_launch", "true",
+				"resume_failures", "2", "resume_launch", "true", "resume_seeded", "true",
 			},
 			patchSite(asleepHealPatch),
 		},
 		"internal/session/lifecycle_exits.go:ConversationResetPatch": {
-			[]string{"session_key", "k", "resume_failures", "2", "resume_launch", "true"},
+			[]string{"session_key", "k", "resume_failures", "2", "resume_launch", "true", "resume_seeded", "true"},
 			patchSite(func(session.Info) session.MetadataPatch { return session.ConversationResetPatch(false) }),
 		},
 		"cmd/gc/session_lifecycle_parallel.go:clearStaleResumeKeyMetadata": {
-			[]string{"session_key", "k", "started_config_hash", "h", "resume_failures", "2", "resume_launch", "true"},
+			[]string{"session_key", "k", "started_config_hash", "h", "resume_failures", "2", "resume_launch", "true", "resume_seeded", "true"},
 			patchSite(func(session.Info) session.MetadataPatch {
 				return session.MetadataPatch(clearStaleResumeKeyMetadata("", nil))
 			}),
 		},
 		"cmd/gc/session_reconcile.go:healStatePatchWithRollbackInfo": {
-			[]string{"state", "active", "session_key", "k", "started_config_hash", "h", "resume_failures", "2", "resume_launch", "true"},
+			[]string{"state", "active", "session_key", "k", "started_config_hash", "h", "resume_failures", "2", "resume_launch", "true", "resume_seeded", "true"},
 			patchSite(func(info session.Info) session.MetadataPatch {
 				return session.MetadataPatch(healStatePatchWithRollbackInfo(info, false, true, &clock.Fake{Time: now}, 0, true))
 			}),

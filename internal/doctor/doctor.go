@@ -27,6 +27,11 @@ type Report struct {
 	// SeverityBlocking — the subset of Failed that should gate dispatch,
 	// CLI exit codes, and other automation.
 	BlockingFailed int
+	// Skipped is the number of checks with StatusSkipped — checks that did
+	// NOT assess their subject (unconfigured, inapplicable, or precondition
+	// unresolved). Counted separately from Passed so a not-assessed check is
+	// never reported as a passing one (ga-51iq0s).
+	Skipped int
 	// Fixed is the number of checks remediated by --fix.
 	Fixed int
 	// Results holds the per-check results in the order they ran. Populated
@@ -118,7 +123,7 @@ func (d *Doctor) run(ctx *CheckContext, w io.Writer, fix, stream bool) *Report {
 		// check is skipped: its Run never completed, so its failure state
 		// is unknown and a fix (plus the verifying re-run) could wedge the
 		// loop the same way the check did.
-		if fix && result.Status != StatusOK && !result.TimedOut && c.CanFix() {
+		if fix && result.Status.IsFailure() && !result.TimedOut && c.CanFix() {
 			var fixAbandoned bool
 			result, fixAbandoned = d.fixAndVerify(c, ctx, result)
 			abandoned = abandoned || fixAbandoned || result.TimedOut
@@ -147,6 +152,8 @@ func (r *Report) tally(result *CheckResult) {
 	case result.Fixed:
 		r.Fixed++
 		r.Passed++ // Fixed counts as passed.
+	case result.Status == StatusSkipped:
+		r.Skipped++
 	case result.Status == StatusOK:
 		r.Passed++
 	case result.Status == StatusWarning:
@@ -165,14 +172,18 @@ func (r *Report) tally(result *CheckResult) {
 // buffer: on completion the buffer is flushed to the real writer (keeping a
 // check's incidental output grouped before its result line); on timeout the
 // goroutine is abandoned with its private buffer, so a still-running check
-// can never interleave writes with — or race against — the rest of the run.
+// can never interleave writes with — or race against — the rest of the run,
+// and the check's CheckContext.Done is closed so it can stop issuing I/O.
 func (d *Doctor) boundedRun(c Check, ctx *CheckContext) *CheckResult {
 	if d.CheckTimeout <= 0 {
 		return runCheckRecoveringPanic(c, ctx)
 	}
 	var buf bytes.Buffer
+	abandoned := make(chan struct{})
 	checkCtx := *ctx
 	checkCtx.Output = &buf
+	checkCtx.Deadline = time.Now().Add(d.CheckTimeout)
+	checkCtx.Done = abandoned
 	done := make(chan *CheckResult, 1)
 	d.inFlight.Add(1)
 	go func() {
@@ -186,6 +197,7 @@ func (d *Doctor) boundedRun(c Check, ctx *CheckContext) *CheckResult {
 		}
 		return result
 	case <-time.After(d.CheckTimeout):
+		close(abandoned)
 		return &CheckResult{
 			Name:     c.Name(),
 			Status:   StatusError,
@@ -302,6 +314,8 @@ func printResult(w io.Writer, r *CheckResult, verbose bool) {
 	switch {
 	case r.Fixed:
 		icon = "✓" // Fixed shows as pass.
+	case r.Status == StatusSkipped:
+		icon = "○" // not assessed — distinct from ✓ so it cannot read as a pass.
 	case r.Status == StatusOK:
 		icon = "✓"
 	case r.Status == StatusWarning:
@@ -315,7 +329,7 @@ func printResult(w io.Writer, r *CheckResult, verbose bool) {
 		suffix = " (fixed)"
 	}
 	advisorySuffix := ""
-	if r.Status != StatusOK && !r.Fixed && r.Severity == SeverityAdvisory {
+	if r.Status.IsFailure() && !r.Fixed && r.Severity == SeverityAdvisory {
 		advisorySuffix = " (advisory)"
 	}
 	fmt.Fprintf(w, "  %s %s — %s%s%s\n", icon, r.Name, r.Message, advisorySuffix, suffix) //nolint:errcheck // best-effort output
@@ -324,12 +338,12 @@ func printResult(w io.Writer, r *CheckResult, verbose bool) {
 			fmt.Fprintf(w, "      %s\n", d) //nolint:errcheck // best-effort output
 		}
 	}
-	if r.FixError != "" && r.Status != StatusOK && !r.Fixed {
+	if r.FixError != "" && r.Status.IsFailure() && !r.Fixed {
 		fmt.Fprintf(w, "      fix failed: %s\n", r.FixError) //nolint:errcheck // best-effort output
-	} else if r.FixAttempted && r.Status != StatusOK && !r.Fixed {
+	} else if r.FixAttempted && r.Status.IsFailure() && !r.Fixed {
 		fmt.Fprintf(w, "      fix attempted; check still failing\n") //nolint:errcheck // best-effort output
 	}
-	if r.FixHint != "" && r.Status != StatusOK && !r.Fixed {
+	if r.FixHint != "" && r.Status.IsFailure() && !r.Fixed {
 		// Continuation lines of a multi-line hint align under its first.
 		const label = "      hint: "
 		hint := strings.ReplaceAll(r.FixHint, "\n", "\n"+strings.Repeat(" ", len(label)))
@@ -351,6 +365,9 @@ func PrintSummary(w io.Writer, r *Report) {
 	}
 	if advisory := r.Failed - r.BlockingFailed; advisory > 0 {
 		parts = append(parts, fmt.Sprintf("%d advisory", advisory))
+	}
+	if r.Skipped > 0 {
+		parts = append(parts, fmt.Sprintf("%d not assessed", r.Skipped))
 	}
 	if r.Fixed > 0 {
 		parts = append(parts, fmt.Sprintf("%d fixed", r.Fixed))

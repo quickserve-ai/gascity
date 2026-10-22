@@ -462,9 +462,7 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 		}
 		provider := effectiveAgentProviderFamily(cfgAgent, wsProvider, p.providers)
 		if _, ok := materialize.VendorSink(provider); ok {
-			scopeRoot := agentScopeRoot(cfgAgent, p.cityPath, p.rigs)
-			canonWorkDir := canonicaliseFilePath(workDir, p.cityPath)
-			stage1Delivers := canStage1Materialize(p.sessionProvider, cfgAgent) && canonWorkDir == scopeRoot
+			stage1Delivers := stage1DeliversToWorkDir(p.sessionProvider, cfgAgent, workDir, p.cityPath, p.rigs)
 			stage2Delivers := isStage2EligibleSession(p.sessionProvider, cfgAgent)
 			if stage1Delivers || stage2Delivers {
 				var agentCat materialize.AgentCatalog
@@ -495,6 +493,7 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 	env := mergeEnv(passthroughEnv(), expandEnvMap(workspaceEnv), expandEnvMap(resolved.Env), expandEnvMap(cfgAgent.Env), agentEnv)
 	processenv.PrependGCBinDirToPATH(env, env["GC_BIN"])
 	env = convergence.ScrubTokenEnv(env)
+	stampContextLaunchModel(env, command)
 
 	// OperatorEnv carries only the operator-authored layers (workspace,
 	// resolved provider, agent) — excluding passthrough and the generated
@@ -572,6 +571,45 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 	// assignment overrides it.
 	for key, val := range processenv.ControllerOnlyEnvOverlay() {
 		env[key] = val
+	}
+
+	// Interactive tmux TUI agents render monochrome even with a clean color
+	// env. The ga-od2 ~/.tmux.conf band-aid scrubs the NO_COLOR=1 / TERM=dumb
+	// the supervisor leaks into the tmux server, which restores color for
+	// tools that honor no-color.org (oh-my-posh, codex) — but Claude Code has a
+	// second-order quirk: under the managed tmux server it will not confirm
+	// color support even with COLORTERM=truecolor, a real tty, and NO_COLOR
+	// absent (verified: a fresh pane's claude process has clean env yet emits
+	// zero SGR sequences; FORCE_COLOR=3 restores full color). Default
+	// FORCE_COLOR=3 (truecolor) for interactive tmux sessions so the agent TUI
+	// is colored regardless of the detection path. Scope is deliberately narrow:
+	// only the tmux runtime (subprocess/ACP/k8s providers and deterministic
+	// control-dispatchers emit machine-parsed output that must stay uncolored).
+	// Overridable — set only when neither FORCE_COLOR nor NO_COLOR is already
+	// present, so workspace/provider/agent config can opt out.
+	if rt := effectiveSessionProvider(cfgAgent.Session, p.sessionProvider); (rt == "" || rt == "tmux") && !suppressStartupPrompt {
+		if env == nil {
+			env = map[string]string{}
+		}
+		_, hasForceColor := env["FORCE_COLOR"]
+		_, hasNoColor := env["NO_COLOR"]
+		if !hasForceColor && !hasNoColor {
+			env["FORCE_COLOR"] = "3"
+		}
+	}
+
+	// Account guard (ga-ai7gz2): the passthrough layer resets the ambient
+	// CLAUDE_CONFIG_DIR, so by here a non-empty value can only come from a
+	// declared config layer. A claude-family agent with none declared while
+	// the controller carries an ambient account must fail loudly, never
+	// silently bill the controller's account. k8s sessions are exempt: the
+	// pod builder supplies a pod-local CLAUDE_CONFIG_DIR with mounted
+	// credentials (internal/runtime/k8s/pod.go), so the controller's ambient
+	// state is irrelevant to the account the pod runs under.
+	if rt := effectiveSessionProvider(cfgAgent.Session, p.sessionProvider); rt != "k8s" {
+		if err := processenv.RequireDeclaredClaudeAccount(resolvedProviderName(resolved), resolved.AccountFamily(), env); err != nil {
+			return TemplateParams{}, fmt.Errorf("agent %q: %w", qualifiedName, err)
+		}
 	}
 
 	// Step 11: Expand session setup templates. configDir was resolved ahead
@@ -796,6 +834,15 @@ func isOperationalScript(rel string) bool {
 		}
 	}
 	return false
+}
+
+func stampContextLaunchModel(env map[string]string, command string) {
+	if env == nil {
+		return
+	}
+	if model := launchModelFromCommand(command); model != "" {
+		env["GC_CONTEXT_LAUNCH_MODEL"] = model
+	}
 }
 
 // composeStartupPrompt combines the session beacon with the rendered prompt

@@ -1043,6 +1043,123 @@ func TestDoStartSessionReturnsNudgeDeliveryError(t *testing.T) {
 		callsByMethod(t, ops, "sendKeys", 1)
 		callsByMethod(t, ops, "recordUnconfirmedNudge", 1)
 	})
+
+	// A startup turn (prompt_mode = "arg") that outlasts the ladder holds
+	// every attempt's interrupting submit, so the nudge was never delivered.
+	// The busy pane is that turn, not the nudge landing: the start must not
+	// read it as delivery, and it must not fail either. It warns and leaves
+	// the durable artifact, as an unconfirmed nudge does.
+	t.Run("busy deferral is not fatal and never read as delivered", func(t *testing.T) {
+		origBackoffs := startupNudgeRetryBackoffs
+		startupNudgeRetryBackoffs = []time.Duration{time.Millisecond, time.Millisecond}
+		defer func() { startupNudgeRetryBackoffs = origBackoffs }()
+		ops := &fakeStartOps{
+			hasSessionResult:           true,
+			sendKeysErr:                fmt.Errorf("%w: session %q: its submit keys were held back", runtime.ErrSessionBusy, "test"),
+			paneBusyResult:             true,
+			recordUnconfirmedNudgePath: "/city/.gc/sessions/test/startup-nudge-unconfirmed.log",
+		}
+
+		cfg := runtime.Config{
+			Command: "codex",
+			Nudge:   "startup prompt",
+		}
+
+		if err := doStartSession(context.Background(), ops, "test", cfg, DefaultConfig().SetupTimeout); err != nil {
+			t.Fatalf("doStartSession = %v, want nil for a deferred startup nudge", err)
+		}
+		callsByMethod(t, ops, "sendKeys", len(startupNudgeRetryBackoffs)+1)
+		callsByMethod(t, ops, "paneBusy", 0)
+		callsByMethod(t, ops, "recordUnconfirmedNudge", 1)
+	})
+
+	// A held submit whose draft would not clear left the nudge typed but
+	// unsent: no retry (a re-paste would land on that draft), no start
+	// failure, and the durable artifact.
+	t.Run("held draft that would not clear is not fatal", func(t *testing.T) {
+		ops := &fakeStartOps{
+			hasSessionResult:           true,
+			sendKeysErr:                fmt.Errorf("%w: session %q", errNudgeSubmitHeld, "test"),
+			recordUnconfirmedNudgePath: "/city/.gc/sessions/test/startup-nudge-unconfirmed.log",
+		}
+
+		cfg := runtime.Config{
+			Command: "codex",
+			Nudge:   "startup prompt",
+		}
+
+		if err := doStartSession(context.Background(), ops, "test", cfg, DefaultConfig().SetupTimeout); err != nil {
+			t.Fatalf("doStartSession = %v, want nil for a held startup nudge", err)
+		}
+		callsByMethod(t, ops, "sendKeys", 1)
+		callsByMethod(t, ops, "recordUnconfirmedNudge", 1)
+	})
+}
+
+// TestSendStartupNudgeWithRetry_BusyDeferralIsRetriedNeverDelivered: an
+// attempt deferred because a turn held its interrupting submit
+// (runtime.ErrSessionBusy) sent no submit, so the pane reading busy after it
+// is the turn that held it, not the nudge landing. The ladder re-runs the
+// delivery instead of returning nil, and hands the deferral back once its
+// backoffs are spent.
+func TestSendStartupNudgeWithRetry_BusyDeferralIsRetriedNeverDelivered(t *testing.T) {
+	calls, busyCalls := 0, 0
+	send := func() error {
+		calls++
+		return fmt.Errorf("%w: session %q: its submit keys were held back", runtime.ErrSessionBusy, "test")
+	}
+	busy := func() (bool, error) {
+		busyCalls++
+		return true, nil
+	}
+	err := sendStartupNudgeWithRetry(context.Background(), send, func(time.Duration) {}, busy)
+	if !errors.Is(err, runtime.ErrSessionBusy) {
+		t.Fatalf("err = %v, want runtime.ErrSessionBusy: a held submit is not a delivery", err)
+	}
+	if want := len(startupNudgeRetryBackoffs) + 1; calls != want {
+		t.Fatalf("send calls = %d, want %d", calls, want)
+	}
+	if busyCalls != 0 {
+		t.Fatalf("busy calls = %d, want 0: busy after a deferral proves nothing about the nudge", busyCalls)
+	}
+}
+
+// TestSendStartupNudgeWithRetry_DeliversAfterABusyDeferral: once the turn
+// that held the submit ends, a later attempt delivers.
+func TestSendStartupNudgeWithRetry_DeliversAfterABusyDeferral(t *testing.T) {
+	calls := 0
+	send := func() error {
+		calls++
+		if calls < 3 {
+			return fmt.Errorf("%w: session %q", runtime.ErrSessionBusy, "test")
+		}
+		return nil
+	}
+	busy := func() (bool, error) { return true, nil }
+	if err := sendStartupNudgeWithRetry(context.Background(), send, func(time.Duration) {}, busy); err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if calls != 3 {
+		t.Fatalf("send calls = %d, want 3", calls)
+	}
+}
+
+// TestSendStartupNudgeWithRetry_HeldDraftIsNotRetried: a held submit whose
+// draft would not clear left the message typed; re-running the delivery would
+// paste onto it, so the ladder returns it at once.
+func TestSendStartupNudgeWithRetry_HeldDraftIsNotRetried(t *testing.T) {
+	calls, slept := 0, false
+	send := func() error {
+		calls++
+		return fmt.Errorf("%w: session %q", errNudgeSubmitHeld, "test")
+	}
+	err := sendStartupNudgeWithRetry(context.Background(), send, func(time.Duration) { slept = true }, nil)
+	if !errors.Is(err, errNudgeSubmitHeld) {
+		t.Fatalf("err = %v, want errNudgeSubmitHeld", err)
+	}
+	if calls != 1 || slept {
+		t.Fatalf("send calls = %d, slept = %t; want one attempt and no backoff", calls, slept)
+	}
 }
 
 // TestSendStartupNudgeWithRetry_ConfirmsOnLaterAttempt is the fail-before/
@@ -3566,5 +3683,216 @@ func TestDoStartSession_WarnsWhenTrustDialogLeftUnconfirmed(t *testing.T) {
 	}
 	if !strings.Contains(warnings.String(), `"gc-city-mayor"`) {
 		t.Fatalf("warning %q does not name the session", warnings.String())
+	}
+}
+
+// TestDoRelaunchSession_ReappliesEnvOnRespawn covers ga-xd3bjx item 2: the
+// warm relaunch path must hand cfg.Env to the respawn, so the EMPTY values —
+// the "unset this var" convention, e.g. the CLAUDE_CONFIG_DIR reset — reach
+// respawnAgent, which re-marks the durable ones removed from the session
+// environment before respawn-pane runs.
+func TestDoRelaunchSession_ReappliesEnvOnRespawn(t *testing.T) {
+	ops := &fakeStartOps{
+		hasSessionResult: true,
+	}
+
+	cfg := runtime.Config{
+		Command: "claude",
+		WorkDir: "/proj",
+		Env: map[string]string{
+			"CLAUDE_CONFIG_DIR": "",
+			"GC_CITY":           "/city",
+		},
+	}
+
+	err := doRelaunchSession(context.Background(), ops, "test", cfg, DefaultConfig().SetupTimeout)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var respawn *startCall
+	for i := range ops.calls {
+		if ops.calls[i].method == "respawnAgent" {
+			respawn = &ops.calls[i]
+			break
+		}
+	}
+	if respawn == nil {
+		t.Fatalf("respawnAgent never called; calls = %v", ops.callMethods())
+	}
+	if respawn.env == nil {
+		t.Fatal("respawnAgent received nil env; the create path's env resets are lost on warm relaunch")
+	}
+	if v, ok := respawn.env["CLAUDE_CONFIG_DIR"]; !ok || v != "" {
+		t.Fatalf("respawn env CLAUDE_CONFIG_DIR = (%q, %v), want declared-empty unset", v, ok)
+	}
+	if got := respawn.env["GC_CITY"]; got != "/city" {
+		t.Fatalf("respawn env GC_CITY = %q, want /city", got)
+	}
+}
+
+// TestRespawnAgentMarksClaudeAccountRemovedFromSessionEnv pins the one key
+// ga-ai7gz2 adds to durableWithholdKeys. An empty CLAUDE_CONFIG_DIR is the
+// passthrough reset every session without a declared account carries, and it is
+// account authority: respawn-pane takes no env argument, so unless the key is
+// marked removed from the SESSION environment the respawned agent sees the
+// server's global value, which is the controller's own account. A declared
+// account is a real value and is never marked.
+func TestRespawnAgentMarksClaudeAccountRemovedFromSessionEnv(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		account    string
+		wantMarked bool
+	}{
+		{name: "reset account is withheld across respawn", account: "", wantMarked: true},
+		{name: "declared account is left in place", account: "/accounts/seat", wantMarked: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// The respawn resolves the agent pane first (upstream #7677).
+			fake := &fakeExecutor{agentPane: true}
+			tm := NewTmux()
+			tm.exec = fake
+			ops := &tmuxStartOps{tm: tm}
+
+			env := map[string]string{
+				"GC_CITY":           "/tmp/city",
+				"CLAUDE_CONFIG_DIR": tc.account,
+				"CLAUDECODE":        "",
+			}
+			if err := ops.respawnAgent("gc-test-account-pin", "/proj", "claude", env); err != nil {
+				t.Fatalf("respawnAgent: %v", err)
+			}
+			var setEnv []string
+			for _, call := range fake.calls {
+				if joined := strings.Join(call, " "); strings.Contains(joined, "set-environment") {
+					setEnv = append(setEnv, joined)
+				}
+			}
+			if tc.wantMarked {
+				if len(setEnv) != 1 || !strings.Contains(setEnv[0], "set-environment -t =gc-test-account-pin -r CLAUDE_CONFIG_DIR") {
+					t.Errorf("set-environment calls = %q, want CLAUDE_CONFIG_DIR marked removed from the session env", setEnv)
+				}
+			} else if len(setEnv) != 0 {
+				t.Errorf("set-environment calls = %q, want none for a declared account", setEnv)
+			}
+			// The respawn is not the last call: the input fence's environment
+			// read follows it (republishInputFence, upstream #7962). What the
+			// withholding needs is the order: the session env is marked before
+			// respawn-pane starts the agent, which inherits that env.
+			respawnAt, markAt := -1, -1
+			for i, call := range fake.calls {
+				joined := strings.Join(call, " ")
+				if respawnAt < 0 && strings.Contains(joined, "respawn-pane") {
+					respawnAt = i
+				}
+				if markAt < 0 && strings.Contains(joined, "set-environment") {
+					markAt = i
+				}
+			}
+			if respawnAt < 0 {
+				t.Fatalf("tmux calls = %q, want a respawn-pane", fake.calls)
+			}
+			if tc.wantMarked && markAt > respawnAt {
+				t.Errorf("set-environment ran as call %d, after respawn-pane (call %d): the respawned agent would inherit the account", markAt, respawnAt)
+			}
+		})
+	}
+}
+
+// foundingEnvExecutor records which tmux invocations ran with an explicit,
+// caller-built environment (executeCtxEnv) alongside every invocation.
+type foundingEnvExecutor struct {
+	fakeExecutor
+	envCalls [][]string // args of each executeCtxEnv call
+	envs     [][]string // the environment each executeCtxEnv call received
+}
+
+func (f *foundingEnvExecutor) executeCtxEnv(ctx context.Context, args []string, env []string) (string, error) {
+	f.envCalls = append(f.envCalls, append([]string(nil), args...))
+	f.envs = append(f.envs, append([]string(nil), env...))
+	return f.executeCtx(ctx, args)
+}
+
+// TestRunCtxScrubsSecretEnvForServerFoundingClients pins the ga-fhbnmz residual
+// on #5425's staging seam. A tmux server keeps the environment of the client
+// that forked it, so every client that can found the server — the command-file
+// path's start-server and the argv path's new-session alike — runs with
+// secret-classified names removed. Commands that cannot start a server keep gc's
+// environment, and so does every command against the user's default server.
+func TestRunCtxScrubsSecretEnvForServerFoundingClients(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	t.Setenv("GA_FHBNMZ_CANARY_TOKEN", "leak-me-not")
+	t.Setenv("GA_FHBNMZ_PLAIN_CANARY", "keep-me")
+
+	cfg := DefaultConfig()
+	cfg.SocketName = "gctest-founding"
+	tm := NewTmuxWithConfig(cfg)
+	fe := &foundingEnvExecutor{}
+	tm.exec = fe
+
+	if err := tm.NewSessionWithCommandAndEnv("gctest-founding-staged", "/work", "claude",
+		map[string]string{"ANTHROPIC_AUTH_TOKEN": "sk-test-not-a-real-credential"}); err != nil {
+		t.Fatalf("NewSessionWithCommandAndEnv (staged env): %v", err)
+	}
+	if err := tm.NewSessionWithCommandAndEnv("gctest-founding-argv", "/work", "claude",
+		map[string]string{"GC_RIG": "rig-a"}); err != nil {
+		t.Fatalf("NewSessionWithCommandAndEnv (argv env): %v", err)
+	}
+
+	if len(fe.envCalls) != 2 {
+		t.Fatalf("scrubbed-env calls = %d (%q), want 2: one founding client per session", len(fe.envCalls), fe.envCalls)
+	}
+	for i, want := range []string{"start-server", "new-session"} {
+		if !strings.Contains(strings.Join(fe.envCalls[i], " "), want) {
+			t.Errorf("scrubbed-env call %d = %q, want the %s client", i, fe.envCalls[i], want)
+		}
+		var sawPlain bool
+		for _, kv := range fe.envs[i] {
+			if strings.HasPrefix(kv, "GA_FHBNMZ_CANARY_TOKEN=") {
+				t.Errorf("founding client %d still carries the secret: %q", i, kv)
+			}
+			if kv == "GA_FHBNMZ_PLAIN_CANARY=keep-me" {
+				sawPlain = true
+			}
+		}
+		if !sawPlain {
+			t.Errorf("founding client %d lost a non-secret variable; the scrub must remove only secret-classified names", i)
+		}
+	}
+	if len(fe.calls) <= len(fe.envCalls) {
+		t.Fatalf("calls = %q, want the has-session probes and set-option calls to run outside the scrub", fe.calls)
+	}
+
+	defaultServer := NewTmux()
+	defaultFE := &foundingEnvExecutor{}
+	defaultServer.exec = defaultFE
+	if err := defaultServer.NewSessionWithCommandAndEnv("gctest-founding-default", "/work", "claude",
+		map[string]string{"GC_RIG": "rig-a"}); err != nil {
+		t.Fatalf("NewSessionWithCommandAndEnv (default server): %v", err)
+	}
+	if len(defaultFE.envCalls) != 0 {
+		t.Fatalf("scrubbed-env calls on the default server = %q, want none", defaultFE.envCalls)
+	}
+}
+
+func TestTmuxArgsCanStartServer(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want bool
+	}{
+		{args: []string{"new-session", "-d", "-s", "x"}, want: true},
+		{args: []string{"start-server", ";", "source-file", "/tmp/session.tmux"}, want: true},
+		{args: []string{"attach-session", "-t", "x"}, want: true},
+		{args: []string{"new", "-d"}, want: true},
+		{args: []string{"source-file", "/tmp/a", ";", "new-session", "-d"}, want: true},
+		{args: nil, want: true},
+		{args: []string{"has-session", "-t", "=x"}, want: false},
+		{args: []string{"set-environment", "-t", "x", "-r", "K"}, want: false},
+		{args: []string{"send-keys", "-t", "x", "new-session"}, want: false},
+		{args: []string{"new-window", "-t", "x"}, want: false},
+	} {
+		if got := tmuxArgsCanStartServer(tc.args); got != tc.want {
+			t.Errorf("tmuxArgsCanStartServer(%q) = %v, want %v", tc.args, got, tc.want)
+		}
 	}
 }

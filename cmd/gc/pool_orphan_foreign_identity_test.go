@@ -1191,7 +1191,7 @@ func TestReleaseConfirmedOrphanSessionWork_ReleasesTrimmedSeatUnderItsStableAlia
 
 	released := releaseConfirmedOrphanSessionWork(cfg, cityStore, rigStores,
 		[]beads.Bead{seat, foreign},
-		[]beads.Store{rigStore, rigStore},
+		[]beads.Store{rigStore, rigStore}, nil,
 		session.Info{
 			ID:                  "gc-seat",
 			SessionNameMetadata: "worker-gc-nux",
@@ -1199,8 +1199,7 @@ func TestReleaseConfirmedOrphanSessionWork_ReleasesTrimmedSeatUnderItsStableAlia
 			Template:            "repo/worker",
 			PoolSlot:            "2",
 			PoolManaged:         true,
-		},
-	)
+		})
 	if len(released) != 1 || released[0].ID != seat.ID {
 		t.Fatalf("released = %v, want exactly [%s] (the orphaned seat's own alias claim)", released, seat.ID)
 	}
@@ -1303,5 +1302,198 @@ func TestCityRuntimeBeadReconcileTick_OrphanCloseReleasesTrimmedSeatAndClosesIt(
 	}
 	if gotForeign.Status != "in_progress" || gotForeign.Assignee != "repo/dalinar" {
 		t.Fatalf("foreign claim = status %q assignee %q, want in_progress/repo/dalinar untouched", gotForeign.Status, gotForeign.Assignee)
+	}
+}
+
+// TestReleaseConfirmedOrphanSessionWork_GatesUnobservableIdentifier covers the
+// SECOND release site (the ga-jrnou orphan-close tie-break). Its identifier set
+// is built from raw session-bead metadata (sessionAssignmentIdentifierRawInfo),
+// not from the roster, so a stored session_name colliding with another city's
+// identity reaches this release with no other guard. One call carries both
+// claims: the unobservable identity is protected while the locally-minted pool
+// instance is still released — the same non-vacuity shape as the sweep test, so
+// a gate that simply disabled this site would fail the second half.
+func TestReleaseConfirmedOrphanSessionWork_GatesUnobservableIdentifier(t *testing.T) {
+	cityStore := beads.NewMemStore()
+	rigStore := beads.NewMemStore()
+	cfg := foreignIdentityTestCity(t)
+	rigStores := map[string]beads.Store{"repo": rigStore}
+
+	foreign := seedForeignIdentityWork(t, rigStore, "claim under a foreign-shaped stored name", "repo/dalinar")
+	local := seedForeignIdentityWork(t, rigStore, "claim under a locally minted pool instance", "repo/worker-1")
+
+	logBuf := captureSweepLog(t)
+	released := releaseConfirmedOrphanSessionWork(cfg, cityStore, rigStores,
+		[]beads.Bead{foreign, local},
+		[]beads.Store{rigStore, rigStore},
+		nil,
+		session.Info{SessionNameMetadata: "repo/dalinar"},
+	)
+	if len(released) != 0 {
+		t.Fatalf("released = %v, want none (the only matching identifier is unobservable)", released)
+	}
+	gotForeign, err := rigStore.Get(foreign.ID)
+	if err != nil {
+		t.Fatalf("Get foreign-shaped claim: %v", err)
+	}
+	if gotForeign.Status != "in_progress" || gotForeign.Assignee != "repo/dalinar" {
+		t.Fatalf("claim = status %q assignee %q, want in_progress/repo/dalinar untouched", gotForeign.Status, gotForeign.Assignee)
+	}
+	if logged := logBuf.String(); !strings.Contains(logged, `protected "repo/dalinar" (`+foreign.ID+`)`) {
+		t.Fatalf("gate must refuse loudly, naming the identity and claim:\n%s", logged)
+	}
+
+	released = releaseConfirmedOrphanSessionWork(cfg, cityStore, rigStores,
+		[]beads.Bead{foreign, local},
+		[]beads.Store{rigStore, rigStore},
+		nil,
+		session.Info{SessionNameMetadata: "repo/worker-1"},
+	)
+	if len(released) != 1 || released[0].ID != local.ID {
+		t.Fatalf("released = %v, want exactly [%s] (the locally minted instance still releases)", released, local.ID)
+	}
+	gotLocal, err := rigStore.Get(local.ID)
+	if err != nil {
+		t.Fatalf("Get local claim: %v", err)
+	}
+	if gotLocal.Status != "open" || gotLocal.Assignee != "" {
+		t.Fatalf("local claim = status %q assignee %q, want open/unassigned", gotLocal.Status, gotLocal.Assignee)
+	}
+}
+
+// storePrefixTestCity carries the three ways this city names its own stores: a
+// declared HQ prefix, a rig that declares its prefix, and a rig that declares
+// NONE and so gets one derived from its name — the shape "astro" has in the
+// field. The derived prefix is the one a hand-maintained list would forget.
+func storePrefixTestCity(t *testing.T) *config.City {
+	t.Helper()
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "gascity", Prefix: "ga"},
+		Rigs: []config.Rig{
+			{Name: "qcore", Path: t.TempDir(), Prefix: "qc"},
+			{Name: "astro", Path: t.TempDir()},
+		},
+		Agents: []config.Agent{{Name: "worker", Dir: "qcore"}},
+	}
+	if got := cfg.Rigs[1].EffectivePrefix(); got != "as" {
+		t.Fatalf("fixture drift: astro's derived prefix = %q, want %q", got, "as")
+	}
+	return cfg
+}
+
+// TestPoolAssigneeObservability_BareSessionBeadIDFromAnotherStoreIsForeign is
+// ga-x1f77i. Measured 2026-09-24: `gc agent is-foreign we-wisp-126vyfx`
+// answered local/not_qualified, though "we" is the westeros hub's store prefix
+// and six live westeros sessions held claims on qcore beads in the shared store.
+// "Local" licenses this city to judge liveness and reap, so a session bead ID
+// minted by a store this city does not own must read foreign — while every
+// other bare shape keeps today's not_qualified/local path, or the sweeper
+// silently stops reclaiming this city's own work.
+func TestPoolAssigneeObservability_BareSessionBeadIDFromAnotherStoreIsForeign(t *testing.T) {
+	cfg := storePrefixTestCity(t)
+
+	cases := []struct {
+		name       string
+		assignee   string
+		wantLocal  bool
+		wantReason poolRosterReason
+		wantDetail string
+	}{
+		{"westeros session bead (the measured case)", "we-wisp-126vyfx", false, poolRosterReasonForeignStorePrefix, "we"},
+		{"foreign session bead, uppercase", "WE-WISP-126VYFX", false, poolRosterReasonForeignStorePrefix, "we"},
+		{"foreign session bead, surrounding whitespace", " \twe-wisp-126vyfx\n", false, poolRosterReasonForeignStorePrefix, "we"},
+		{"foreign session bead, multi-char prefix", "gcy-wisp-dv78", false, poolRosterReasonForeignStorePrefix, "gcy"},
+
+		{"session bead under the HQ prefix", "ga-wisp-lkjjkry", true, poolRosterReasonNotQualified, ""},
+		{"session bead under the HQ prefix, uppercase", "GA-WISP-LKJJKRY", true, poolRosterReasonNotQualified, ""},
+		{"session bead under a declared rig prefix", "qc-wisp-x", true, poolRosterReasonNotQualified, ""},
+		{"session bead under a declared rig prefix, padded", "  qc-wisp-89ytnk  ", true, poolRosterReasonNotQualified, ""},
+		{"session bead under a DERIVED rig prefix", "as-wisp-3nvj3yx", true, poolRosterReasonNotQualified, ""},
+
+		// Not session-bead IDs at all: these must keep today's answer exactly.
+		{"bare alias", "mayor", true, poolRosterReasonNotQualified, ""},
+		{"hyphenated bare alias", "platform-lead", true, poolRosterReasonNotQualified, ""},
+		{"runtime session name", "qcore--refinery", true, poolRosterReasonNotQualified, ""},
+		{"empty", "", true, poolRosterReasonNotQualified, ""},
+		{"whitespace only", "   ", true, poolRosterReasonNotQualified, ""},
+		// A runtime name that EMBEDS a wisp id (the herdr tab shape) is not
+		// itself one: its "prefix" carries a dash, so it is not a store prefix.
+		{"runtime name embedding a wisp id", "polecat-we-wisp-3nvj3yx", true, poolRosterReasonNotQualified, ""},
+		{"wisp infix with no tail", "we-wisp-", true, poolRosterReasonNotQualified, ""},
+		{"wisp infix with no prefix", "-wisp-126vyfx", true, poolRosterReasonNotQualified, ""},
+		{"wisp tail carrying a dash", "we-wisp-126-vyfx", true, poolRosterReasonNotQualified, ""},
+		{"wisp tail carrying a child suffix", "we-wisp-126vyfx.1", true, poolRosterReasonNotQualified, ""},
+		{"prefix carrying an underscore", "w_e-wisp-126vyfx", true, poolRosterReasonNotQualified, ""},
+		// Outside the decided rule: only the wisp shape is read as a session
+		// bead ID, so a main-tier foreign ID keeps the not_qualified answer.
+		{"foreign main-tier bead id", "we-126vyfx", true, poolRosterReasonNotQualified, ""},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := poolAssigneeObservability(cfg, "gascity", tc.assignee)
+			if got.Local != tc.wantLocal {
+				t.Fatalf("poolAssigneeObservability(%q).Local = %v, want %v (reason %q, detail %q)", tc.assignee, got.Local, tc.wantLocal, got.Reason, got.Detail)
+			}
+			if got.Reason != tc.wantReason {
+				t.Fatalf("poolAssigneeObservability(%q).Reason = %q, want %q", tc.assignee, got.Reason, tc.wantReason)
+			}
+			if got.Detail != tc.wantDetail {
+				t.Fatalf("poolAssigneeObservability(%q).Detail = %q, want %q", tc.assignee, got.Detail, tc.wantDetail)
+			}
+			if observable := poolAssigneeIsLocallyObservable(cfg, "gascity", tc.assignee); observable != got.Local {
+				t.Fatalf("poolAssigneeIsLocallyObservable(%q) = %v but poolAssigneeObservability.Local = %v — the predicate and the explained form have drifted", tc.assignee, observable, got.Local)
+			}
+		})
+	}
+}
+
+// TestPoolAssigneeObservability_NilConfigKeepsNoConfigForSessionBeadIDs pins
+// the ordering: with no config there is no set of store prefixes to compare
+// against, so a wisp-shaped ID must get the same no_config answer as anything
+// else rather than being judged against an empty set and read as foreign.
+func TestPoolAssigneeObservability_NilConfigKeepsNoConfigForSessionBeadIDs(t *testing.T) {
+	for _, assignee := range []string{"we-wisp-126vyfx", "ga-wisp-lkjjkry", "mayor"} {
+		got := poolAssigneeObservability(nil, "gascity", assignee)
+		if !got.Local || got.Reason != poolRosterReasonNoConfig {
+			t.Fatalf("poolAssigneeObservability(nil, %q) = %+v, want Local/no_config", assignee, got)
+		}
+	}
+}
+
+// TestReleaseOrphanedPoolAssignments_ProtectsForeignSessionBeadAssignee drives
+// ga-x1f77i through the sweeper itself: a claim held by another city's session
+// bead is protected AND named in the per-sweep summary, in the same pass that
+// still reclaims a genuinely dead local holder.
+func TestReleaseOrphanedPoolAssignments_ProtectsForeignSessionBeadAssignee(t *testing.T) {
+	cityPath := t.TempDir()
+	cityStore := beads.NewMemStore()
+	rigStore := beads.NewMemStore()
+	cfg := foreignIdentityTestCity(t)
+	cfg.Workspace.Prefix = "ga"
+
+	foreign := seedForeignIdentityWork(t, rigStore, "claimed by a westeros session", "we-wisp-126vyfx")
+	local := seedForeignIdentityWork(t, rigStore, "work held by a dead local pool worker", "repo/worker-1")
+
+	logBuf := captureSweepLog(t)
+	released := releaseOrphanedPoolAssignmentsFromBeads(
+		cityStore, cfg, cityPath, nil,
+		[]beads.Bead{foreign, local},
+		[]beads.Store{rigStore, rigStore},
+		[]string{"repo", "repo"},
+		map[string]beads.Store{"repo": rigStore},
+	)
+	if len(released) != 1 || released[0].ID != local.ID {
+		t.Fatalf("released = %v, want exactly [%s] (the locally-configured dead holder)", released, local.ID)
+	}
+	gotForeign, err := rigStore.Get(foreign.ID)
+	if err != nil {
+		t.Fatalf("Get foreign work bead: %v", err)
+	}
+	if gotForeign.Status != "in_progress" || gotForeign.Assignee != "we-wisp-126vyfx" {
+		t.Fatalf("foreign claim = status %q assignee %q, want in_progress/we-wisp-126vyfx untouched", gotForeign.Status, gotForeign.Assignee)
+	}
+	if logged := logBuf.String(); !strings.Contains(logged, `"we-wisp-126vyfx" (1: `+foreign.ID+")") {
+		t.Fatalf("summary must name the protected session-bead assignee and its claim:\n%s", logged)
 	}
 }

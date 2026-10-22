@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -3950,7 +3951,7 @@ func TestSweepOrphanedOrderTrackingRetryLimitSpendsRemainingBudget(t *testing.T)
 		t.Fatalf("n = %d, want 2", n)
 	}
 	if fs.listCalls != 1 {
-		t.Fatalf("ListByLabel calls = %d, want 1 (budget exhaustion should stop retries)", fs.listCalls)
+		t.Fatalf("order-tracking list calls = %d, want 1 (budget exhaustion should stop retries)", fs.listCalls)
 	}
 }
 
@@ -6569,7 +6570,7 @@ func TestSweepOrphanedOrderTracking_RetryOnTransientError(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 
-	// Fail the first 2 ListByLabel calls, succeed on the 3rd.
+	// Fail the first 2 order-tracking list reads, succeed on the 3rd.
 	fs := &countFailStore{Store: inner, failCount: 2}
 	closed, err := sweepOrphanedOrderTrackingRetry(fs, 3, time.Millisecond)
 	if err != nil {
@@ -6579,7 +6580,7 @@ func TestSweepOrphanedOrderTracking_RetryOnTransientError(t *testing.T) {
 		t.Fatalf("closed = %d, want 1", closed)
 	}
 	if fs.calls != 3 {
-		t.Fatalf("ListByLabel calls = %d, want 3", fs.calls)
+		t.Fatalf("order-tracking list calls = %d, want 3", fs.calls)
 	}
 }
 
@@ -6600,7 +6601,7 @@ func TestSweepOrphanedOrderTracking_RetryExhausted(t *testing.T) {
 		t.Fatal("expected error when retries exhausted")
 	}
 	if fs.calls != 3 {
-		t.Fatalf("ListByLabel calls = %d, want 3", fs.calls)
+		t.Fatalf("order-tracking list calls = %d, want 3", fs.calls)
 	}
 }
 
@@ -6632,23 +6633,30 @@ func TestSweepOrphanedOrderTracking_RetryOnPartialClose(t *testing.T) {
 		t.Fatalf("n = %d, want 3 (accumulated across retries)", n)
 	}
 	if fs.listCalls != 3 {
-		t.Fatalf("ListByLabel calls = %d, want 3 (retry on partial close)", fs.listCalls)
+		t.Fatalf("order-tracking list calls = %d, want 3 (retry on partial close)", fs.listCalls)
 	}
 }
 
-// countFailStore wraps a Store and fails the first N ListByLabel calls.
+// countFailStore wraps a Store and fails the first N order-tracking list
+// reads. The injection sits on List, not ListByLabel, because the sweep reads
+// through beads.HandlesFor(store).Live.List (ga-v5vnyp) — an override left on
+// ListByLabel is never called, so the fault silently never fires and the retry
+// loop goes untested while the test still passes its earlier assertions.
 type countFailStore struct {
 	beads.Store
 	failCount int
 	calls     int
 }
 
-func (f *countFailStore) ListByLabel(label string, limit int, opts ...beads.QueryOpt) ([]beads.Bead, error) {
+func (f *countFailStore) List(query beads.ListQuery) ([]beads.Bead, error) {
+	if query.Label != labelOrderTracking {
+		return f.Store.List(query)
+	}
 	f.calls++
 	if f.calls <= f.failCount {
 		return nil, fmt.Errorf("connection refused")
 	}
-	return f.Store.ListByLabel(label, limit, opts...)
+	return f.Store.List(query)
 }
 
 // closeFailStore wraps a Store and always fails CloseAll with a
@@ -6659,9 +6667,13 @@ type closeFailStore struct {
 	closeN    int // number of beads "closed" before error
 }
 
-func (f *closeFailStore) ListByLabel(label string, limit int, opts ...beads.QueryOpt) ([]beads.Bead, error) {
-	f.listCalls++
-	return f.Store.ListByLabel(label, limit, opts...)
+// List counts the sweep's own order-tracking reads. Same reason as
+// countFailStore: the production read path is Live.List, not ListByLabel.
+func (f *closeFailStore) List(query beads.ListQuery) ([]beads.Bead, error) {
+	if query.Label == labelOrderTracking {
+		f.listCalls++
+	}
+	return f.Store.List(query)
 }
 
 func (f *closeFailStore) CloseAll(_ []string, _ map[string]string) (int, error) {
@@ -7894,6 +7906,70 @@ interval = "30s"
 	// Verify stderr contains the "not found" warning from ApplyOverrides.
 	if !strings.Contains(stderr.String(), "not found") {
 		t.Errorf("expected stderr to contain 'not found' warning, got: %s", stderr.String())
+	}
+}
+
+// The dispatcher logs an override error and keeps going, so an unmatched
+// override must not cost it the overrides after it: here the disable below
+// the miss must still keep digest out of dispatch, and the enable must still
+// bring in patrol, which its pack ships disabled.
+func TestBuildOrderDispatcherAppliesOverridesBelowAMiss(t *testing.T) {
+	sysDir := t.TempDir()
+	sysLayer := filepath.Join(sysDir, "formulas")
+	sysOrderDir := filepath.Join(sysDir, "orders")
+	for _, dir := range []string{sysLayer, sysOrderDir} {
+		if err := mkdirAll(dir); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeFile(t, filepath.Join(sysOrderDir, "beads-health.toml"), `[order]
+exec = "scripts/beads-health.sh"
+trigger = "cooldown"
+interval = "30s"
+`)
+	writeFile(t, filepath.Join(sysOrderDir, "digest.toml"), `[order]
+exec = "scripts/digest.sh"
+trigger = "cooldown"
+interval = "1h"
+`)
+	writeFile(t, filepath.Join(sysOrderDir, "patrol.toml"), `[order]
+exec = "scripts/patrol.sh"
+trigger = "cooldown"
+interval = "15m"
+enabled = false
+`)
+
+	tenSec := "10s"
+	off, on := false, true
+	cfg := &config.City{
+		FormulaLayers: config.FormulaLayers{
+			City: []string{sysLayer},
+		},
+		PackDirs: []string{sysDir},
+		Orders: config.OrdersConfig{
+			Overrides: []config.OrderOverride{
+				{Name: "wasteland-poll", Interval: &tenSec},
+				{Name: "digest", Enabled: &off},
+				{Name: "patrol", Enabled: &on},
+			},
+		},
+	}
+
+	var stderr bytes.Buffer
+	ad := buildOrderDispatcher(nil, t.TempDir(), cfg, events.Discard, &stderr)
+	if ad == nil {
+		t.Fatalf("expected non-nil dispatcher; stderr: %s", stderr.String())
+	}
+	var got []string
+	for _, a := range ad.(*memoryOrderDispatcher).aa {
+		got = append(got, a.Name)
+	}
+	sort.Strings(got)
+	if strings.Join(got, ",") != "beads-health,patrol" {
+		t.Fatalf("dispatched orders = %v, want [beads-health patrol]; stderr: %s", got, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `order "wasteland-poll" not found`) {
+		t.Errorf("expected stderr to name the unmatched override, got: %s", stderr.String())
 	}
 }
 
@@ -10570,7 +10646,10 @@ func TestRunDispatchGuardedRecoversPanic(t *testing.T) {
 	var logs bytes.Buffer
 	m := &memoryOrderDispatcher{stderr: &logs} // rec is nil → dispatchOne panics on Record
 
-	order := orders.Order{Name: "boom", Trigger: "webhook", Formula: "f"}
+	// The name must read as a fixture in interleaved gate logs: a previous
+	// name of "boom" rendered as "gc: order boom: dispatch goroutine panic"
+	// and was misfiled as a production nil-deref (ga-4mkhyy).
+	order := orders.Order{Name: "intentional-panic-fixture", Trigger: "webhook", Formula: "f"}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -10947,5 +11026,82 @@ func TestHasOpenWorkStrictIgnoresAForgedOrderRunLabel(t *testing.T) {
 	}
 	if summary := entries["digest"]; summary.openWorkTracking || len(summary.openRoots) != 0 {
 		t.Fatalf("index summary %+v, want no run of digest", summary)
+	}
+}
+
+func TestOrderDispatchConfiguredBudgetAboveDefaultFiresMore(t *testing.T) {
+	store := beads.NewMemStore()
+	var aa []orders.Order
+	for i := 0; i < 8; i++ {
+		aa = append(aa, orders.Order{
+			Name:     fmt.Sprintf("order-%d", i),
+			Trigger:  "cooldown",
+			Interval: "1m",
+			Exec:     "true",
+		})
+	}
+	ad := buildOrderDispatcherFromListExec(aa, store, nil, func(context.Context, string, string, []string) ([]byte, error) {
+		return []byte("ok\n"), nil
+	}, nil)
+	if ad == nil {
+		t.Fatal("expected non-nil dispatcher")
+	}
+	m := ad.(*memoryOrderDispatcher)
+	m.maxDispatchesPerTick = 6
+	var stderr bytes.Buffer
+	m.stderr = lockedStderr(&stderr)
+
+	now := time.Date(2026, 9, 10, 2, 30, 0, 0, time.UTC)
+	ad.dispatch(context.Background(), t.TempDir(), now)
+	ad.drain(context.Background())
+
+	if got := countOrderTrackingRuns(t, store); got != 6 {
+		t.Fatalf("tracking runs after one tick = %d, want 6 (configured budget above default)", got)
+	}
+	if !strings.Contains(stderr.String(), "per-tick budget 6 spent") { // upstream #5990 wording (logUnreachedCandidates)
+		t.Fatalf("expected budget-exhaustion line naming the cap, got stderr:\n%s", stderr.String())
+	}
+
+	// A second pass fires the remaining two (plus rotation continues); the
+	// exhaustion line must NOT fire when the pass ends with nothing unvisited.
+	stderr.Reset()
+	ad.dispatch(context.Background(), t.TempDir(), now.Add(2*time.Minute))
+	ad.drain(context.Background())
+	if got := countOrderTrackingRuns(t, store); got <= 6 {
+		t.Fatalf("tracking runs after second tick = %d, want > 6", got)
+	}
+}
+
+func TestOrderDispatchBudgetExhaustionSilentWhenNothingUnvisited(t *testing.T) {
+	store := beads.NewMemStore()
+	var aa []orders.Order
+	for i := 0; i < 3; i++ {
+		aa = append(aa, orders.Order{
+			Name:     fmt.Sprintf("order-%d", i),
+			Trigger:  "cooldown",
+			Interval: "1m",
+			Exec:     "true",
+		})
+	}
+	ad := buildOrderDispatcherFromListExec(aa, store, nil, func(context.Context, string, string, []string) ([]byte, error) {
+		return []byte("ok\n"), nil
+	}, nil)
+	if ad == nil {
+		t.Fatal("expected non-nil dispatcher")
+	}
+	m := ad.(*memoryOrderDispatcher)
+	m.maxDispatchesPerTick = 3
+	var stderr bytes.Buffer
+	m.stderr = lockedStderr(&stderr)
+
+	now := time.Date(2026, 9, 10, 2, 30, 0, 0, time.UTC)
+	ad.dispatch(context.Background(), t.TempDir(), now)
+	ad.drain(context.Background())
+
+	if got := countOrderTrackingRuns(t, store); got != 3 {
+		t.Fatalf("tracking runs = %d, want 3", got)
+	}
+	if s := stderr.String(); strings.Contains(s, "per-tick budget") {
+		t.Fatalf("exhaustion line must not fire when the last order fired at the end of the rotation, got:\n%s", s)
 	}
 }

@@ -170,6 +170,11 @@ func assignedWorkIndexReachableFromAgentOnClaimRefs(
 // backing template because pool scale decisions are per agent template.
 // leading is the store this arm was handed; it resolves the claim refs, and is
 // a property of the CITY so it is read once rather than per bead.
+//
+// wakeReady is the serve side's readiness verdict for the rows whose claimant
+// session is gone (newPoolWakeReadiness). It may be nil, which keeps every row
+// the caller handed in — callers that cannot resolve a verdict must not have
+// one invented for them.
 func filterAssignedWorkBeadsForPoolDemand(
 	cfg *config.City,
 	cityPath string,
@@ -177,6 +182,7 @@ func filterAssignedWorkBeadsForPoolDemand(
 	sessionInfos []sessionpkg.Info,
 	assignedWorkBeads []beads.Bead,
 	assignedWorkStoreRefs []string,
+	wakeReady *poolWakeReadiness,
 ) []beads.Bead {
 	if len(assignedWorkBeads) == 0 || len(assignedWorkStoreRefs) == 0 {
 		return assignedWorkBeads
@@ -185,13 +191,21 @@ func filterAssignedWorkBeadsForPoolDemand(
 		return assignedWorkBeads
 	}
 	claimRefs := assignedWorkRelocatedClaimRefs(cityPath, cfg, leading)
-	return filterAssignedWorkBeadsForPoolDemandAt(cfg, cityPath, claimRefs, sessionInfos, assignedWorkBeads, assignedWorkStoreRefs, time.Now().UTC())
+	filtered, withheld := filterAssignedWorkBeadsForPoolDemandAt(cfg, cityPath, claimRefs, sessionInfos, assignedWorkBeads, assignedWorkStoreRefs, time.Now().UTC(), wakeReady)
+	for _, w := range withheld {
+		wakeReady.reportWithheld(w.storeRef, w.bead, w.template)
+	}
+	return filtered
 }
 
 // filterAssignedWorkBeadsForPoolDemandAt is filterAssignedWorkBeadsForPoolDemand
 // with the claim refs (assignedWorkRelocatedClaimRefs) resolved and the clock
 // read by the caller, so it does no I/O: the v2 allocator calls it inside its
-// pure pass.
+// pure pass. wakeReady is as for filterAssignedWorkBeadsForPoolDemand; nil
+// keeps every row. It returns the rows the readiness veto withheld beside the
+// kept ones instead of reporting them: the report writes stderr under the
+// verdict's lock, which a pure pass may not reach, so the caller reports
+// (poolWakeReadiness.reportWithheld).
 func filterAssignedWorkBeadsForPoolDemandAt(
 	cfg *config.City,
 	cityPath string,
@@ -200,15 +214,26 @@ func filterAssignedWorkBeadsForPoolDemandAt(
 	assignedWorkBeads []beads.Bead,
 	assignedWorkStoreRefs []string,
 	now time.Time,
-) []beads.Bead {
+	wakeReady *poolWakeReadiness,
+) ([]beads.Bead, []poolWakeWithheldRow) {
 	if len(assignedWorkBeads) == 0 || len(assignedWorkStoreRefs) == 0 {
-		return assignedWorkBeads
+		return assignedWorkBeads, nil
 	}
 	if cfg == nil {
-		return assignedWorkBeads
+		return assignedWorkBeads, nil
 	}
 	assigneeToSessionBeadID := make(map[string]string)
 	sessionBeadTemplate := make(map[string]string)
+	// eligibleClaimants is the identity set the WAKE tier itself treats as a
+	// surviving owner. computePoolDesiredStatesAt drops a session carrying a
+	// terminal provider error before it builds the same map, so a row held by
+	// one of those is orphaned as far as that tier is concerned and must face
+	// the readiness veto like any other orphan — sharing assigneeToSessionBeadID
+	// here would let it past the gate and straight into wake demand.
+	// The two maps stay separate deliberately: the template fallback below reads
+	// assigneeToSessionBeadID and must keep resolving a route through a dying
+	// session's own template.
+	eligibleClaimants := make(map[string]struct{})
 	for _, sb := range sessionInfos {
 		if sb.Closed {
 			continue
@@ -220,11 +245,16 @@ func filterAssignedWorkBeadsForPoolDemandAt(
 		if template != "" {
 			sessionBeadTemplate[sb.ID] = template
 		}
+		eligible := !sessionHasProviderTerminalErrorInfo(sb)
 		for _, id := range sessionBeadAssigneeIdentitiesInfo(sb) {
 			assigneeToSessionBeadID[id] = sb.ID
+			if eligible {
+				eligibleClaimants[id] = struct{}{}
+			}
 		}
 	}
 	filtered := make([]beads.Bead, 0, len(assignedWorkBeads))
+	var withheld []poolWakeWithheldRow
 	for i, wb := range assignedWorkBeads {
 		// A deferred bead is deliberately parked (future defer_until) and is
 		// invisible to bd ready, so scale_check reports zero demand for it.
@@ -256,11 +286,30 @@ func filterAssignedWorkBeadsForPoolDemandAt(
 		if agentCfg == nil {
 			continue
 		}
-		if assignedWorkIndexReachableFromAgentOnClaimRefs(cityPath, cfg, agentCfg, assignedWorkStoreRefs, i, claimRefs) {
-			filtered = append(filtered, wb)
+		// A row whose claimant is gone can only become demand through the
+		// wake-known-identity tier, and the seat that tier mints reads for an
+		// open row with `bd ready --assignee=<identity>`. The status gate
+		// downstream cannot tell whether that read would answer: Bead.Status is
+		// the collapsed mapBdStatus value, so a dependency-blocked row arrives
+		// here spelled "open" exactly like claimable work, is counted forever,
+		// and every seat it spawns finds an empty hook (#6207, parent #4114).
+		// Ask the serve side's own predicate instead — after the target template
+		// is resolved, because whether that predicate is even the right one is a
+		// property of the agent (see vetoesWakeCandidate), and after the
+		// reachability check, so the record names only rows this gate removed.
+		if !assignedWorkIndexReachableFromAgentOnClaimRefs(cityPath, cfg, agentCfg, assignedWorkStoreRefs, i, claimRefs) {
+			continue
 		}
+		if i < len(assignedWorkStoreRefs) {
+			_, claimantLive := eligibleClaimants[strings.TrimSpace(wb.Assignee)]
+			if wakeReady.vetoesWakeCandidate(wb, agentCfg, claimantLive, assignedWorkStoreRefs[i]) {
+				withheld = append(withheld, poolWakeWithheldRow{storeRef: assignedWorkStoreRefs[i], bead: wb, template: template})
+				continue
+			}
+		}
+		filtered = append(filtered, wb)
 	}
-	return filtered
+	return filtered, withheld
 }
 
 // filterAssignedWorkBeadsForSessionWake resolves work through assignment

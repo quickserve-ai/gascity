@@ -20,6 +20,7 @@ import (
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/opjournal"
+	"github.com/gastownhall/gascity/internal/opjournal/legacyop"
 	"github.com/gastownhall/gascity/internal/reconcilekey"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
@@ -42,7 +43,7 @@ continuity.`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(_ *cobra.Command, args []string) error {
 			if len(args) == 0 {
-				fmt.Fprintln(stderr, "gc session: missing subcommand (new, list, attach, submit, suspend, pin, unpin, reset, close, rename, prune, peek, kill, nudge, logs, wake, wait)") //nolint:errcheck // best-effort stderr
+				fmt.Fprintln(stderr, "gc session: missing subcommand (new, list, attach, submit, suspend, pin, unpin, reset, close, rename, prune, peek, kill, nudge, logs, history, resume, wake, wait)") //nolint:errcheck // best-effort stderr
 			} else {
 				fmt.Fprintf(stderr, "gc session: unknown subcommand %q\n", args[0]) //nolint:errcheck // best-effort stderr
 			}
@@ -63,8 +64,11 @@ continuity.`,
 		newSessionPruneCmd(stdout, stderr),
 		newSessionPeekCmd(stdout, stderr),
 		newSessionKillCmd(stdout, stderr),
+		newSessionBindCloudCmd(stdout, stderr),
 		newSessionNudgeCmd(stdout, stderr),
 		newSessionLogsCmd(stdout, stderr),
+		newSessionHistoryCmd(stdout, stderr),
+		newSessionResumeCmd(stdout, stderr),
 		newSessionWakeCmd(stdout, stderr),
 		newSessionWaitCmd(stdout, stderr),
 	)
@@ -72,7 +76,7 @@ continuity.`,
 }
 
 func newSessionSubmitCmd(stdout, stderr io.Writer) *cobra.Command {
-	var intent string
+	var intent, key string
 	var jsonOutput bool
 	cmd := &cobra.Command{
 		Use:   "submit <id-or-alias> <message...>",
@@ -91,7 +95,7 @@ according to the selected semantic intent.`,
 				fmt.Fprintf(stderr, "gc session submit: %v\n", err) //nolint:errcheck // best-effort stderr
 				return errExit
 			}
-			if cmdSessionSubmit(args, parsedIntent, jsonOutput, stdout, stderr) != 0 {
+			if cmdSessionSubmit(args, parsedIntent, key, jsonOutput, stdout, stderr) != 0 {
 				return errExit
 			}
 			return nil
@@ -100,6 +104,7 @@ according to the selected semantic intent.`,
 	}
 	cmd.Flags().StringVar(&intent, "intent", string(session.SubmitIntentDefault), "submit intent: default, follow_up, or interrupt_now")
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "JSON output")
+	addOpKeyFlag(cmd, &key, "")
 	return cmd
 }
 
@@ -204,6 +209,30 @@ func cmdSessionNew(args []string, alias, title, titleHint string, noAttach, json
 		alias = workdirutil.SessionQualifiedName(cityPath, found, cfg.Rigs, requestedAlias, "")
 	}
 	cityName := loadedCityName(cfg, cityPath)
+	// ga-e4jb: an alias-less session created from a SINGLE-session template
+	// that backs a configured named session duplicates that identity — it
+	// claims the raw template qualified name as its alias and shares the
+	// named session's work dir, while carrying no named-session metadata, so
+	// the dedup machinery never sees it (the "two lanas" incident). Point
+	// the caller at the named identity; an explicit --alias remains the
+	// escape hatch for a deliberate parallel session under its own identity.
+	// Multi-session templates are exempt: factory creates there mint
+	// distinct instance identities with an empty alias and are sanctioned
+	// (see TestPhase0CmdSessionNew_FactoryTargetDoesNotMaterializeNamedIdentity).
+	// A template backing a named session of the SAME name is Fix B's case
+	// (#3884, below): it materializes the configured identity rather than a
+	// shadow, so the refusal applies only when no configured owner resolves.
+	if requestedAlias == "" && !found.SupportsMultipleSessions() && sessionNewAliasOwner(cfg, &found) == "" {
+		if specs := findNamedSessionSpecsByBackingTemplate(cfg, cityName, found.QualifiedName()); len(specs) > 0 {
+			identities := make([]string, len(specs))
+			for i, s := range specs {
+				identities[i] = s.Identity
+			}
+			_, _ = fmt.Fprintf(stderr, "gc session new: template %q backs configured named session %s — target it directly (e.g. \"gc nudge %s\"), or pass --alias to create a separate session under its own identity\n",
+				found.QualifiedName(), strings.Join(identities, ", "), identities[0])
+			return 1
+		}
+	}
 	explicitName, err := sessionExplicitNameForNewSession(cityPath, cityName, cfg.Rigs, &found, alias)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session new: %v\n", err) //nolint:errcheck // best-effort stderr
@@ -271,6 +300,10 @@ func cmdSessionNew(args []string, alias, title, titleHint string, noAttach, json
 	if err != nil {
 		titleProvider = nil
 	}
+	// Render a templated start_command for this session's own identity the
+	// way the reconciler's create path does: the direct-start fallback below
+	// launches this command itself (ga-b1u4yg).
+	resolved = renderResolvedCommandForNewSession(cityPath, cfg, &found, sessionQualifiedName, explicitName, workDir, resolved)
 	sessionCommand, err := resolvedSessionCommand(cityPath, resolved, nil, sessionTransport)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session new: %v\n", err) //nolint:errcheck // best-effort stderr
@@ -1039,7 +1072,7 @@ func doSessionListFallback(stateFilter, templateFilter string, jsonOutput bool, 
 	sortSessionsCreatedDesc(sessions)
 
 	if jsonOutput {
-		return writeSessionListJSON(sessions, stateFilter, templateFilter, stdout, stderr)
+		return writeSessionListJSON(sessions, providerCtx.cfg, stateFilter, templateFilter, stdout, stderr)
 	}
 
 	// Build the per-session reason-projection index from the one snapshot (no
@@ -1121,24 +1154,24 @@ type sessionListJSONRow struct {
 	Transport string        `json:"transport,omitempty"`
 	Command   string        `json:"command,omitempty"`
 	WorkDir   string        `json:"work_dir,omitempty"`
-	// WorkerDir is the canonical agent process working directory (the raw
-	// worker_dir / gc.work_dir metadata, Info.WorkerDir). It is surfaced
-	// alongside the legacy WorkDir so consumers can reliably map an active
-	// session to the nested per-bead worktree it is actually working in — the
-	// legacy work_dir is stamped at create/dispatch and is often the agent
-	// home (depth-1) or empty, which is why the worktree reaper's liveness
-	// gate needs the canonical value (gastownhall/gascity#4492 accept-crit #1).
-	WorkerDir            string     `json:"worker_dir,omitempty"`
-	SessionName          string     `json:"session_name,omitempty"`
-	SessionKey           string     `json:"session_key,omitempty"`
-	ResumeFlag           string     `json:"resume_flag,omitempty"`
-	ResumeStyle          string     `json:"resume_style,omitempty"`
-	ResumeCommand        string     `json:"resume_command,omitempty"`
-	CreatedAt            time.Time  `json:"created_at"`
-	LastActive           time.Time  `json:"last_active"`
-	LastNudgeDeliveredAt *time.Time `json:"last_nudge_delivered_at,omitempty"`
-	Attached             bool       `json:"attached"`
-	Closed               bool       `json:"closed"`
+	// WorkerDir is the canonical agent process working directory.
+	WorkerDir              string     `json:"worker_dir,omitempty"`
+	SessionName            string     `json:"session_name,omitempty"`
+	ConfiguredNamedSession bool       `json:"configured_named_session"`
+	SessionOrigin          string     `json:"session_origin,omitempty"`
+	PoolManaged            bool       `json:"pool_managed"`
+	ControlPlane           bool       `json:"control_plane"`
+	BaseState              string     `json:"base_state"`
+	NavigatorSchemaVersion string     `json:"navigator_schema_version"`
+	SessionKey             string     `json:"session_key,omitempty"`
+	ResumeFlag             string     `json:"resume_flag,omitempty"`
+	ResumeStyle            string     `json:"resume_style,omitempty"`
+	ResumeCommand          string     `json:"resume_command,omitempty"`
+	CreatedAt              time.Time  `json:"created_at"`
+	LastActive             time.Time  `json:"last_active"`
+	LastNudgeDeliveredAt   *time.Time `json:"last_nudge_delivered_at,omitempty"`
+	Attached               bool       `json:"attached"`
+	Closed                 bool       `json:"closed"`
 }
 
 type sessionListJSON struct {
@@ -1160,8 +1193,8 @@ type sessionListSummary struct {
 	Closed    int `json:"closed"`
 }
 
-func writeSessionListJSON(sessions []session.Info, stateFilter, templateFilter string, stdout, stderr io.Writer) int {
-	rows := sessionListJSONRows(sessions)
+func writeSessionListJSON(sessions []session.Info, cfg *config.City, stateFilter, templateFilter string, stdout, stderr io.Writer) int {
+	rows := sessionListJSONRows(sessions, cfg)
 	result := sessionListJSON{
 		SchemaVersion: "1",
 		Filters:       sessionListFilters{State: stateFilter, Template: templateFilter},
@@ -1207,32 +1240,38 @@ func writeSessionNewJSON(stdout, stderr io.Writer, result sessionNewJSON) error 
 	return writeCLIJSONLineOrErr(stdout, stderr, "gc session new", result)
 }
 
-func sessionListJSONRows(sessions []session.Info) []sessionListJSONRow {
+func sessionListJSONRows(sessions []session.Info, cfg *config.City) []sessionListJSONRow {
 	rows := make([]sessionListJSONRow, len(sessions))
 	for i, s := range sessions {
 		rows[i] = sessionListJSONRow{
-			ID:            s.ID,
-			Name:          sessionListJSONName(s),
-			Template:      s.Template,
-			State:         s.State,
-			Closed:        s.Closed,
-			Title:         s.Title,
-			Rig:           sessionListJSONRig(s),
-			Alias:         s.Alias,
-			AgentName:     s.AgentName,
-			Provider:      s.Provider,
-			Transport:     s.Transport,
-			Command:       s.Command,
-			WorkDir:       s.WorkDir,
-			WorkerDir:     strings.TrimSpace(s.WorkerDir),
-			SessionName:   s.SessionName,
-			SessionKey:    s.SessionKey,
-			ResumeFlag:    s.ResumeFlag,
-			ResumeStyle:   s.ResumeStyle,
-			ResumeCommand: s.ResumeCommand,
-			CreatedAt:     s.CreatedAt,
-			LastActive:    s.LastActive,
-			Attached:      s.Attached,
+			ID:                     s.ID,
+			Name:                   sessionListJSONName(s),
+			Template:               s.Template,
+			State:                  s.State,
+			Closed:                 s.Closed,
+			Title:                  s.Title,
+			Rig:                    sessionListJSONRig(s),
+			Alias:                  s.Alias,
+			AgentName:              s.AgentName,
+			Provider:               s.Provider,
+			Transport:              s.Transport,
+			Command:                s.Command,
+			WorkDir:                s.WorkDir,
+			WorkerDir:              strings.TrimSpace(s.WorkerDir),
+			SessionName:            s.SessionName,
+			ConfiguredNamedSession: s.ConfiguredNamedSession,
+			SessionOrigin:          s.SessionOrigin,
+			PoolManaged:            s.PoolManaged,
+			ControlPlane:           sessionListJSONControlPlane(s, cfg),
+			BaseState:              sessionListJSONBaseState(s),
+			NavigatorSchemaVersion: "1",
+			SessionKey:             s.SessionKey,
+			ResumeFlag:             s.ResumeFlag,
+			ResumeStyle:            s.ResumeStyle,
+			ResumeCommand:          s.ResumeCommand,
+			CreatedAt:              s.CreatedAt,
+			LastActive:             s.LastActive,
+			Attached:               s.Attached,
 		}
 		if !s.LastNudgeDeliveredAt.IsZero() {
 			stamp := s.LastNudgeDeliveredAt.UTC()
@@ -1240,6 +1279,22 @@ func sessionListJSONRows(sessions []session.Info) []sessionListJSONRow {
 		}
 	}
 	return rows
+}
+
+func sessionListJSONBaseState(info session.Info) string {
+	state := strings.TrimSpace(info.MetadataState)
+	if state != "" {
+		return state
+	}
+	return string(info.State)
+}
+
+func sessionListJSONControlPlane(info session.Info, cfg *config.City) bool {
+	if cfg == nil {
+		return false
+	}
+	agent := findAgentByTemplate(cfg, info.Template)
+	return agent != nil && config.IsDeterministicControlDispatcher(agent)
 }
 
 func sessionListJSONName(s session.Info) string {
@@ -1688,7 +1743,9 @@ func buildResumeCommand(cityPath string, cfg *config.City, info session.Info, se
 	if session.UseAgentTemplateForProviderResolution(sessionKind, metadata, info.Provider, found.Provider, foundAgent) {
 		if foundAgent {
 			if resolved, err := config.ResolveProvider(&found, &cfg.Workspace, cfg.Providers, exec.LookPath); err == nil {
-				return buildResolved(resolved)
+				// Render a templated start_command for this session the way
+				// the reconciler's create path does (ga-b1u4yg).
+				return buildResolved(renderResolvedCommandForSession(cityPath, cfg, &found, info, info.WorkDir, resolved))
 			}
 		}
 	}
@@ -1717,6 +1774,14 @@ func newSessionSuspendCmd(stdout, stderr io.Writer) *cobra.Command {
 		Short: "Suspend a session (save state, free resources)",
 		Long: `Suspend an active session by stopping its runtime process.
 The session bead persists and can be resumed later.
+
+The hold is durable: a suspended session that still owns assigned work stays
+asleep rather than being restarted to serve it, and its pool slot and claim are
+left alone. It comes back on ` + "`gc session wake`" + `.
+
+Where session liveness is kept in a separate store, this holds only while that
+store can be read: a reconciler tick that cannot read it may still restart a
+held session that owns assigned work.
 
 Accepts a session ID (e.g., gc-42) or session alias (e.g., mayor).`,
 		Args: cobra.ExactArgs(1),
@@ -1872,6 +1937,18 @@ its name), a rerun by the alias closes that session.`,
 	return cmd
 }
 
+// cfgErrOrUnknown names why the city config is unavailable. Both legs that can
+// leave cfg nil are error-bearing — resolveCity failing, or loadCityConfig
+// erroring — but a future third leg might not be, and a fail-closed message that
+// says "(<nil>)" reads as a bug in the guard rather than a missing config. Keep
+// the message honest when there is no error to quote.
+func cfgErrOrUnknown(err error) string {
+	if err != nil {
+		return err.Error()
+	}
+	return "reason not reported"
+}
+
 // cmdSessionClose is the CLI entry point for "gc session close", recorded
 // under the op key key (empty mints one).
 func cmdSessionClose(args []string, key string, stdout, stderr io.Writer, asJSON bool) int {
@@ -1881,6 +1958,11 @@ func cmdSessionClose(args []string, key string, stdout, stderr io.Writer, asJSON
 	}
 
 	cityPath, cityErr := resolveCity()
+	// cfgErr records WHY the config is unavailable, on either leg
+	// (cliCityConfig carries cityErr when the city did not resolve): the work
+	// release below reads cfg to tell a configured named identity from a
+	// retired or pool one, so a nil cfg is not a benign default — it makes
+	// every assignee look retired (ga-9n8hjv).
 	cfg, cfgErr := cliCityConfig(cityPath, cityErr, configWarnWriter(asJSON, stderr))
 	// SURGICAL route: the session-class consumers (session-ID resolution, session
 	// worker handle, session bead read) go through the session coordination-class
@@ -1938,6 +2020,45 @@ func cmdSessionClose(args []string, key string, stdout, stderr io.Writer, asJSON
 		return emitSessionCloseResult(stdout, stderr, asJSON, sessionID, 0, op)
 	}
 	defer op.end()
+
+	// PUBLISH THE DEFERRED RELEASE BEFORE THE CLOSE (ga-dt5ffp).
+	//
+	// This runs on exactly the path that is about to withhold — cfg == nil, the
+	// same condition the release branch below tests. It releases nothing; it
+	// records what is being withheld so an actor that later holds a real config
+	// can find it. See session_release_marker.go for why each property is
+	// required.
+	//
+	// TWO SEPARATE THINGS DECIDE CORRECTNESS HERE, and conflating them is easy:
+	//
+	//   * WHERE THE CONTENTS COME FROM. The obligation is built from
+	//     closedSessionBead — the snapshot read above, before the close.
+	//     CloseDetailed calls retireConfiguredNamedSessionIdentifiers, which
+	//     blanks session_name, so an obligation built from a bead re-read after
+	//     the close would silently omit it. Do not "simplify" this to a fresh
+	//     Get; TestSessionCloseCapturesTheDeferredReleaseBeforeRetiringIdentifiers
+	//     fails on exactly that change.
+	//   * WHERE THIS CALL SITS. Publishing before the close means a crash between
+	//     the two leaves an obligation on a session that is still OPEN, which is
+	//     inert — a drain's precondition is that the session bead is closed. The
+	//     opposite order loses the obligation entirely on the same crash. Prefer
+	//     an ignored obligation to a missing one.
+	//
+	//     NO TEST COVERS THIS SECOND PROPERTY: a test cannot crash the process
+	//     between two writes, and moving this call below CloseDetailed keeps the
+	//     whole suite green — measured, not assumed. It rests on this comment.
+	//
+	// The obligation records the rig-store scope as unenumerated: rig stores are
+	// enumerated only under "cityErr == nil && cfg != nil" below, because
+	// buildStandaloneRigStores needs the config that failed to load
+	// (buildSessionReleaseObligation records RigStoresKnown=false for that reason).
+	if cfg == nil {
+		rec, closeRec := openDeferredReleaseEventRecorder(cityPath, stderr)
+		deferMissingConfigWorkRelease(sessStore, sessionID, closedSessionBead, sessionBeadErr == nil,
+			cfgErrOrUnknown(cfgErr), rec, time.Now(), stderr)
+		closeRec()
+	}
+
 	closeResult, err := handle.CloseDetailed(context.Background(), sessionActor(session.ActorOperator, cityPath))
 	if err != nil {
 		op.finishErr(err)
@@ -1963,6 +2084,33 @@ func cmdSessionClose(args []string, key string, stdout, stderr io.Writer, asJSON
 	var rigStores map[string]beads.Store
 	if cityErr == nil && cfg != nil {
 		rigStores = buildStandaloneRigStoresWithConfig(cfg, cityPath, stderr)
+	}
+	// ga-sdynmb: cfg (in legs) is what makes this close non-destructive for CREW. A provider
+	// flip or config-drift roll runs `gc session close <agent>` (city.toml documents
+	// it as the required move -- `reset` does not re-resolve the provider), and this
+	// sweep used to clear the assignee on EVERY open/in_progress bead the agent held,
+	// across the city AND rig stores, with an empty fallback route leaving them
+	// unrouted as well. With cfg the sweep keeps work whose assignee is a
+	// still-configured [[named_session]] identity, which the respawned agent
+	// re-acquires; a genuinely retired or pool session matches nothing in cfg and is
+	// released exactly as before.
+	// FAIL CLOSED when the city config did not load (ga-9n8hjv). The keep above
+	// is cfg-driven: with cfg nil there is nothing to match a configured
+	// [[named_session]] identity against, so every assignee would read as
+	// retired and the sweep would release a named seat's whole portfolio (on
+	// 2026-09-11 a close on this path cleared 50 beads off a named seat in one
+	// write). Upstream's ReleaseClaims refuses a release with no config at all
+	// (errReleaseNoConfig: no lane can be judged served), so nothing is
+	// released here and the refusal is logged; say why on stderr, since
+	// nothing downstream revisits a closed session's work once the config
+	// loads. (The carry's earlier narrow release of work bound to the dying
+	// bead ID alone is not re-expressed: it would bypass that refusal, and the
+	// carry measured it as freeing nothing in practice.)
+	if cfg == nil {
+		fmt.Fprintf(stderr, "gc session close: city config unavailable (%s); "+ //nolint:errcheck // best-effort stderr
+			"releasing none of the work held by session bead %s — a configured named identity "+
+			"cannot be distinguished from a retired one without the config. Re-run once the config loads.\n",
+			cfgErrOrUnknown(cfgErr), closedSessionBead.ID)
 	}
 	// The session bead lives in the sessions-class store (sessStore), which on a
 	// split city is not the work store the sweep leads with; the claim
@@ -2541,174 +2689,133 @@ func cmdSessionKillWithForce(args []string, key string, stdout, stderr io.Writer
 	// foreign target lands in the same best-effort branch below (empty identity,
 	// runtime treated as active, proceed to handle.Kill) that beadErr != nil used.
 	info, infoErr := sessionFrontDoor(sessStore).Get(sessionID)
-	identity := ""
-	if infoErr == nil {
-		identity = namedSessionIdentityInfo(info)
-	}
 
 	handle, err := sessionKillHandle(cityPath, sessStore, sp, cfg, sessionID)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session kill: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	// An open row is killed under the kill fence (KillFenced below). A handle
-	// that cannot fence the kill fails it rather than stopping unfenced.
-	fenced, canFence := handle.(worker.FencedKillHandle)
-	if infoErr == nil && !info.Closed && !canFence {
-		fmt.Fprintf(stderr, "gc session kill: session %s: handle %T cannot fence the kill\n", sessionID, handle) //nolint:errcheck // best-effort stderr
-		return 1
-	}
-	// runtimeAlreadyInactive here, before the lease, gates only the
-	// live-subagent refusal; the kill decides it again on a fresh read under
-	// the lease (KillFencedReport), and that decision is the one acted on.
-	// Both read the runtime the bead routes to.
-	runtimeAlreadyInactive := false
-	if infoErr == nil && canFence {
-		runtimeAlreadyInactive, _ = fenced.KillRuntimeGone(context.Background())
-	}
-	if !force && !runtimeAlreadyInactive && refuseKillForLiveSubagents("gc session kill", workerHandleForSessionTargetWithConfig, cityPath, sessStore, sp, cfg, sessionID, stderr) {
-		return 1
-	}
-
+	// The kill is worker.OperatorKill, the same protocol the API's session
+	// kill runs: the live-subagent refusal (--force overrides it), the runtime
+	// lease held from the fence write through the stop and the asleep sync
+	// (I-LEASE; a controller mid-start keeps it for up to
+	// RuntimeLeaseOperatorWait, after which the kill fails retryably, O3, and
+	// --force also overrides a hung holder of the flock whose record expired),
+	// the kill fence recorded BEFORE the runtime is torn down (stopping first
+	// let a controller tick read the kill as a crash), the named-session
+	// circuit-breaker clear, the controller poke after the lease ends, and
+	// session.stopped with the stop metric. A closed row has no fence and no
+	// lifecycle to sync: the kill only stops whatever runtime it left behind.
+	// Its warnings are this command's.
+	//
 	// The kill op (DES-O0API §8.4) is scoped to the generation the row
 	// already loaded names, and proposed after the live-subagent refusal,
-	// before the lease and the fence. A row that did not read, or read with
-	// no generation, is not recordable.
+	// before the lease and the fence (Admit). A row that did not read, or read
+	// with no generation, is not recordable. A recorded kill stops only the
+	// generation its op is scoped to: a start that ran while the kill waited
+	// for the lease has made another run, which the kill refuses (Check)
+	// rather than stop under an op that does not name it. The op closes only
+	// after the lease is released, so no op store write runs under it.
 	scope, unrecordable, unrecordableErr := cliOpSessionScope(info, infoErr)
 	var unreplayed []string
 	if force {
 		unreplayed = []string{"--force"}
 	}
-	op, start := startCLIOp(cfg, sessStore, cliOpRequest{
-		verb: "gc session kill", kind: opjournal.KindKill, key: key, conversation: sessionID,
-		scope: scope, unrecordable: unrecordable, unrecordableErr: unrecordableErr, cfgErr: cfgErr, unreplayed: unreplayed,
-		asJSON: asJSON, stdout: stdout, stderr: stderr,
+	var (
+		op                             *cliOp
+		start                          cliOpStart
+		leaseErr, scopeErr, breakerErr error
+	)
+	_, killErr := worker.OperatorKill(context.Background(), worker.OperatorKillRequest{
+		SessionID: sessionID,
+		Handle:    handle,
+		Info:      info,
+		InfoErr:   infoErr,
+		By:        sessionActor(session.ActorOperator, cityPath),
+		Force:     force,
+		LiveSubagents: func(ctx context.Context) ([]worker.InFlightSubagent, error) {
+			guard, err := workerHandleForSessionTargetWithConfig(cityPath, sessStore, sp, cfg, sessionID)
+			if err != nil {
+				return nil, err
+			}
+			return liveSubagentsForKill(ctx, guard)
+		},
+		Admit: func() error {
+			op, start = startCLIOp(cfg, sessStore, cliOpRequest{
+				verb: "gc session kill", kind: opjournal.KindKill, key: key, conversation: sessionID,
+				scope: scope, unrecordable: unrecordable, unrecordableErr: unrecordableErr, cfgErr: cfgErr, unreplayed: unreplayed,
+				asJSON: asJSON, stdout: stdout, stderr: stderr,
+			})
+			if start == cliOpRefused || start == cliOpReplayed {
+				return errSessionKillOpAnswered
+			}
+			return nil
+		},
+		Lease: func(ctx context.Context, force bool) (*session.RuntimeLease, bool, error) {
+			req := session.RuntimeLeaseRequest{City: cityPath, Name: info.SessionName, ID: sessionID, TTL: session.RuntimeLeaseTTLFor(cfg)}
+			lease, overridden, err := killRuntimeLease(ctx, sessionFrontDoor(sessStore), req, force, stderr)
+			leaseErr = err
+			return lease, overridden, err
+		},
+		Check: func() error {
+			scopeErr = op.killScopeMoved(sessionFrontDoor(sessStore), sessionID)
+			return scopeErr
+		},
+		ResetCircuitBreaker: func(identity string) error {
+			breakerErr = resetSessionCircuitBreakerAfterExplicitKill(cityPath, sessStore, sessionID, identity)
+			return breakerErr
+		},
+		Settled: func(res worker.OperatorKillResult) {
+			outcome := sessionVerbSentinels.SyncResult(opjournal.KindKill, nil, true).Outcome
+			if res.AlreadyInactive {
+				// The runtime was already gone: nothing was killed.
+				outcome = opjournal.Outcome{Arm: opjournal.ArmSkipped, Reason: opjournal.ReasonNotNeeded}
+			}
+			op.finishOutcome(outcome)
+		},
+		Poke: func() error { return sessionKillPokeController(cityPath, reconcilekey.Session(sessionID)) },
+		// Use the resolved session ID as the canonical Subject for event
+		// consumers. This ensures a stable key regardless of how the user
+		// specified the target (session ID or alias). The recorder opens only
+		// once the kill has landed, as it did before the kill moved.
+		Recorder:   lazyRecorder(func() events.Recorder { return openCityRecorder(stderr) }),
+		EventActor: eventActor(),
+		RecordStop: func() { recordSessionKillStop(info, infoErr, cfg) },
+		Warn:       func(msg string) { fmt.Fprintf(stderr, "gc session kill: warning: %s\n", msg) }, //nolint:errcheck // best-effort stderr
+		Now:        time.Now,
 	})
-	switch start {
-	case cliOpRefused:
-		return 1
-	case cliOpReplayed:
+	var refused *worker.LiveSubagentsError
+	switch {
+	case errors.Is(killErr, errSessionKillOpAnswered) && start == cliOpReplayed:
 		return emitSessionKillResult(stdout, stderr, asJSON, sessionID, op)
+	case errors.Is(killErr, errSessionKillOpAnswered):
+		return 1
+	case errors.As(killErr, &refused):
+		printLiveSubagentRefusal("gc session kill", refused.Subagents, refused.At, stderr)
+		return 1
 	}
 	defer op.end()
-
-	// Record the kill intent BEFORE tearing the runtime down. Stopping first left
-	// a window in which the row still claimed a live runtime next to a dead one,
-	// and a controller tick landing there handled the kill as a crash: it
-	// cleared the conversation's resume key and queued a continuation-reset
-	// restart, or reaped a lingering dead pane's bead as a dead-runtime corpse.
-	// The fence (state_reason=kill-pending) also keeps the reverse window safe:
-	// while Stop runs, the row reads asleep next to a still-live runtime, and
-	// the controller leaves a fenced row alone instead of healing it back to
-	// awake. A row whose runtime is already gone has no window to close and
-	// keeps the post-kill sync below.
-	// The kill holds the runtime lease from the fence write through the Stop
-	// and the asleep sync (I-LEASE). A controller mid-start keeps it for up
-	// to RuntimeLeaseOperatorWait, after which the kill fails retryably (O3).
-	// --force also overrides a hung holder of the flock whose record expired.
-	// A lease failure other than busy never holds the kill hostage: it stops
-	// under the name's flock alone. The lease ends before the controller poke.
-	killCtx, killBy := context.Background(), sessionActor(session.ActorOperator, cityPath)
-	releaseLease, leaseOverridden := func() {}, false
-	if infoErr == nil && !info.Closed {
-		req := session.RuntimeLeaseRequest{City: cityPath, Name: info.SessionName, ID: sessionID, TTL: session.RuntimeLeaseTTLFor(cfg)}
-		lease, overridden, err := killRuntimeLease(killCtx, sessionFrontDoor(sessStore), req, force, stderr)
-		if err != nil {
-			op.finishErr(err)
-			fmt.Fprintf(stderr, "gc session kill: %v\n", err) //nolint:errcheck // best-effort stderr
-			return 1
+	if killErr != nil {
+		// OperatorKill released the lease before it returned.
+		switch {
+		case leaseErr != nil:
+			op.finishErr(leaseErr)
+		case scopeErr != nil:
+			op.finishOutcome(cliOpRefusedOutcome(cliOpRefusedTargetMoved))
+		case breakerErr != nil:
+			op.finishErr(breakerErr)
+		default:
+			op.finishOutcome(cliOpKillFailure(killErr))
 		}
-		releaseLease, leaseOverridden = lease.Release, overridden
-		defer releaseLease()
-		killBy.Lease = lease
-	}
-	// A recorded kill stops only the generation its op is scoped to. A start
-	// that ran while the kill waited for the lease has made another run, which
-	// the kill refuses rather than stop under an op that does not name it; the
-	// op closes once the lease is released, as on every other path.
-	if err := op.killScopeMoved(sessionFrontDoor(sessStore), sessionID); err != nil {
-		releaseLease()
-		op.finishOutcome(cliOpRefusedOutcome(cliOpRefusedTargetMoved))
-		fmt.Fprintf(stderr, "gc session kill: %v\n", err) //nolint:errcheck // best-effort stderr
-		return 1
-	}
-	// The fence, the stop and the asleep sync are Manager.KillFencedReport's,
-	// the same kill the API's routes run: under the lease taken above, it
-	// decides on a fresh read of the row and the runtime whether the runtime
-	// is already gone (no fence, the kill alone), and otherwise writes the
-	// fence before the stop and lifts it after (or rolls it back when the
-	// runtime survived). A fence that cannot be written does not hold the
-	// kill hostage to the store: it falls back to the stop and the post-kill
-	// sync. Its warnings are this command's. A closed row has no fence and no
-	// lifecycle to sync: the kill only stops whatever runtime it left behind.
-	var killErr error
-	if infoErr == nil && !info.Closed {
-		warn := func(msg string) { fmt.Fprintf(stderr, "gc session kill: warning: %s\n", msg) } //nolint:errcheck // best-effort stderr
-		report, err := fenced.KillFenced(killCtx, killBy, warn)
-		killErr, runtimeAlreadyInactive = err, report.RuntimeWasGone
-	} else {
-		killErr = handle.Kill(killCtx, killBy)
-	}
-	// The op closes only after the lease is released, so no op store write
-	// runs under it.
-	if killErr != nil && (identity == "" || !runtimeAlreadyInactive) {
-		releaseLease()
-		op.finishOutcome(cliOpKillFailure(killErr))
 		fmt.Fprintf(stderr, "gc session kill: %v\n", killErr) //nolint:errcheck // best-effort stderr
 		return 1
 	}
-
-	if infoErr != nil {
-		fmt.Fprintf(stderr, "gc session kill: warning: loading session %s for circuit breaker clear: %v\n", sessionID, infoErr) //nolint:errcheck // best-effort stderr
-	} else if identity != "" {
-		if err := resetSessionCircuitBreakerAfterExplicitKill(cityPath, sessStore, sessionID, identity); err != nil {
-			fmt.Fprintf(stderr, "gc session kill: warning: clearing session circuit breaker for %q: %v\n", identity, err) //nolint:errcheck // best-effort stderr
-			if killErr != nil {
-				releaseLease()
-				op.finishErr(err)
-				fmt.Fprintf(stderr, "gc session kill: %v\n", killErr) //nolint:errcheck // best-effort stderr
-				return 1
-			}
-		}
-	}
-	outcome := sessionVerbSentinels.SyncResult(opjournal.KindKill, nil, true).Outcome
-	if killErr != nil {
-		// The runtime was already gone: nothing was killed.
-		outcome = opjournal.Outcome{Arm: opjournal.ArmSkipped, Reason: opjournal.ReasonNotNeeded}
-		fmt.Fprintf(stderr, "gc session kill: warning: session %s runtime was already inactive; cleared named-session circuit breaker\n", sessionID) //nolint:errcheck // best-effort stderr
-	}
-
-	// Poke the controller after the asleep sync so the reconciler observes the
-	// killed state immediately instead of waiting a full patrol interval to
-	// revive an always-named session (#3812), the same poke-after-state-write
-	// approach the drain-ack path uses (doRuntimeDrainAck). Best-effort and
-	// unconditional: a poke failure (e.g. no controller running) is non-fatal,
-	// and a spurious poke when the asleep sync was skipped is harmless — the
-	// reconciler observes unchanged state and continues.
-	releaseLease()
-	op.finishOutcome(outcome)
-	if err := sessionKillPokeController(cityPath, reconcilekey.Session(sessionID)); err != nil {
-		fmt.Fprintf(stderr, "gc session kill: warning: poke failed: %v\n", err) //nolint:errcheck // best-effort stderr
-	}
-
-	// Use the resolved session ID as the canonical Subject for event
-	// consumers. This ensures a stable key regardless of how the user
-	// specified the target (session ID or alias).
-	rec := openCityRecorder(stderr)
-	message := "killed"
-	if leaseOverridden {
-		message = "killed past a hung runtime lease holder (--force)"
-	}
-	rec.Record(events.Event{
-		Type:    events.SessionStopped,
-		Actor:   eventActor(),
-		Subject: sessionID,
-		Message: message,
-		Payload: api.SessionLifecyclePayloadJSON(sessionID, "", "killed"),
-	})
-	recordSessionKillStop(info, infoErr, cfg)
 	return emitSessionKillResult(stdout, stderr, asJSON, sessionID, op)
 }
+
+// errSessionKillOpAnswered ends gc session kill's OperatorKill once its op's
+// start refused the kill or replayed an earlier one: nothing more runs.
+var errSessionKillOpAnswered = errors.New("gc session kill: answered by its op")
 
 // emitSessionKillResult prints a kill's success output, a replay's included.
 func emitSessionKillResult(stdout, stderr io.Writer, asJSON bool, sessionID string, op *cliOp) int {
@@ -2746,23 +2853,19 @@ func recordSessionKillStop(info session.Info, beadErr error, cfg *config.City) {
 	telemetry.RecordAgentStop(context.Background(), sessionName, sessionAgentMetricIdentityInfo(info, cfg), "killed", nil)
 }
 
-// killRuntimeLease takes req's runtime lease for `gc session kill`: it waits
-// up to RuntimeLeaseOperatorWait (CONTRACT O3), and with force it then takes
-// the record past a hung flock holder whose record expired (overridden). A
-// failure other than busy never holds the kill hostage: it falls back to the
-// name's flock alone, with a warning.
+// killRuntimeLease is session.KillRuntimeLease for `gc session kill`: it
+// waits through sessionKillWaitLease, and its warning goes to stderr.
 func killRuntimeLease(ctx context.Context, front *session.Store, req session.RuntimeLeaseRequest, force bool, stderr io.Writer) (lease *session.RuntimeLease, overridden bool, err error) {
-	lease, err = sessionKillWaitLease(ctx, front, req)
-	if force && errors.Is(err, session.ErrRuntimeLeaseBusy) {
-		lease, err = session.ForceRuntimeLease(front, req)
-		overridden = err == nil
-	}
-	if err != nil && !errors.Is(err, session.ErrRuntimeLeaseBusy) {
-		fmt.Fprintf(stderr, "gc session kill: warning: stopping %s under the name's flock alone: %v\n", req.Name, err) //nolint:errcheck // best-effort stderr
-		lease, err = session.WaitOperatorRuntimeLease(ctx, nil, session.RuntimeLeaseRequest{City: req.City, Name: req.Name})
-	}
-	return lease, overridden, err
+	return session.KillRuntimeLease(ctx, front, req, force, sessionKillWaitLease, func(msg string) {
+		fmt.Fprintf(stderr, "gc session kill: warning: %s\n", msg) //nolint:errcheck // best-effort stderr
+	})
 }
+
+// lazyRecorder opens its recorder on the first Record, so a command whose
+// event is conditional opens the city's event log only when it records.
+type lazyRecorder func() events.Recorder
+
+func (open lazyRecorder) Record(e events.Event) { open().Record(e) }
 
 // sessionKillHandle builds the worker handle `gc session kill` stops through.
 // A var so a test can hand the command a handle that cannot fence the kill.
@@ -2774,7 +2877,7 @@ var sessionKillWaitLease = session.WaitOperatorRuntimeLease
 
 // newSessionNudgeCmd creates the "gc session nudge <id-or-alias> <message>" command.
 func newSessionNudgeCmd(stdout, stderr io.Writer) *cobra.Command {
-	var delivery string
+	var delivery, key string
 	var jsonOutput bool
 	cmd := &cobra.Command{
 		Use:   "nudge <id-or-alias> <message...>",
@@ -2785,7 +2888,20 @@ The message is delivered as text content to the session's input. This is
 equivalent to typing the message into the session's terminal.
 
 Accepts a session ID or session alias. Multi-word messages are
-joined automatically.`,
+joined automatically.
+
+When [ops] authoritative lists message, a nudge to a session a conversation
+lane can type into is recorded as a lane op instead. wait-idle delivers it
+as a prompt at an idle boundary only, never into a running turn. immediate
+delivers it as a prompt at an idle boundary or, when the session's runtime
+can steer, into its running turn; a busy session whose runtime cannot steer
+gets it at the next boundary. queue delivers it as a notice at the next
+boundary and never wakes the session. When this process can type into the
+session, wait-idle and immediate deliver at once what their mode allows
+now, with or without a running controller; otherwise the nudge is reported
+queued, and the lane host serving the session delivers it as its mode
+says. The [ops] content gate does not govern such a nudge, and one whose op
+cannot be written is refused.`,
 		Args: cobra.MinimumNArgs(2),
 		RunE: func(_ *cobra.Command, args []string) error {
 			mode, err := parseNudgeDeliveryMode(delivery)
@@ -2793,7 +2909,7 @@ joined automatically.`,
 				fmt.Fprintf(stderr, "gc session nudge: %v\n", err) //nolint:errcheck // best-effort stderr
 				return errExit
 			}
-			if cmdSessionNudge(args, mode, jsonOutput, stdout, stderr) != 0 {
+			if cmdSessionNudge(args, mode, key, jsonOutput, stdout, stderr) != 0 {
 				return errExit
 			}
 			return nil
@@ -2802,8 +2918,15 @@ joined automatically.`,
 	}
 	cmd.Flags().StringVar(&delivery, "delivery", string(nudgeDeliveryWaitIdle), "delivery mode: immediate, wait-idle, or queue")
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "JSON output")
+	cmd.Flags().StringVar(&key, "key", "", sessionNudgeKeyUsage)
 	return cmd
 }
+
+// sessionNudgeKeyUsage is gc session nudge's --key help: the op journal also
+// records the nudge when [ops] authoritative lists message. The lane and the
+// legacy path record different policies for one nudge, so a key does not
+// carry across a change to that list.
+const sessionNudgeKeyUsage = "idempotency key: while the op journal records this command (its [ops] content gate is auto or require, or [ops] authoritative lists message), rerunning with the same key reports the first run's outcome instead of acting again, except across a change to whether [ops] authoritative lists message, which refuses the rerun as a different request; ignored otherwise (default: a new key each run)"
 
 func parseSessionSubmitIntent(raw string) (session.SubmitIntent, error) {
 	switch strings.TrimSpace(raw) {
@@ -2825,9 +2948,39 @@ type sessionSubmitJSON struct {
 	Intent        string `json:"intent"`
 	Queued        bool   `json:"queued"`
 	Outcome       string `json:"outcome"`
+	// OpID, Key and Replayed name the operation-journal op that backs the
+	// run, when one does (DES-O0API §8.3).
+	OpID     string `json:"op_id,omitempty"`
+	Key      string `json:"key,omitempty"`
+	Replayed bool   `json:"replayed,omitempty"`
 }
 
-func cmdSessionSubmit(args []string, intent session.SubmitIntent, jsonOutput bool, stdout, stderr io.Writer) int {
+// sessionSubmitAcceptedOutcome is the JSON outcome of a submit whose local
+// fallback found its op open under the API: the API accepted the message
+// and delivers it.
+const sessionSubmitAcceptedOutcome = "accepted"
+
+// sessionSubmitOp names the op that backs a submit's success output.
+type sessionSubmitOp struct {
+	id, key  string
+	replayed bool
+}
+
+// cmdSessionSubmit is the CLI entry point for "gc session submit", recorded
+// under the op key key as a message op under the operator principal on both
+// of its paths (DES-O0API §8.4). While ops.content records, the key (minted
+// when key is empty) goes to the API as its Idempotency-Key, and the API
+// records the op; a call that fails so the CLI falls back proposes the same
+// op id locally: absent, it delivers (legacy:cli); closed, it reports that
+// outcome; open under the API, it reports the API accepted the message and
+// exits 0. The gate is read from the city config before the API call, which
+// that config load reports only as the warning that its [ops] gates were not
+// read: the local path loads it again, as it always has, from the
+// invocation's config memo. Under require the local path checks that the op
+// journal can record before it resolves the target, which may materialize a
+// named session's row.
+func cmdSessionSubmit(args []string, intent session.SubmitIntent, key string, jsonOutput bool, stdout, stderr io.Writer) int {
+	defer beginInvocationConfigMemo()()
 	target := args[0]
 	message := strings.Join(args[1:], " ")
 
@@ -2841,12 +2994,50 @@ func cmdSessionSubmit(args []string, intent session.SubmitIntent, jsonOutput boo
 		return 1
 	}
 
+	gateCfg, gateErr := loadCityConfig(cityPath, io.Discard)
+	if gateErr != nil {
+		gateCfg = nil
+	}
+	op := newCLIOp(gateCfg, nil, cliOpRequest{
+		verb: "gc session submit", kind: opjournal.KindMessage, key: key,
+		payload: message, policy: api.MessageOpPolicy(intent),
+		asOperator: true, acceptsAPIOp: true, cfgErr: gateErr,
+		asJSON: jsonOutput, stdout: stdout, stderr: stderr,
+	})
+	if op.recording() && key == "" {
+		minted, err := legacyop.MintKey()
+		if err != nil {
+			fmt.Fprintf(stderr, "gc session submit: warning: minting an op key: %v; the API call carries none\n", err) //nolint:errcheck // best-effort stderr
+		}
+		op.req.presetKey = minted
+	}
+
 	if c := apiClient(cityPath); c != nil {
-		resp, err := c.SubmitSession(target, message, intent)
+		// The key is the API's Idempotency-Key only while the gate records,
+		// as --key is ignored when it is off.
+		apiKey := ""
+		if op.recording() {
+			apiKey = op.requestKey()
+		}
+		resp, err := c.SubmitSessionWithKey(target, message, intent, apiKey)
 		if err == nil {
-			return emitSessionSubmitResult(stdout, stderr, target, intent, resp.Queued, jsonOutput)
+			recorded := sessionSubmitOp{id: resp.OpID, replayed: resp.Replayed}
+			if resp.OpID != "" {
+				recorded.key = apiKey
+			}
+			if resp.Replayed {
+				fmt.Fprintf(stderr, "gc session submit: replayed op %s; resume was not reapplied (outside the op's request)\n", resp.OpID) //nolint:errcheck // best-effort stderr
+			}
+			if key != "" && apiKey != "" && resp.OpID == "" && !resp.Replayed {
+				fmt.Fprintf(stderr, "gc session submit: warning: --key not recorded (the API ran the message without recording an op), so a rerun acts again\n") //nolint:errcheck // best-effort stderr
+			}
+			return emitSessionSubmitResult(stdout, stderr, target, intent, resp.Queued, jsonOutput, recorded)
 		}
 		if !api.ShouldFallback(c, err) {
+			if apiKey != "" {
+				fmt.Fprintf(stderr, "gc session submit: %v (key %s)\n", err, apiKey) //nolint:errcheck // best-effort stderr
+				return 1
+			}
 			fmt.Fprintf(stderr, "gc session submit: %v\n", err) //nolint:errcheck // best-effort stderr
 			return 1
 		}
@@ -2865,6 +3056,10 @@ func cmdSessionSubmit(args []string, intent session.SubmitIntent, jsonOutput boo
 	// worker handle), so route the whole flow through the session coordination-class
 	// store for relocation-safety.
 	sessStore := cliSessionStore(store, cfg, cityPath)
+	op.sessStore = sessStore
+	if !op.preflight() {
+		return 1
+	}
 
 	sessionID, err := resolveSessionIDMaterializingNamed(cityPath, cfg, sessStore, target)
 	if err != nil {
@@ -2872,13 +3067,27 @@ func cmdSessionSubmit(args []string, intent session.SubmitIntent, jsonOutput boo
 		return 1
 	}
 
+	op.req.conversation = sessionID
+	switch op.start() {
+	case cliOpRefused:
+		return 1
+	case cliOpReplayed:
+		id, k, replayed := op.jsonFields()
+		return emitSessionSubmitResult(stdout, stderr, target, intent, op.replayedQueued(), jsonOutput, sessionSubmitOp{id: id, key: k, replayed: replayed})
+	case cliOpAcceptedByAPI:
+		return emitSessionSubmitAccepted(stdout, stderr, target, intent, op.apiOp.ID, op.requestKey(), jsonOutput)
+	}
+	defer op.end()
+
 	sp, err := newSessionProvider()
 	if err != nil {
+		op.finishMessage(false, err)
 		fmt.Fprintf(stderr, "gc session submit: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
 	handle, err := workerHandleForSessionWithConfig(cityPath, sessStore, sp, cfg, sessionID)
 	if err != nil {
+		op.finishMessage(false, err)
 		fmt.Fprintf(stderr, "gc session submit: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
@@ -2886,14 +3095,35 @@ func cmdSessionSubmit(args []string, intent session.SubmitIntent, jsonOutput boo
 		Text:     message,
 		Delivery: workerDeliveryIntentForSubmitIntent(intent),
 	})
+	op.finishMessageInterrupted(outcome.Queued, err, outcome.Interrupt)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session submit: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	return emitSessionSubmitResult(stdout, stderr, target, intent, outcome.Queued, jsonOutput)
+	id, k, replayed := op.jsonFields()
+	return emitSessionSubmitResult(stdout, stderr, target, intent, outcome.Queued, jsonOutput, sessionSubmitOp{id: id, key: k, replayed: replayed})
 }
 
-func emitSessionSubmitResult(stdout, stderr io.Writer, target string, intent session.SubmitIntent, queued, jsonOutput bool) int {
+// emitSessionSubmitAccepted reports a submit whose local fallback found its
+// op opID open under the API: the API accepted the message, so this run
+// delivers nothing, and a same-key rerun reports the op's outcome.
+func emitSessionSubmitAccepted(stdout, stderr io.Writer, target string, intent session.SubmitIntent, opID, key string, jsonOutput bool) int {
+	if jsonOutput {
+		return writeCLIJSONLineOrExit(stdout, stderr, "gc session submit", sessionSubmitJSON{
+			SchemaVersion: "1",
+			OK:            true,
+			Target:        target,
+			Intent:        string(intent),
+			Outcome:       sessionSubmitAcceptedOutcome,
+			OpID:          opID,
+			Key:           key,
+		})
+	}
+	fmt.Fprintf(stdout, "Accepted by the controller for %s (op %s); gc session submit --key %s reports its outcome\n", target, opID, key) //nolint:errcheck // best-effort stdout
+	return 0
+}
+
+func emitSessionSubmitResult(stdout, stderr io.Writer, target string, intent session.SubmitIntent, queued, jsonOutput bool, recorded sessionSubmitOp) int {
 	if jsonOutput {
 		outcome := "submitted"
 		if queued {
@@ -2908,6 +3138,9 @@ func emitSessionSubmitResult(stdout, stderr io.Writer, target string, intent ses
 			Intent:        string(intent),
 			Queued:        queued,
 			Outcome:       outcome,
+			OpID:          recorded.id,
+			Key:           recorded.key,
+			Replayed:      recorded.replayed,
 		})
 	}
 	switch {
@@ -2932,12 +3165,20 @@ type sessionNudgeJSON struct {
 	Delivery      string `json:"delivery"`
 	Queued        bool   `json:"queued"`
 	Outcome       string `json:"outcome"`
+	// OpID, Key and Replayed name the operation-journal op that backs the
+	// run, when one does (DES-O0API §8.3).
+	OpID     string `json:"op_id,omitempty"`
+	Key      string `json:"key,omitempty"`
+	Replayed bool   `json:"replayed,omitempty"`
 }
 
-// cmdSessionNudge is the CLI entry point for "gc session nudge". A worker site
-// refuses before it resolves the target or writes anything
-// (errWorkerSiteDeliveryNeedsController).
-func cmdSessionNudge(args []string, delivery nudgeDeliveryMode, jsonOutput bool, stdout, stderr io.Writer) int {
+// cmdSessionNudge is the CLI entry point for "gc session nudge", recorded
+// under the op key key (empty mints one). A worker site refuses before it
+// resolves the target or writes anything
+// (errWorkerSiteDeliveryNeedsController), and so does a require gate whose op
+// journal cannot record, or, when [ops] authoritative lists message, a lane
+// op that cannot be written (resolveSessionNudgeTarget).
+func cmdSessionNudge(args []string, delivery nudgeDeliveryMode, key string, jsonOutput bool, stdout, stderr io.Writer) int {
 	target := args[0]
 	message := strings.Join(args[1:], " ")
 
@@ -2950,12 +3191,15 @@ func cmdSessionNudge(args []string, delivery nudgeDeliveryMode, jsonOutput bool,
 		fmt.Fprintf(stderr, "gc session nudge: %v\n", errWorkerSiteDeliveryNeedsController) //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	targetInfo, err := resolveNudgeTarget(target)
+	targetInfo, err := resolveSessionNudgeTarget(target, sessionNudgeOpRequest(message, delivery, key, jsonOutput, stdout, stderr))
+	if errors.Is(err, errMessageOpRefused) {
+		return 1
+	}
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session nudge: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	return deliverSessionNudge(targetInfo, message, delivery, jsonOutput, stdout, stderr)
+	return deliverSessionNudge(targetInfo, message, delivery, key, jsonOutput, stdout, stderr)
 }
 
 // resolveWorkDir determines the working directory for a session based on the

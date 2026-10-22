@@ -1,0 +1,956 @@
+package tmux
+
+import (
+	"errors"
+	"fmt"
+	"math"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/sessionlog"
+)
+
+// ErrNudgeDeferredHumanPrompt means a nudge sent NO keys because the target
+// pane was showing something that answers to keystrokes on a human's behalf:
+// a question dialog, an approval prompt, another numbered selection list, or a
+// human's half-typed draft on an attached session (ga-ubfc7j). Claude Code's
+// AskUserQuestion dialog is quiet and shows no spinner, so to the old
+// quiescence test it looked idle; the typed text was swallowed and every
+// Enter the nudge path sent SELECTED the highlighted option, then submitted
+// the dialog as "User answered Claude's questions".
+//
+// The nudge was not delivered and nothing was typed, so a caller that can
+// retry must keep the message queued and try again on a later pass. It is not
+// a delivery failure: the queue must not spend one of the item's bounded
+// attempts on it, or a dialog left open for an hour would dead-letter every
+// reminder queued behind it.
+var ErrNudgeDeferredHumanPrompt = errors.New("nudge: deferred, the pane is holding a prompt meant for a human")
+
+// Reasons a nudge is deferred. They are recorded verbatim in the nudge
+// delivery log, so they are part of its schema.
+const (
+	// NudgeDeferReasonQuestionDialog: Claude Code's AskUserQuestion dialog
+	// (its "☐ Q1 … ✔ Submit" tab strip, its "Enter to select" footer, or its
+	// "Review your answers" page).
+	NudgeDeferReasonQuestionDialog = "question_dialog"
+	// NudgeDeferReasonApprovalPrompt: a tool-permission prompt ("Do you want
+	// to proceed?" over numbered Yes/No options, or the older "This command
+	// requires approval" layout parseApprovalPrompt reads).
+	NudgeDeferReasonApprovalPrompt = "approval_prompt"
+	// NudgeDeferReasonSelectionPrompt: any other numbered option list with a
+	// cursor on it. Enter picks the highlighted row, so it is refused too.
+	NudgeDeferReasonSelectionPrompt = "selection_prompt"
+	// NudgeDeferReasonHumanDraft: the composer holds text on an ATTACHED
+	// session, so a person may be mid-message. Before the first Enter
+	// (stage before_submit) it means the composer holds text that is not
+	// the nudge just typed: a person replaced it (ga-da5vmz).
+	NudgeDeferReasonHumanDraft = "human_draft"
+	// NudgeDeferReasonCaptureFailed: the pane could not be read, so a prompt
+	// could not be ruled out. The guard fails closed.
+	NudgeDeferReasonCaptureFailed = "capture_failed"
+	// NudgeDeferReasonMachineDialogAttached: a mid-session machine dialog
+	// (the resume selector, the feedback survey) is on an ATTACHED session.
+	// Its pre-nudge dismissal only runs on a detached pane, where no person
+	// can be typing, so here the nudge waits for the person to clear it
+	// rather than being typed into the dialog.
+	NudgeDeferReasonMachineDialogAttached = "machine_dialog_attached"
+)
+
+// Stages at which the guard can defer a nudge.
+const (
+	nudgeGuardStageBeforeType   = "before_type"
+	nudgeGuardStageBeforeSubmit = "before_submit"
+)
+
+// NudgeDeferredError is the concrete error behind ErrNudgeDeferredHumanPrompt.
+// errors.Is(err, ErrNudgeDeferredHumanPrompt) matches it; errors.As recovers
+// the session, the reason and the stage for a delivery record.
+type NudgeDeferredError struct {
+	Session string
+	Reason  string
+	Stage   string
+	// Err is the capture error when Reason is NudgeDeferReasonCaptureFailed.
+	Err error
+}
+
+func (e *NudgeDeferredError) Error() string {
+	msg := fmt.Sprintf("%v: session %q, %s (%s)", ErrNudgeDeferredHumanPrompt, e.Session, e.Reason, e.Stage)
+	if e.Err != nil {
+		msg += ": " + e.Err.Error()
+	}
+	return msg
+}
+
+// Is makes errors.Is(err, ErrNudgeDeferredHumanPrompt) true. A deferral on a
+// permission prompt (NudgeDeferReasonApprovalPrompt) is also
+// runtime.ErrPendingInteraction: it is the pane state upstream's own look
+// refuses with that sentinel (#6832), and every caller that answers a pending
+// interaction (the API's 409, the queue's release) recognizes it either way.
+// Callers that check for the deferral first keep the carry's handling.
+func (e *NudgeDeferredError) Is(target error) bool {
+	if target == ErrNudgeDeferredHumanPrompt {
+		return true
+	}
+	return target == runtime.ErrPendingInteraction && e.Reason == NudgeDeferReasonApprovalPrompt
+}
+
+// Unwrap exposes the capture error, if any.
+func (e *NudgeDeferredError) Unwrap() error { return e.Err }
+
+// NudgeDeferredReason returns the reason a nudge was deferred, and whether err
+// is a deferral at all.
+func NudgeDeferredReason(err error) (string, bool) {
+	var d *NudgeDeferredError
+	if errors.As(err, &d) {
+		return d.Reason, true
+	}
+	if errors.Is(err, ErrNudgeDeferredHumanPrompt) {
+		return "", true
+	}
+	return "", false
+}
+
+// NudgeDeferredAfterTyping reports whether a deferral came AFTER text reached
+// the pane: the submit was withheld (stage before_submit), or a chunked paste
+// was cut off part way. Such a deferral sent keys, just no Enter, and an audit
+// record must not read it as "nothing reached the pane".
+func NudgeDeferredAfterTyping(err error) bool {
+	var d *NudgeDeferredError
+	if errors.As(err, &d) && d.Stage == nudgeGuardStageBeforeSubmit {
+		return true
+	}
+	return errors.Is(err, errPartialPasteDelivery)
+}
+
+// selectionOptionRe matches one row of a numbered selection list once box
+// borders are stripped: an optional cursor glyph, then "N." or "N)" and a
+// label. Claude draws its cursor as ❯ ("❯ 1. Yes"), Codex as ›. omp's Ask
+// box (also what a Codex-model pool worker shows) draws unnumbered radio rows,
+// "❯ ○ Alpha (Recommended)" / "○ Beta", captured live 2026-09-29; a radio mark
+// stands in for the number.
+var selectionOptionRe = regexp.MustCompile(`^([❯›>→▸▶]\s*)?(\d{1,2}[.)]|[○●◉◯])\s+\S`)
+
+// normalizePaneLine folds NBSP, trims, and strips a leading and trailing box
+// border so a row drawn inside a bordered box reads like a bare one.
+func normalizePaneLine(line string) string {
+	s := strings.TrimSpace(strings.ReplaceAll(line, " ", " "))
+	s = stripLeadingBoxBorder(s)
+	s = strings.TrimRight(s, " \t")
+	for _, border := range []string{"│", "┃"} {
+		if strings.HasSuffix(s, border) {
+			s = strings.TrimRight(strings.TrimSuffix(s, border), " \t")
+			break
+		}
+	}
+	return s
+}
+
+// selectionOption reports whether a normalized line is a numbered option row,
+// and whether the cursor is on it.
+func selectionOption(s string) (option, highlighted bool) {
+	m := selectionOptionRe.FindStringSubmatch(s)
+	if m == nil {
+		return false, false
+	}
+	return true, m[1] != ""
+}
+
+// lastComposerLine returns the index of the LAST captured line that is the
+// agent's input composer (the ready-prompt prefix followed by whatever is on
+// the line) and that remainder, trimmed; -1 when no line is. A highlighted
+// option row ("❯ 1. Yes") starts with the same glyph but is a dialog row, not
+// the composer, so it is skipped. Earlier composer-looking lines are
+// scrollback echoes of past prompts.
+func lastComposerLine(lines []string, promptPrefix string) (int, string) {
+	prefix := strings.ReplaceAll(promptPrefix, " ", " ")
+	bare := strings.TrimSpace(prefix)
+	idx, remainder := -1, ""
+	for i, line := range lines {
+		s := normalizePaneLine(line)
+		var rest string
+		switch {
+		case prefix != "" && strings.HasPrefix(s, prefix):
+			rest = s[len(prefix):]
+		case bare != "" && s == bare:
+			rest = ""
+		default:
+			continue
+		}
+		if option, _ := selectionOption(s); option {
+			continue
+		}
+		idx, remainder = i, strings.TrimSpace(rest)
+	}
+	return idx, remainder
+}
+
+// classifyHumanPrompt decides whether a captured pane is showing something a
+// nudge must not type into, and why; "" means it is safe.
+//
+// Only the region BELOW the live composer is examined for dialogs. When a
+// dialog is up, Claude draws it in place of the composer, so the last
+// composer-looking line is a scrollback echo above the dialog and the dialog
+// is below it. When the pane is idle, the live composer is at the bottom and
+// anything above it -- including a dialog QUOTED in the agent's output, or a
+// seat reading these very captures -- is history, not a prompt. That anchor is
+// what keeps the detector from stalling a seat on scrollback.
+//
+// checkDraft asks whether a non-empty composer should defer too. The caller
+// sets it only for an attached claude pane (see Tmux.humanPromptGuard).
+func classifyHumanPrompt(lines []string, promptPrefix string, checkDraft bool) string {
+	composerIdx, _ := lastComposerLine(lines, promptPrefix)
+	if reason := classifyDialog(lines[composerIdx+1:]); reason != "" {
+		return reason
+	}
+	if checkDraft && composerHoldsHumanDraft(lines, promptPrefix) {
+		return NudgeDeferReasonHumanDraft
+	}
+	return ""
+}
+
+// composerHoldsHumanDraft reports whether the live composer holds text that is
+// not gc's own (isGCNudgeDraft): the draft half of classifyHumanPrompt, which
+// applies it only where the caller says a draft can be a person's.
+func composerHoldsHumanDraft(lines []string, promptPrefix string) bool {
+	found, text := composerDraft(lines, promptPrefix)
+	return found && text != "" && !isGCNudgeDraft(text)
+}
+
+// composerDraft returns the text in the live composer and whether a composer
+// was found. Claude draws its composer between two horizontal rules at the
+// bottom of the pane. When the last two rules enclose a block that opens with
+// the prompt, the WHOLE block is the draft: a person's draft can wrap, can
+// start on a continuation line (the prompt line itself empty), or can begin
+// with "1." -- which lastComposerLine skips as a dialog row. Without that box
+// it falls back to the last composer-looking line.
+func composerDraft(lines []string, promptPrefix string) (bool, string) {
+	if text, ok := composerBoxText(lines, promptPrefix); ok {
+		return true, text
+	}
+	idx, remainder := lastComposerLine(lines, promptPrefix)
+	return idx >= 0, remainder
+}
+
+func composerBoxText(lines []string, promptPrefix string) (string, bool) {
+	var rules []int
+	for i, line := range lines {
+		if isHorizontalRule(line) {
+			rules = append(rules, i)
+		}
+	}
+	if len(rules) < 2 {
+		return "", false
+	}
+	top, bottom := rules[len(rules)-2], rules[len(rules)-1]
+	prefix := strings.ReplaceAll(promptPrefix, "\u00a0", " ")
+	bare := strings.TrimSpace(prefix)
+	var parts []string
+	opened := false
+	for _, line := range lines[top+1 : bottom] {
+		s := normalizePaneLine(line)
+		if !opened {
+			if s == "" {
+				continue
+			}
+			switch {
+			case prefix != "" && strings.HasPrefix(s, prefix):
+				s = s[len(prefix):]
+			case bare != "" && strings.HasPrefix(s, bare):
+				s = s[len(bare):]
+			default:
+				return "", false
+			}
+			opened = true
+		}
+		if s = strings.TrimSpace(s); s != "" {
+			parts = append(parts, s)
+		}
+	}
+	if !opened {
+		return "", false
+	}
+	return strings.Join(parts, "\n"), true
+}
+
+// isHorizontalRule reports whether a captured line is a full-width rule such
+// as the one Claude draws above and below its composer.
+func isHorizontalRule(line string) bool {
+	s := strings.TrimSpace(line)
+	return utf8.RuneCountInString(s) >= 8 && strings.Trim(s, "─━") == ""
+}
+
+// classifyDialog looks for a dialog in the live region of a pane.
+func classifyDialog(live []string) string {
+	norm := make([]string, 0, len(live))
+	options, highlighted := 0, false
+	for _, line := range live {
+		s := normalizePaneLine(line)
+		norm = append(norm, s)
+		if option, cursor := selectionOption(s); option {
+			options++
+			highlighted = highlighted || cursor
+		}
+	}
+	// A cursor on one of at least two numbered rows: Enter picks that row.
+	selection := highlighted && options >= 2
+	text := strings.Join(norm, "\n")
+
+	for _, s := range norm {
+		// The question dialog's footer and its tab strip. Either is the
+		// dialog, on any of its pages, including the free-text "Type
+		// something." row that has no numbered cursor.
+		if strings.Contains(s, "Enter to select") && strings.Contains(s, "Esc to cancel") {
+			return NudgeDeferReasonQuestionDialog
+		}
+		if strings.Contains(s, "Submit") && (strings.Contains(s, "☐") || strings.Contains(s, "☒")) {
+			return NudgeDeferReasonQuestionDialog
+		}
+		// omp's Ask box: "Enter select · n note · ↑/↓ move · Esc cancel".
+		// It fired live on a Codex-model pool worker (pl-022h, 04:34Z 9/29).
+		if strings.Contains(s, "Enter select") && strings.Contains(s, "Esc cancel") {
+			return NudgeDeferReasonQuestionDialog
+		}
+	}
+	if selection && (strings.Contains(text, "Review your answers") || strings.Contains(text, "Ready to submit your answers?")) {
+		return NudgeDeferReasonQuestionDialog
+	}
+	if parseApprovalPrompt(strings.Join(live, "\n")) != nil {
+		return NudgeDeferReasonApprovalPrompt
+	}
+	if selection {
+		for _, s := range norm {
+			if strings.HasPrefix(s, "Do you want to ") || strings.Contains(s, "Tab to amend") || strings.Contains(s, "don't ask again") {
+				return NudgeDeferReasonApprovalPrompt
+			}
+		}
+		return NudgeDeferReasonSelectionPrompt
+	}
+	return ""
+}
+
+// isGCNudgeDraft reports whether a composer draft is gc's own: a queued
+// nudge left on the line by a lost submit (ga-bwm) is one or more complete
+// reminders and nothing else. It is not a person's message, so it does not
+// hold delivery back. A reminder with anything after it is a person's draft
+// (ga-da5vmz): typing onto it would add to their text, and a survey's "0"
+// and Enter would submit it.
+func isGCNudgeDraft(draft string) bool {
+	return stripLeadingGCReminders(squashSpace(draft)) == ""
+}
+
+// composerHoldsSent reports whether the live composer still shows the text a
+// delivery typed -- the only condition under which re-sending Enter can do
+// what it is for (submit a draft whose first Enter was dropped, ga-bwm).
+// Anything else on screen (a drained composer, a dialog the agent raised, an
+// unreadable pane) means a re-sent Enter would land on something that is not
+// our draft.
+func composerHoldsSent(lines []string, promptPrefix, sent string) bool {
+	found, remainder := composerDraft(lines, promptPrefix)
+	if !found {
+		return false
+	}
+	if draft := firstNRunes(strings.TrimSpace(firstNonEmptyLine(sent)), 40); draft != "" && strings.Contains(remainder, draft) {
+		return true
+	}
+	// Long pastes are shown as a placeholder, not their text: Claude's
+	// "[Pasted text #N +M lines]", Codex's "[Pasted Content N chars]" — the
+	// staged-draft markers upstream keeps per family (stagedDraftMarkers).
+	for _, m := range stagedDraftMarkers {
+		if strings.Contains(remainder, m.marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// firstNonEmptyLine returns the first line of s that is not blank, or "".
+func firstNonEmptyLine(s string) string {
+	for _, line := range strings.Split(s, "\n") {
+		if trimmed := strings.TrimSpace(line); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+// draftOwner is what a delivery knows of its own composer draft (ga-da5vmz):
+// the message it typed, and the paste placeholder the composer showed for it,
+// whitespace squashed ("" if it showed none). A person's paste gets a
+// different #N. The first read that shows a draft sets it: the provenance
+// read as the text goes in (noteDraft), else resendGate's.
+type draftOwner struct {
+	message, placeholder string
+	settled              bool
+	// quiet is each attached client's #{client_activity} (a unix second,
+	// bumped by any input that client sends), keyed by client tty, read just
+	// before our text went in; quietKnown is false when that read failed or
+	// was ambiguous, in which case no quiet claim is made (noHumanInputSince).
+	quiet      map[string]int64
+	quietKnown bool
+	// preSubmit is the composer draft resendGate's first read saw, just
+	// before the first submit ("" when it saw none or could not read one).
+	preSubmit string
+}
+
+// newDraftOwner makes the owner for message with the session's input
+// high-water marks read now, before the text goes in. A client whose mark is
+// the current second is ambiguous (input later in that second reads the
+// same), so the owner then claims nothing.
+func (t *Tmux) newDraftOwner(session, message string) *draftOwner {
+	o := &draftOwner{message: message}
+	now := time.Now().Unix()
+	if marks, ok := t.clientActivity(session); ok {
+		o.quiet, o.quietKnown = marks, true
+		for _, at := range marks {
+			if at >= now {
+				o.quietKnown = false
+			}
+		}
+	}
+	return o
+}
+
+// clientActivity returns #{client_activity} per client attached to session,
+// keyed by #{client_tty}, or false when the read fails, no client is
+// attached, or a line does not parse. tmux bumps client_activity (whole
+// seconds) on every input event from that client, so an unchanged mark means
+// that client has sent no key, paste or other input since the second it
+// names; input later in that same second reads the same, which is why
+// newDraftOwner claims nothing for a mark in the current second.
+func (t *Tmux) clientActivity(session string) (map[string]int64, bool) {
+	out, err := t.run("list-clients", "-t", session, "-F", "#{client_tty} #{client_activity}")
+	if err != nil {
+		return nil, false
+	}
+	marks := map[string]int64{}
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) == 0 {
+			continue
+		}
+		if len(f) != 2 {
+			return nil, false
+		}
+		n, err := strconv.ParseInt(f[1], 10, 64)
+		if err != nil || n < 0 {
+			return nil, false
+		}
+		if _, dup := marks[f[0]]; dup {
+			// Two rows for one tty: which mark is current is ambiguous.
+			return nil, false
+		}
+		marks[f[0]] = n
+	}
+	return marks, len(marks) > 0
+}
+
+// noHumanInputSince reports whether no client of session has sent any input
+// since owner's text went in (ga-ib2ffp): the same clients are attached as
+// at the pre-type read, and none has a newer activity mark. It is evidence
+// about the attached clients only (one that attached and detached between
+// the two reads leaves no mark), so draftIsNotOurs consults it for one
+// shape alone: a bare paste placeholder when no placeholder of ours was
+// recorded. That is the shape of a long paste that showed inline for a
+// moment and then collapsed to "[Pasted text #N +M lines]" after the
+// provenance read, which is how six seats were left deaf behind their own
+// nudge on 2026-10-09. A client that joined or left, a failed or
+// ambiguous read, each claims nothing (false): the oracle fails toward "a
+// person may have typed". It never overrides a dialog, an unreadable
+// composer, or visible text that is not a bare paste placeholder;
+// draftIsNotOurs settles those first.
+func (t *Tmux) noHumanInputSince(session string, owner *draftOwner) bool {
+	if owner == nil || !owner.quietKnown {
+		return false
+	}
+	marks, ok := t.clientActivity(session)
+	if !ok || len(marks) != len(owner.quiet) {
+		return false
+	}
+	for tty, at := range marks {
+		was, seen := owner.quiet[tty]
+		if !seen || at > was {
+			return false
+		}
+	}
+	return true
+}
+
+// noteDraft reads target's composer and records it in o (notePlaceholder).
+// Called the moment a delivery's text is in, before any debounce, a
+// placeholder it sees is our paste's, not one a person pasted in the wait.
+func (t *Tmux) noteDraft(o *draftOwner, session, target string) {
+	if lines, err := t.CapturePaneLines(target, promptObservationLines); err == nil {
+		if found, text := composerDraft(lines, t.resolveIdlePromptPrefix(session)); found {
+			o.notePlaceholder(text)
+		}
+	}
+}
+
+// notePlaceholder records the placeholder a composer draft shows, if it shows
+// only that (after complete gc reminders), or none if it shows other text.
+// The first draft that is not empty settles it; an empty one leaves it open.
+func (o *draftOwner) notePlaceholder(draft string) {
+	d := stripLeadingGCReminders(squashSpace(draft))
+	if o.settled || d == "" {
+		return
+	}
+	o.settled = true
+	if claudePastePlaceholderOnly.MatchString(d) {
+		o.placeholder = d
+	}
+}
+
+// owns reports whether draft can be only o's nudge (composerDraftIsOurs).
+func (o *draftOwner) owns(draft string) bool {
+	return composerDraftIsOurs(draft, o.message, o.placeholder)
+}
+
+// composerDraftIsOurs reports whether a composer draft can be only the nudge
+// sent, as Claude draws it before the first Enter (ga-da5vmz). Whitespace is
+// ignored throughout, since the composer re-wraps long lines. Complete gc
+// reminders at the front are set aside (stripLeadingGCReminders): an earlier
+// undelivered nudge left on the line, or this one. What remains must be one
+// of:
+//
+//   - nothing;
+//   - the opening of this message, at least composerPrefixMinRunes long or
+//     the whole message (the paste still rendering);
+//   - the end of this message, at least composerTailMinRunes long or the
+//     whole message (a tall draft scrolled so only its tail shows);
+//   - placeholder, the paste placeholder our own paste showed, and nothing
+//     else (a long paste shows only that). Another placeholder -- a person's
+//     paste replacing ours -- is not ours, nor is any placeholder when ours
+//     showed none.
+//
+// Anything else is not ours: text before or after the nudge, a run from its
+// middle, a sentence quoting it, or a placeholder with words beside it. The
+// draft only has to CONTAIN a person's words for the first Enter to submit
+// them.
+//
+// Known gap: a person who replaces our paste with their own in the ms before
+// the provenance read (or, if ours had not rendered by then, before the read
+// after the debounce) has their placeholder taken as ours.
+func composerDraftIsOurs(draft, sent, placeholder string) bool {
+	d := stripLeadingGCReminders(squashSpace(draft))
+	if d == "" || (placeholder != "" && d == placeholder) {
+		return true
+	}
+	m := squashSpace(sent)
+	n, whole := utf8.RuneCountInString(d), utf8.RuneCountInString(m)
+	if strings.HasPrefix(m, d) && n >= min(whole, composerPrefixMinRunes) {
+		return true
+	}
+	return strings.HasSuffix(m, d) && n >= min(whole, composerTailMinRunes)
+}
+
+// composerPrefixMinRunes and composerTailMinRunes are the shortest opening
+// and tail of a message (whitespace squashed) composerDraftIsOurs accepts as
+// the message: a person's "Yo" is a prefix of "You have mail", and that must
+// not count.
+const (
+	composerPrefixMinRunes = 24
+	composerTailMinRunes   = 16
+)
+
+// claudePastePlaceholderOnly matches Claude's paste placeholder, whitespace
+// squashed, as a whole draft: "[Pasted text #3 +6 lines]" or "[Pasted text #3]".
+var claudePastePlaceholderOnly = regexp.MustCompile(`^\[Pastedtext#\d+(\+\d+lines?)?\]$`)
+
+// stripLeadingGCReminders removes complete gc reminders from the front of a
+// whitespace-squashed draft: each must open with <system-reminder>, close
+// with </system-reminder>, and hold no second opening tag in between.
+// Whatever follows the last one is returned as is.
+func stripLeadingGCReminders(d string) string {
+	const open, closing = "<system-reminder>", "</system-reminder>"
+	for strings.HasPrefix(d, open) {
+		end := strings.Index(d, closing)
+		if end < 0 || strings.Contains(d[len(open):end], open) {
+			break
+		}
+		d = d[end+len(closing):]
+	}
+	return d
+}
+
+// squashSpace drops every whitespace rune from s.
+func squashSpace(s string) string {
+	return strings.Join(strings.Fields(s), "")
+}
+
+// humanPromptGuard captures target and returns a *NudgeDeferredError when the
+// pane shows a human prompt.
+//
+// It is the ONE check every nudge keystroke passes (the chokepoint): the text
+// senders sendKeysLiteralWithRetry and sendStartupKeysLiteralWithRetry call it
+// before typing, and sendNudgeSubmitSequence calls it before every submit key
+// (dialogs, plus the delivery's own-draft check; see
+// sendNudgeSubmitSequenceOwning). Every nudge caller -- NudgeSession on a detached or an
+// attached pane, Provider.Nudge's send-after-idle-timeout, the startup nudge
+// and its retry ladder, NudgePane -- reaches those senders, so none of them
+// can type into a prompt meant for a human. nudgeSession also calls it once
+// up front, because its C-u clear and its feedback-survey digit are keys sent
+// BEFORE the text; that early call protects those two keys, and the
+// chokepoint stays authoritative for the text and the submit. checkDraft adds the attached-draft rule (c); it
+// is applied only to claude-family panes, whose empty composer is a bare "❯".
+// Other TUIs draw placeholder text in an empty composer ("Type your message
+// or @path/to/file"), which the pane text cannot tell from a draft, so for
+// them the rule would stall every nudge while a client is attached.
+//
+// A capture that fails because the session or server is gone is returned as
+// is, so callers keep treating it as "session gone"; any other capture failure
+// defers, because a prompt could not be ruled out.
+func (t *Tmux) humanPromptGuard(session, target, stage string, checkDraft bool) error {
+	return t.humanPromptGuardOwning(session, target, stage, checkDraft, nil)
+}
+
+// humanPromptGuardOwning is humanPromptGuard plus, when owner is set, the
+// ownership rule on the SAME capture (ga-da5vmz): on an attached claude pane,
+// a composer draft that owner does not own defers as a human draft
+// (draftIsNotOurs). The submit chokepoint runs it just before every submit
+// key, so a person who replaces the nudge is caught up to that read; only the
+// gap between the read and the key is left.
+func (t *Tmux) humanPromptGuardOwning(session, target, stage string, checkDraft bool, owner *draftOwner) error {
+	lines, err := t.CapturePaneLines(target, promptObservationLines)
+	if err != nil {
+		if errors.Is(err, ErrSessionNotFound) || errors.Is(err, ErrNoServer) {
+			return err
+		}
+		return &NudgeDeferredError{Session: session, Reason: NudgeDeferReasonCaptureFailed, Stage: stage, Err: err}
+	}
+	reason := t.classifyPaneLines(session, target, lines, checkDraft)
+	if reason == "" && owner != nil && t.draftIsNotOurs(session, target, lines, owner) {
+		reason = NudgeDeferReasonHumanDraft
+	}
+	if reason != "" {
+		return &NudgeDeferredError{Session: session, Reason: reason, Stage: stage}
+	}
+	return nil
+}
+
+// draftIsNotOurs reports whether lines show, on an attached claude pane, a
+// composer draft owner does not own and that an attribute re-read with faint
+// placeholder text dropped does not clear (undimmedComposerDraft), unless it
+// is a bare paste placeholder of our message's line count (exact, or one
+// less), no placeholder of ours was recorded, and no attached client's mark
+// moved since our text went in (noHumanInputSince). On the plain capture
+// only positive evidence of someone else's text counts: an empty or
+// unreadable composer there does not. The styled re-read is the other way
+// round: once a draft is seen, a re-read that fails or shows a dialog keeps
+// the veto. Other families are not checked: claude is the one family whose
+// composer the draft rule models (see humanPromptGuard).
+func (t *Tmux) draftIsNotOurs(session, target string, lines []string, owner *draftOwner) bool {
+	prefix := t.resolveIdlePromptPrefix(session)
+	found, text := composerDraft(lines, prefix)
+	if !found || owner.owns(text) || t.sessionClientCount(session) == 0 || !t.paneIsClaudeFamily(target) {
+		return false
+	}
+	undimmedFound, undimmed := t.undimmedComposerDraft(target, prefix)
+	if !undimmedFound {
+		// A failed re-read, or a dialog on the newer capture: never ours,
+		// whatever the input marks say (an agent can raise a question with
+		// nobody typing).
+		return true
+	}
+	if owner.owns(undimmed) {
+		return false
+	}
+	if owner.placeholder != "" || !placeholderFitsMessage(stripLeadingGCReminders(squashSpace(undimmed)), owner.message) {
+		// Visible text that is not ours keeps its veto whatever the input
+		// marks say: a client can attach, type and detach between the two
+		// reads. The quiet-clients rule covers one shape only: a bare paste
+		// placeholder whose line count is our message's, and only when no
+		// placeholder of ours was recorded (one was, and a different one
+		// shows now: that is someone else's paste, by provenance).
+		return true
+	}
+	return !t.noHumanInputSince(session, owner)
+}
+
+// claudePastePlaceholderLines captures the "+M lines" count of a squashed
+// Claude Code paste placeholder; a placeholder without it is a one-line paste.
+var claudePastePlaceholderLines = regexp.MustCompile(`^\[Pastedtext#\d+(?:\+(\d+)lines?)?\]$`)
+
+// placeholderFitsMessage reports whether d is a bare paste placeholder whose
+// line count is message's: Claude Code shows "+M lines" for a paste with M
+// line breaks (a 6-item queued batch of 12 line breaks shows "+12 lines";
+// measured 2026-10-09), and no count for a paste with none. A placeholder
+// that does not fit is someone else's paste, whatever the input marks say.
+func placeholderFitsMessage(d, message string) bool {
+	m := claudePastePlaceholderLines.FindStringSubmatch(d)
+	if m == nil {
+		return false
+	}
+	breaks := strings.Count(message, "\n")
+	if m[1] == "" {
+		return breaks == 0
+	}
+	n, err := strconv.Atoi(m[1])
+	return err == nil && (n == breaks || n == breaks-1)
+}
+
+// classifyPaneLines is humanPromptGuard's decision on an already-captured
+// pane: classifyHumanPrompt, with the draft rule applied only to an attached
+// claude pane, and a faint placeholder not counted as a draft.
+func (t *Tmux) classifyPaneLines(session, target string, lines []string, checkDraft bool) string {
+	draft := checkDraft && t.sessionClientCount(session) != 0 && t.paneIsClaudeFamily(target)
+	prefix := t.resolveIdlePromptPrefix(session)
+	reason := classifyHumanPrompt(lines, prefix, draft)
+	if reason == NudgeDeferReasonHumanDraft && t.composerHoldsOnlyDimText(target, prefix) {
+		reason = ""
+	}
+	return reason
+}
+
+// classifyLifecycleHumanPrompt is the lifecycle paths' (idle timeout, max
+// age, drain, sleep) read of a pane: a question dialog or an approval prompt
+// holds the seat whether or not a client is attached, because the human who
+// must answer it may come back. A DRAFT holds only while a client is attached,
+// the nudge guard's rule: on a detached pane unsent text is far more often
+// gc's own (a nudge whose Enter was dropped, a paste cut mid-reminder, a
+// startup prompt left on the line) than a person's, nothing could ever clear
+// it, and a hold on it would never expire (fork PR 243, independent read F2).
+// A SELECTION prompt that is neither (a bare numbered chooser, Claude's
+// usage-limit "Stop and wait / Upgrade" among them) does not hold: before this
+// change the idle timeout reclaimed such a seat, and it keeps doing so (F1).
+// Other providers' non-faint placeholders are not distinguishable from
+// drafts, so only Claude drafts are classified.
+//
+// The client count and the provider are read only when the composer holds
+// text the draft rule could hold on, so a pane without one costs SnapshotIdle
+// no probe beyond its one capture.
+func (t *Tmux) classifyLifecycleHumanPrompt(session, target string, lines []string, prefix string) string {
+	reason := classifyHumanPrompt(lines, prefix, false)
+	if reason == "" && composerHoldsHumanDraft(lines, prefix) && t.sessionClientCount(session) != 0 && t.paneIsClaudeFamily(target) {
+		reason = NudgeDeferReasonHumanDraft
+	}
+	switch reason {
+	case NudgeDeferReasonSelectionPrompt:
+		return ""
+	case NudgeDeferReasonHumanDraft:
+		if t.composerHoldsOnlyDimText(target, prefix) {
+			return ""
+		}
+	}
+	return reason
+}
+
+// composerHoldsOnlyDimText re-reads the pane WITH its text attributes and
+// reports whether the composer's apparent draft is all faint (SGR 2) text.
+// An empty Claude composer draws a placeholder there in faint text -- on a
+// fresh session `❯ Try "how does <filepath> work?"` -- which a plain capture
+// cannot tell from a human's draft, so without this check every nudge to an
+// attached seat would wait until the person typed and submitted something.
+// Typed text is drawn without attributes (both measured on Claude Code,
+// 2026-09-29). Only faint runs are discounted: treating any other styled text
+// as a placeholder would let a nudge type into a real draft, and a capture
+// that fails keeps the draft rule in force.
+func (t *Tmux) composerHoldsOnlyDimText(target, promptPrefix string) bool {
+	found, text := t.undimmedComposerDraft(target, promptPrefix)
+	return found && text == ""
+}
+
+// undimmedComposerDraft re-reads the pane with its text attributes and
+// returns the composer draft with faint (SGR 2) text dropped. A failed or
+// empty capture reports no composer, and so does one that shows a dialog
+// (classifyHumanPrompt): being newer than the read it clears, it must pass
+// the same dialog check before it can clear anything.
+func (t *Tmux) undimmedComposerDraft(target, promptPrefix string) (bool, string) {
+	out, err := t.run("capture-pane", "-p", "-e", "-t", paneTarget(target), "-S", fmt.Sprintf("-%d", promptObservationLines))
+	if err != nil || out == "" {
+		return false, ""
+	}
+	styled := strings.Split(out, "\n")
+	plain := make([]string, len(styled))
+	undimmed := make([]string, len(styled))
+	for i, line := range styled {
+		plain[i] = stripTerminalStyle(line, false)
+		undimmed[i] = stripTerminalStyle(line, true)
+	}
+	if classifyHumanPrompt(plain, promptPrefix, false) != "" {
+		return false, ""
+	}
+	return composerDraft(undimmed, promptPrefix)
+}
+
+// sessionClientCount returns how many tmux clients are attached to the
+// session, or -1 when that cannot be read, and the nudge path treats -1 as
+// attached: when it cannot tell, it assumes a person may be typing. It reads
+// upstream's attach probe (SessionAttachedWithError: #{session_name} echoed
+// beside #{session_attached}, which is a COUNT) and keeps the count, so the
+// carry's guards and upstream's attach checks read one probe.
+func (t *Tmux) sessionClientCount(target string) int {
+	if strings.TrimSpace(target) == "" {
+		return -1
+	}
+	out, err := t.run("display-message", "-t", paneTarget(target), "-p", "#{session_name}|#{session_attached}")
+	if err != nil {
+		return -1
+	}
+	echoed, count, _ := cutLast(strings.TrimSpace(out), "|")
+	if echoed == "" || (validSessionNameRe.MatchString(target) && echoed != target) {
+		return -1
+	}
+	n, err := parseAttachedClients(count)
+	if err != nil || n > math.MaxInt32 {
+		return -1
+	}
+	return int(n)
+}
+
+// stripTerminalStyle removes escape sequences from one captured line: CSI
+// sequences (SGR among them) and OSC strings such as hyperlinks. With
+// dropFaint it also drops the text drawn while SGR 2 (faint) is in effect.
+func stripTerminalStyle(line string, dropFaint bool) string {
+	var b strings.Builder
+	faint := false
+	for i := 0; i < len(line); {
+		if line[i] != 0x1b || i+1 >= len(line) {
+			if !dropFaint || !faint {
+				b.WriteByte(line[i])
+			}
+			i++
+			continue
+		}
+		switch line[i+1] {
+		case '[':
+			j := i + 2
+			for j < len(line) && (line[j] < 0x40 || line[j] > 0x7e) {
+				j++
+			}
+			if j >= len(line) {
+				return b.String()
+			}
+			if line[j] == 'm' {
+				faint = applySGRFaint(line[i+2:j], faint)
+			}
+			i = j + 1
+		case ']':
+			j := i + 2
+			for j < len(line) && line[j] != 0x07 && (line[j] != 0x1b || j+1 >= len(line) || line[j+1] != '\\') {
+				j++
+			}
+			switch {
+			case j >= len(line):
+				return b.String()
+			case line[j] == 0x07:
+				i = j + 1
+			default:
+				i = j + 2
+			}
+		default:
+			i += 2
+		}
+	}
+	return b.String()
+}
+
+// applySGRFaint folds one SGR parameter list into the faint state: 2 sets it;
+// 0, an empty list, and 22 (normal intensity) clear it. Extended color
+// arguments (38;5;n, 38;2;r;g;b and their 48/58 forms) are skipped so a
+// color index of 2 or 22 is not read as an intensity change.
+func applySGRFaint(params string, faint bool) bool {
+	if params == "" {
+		return false
+	}
+	fields := strings.FieldsFunc(params, func(r rune) bool { return r == ';' || r == ':' })
+	for k := 0; k < len(fields); k++ {
+		switch fields[k] {
+		case "0", "00", "22":
+			faint = false
+		case "2":
+			faint = true
+		case "38", "48", "58":
+			if k+1 < len(fields) {
+				switch fields[k+1] {
+				case "5":
+					k += 2
+				case "2":
+					k += 4
+				}
+			}
+		}
+	}
+	return faint
+}
+
+// recoveryDraftIsNotOurs reports whether a staged-draft recovery submit
+// (recoverStagedDraft) would land on a draft that is not the one this nudge
+// left before its first submit: the re-send gate's snapshot is known and the
+// composer now shows something else, such as another paste's placeholder
+// (ga-da5vmz; a person's paste gets the next #N). Only positive evidence
+// counts: with no snapshot, or no composer this read can find (codex's
+// "› " under a claude prompt prefix), recovery keeps upstream's rule and
+// re-sends while a staged draft is visible. A failed read stops it.
+func (t *Tmux) recoveryDraftIsNotOurs(session, target string, owner *draftOwner) bool {
+	if owner == nil || owner.preSubmit == "" {
+		return false
+	}
+	lines, err := t.CapturePaneLines(target, promptObservationLines)
+	if err != nil {
+		return true
+	}
+	found, text := composerDraft(lines, t.resolveIdlePromptPrefix(session))
+	return found && text != owner.preSubmit
+}
+
+// paneIsClaudeFamily resolves target's provider family the way
+// targetIsClaudeFamily does, without its process sniff fallback cost when the
+// pane declares GC_PROVIDER.
+func (t *Tmux) paneIsClaudeFamily(target string) bool {
+	if provider := t.providerEnv(target); provider != "" {
+		return sessionlog.ProviderFamily(provider) == "claude"
+	}
+	return t.targetLooksLikeProvider(target, "claude")
+}
+
+// resendGate returns the check submitAndConfirmGated runs before a
+// RE-sent submit (ga-bwm's repair for a dropped first Enter). The re-send is
+// allowed only while a fresh capture shows the composer still holding the
+// text this delivery typed and no dialog is up; otherwise it stops the loop
+// without an error, and the caller classifies the outcome from the pane as it
+// already does. The first submit is not stopped here: the submit chokepoint
+// (sendNudgeSubmitSequenceOwning) refuses every submit key, first or re-sent,
+// on a dialog or a draft that is not ours. This gate's first read records
+// the paste placeholder the chokepoint will accept as ours (owner).
+//
+// "The text this delivery typed" is pinned to what the composer showed just
+// before the FIRST submit: the re-send needs the composer to still show exactly
+// that. Matching the message alone is not enough -- a long paste shows only as
+// a placeholder ("[Pasted text #N +M lines]"), and a person who pastes their
+// own text after a submit that landed unobserved would otherwise have THEIR
+// placeholder submitted. Claude numbers each paste, so theirs differs.
+//
+// The ownership check itself (ga-da5vmz) is not here but in the submit
+// chokepoint, on the capture taken just before each key.
+func (t *Tmux) resendGate(session, target, message string, owner *draftOwner) func(resend bool) (bool, error) {
+	promptPrefix := t.resolveIdlePromptPrefix(session)
+	snapshot := ""
+	return func(resend bool) (bool, error) {
+		lines, err := t.CapturePaneLines(target, promptObservationLines)
+		if !resend {
+			snapshot = ""
+			if err == nil {
+				if found, text := composerDraft(lines, promptPrefix); found {
+					snapshot = text
+				}
+			}
+			owner.notePlaceholder(snapshot)
+			owner.preSubmit = snapshot
+			return true, nil
+		}
+		if err != nil || snapshot == "" {
+			return false, nil
+		}
+		if classifyHumanPrompt(lines, promptPrefix, false) != "" {
+			return false, nil
+		}
+		if found, text := composerDraft(lines, promptPrefix); !found || text != snapshot {
+			return false, nil
+		}
+		return composerHoldsSent(lines, promptPrefix, message), nil
+	}
+}

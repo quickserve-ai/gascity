@@ -396,11 +396,21 @@ type closeReleases struct {
 	now      time.Time
 	alerts   *strandedClaimAlerts
 	stderr   io.Writer
+	// sp is the pass's provider, read only by the cascade's worktree prune for
+	// its liveness veto (ga-1xiv); no provider verb runs through it here.
+	sp runtime.Provider
 }
 
 // release is a work branch's release over the seat's legs, read live.
 func (c *closeReleases) release(r closeRelease) (closeReleased, error) {
-	out, err := ReleaseClaims(seatWorkFor(c.legs, r.scope), r.scope, r.seat, r.why, ReleaseOpts{})
+	// A seat's release reports its landed releases and named proposals where
+	// the close reports (ga-9n8hjv), as the legacy close does; the orphan
+	// release's lines go to the process log, as on every orphan path.
+	opts := ReleaseOpts{Audit: c.stderr}
+	if r.why == releaseOrphan {
+		opts.Audit = nil
+	}
+	out, err := ReleaseClaims(seatWorkFor(c.legs, r.scope), r.scope, r.seat, r.why, opts)
 	logRelease(c.stderr, "closing", r.seat.id, out, err)
 	done := closeReleased{why: r.why, out: out}
 	if r.why == releaseOrphan {
@@ -446,18 +456,25 @@ func (c *closeReleases) cascade(ctx context.Context, it intent) {
 	}
 	if it.Closing.Kind != closeFailedCreate {
 		preserve := assigneePreserveSet(it.Closing.Preserve)
-		scope := releaseScopeOfBead(b, c.cfg).except(preserve)
+		// A closing seat's durable identities are not released on (ga-9n8hjv), as
+		// on the legacy close cascade (releaseWorkFromClosedSessionBeadExcept).
+		scope := releaseScopeOfBead(b, c.cfg).except(preserve).except(durableSessionIdentities(c.cfg, b))
 		if ctx.Err() == nil {
 			if err := clearSessionCurrentClaim(store, b.ID); err != nil {
 				fmt.Fprintf(c.stderr, "session beads: clearing current claim on closing session %s: %v\n", b.ID, err) //nolint:errcheck // best-effort stderr
 			}
 		}
-		out, err := ReleaseClaims(seatWorkFor(c.legs, scope), scope, releaseSeatOfBead(b), releaseCloseCascade, ReleaseOpts{Late: true, Deadline: deadline})
+		out, err := ReleaseClaims(seatWorkFor(c.legs, scope), scope, releaseSeatOfBead(b), releaseCloseCascade, ReleaseOpts{Late: true, Deadline: deadline, Audit: c.stderr})
 		logRelease(c.stderr, "closing", b.ID, out, err)
 		strand(c.alerts, releaseSeatOfBead(b), strings.TrimSpace(b.Metadata["state"]), out, c.now, c.stderr)
 	}
 	if it.Closing.Kind == closePoolSlot && c.cfg != nil && ctx.Err() == nil && !c.workDirInUse(store, b) {
-		pruneWorktree(sessionInfoFromBead(b), c.cityPath, c.cfg, c.stderr)
+		// The prune re-reads the runtime itself (ga-1xiv's prune-time veto), with
+		// the close's own provider, as the legacy close does. The close's
+		// transaction read it too, but the cascade runs after the lock and after
+		// the release's store round-trips, and a runtime that came back in that
+		// window must keep its worktree.
+		pruneWorktree(sessionInfoFromBead(b), c.cityPath, c.cfg, c.sp, c.stderr)
 	}
 }
 
@@ -501,7 +518,7 @@ func (c *closeReleases) workDirInUse(store beads.Store, closed beads.Bead) bool 
 func newCloseReleases(w *World, alerts *strandedClaimAlerts, stderr io.Writer) *closeReleases {
 	c := &closeReleases{legs: w.WorkLegs, stores: w.LegStores, cityPath: w.CityPath, now: w.Now, alerts: alerts, stderr: stderr}
 	if w.Env != nil {
-		c.cfg = w.Env.Cfg
+		c.cfg, c.sp = w.Env.Cfg, w.Env.SP
 	}
 	if c.stderr == nil {
 		c.stderr = io.Discard

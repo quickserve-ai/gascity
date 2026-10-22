@@ -1156,10 +1156,12 @@ func TestAgentConfigFromAgentCoversPersistedFields(t *testing.T) {
 		DefaultSlingFormula:    &formula,
 		InjectFragments:        []string{"frag1"},
 		AppendFragments:        []string{"append1"},
+		OptInSkills:            []string{"fleet.login"},
 		Attach:                 &trueVal,
 		DependsOn:              []string{"other-agent"},
 		ResumeCommand:          "claude --resume {{.SessionKey}} --dangerously",
 		WakeMode:               "fresh",
+		WakeTransport:          "claude-cloud",
 		MouseMode:              "on",
 	}
 

@@ -404,6 +404,13 @@ server_sql() {
         sql -q "$1"
 }
 
+server_sql_csv() {
+    local host
+    host=$(connect_host)
+    dolt --host "$host" --port "$DOLT_PORT" --user "$DOLT_USER" --password "${DOLT_PASSWORD:-}" --no-tls \
+        sql --result-format csv -q "$1"
+}
+
 # is_retryable_error checks if an error message is a transient Dolt failure worth retrying.
 # Matches the 7 patterns from upstream isDoltRetryableError().
 is_retryable_error() {
@@ -2436,7 +2443,7 @@ wait_for_managed_pid_ready() {
 }
 
 load_start_managed_from_gc() {
-    local gc_bin host output key value status parsed=false
+    local gc_bin host output key value status parsed=false help probe_status=0 refused=false
     host=$(connect_host)
     gc_bin=$(resolve_gc_helper_bin)
     GC_START_MANAGED_USED="false"
@@ -2444,9 +2451,38 @@ load_start_managed_from_gc() {
     GC_START_PID=""
     GC_START_PORT="$DOLT_PORT"
     GC_START_ADDRESS_IN_USE="false"
-    [ -n "$gc_bin" ] || return 1
-    GC_START_MANAGED_USED="true"
-    output=$("$gc_bin" dolt-state start-managed --city "$GC_CITY_PATH" --host "$DOLT_HOST" --port "$DOLT_PORT" --user "$DOLT_USER" --log-level "$DOLT_LOGLEVEL" --timeout-ms 30000 9>&- </dev/null 2>/dev/null)
+    GC_START_ERROR=""
+    GC_START_UNWATCHED_REASON=""
+    if [ -z "$gc_bin" ]; then
+        GC_START_UNWATCHED_REASON="no gc helper (GC_BIN unset)"
+        return 1
+    fi
+    # A gc older than this script has no --lifecycle-lock-fd and would refuse
+    # the call on an unknown flag. Ask its --help first (cobra prints usage and
+    # exits before any hook or RunE runs; fd 9 closed, stdin /dev/null). An
+    # old helper, or a failed probe, gets the pre-ga-7yjvin outcome: a bare
+    # start, not a dead data plane.
+    help=$("$gc_bin" dolt-state start-managed --help </dev/null 9>&- 2>&1) || probe_status=$?
+    if [ "$probe_status" -ne 0 ]; then
+        GC_START_UNWATCHED_REASON="gc helper $gc_bin start-managed --help probe failed (exit $probe_status)"
+        return 1
+    fi
+    case "$help" in
+        *--lifecycle-lock-fd*) ;;
+        *)
+            GC_START_UNWATCHED_REASON="gc helper $gc_bin is too old to take the held lifecycle lock (start-managed --help does not list --lifecycle-lock-fd)"
+            return 1
+            ;;
+    esac
+    # op_start holds the lifecycle flock on fd 9. start-managed takes the same
+    # lock; through a fresh open of the lock file the script's own lock always
+    # refused it as busy, and op_start fell back to an unwatched bare start
+    # (ga-7yjvin). Hand it fd 9 instead: it locks through this open file
+    # description and marks the fd close-on-exec, so the dolt server and scope
+    # watchdog it spawns do not inherit the lock. stderr stays /dev/null: the
+    # watchdog inherits it as its escalation channel. Failures arrive on stdout
+    # as error/refused lines.
+    output=$("$gc_bin" dolt-state start-managed --city "$GC_CITY_PATH" --host "$DOLT_HOST" --port "$DOLT_PORT" --user "$DOLT_USER" --log-level "$DOLT_LOGLEVEL" --timeout-ms 30000 --lifecycle-lock-fd 9 </dev/null 2>/dev/null)
     status=$?
     while IFS="$(printf '	')" read -r key value; do
         case "$key" in
@@ -2466,15 +2502,33 @@ load_start_managed_from_gc() {
                 GC_START_ADDRESS_IN_USE="$value"
                 parsed=true
                 ;;
+            error)
+                GC_START_ERROR="$value"
+                ;;
+            refused)
+                refused="$value"
+                ;;
         esac
     done <<EOF
 $output
 EOF
-    if [ "$status" -ne 0 ] && [ "$parsed" != "true" ]; then
-        GC_START_MANAGED_USED="false"
+    if [ "$status" -eq 0 ]; then
+        GC_START_MANAGED_USED="true"
+        return 0
+    fi
+    # Whether a failure may fall back to the bare start (ga-7yjvin):
+    # - refused: a bare start could add a second server or override an
+    #   ownership decision. op_start dies with the reason.
+    # - the helper got as far as a server (pid, ready, or address in use): a
+    #   server may exist. op_start dies, as it always has on this path.
+    # - anything else (an error line only, or nothing at all, e.g. a crash):
+    #   fall back to the bare start production has always run, and say so.
+    if [ "$refused" = "true" ] || [ -n "$GC_START_PID" ] || [ "$GC_START_READY" = "true" ] || [ "$GC_START_ADDRESS_IN_USE" = "true" ]; then
+        GC_START_MANAGED_USED="true"
         return 1
     fi
-    [ "$status" -eq 0 ]
+    GC_START_UNWATCHED_REASON="gc helper failed: ${GC_START_ERROR:-no reason reported}"
+    return 1
 }
 
 wait_for_concurrent_start_ready() {
@@ -3189,10 +3243,16 @@ op_start() {
             DOLT_PORT="$GC_START_PORT"
             rm -f "$PID_FILE"
             save_state 0 false
-            die "dolt server could not start via gc helper (check $LOG_FILE)"
+            die "dolt server could not start via gc helper: ${GC_START_ERROR:-start-managed gave no reason} (check $LOG_FILE)"
         fi
         break
     done
+
+    # Only reached when load_start_managed_from_gc left the start to this
+    # script (no helper, a helper too old for --lifecycle-lock-fd, or a helper
+    # failure that is neither a refusal nor past a spawned server); it set the
+    # reason. Say so where start failures are read: stderr and the dolt log.
+    echo "warning: starting dolt sql-server WITHOUT a scope watchdog: ${GC_START_UNWATCHED_REASON:-gc helper not used}" | tee -a "$LOG_FILE" >&2 || true
 
     local launch_attempt=0
     while [ "$launch_attempt" -lt 5 ]; do
@@ -3537,21 +3597,173 @@ dump_bd_init_forensics() {
     fi
 }
 
+is_bd_dirty_schema_migration_error() {
+    case "$1" in
+        *"failed to initialize schema: schema migration: pending schema migrations alter pre-existing dirty tables:"*"; run 'bd dolt commit' to commit the working set at the current schema, then re-run the migration (gastownhall/beads#4566)"*) return 0 ;;
+    esac
+    return 1
+}
+
+is_bd_partial_init_migration_table() {
+    case "$1" in
+        child_counters|comments|compaction_snapshots|dependencies|dolt_schemas|events|issues|issue_snapshots|labels|schema_migrations) return 0 ;;
+    esac
+    return 1
+}
+
+checkpoint_partial_bd_init_schema() {
+    local dolt_database="$1"
+    local dirty_tables table
+    if ! valid_sql_name "$dolt_database"; then
+        echo "error: invalid database name for bd init schema checkpoint: $dolt_database" >&2
+        return 1
+    fi
+
+    # This allowlist mirrors beads v1.1.0's narrowly-scoped failed-0053
+    # recovery. Inspect before staging anything so an unexpected or
+    # operator-owned dirty table makes the automatic repair fail closed.
+    if ! dirty_tables=$(server_sql_csv "USE \`$dolt_database\`; SELECT DISTINCT s.table_name FROM dolt_status s WHERE NOT EXISTS (SELECT 1 FROM dolt_ignore di WHERE di.ignored = 1 AND s.table_name LIKE di.pattern) ORDER BY s.table_name" 2>/dev/null); then
+        echo "error: could not inspect dirty tables before bd init schema checkpoint" >&2
+        return 1
+    fi
+    dirty_tables=$(printf '%s\n' "$dirty_tables" | tail -n +2 | tr -d '\r' | sed '/^[[:space:]]*$/d')
+    if [ -z "$dirty_tables" ]; then
+        # Another initializer may have completed the same checkpoint while
+        # this one was observing the failure. Retrying bd init is sufficient.
+        return 0
+    fi
+
+    while IFS= read -r table; do
+        if ! is_bd_partial_init_migration_table "$table"; then
+            echo "error: refusing bd init schema checkpoint with unexpected dirty table: $table" >&2
+            return 1
+        fi
+    done <<EOF
+$dirty_tables
+EOF
+
+    while IFS= read -r table; do
+        server_sql_retry "USE \`$dolt_database\`; CALL DOLT_ADD('-f', '$table')" >/dev/null || return 1
+    done <<EOF
+$dirty_tables
+EOF
+
+    # --skip-empty makes a concurrent equivalent recovery idempotent without
+    # creating a redundant commit. Do not use -A: it would sweep unrelated
+    # working-set changes into this commit.
+    server_sql_retry "USE \`$dolt_database\`; CALL DOLT_COMMIT('--skip-empty', '-m', 'gc: checkpoint partial bd init schema')" >/dev/null
+}
+
+# export_created_database_migrate_consent gives bd consent to finish migrating
+# a server-mode database, but only one this invocation proved it created
+# (database_created_by_gc: backing store absent before its own CREATE
+# DATABASE). The 5-second --reinit-local preflight that first cut migrations
+# part-way (v41..v46 of v66 in fork CI, ga-zyvj2k, gastownhall/beads#6746) is
+# read-only at the pinned beads (countExistingIssues, ga-ylug59) and migrates
+# nothing. This consent and the partial-schema checkpoint above now cover a
+# migration stopped inside one step by a kill or by an error other than a
+# timeout. bd's own interrupted-bootstrap heal never arms on these databases:
+# it needs bd's own CREATE DATABASE to have created the database, and gc
+# created it first. Without consent, bd's next open takes its own half-done
+# migration for a co-resident client's and refuses it (#5920), so init dies on
+# a store nobody else has seen. Creating the database is consent to its
+# schema. A database that already existed may have clients on an older bd,
+# which is what the refusal protects, so this script never grants it consent
+# (an operator who exports BD_ALLOW_REMOTE_MIGRATE themselves still reaches
+# every init). Call it only inside the subshell that runs bd init
+# --reinit-local, so the consent cannot leak into the rest of this script; a
+# plain init has no preflight, and there consent would also unlock migrating
+# a remote-backed clone.
+#
+# bd reads the consent once for the whole process, so every database that
+# process opens must be the one created here:
+# - the preflight opens BEADS_DOLT_SERVER_DATABASE if set, else the database
+#   metadata.json names (not --database), so both must name this database;
+# - bd's shared-server mode also opens beads_global, which may already exist.
+#   An environment that asks for that mode (BEADS_DOLT_SHARED_SERVER as bd's
+#   IsSharedServerMode reads it, BD_DOLT_SHARED_SERVER as bd's config reads a
+#   bool) gets no consent, and the consented call runs with
+#   BD_DOLT_SHARED_SERVER=false, which outranks a dolt.shared-server line in
+#   bd's config.yaml. A gc city never sets that line; if one did, this call
+#   would also skip the global_* metadata that mode writes.
+# Args: <database_created_for_init> <dir> <dolt_database>
+export_created_database_migrate_consent() {
+    [ "${1:-false}" = "true" ] || return 0
+    [ -n "${3:-}" ] || return 0
+    [ "$(read_existing_dolt_database "$2/.beads/metadata.json")" = "$3" ] || return 0
+    case "${BEADS_DOLT_SERVER_DATABASE:-}" in
+        ""|"$3") ;;
+        *) return 0 ;;
+    esac
+    case "${BEADS_DOLT_SHARED_SERVER:-}" in
+        1|[Tt][Rr][Uu][Ee]) return 0 ;;
+    esac
+    case "${BD_DOLT_SHARED_SERVER:-}" in
+        1|t|T|true|TRUE|True) return 0 ;;
+    esac
+    BD_DOLT_SHARED_SERVER=false
+    BD_ALLOW_REMOTE_MIGRATE=1
+    export BD_DOLT_SHARED_SERVER BD_ALLOW_REMOTE_MIGRATE
+}
+
 run_bd_init_pinned() {
     local dir="$1"
     local prefix="$2"
     local dolt_database="$3"
     local host="$4"
-    local force_init="${5:-false}"
-    set -- init
-    if [ "$force_init" = "true" ]; then
-        set -- "$@" --force
+    local reinit_local="${5:-false}"
+    local database_created_for_init="${6:-false}"
+    local init_output
+    if [ "$reinit_local" = "true" ]; then
+        if init_output=$(export_created_database_migrate_consent "$database_created_for_init" "$dir" "$dolt_database"
+            run_bd_pinned "$dir" init --reinit-local --quiet --server -p "$prefix" --database "$dolt_database" --skip-hooks --skip-agents \
+            --server-host "$host" --server-port "$DOLT_PORT" "$dir" 8>&- 2>&1); then
+            [ -z "$init_output" ] || printf '%s\n' "$init_output"
+            return 0
+        fi
+    else
+        if init_output=$(run_bd_pinned "$dir" init --quiet --server -p "$prefix" --database "$dolt_database" --skip-hooks --skip-agents \
+            --server-host "$host" --server-port "$DOLT_PORT" "$dir" 8>&- 2>&1); then
+            [ -z "$init_output" ] || printf '%s\n' "$init_output"
+            return 0
+        fi
     fi
-    run_bd_pinned "$dir" "$@" --quiet --server -p "$prefix" --database "$dolt_database" --skip-hooks --skip-agents \
-        --server-host "$host" --server-port "$DOLT_PORT" "$dir" 8>&- || {
-            dump_bd_init_forensics "$dolt_database"
-            die "bd init failed for $dir"
-        }
+
+    printf '%s\n' "$init_output" >&2
+    # A database this invocation did not create is refused whatever wording bd
+    # used for its dirty-table refusal, not only for the exact signature below.
+    # A reworded refusal (for example "pending ignored schema migrations alter
+    # pre-existing dirty tables") must not reach the generic failure: gc's Go
+    # recovery commits the whole working set after any dirty-table failure that
+    # does not carry this refusal (cmd/gc/beads_provider_dirty_tables.go). The
+    # match ignores case, as that Go matcher does.
+    init_output_lower=$(printf '%s' "$init_output" | tr '[:upper:]' '[:lower:]')
+    case "$init_output_lower" in
+        *"alter pre-existing dirty tables"*)
+            if [ "$database_created_for_init" != "true" ]; then
+                dump_bd_init_forensics "$dolt_database"
+                die "bd init failed for $dir; refusing to checkpoint a pre-existing database"
+            fi
+            ;;
+    esac
+    if ! is_bd_dirty_schema_migration_error "$init_output"; then
+        dump_bd_init_forensics "$dolt_database"
+        die "bd init failed for $dir"
+    fi
+
+    # beads v1.1.0 can leave its own fresh server-mode schema migration dirty
+    # before returning the #4566 guard. Checkpoint exactly that partial schema,
+    # then retry the supported local-reinit path on a clean working set.
+    echo "warning: bd init left a dirty partial schema; checkpointing and retrying" >&2
+    checkpoint_partial_bd_init_schema "$dolt_database" || die "failed to checkpoint partial bd init schema for $dolt_database"
+    (
+        export_created_database_migrate_consent "$database_created_for_init" "$dir" "$dolt_database"
+        run_bd_pinned "$dir" init --reinit-local --quiet --server -p "$prefix" --database "$dolt_database" --skip-hooks --skip-agents \
+            --server-host "$host" --server-port "$DOLT_PORT" "$dir" 8>&-
+    ) || {
+        dump_bd_init_forensics "$dolt_database"
+        die "bd init retry failed for $dir"
+    }
 }
 
 # run_bd_init_pinned_over_verified_empty runs a PLAIN bd init (no --force)
@@ -3800,8 +4012,9 @@ op_init() {
     local metadata_path="$dir/.beads/metadata.json"
     local existing_db=""
     local allow_reserved_existing=false
-    local bd_init_force=""
+    local bd_init_reinit=""
     local bd_init_over_verified_empty=false
+    local database_created_by_gc=false
     if [ -z "$dir" ] || [ -z "$prefix" ]; then
         die "usage: gc-beads-bd init <dir> <prefix> [dolt_database]"
     fi
@@ -3959,30 +4172,33 @@ op_init() {
     # writes metadata.json (dolt_database/dolt_mode) BEFORE invoking us, so a
     # fresh init also reaches this branch — that is intentional. The branch
     # does NOT blindly skip init: it only exits early when the server already
-    # has a live bd schema (bd_runtime_schema_ready). Otherwise it sets
-    # bd_init_force="--force" so the fall-through bd init reinitializes over
+    # has a live bd schema (bd_runtime_schema_ready). Otherwise
+    # bd_init_reinit marks that the fall-through bd init must reinitialize over
     # the gc-pre-seeded metadata stub instead of aborting with bd's "This
     # workspace is already initialized" guard. Gating this branch on project_id
     # instead breaks fresh init: gc-pre-seeded metadata has no project_id, so
-    # --force is never set and bd init aborts.
+    # --reinit-local is never selected and bd init aborts.
     if [ -f "$dir/.beads/metadata.json" ]; then
         # A pre-existing metadata.json means the store may already be
         # initialized. Both checks below run SQL against the managed Dolt
         # server, so a transient server-unreachable blip (port drift, an
         # exclusive lock held by a stale dolt process, a slow server start)
         # is indistinguishable from "schema missing" / "not registered" —
-        # and both of those branches react by forcing a DESTRUCTIVE reinit
-        # (--force), which trips bd's remote-history guard and aborts city
+        # and both of those branches react by selecting a DESTRUCTIVE local
+        # reinit, which trips bd's remote-history guard and aborts city
         # init on an otherwise healthy store. Confirm the server actually
         # answers before trusting a negative result; otherwise fail closed
         # so the caller's retry loop waits for the server to come up instead
         # of reinitializing live data.
         if ! server_reachable; then
-            die "managed Dolt server unreachable while inspecting existing store '$dolt_database'; refusing to force-reinitialize (data-safety). retry once the Dolt server is reachable."
+            die "managed Dolt server unreachable while inspecting existing store '$dolt_database'; refusing to reinitialize (data-safety). retry once the Dolt server is reachable."
         fi
         if ensure_database_registered "$dolt_database"; then
             local schema_ready=false
             local holds_bd_tables=0
+            if [ "${GC_DATABASE_CREATED_BY_ENSURE:-false}" = true ]; then
+                database_created_by_gc=true
+            fi
             if probe_schema_state_or_die "$dolt_database"; then
                 schema_ready=true
             else
@@ -4051,10 +4267,10 @@ op_init() {
             fi
             echo "warning: database '$dolt_database' missing bd schema; re-initializing" >&2
             heal_interrupted_bootstrap "$dolt_database"
-            bd_init_force="--force"
+            bd_init_reinit="--reinit-local"
         else
             echo "warning: database '$dolt_database' not registered; re-initializing" >&2
-            bd_init_force="--force"
+            bd_init_reinit="--reinit-local"
         fi
     fi
 
@@ -4074,6 +4290,13 @@ op_init() {
     if ! ensure_database_registered "$dolt_database"; then
         die "failed to register Dolt database '$dolt_database' on running server (CREATE DATABASE failed); see warnings above. cannot proceed with bd init."
     fi
+    # database_created_by_gc is this invocation's proof that it created the
+    # store (backing store absent before a CREATE that then became visible).
+    # It gates the automatic partial-schema recovery in run_bd_init_pinned,
+    # which is never safe on a database someone else may own.
+    if [ "${GC_DATABASE_CREATED_BY_ENSURE:-false}" = true ]; then
+        database_created_by_gc=true
+    fi
 
     ensure_current_era_scope_metadata "$dir" "$prefix" "$dolt_database"
     # A scope with no metadata.json is not proof of a fresh database. The
@@ -4088,7 +4311,7 @@ op_init() {
     # FORCE-seed a missing one. Only a database with no bd schema reaches
     # bd init at all.
     heal_interrupted_bootstrap "$dolt_database"
-    if [ "$GC_SCOPE_METADATA_PRESEEDED" = "1" ] && [ -z "$bd_init_force" ]; then
+    if [ "$GC_SCOPE_METADATA_PRESEEDED" = "1" ] && [ -z "$bd_init_reinit" ]; then
         if probe_schema_state_or_die "$dolt_database"; then
             # Witness BEFORE the first bd command: bd's server-branch guard
             # refuses a server-mode scope with no .local_version as a legacy
@@ -4104,10 +4327,10 @@ op_init() {
         fi
         # We just wrote the metadata bd reads as "initialized"; the database
         # has no bd schema yet. Seed it the way the schema-repair path does.
-        bd_init_force="--force"
+        bd_init_reinit="--reinit-local"
     fi
 
-    # The classification above (whichever branch set bd_init_force) can go
+    # The classification above (whichever branch set bd_init_reinit) can go
     # stale before the force actually runs: ensure_database_registered,
     # ensure_current_era_scope_metadata and the interrupted-bootstrap heal
     # all do real work in the gap between that decision and here, during
@@ -4115,7 +4338,7 @@ op_init() {
     # advancing its cursor. Revalidate immediately before forcing rather than
     # acting on a read that is now however-old -- this is the same probe the
     # classification above used, just re-run at the moment it actually matters.
-    if [ -n "$bd_init_force" ]; then
+    if [ -n "$bd_init_reinit" ]; then
         # Revalidating alone is not enough when the concurrent initializer
         # is a SEPARATE OS process (e.g. a second city/worktree pointed at
         # this same dolt_database): two processes can each revalidate
@@ -4158,10 +4381,10 @@ op_init() {
     # Run bd init in server mode through the pinned wrapper so the fallback
     # path uses the same authenticated Dolt target as the rest of init.
     # Metadata-only scopes already look initialized to bd, so schema-repair
-    # fallback must force reinit to seed the missing tables into the pinned DB
+    # fallback must select local reinit to seed the missing tables into the pinned DB
     # -- UNLESS the revalidation above just reconfirmed the store is
     # genuinely empty, in which case there is nothing to reinit over and a
-    # plain init through the stub-aside helper avoids --force's destructive
+    # plain init through the stub-aside helper avoids the reinit's destructive
     # preflight entirely (see run_bd_init_pinned_over_verified_empty).
     # Always pass the pinned server database explicitly; `-p` controls the
     # visible issue prefix, while `--database` tells bd which existing Dolt
@@ -4170,14 +4393,25 @@ op_init() {
     # A plain bd init runs migrations too, so it takes the shared init lock
     # like every other migration step (a no-op when the force path above
     # already holds it exclusively).
+    #
+    # A database THIS invocation created keeps the consented local reinit
+    # below (run_bd_init_pinned: BD_ALLOW_REMOTE_MIGRATE for the created
+    # database only, and the checkpoint retry after a dirty partial schema,
+    # ga-zyvj2k). The verified-empty plain init is for an empty database gc did
+    # not create, which may not be given that consent.
     if [ "$FLOCK_AVAILABLE" = true ]; then
         acquire_init_lock "$dolt_database" shared
     fi
     ensure_current_era_version_witness "$dir" "$dolt_database"
-    if [ "$bd_init_over_verified_empty" = true ]; then
+    if [ "$bd_init_over_verified_empty" = true ] && [ "$database_created_by_gc" != true ]; then
         run_bd_init_pinned_over_verified_empty "$dir" "$prefix" "$dolt_database" "$host"
     else
-        run_bd_init_pinned "$dir" "$prefix" "$dolt_database" "$host" "${bd_init_force:+true}"
+        # Automatic partial-schema recovery is safe only for a database this
+        # invocation created: an existing database may contain operator-owned
+        # working-set changes and must always fail closed. database_created_by_gc
+        # is that proof (backing store absent before a CREATE that then became
+        # visible), so the recovery gate shares the version witness's evidence.
+        run_bd_init_pinned "$dir" "$prefix" "$dolt_database" "$host" "${bd_init_reinit:+true}" "$database_created_by_gc"
     fi
 
     # Release the init lock promptly rather than holding it through the
@@ -4360,14 +4594,14 @@ enospc_helper="$(CDPATH= cd -- "$(dirname "$0")" && pwd)/dolt-enospc.sh"
 if [ -r "$enospc_helper" ]; then
     . "$enospc_helper"
 else
-    # Some focused shell harnesses execute gc-beads-bd's prelude as a single
-    # temporary file without sibling assets. Keep the production helper as the
-    # canonical copy, but preserve the same detector behavior for those harnesses.
+    # The bd pack always ships the helper beside this script (the city shim
+    # execs the real script, so $0 resolves into the pack). Only focused shell
+    # harnesses that run this prelude as a lone temporary file land here. The
+    # helper is the guard's only implementation, so without it recovery fails
+    # closed instead of running a second copy that could drift from it.
     recovery_should_skip_due_to_enospc() {
-        [ -n "${LOG_FILE:-}" ] && [ -r "$LOG_FILE" ] || return 1
-        tail -n 1000 "$LOG_FILE" 2>/dev/null \
-            | grep -qE 'no space left on device|copy_file_range:.*no space|ENOSPC' \
-            || return 1
+        ENOSPC_REFUSAL_REASON="ENOSPC guard helper not found at $enospc_helper"
+        ENOSPC_REFUSAL_DETAIL="  the bd pack ships dolt-enospc.sh beside gc-beads-bd.sh; reinstall the pack"
         return 0
     }
 fi
@@ -4380,16 +4614,20 @@ op_recover() {
         die "recovery not supported for remote dolt servers"
     fi
 
-    # Skip auto-recovery when dolt has been failing due to disk exhaustion.
-    # Restarting dolt does not free disk space, and the recovery cycle
-    # itself amplifies the failure: each restart triggers a conjoin/backup
-    # sync that writes another partial table file to the backup remote.
-    # Require manual intervention (free disk space) before recovery
-    # resumes. See gastownhall/gascity#2158.
+    # Skip auto-recovery when the Dolt data volume is short of space now or
+    # the Dolt log shows recent ENOSPC. Restarting dolt does not free disk
+    # space, and the recovery cycle itself amplifies the failure: each restart
+    # triggers a conjoin/backup sync that writes another partial table file to
+    # the backup remote. Require manual intervention (free disk space) before
+    # recovery resumes. See gastownhall/gascity#2158.
     if recovery_should_skip_due_to_enospc; then
-        echo "skipping dolt recovery: recent dolt log shows ENOSPC — manual intervention required" >&2
-        echo "  free disk space, then re-run health checks" >&2
-        die "dolt recovery skipped: ENOSPC detected"
+        echo "skipping dolt recovery: $ENOSPC_REFUSAL_REASON — manual intervention required" >&2
+        printf '%s\n' "$ENOSPC_REFUSAL_DETAIL" >&2
+        echo "  free disk space on the Dolt data volume, then re-run health checks" >&2
+        die "dolt recovery skipped: ENOSPC guard"
+    fi
+    if [ -n "${ENOSPC_NOTE:-}" ]; then
+        echo "dolt recovery: $ENOSPC_NOTE" >&2
     fi
 
     if load_recover_managed_from_gc; then
@@ -5037,7 +5275,38 @@ else
 fi
 
 # Resolve DOLT_PORT now that STATE_FILE is set.
-DOLT_PORT=$(allocate_port)
+#
+# A REMOTE STORE MUST NOT BE GIVEN THE MANAGED-LOCAL PORT (ga-tmhxnd).
+# allocate_port() is the MANAGED server's allocator: it asks
+# `gc dolt-state allocate-port` first and returns that immediately, so
+# GC_DOLT_PORT is never consulted when the helper answers. That is right for a
+# managed store — validated provider state should beat a stale inherited port —
+# and wrong for a rig whose store lives on another box.
+#
+# What it cost, 2026-08-27: after the qcore flip, connect_host() correctly
+# returned the hub (100.71.23.94) while DOLT_PORT came back 51361, the LOCAL
+# managed port. init therefore dialled 100.71.23.94:51361 — nothing listens
+# there — and reported "managed Dolt server unreachable". Measured: hub:51361
+# CLOSED, hub:3307 OPEN, 127.0.0.1:51361 OPEN. The endpoint was assembled from
+# two different scopes, host from the rig config and port from the local
+# allocator.
+#
+# The damage was not a failed init. `gc supervisor` runs this on every config
+# reload, so the controller REJECTED all four reloads that day and kept running
+# stale config while city.toml said otherwise — operators believed changes had
+# applied. It also put a restart at risk, because the same call runs at city
+# start.
+#
+# Fails CLOSED when a remote store has no port: dialling a guessed port against
+# someone else's host is how this bug looked in the first place.
+if is_remote; then
+    if [ -z "${GC_DOLT_PORT:-}" ]; then
+        die "remote Dolt host '$GC_DOLT_HOST' given with no GC_DOLT_PORT; refusing to fall back to the managed-local port (ga-tmhxnd)"
+    fi
+    DOLT_PORT="$GC_DOLT_PORT"
+else
+    DOLT_PORT=$(allocate_port)
+fi
 
 case "$op" in
     start)        op_start ;;

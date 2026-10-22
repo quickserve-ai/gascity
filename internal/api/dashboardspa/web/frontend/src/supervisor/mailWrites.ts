@@ -16,6 +16,11 @@ export interface MailActionTarget {
   rig?: string;
 }
 
+// sendSupervisorMail and replySupervisorMail reject with
+// SupervisorMailUnconfirmedError when the supervisor answers 202 (the write was
+// reported created but could not be read back; ga-nee27h). Callers show that
+// error and keep the draft: an unconfirmed write is never reported as sent.
+
 export async function sendSupervisorMail(
   draft: MailComposeDraft,
   operatorWireAlias: string,

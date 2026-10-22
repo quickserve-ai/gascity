@@ -616,7 +616,7 @@ func TestLaunchDriftRelaunchTakesTheRuntimeLease(t *testing.T) {
 	})
 	city := t.TempDir()
 	relaunch := func() (bool, map[string]string) {
-		return relaunchAgentForLaunchDrift(context.Background(), env.sp, sessionFrontDoor(env.store), env.sessionInfo(b.ID), "worker",
+		return relaunchAgentForLaunchDrift(context.Background(), nil, env.sp, sessionFrontDoor(env.store), env.sessionInfo(b.ID), "worker",
 			tp, city, env.cfg, env.store, dispatchOptionSources{}, runtime.CoreFingerprint(oldCfg), runtime.CoreFingerprint(agentCfg),
 			runtime.ProvisionFingerprint(oldCfg), runtime.LaunchFingerprint(oldCfg), []string{"Command"}, env.rec, nil, &env.stdout, &env.stderr)
 	}
@@ -655,7 +655,7 @@ func TestLaunchDriftRelaunchFallsBackOnANonBusyLeaseError(t *testing.T) {
 	if err := env.store.Close(b.ID); err != nil {
 		t.Fatal(err)
 	}
-	ok, batch := relaunchAgentForLaunchDrift(context.Background(), env.sp, sessionFrontDoor(env.store), info, "worker",
+	ok, batch := relaunchAgentForLaunchDrift(context.Background(), nil, env.sp, sessionFrontDoor(env.store), info, "worker",
 		tp, t.TempDir(), env.cfg, env.store, dispatchOptionSources{}, "a", "b", "c", "d", []string{"Command"}, env.rec, nil, &env.stdout, &env.stderr)
 	if ok || batch != nil || env.sp.CountCalls("Relaunch", "worker") != 0 || !strings.Contains(env.stderr.String(), "falling back to full restart") {
 		t.Fatalf("relaunch on a closed row = (%v, %v), relaunches %d, stderr %q; want the full-restart fallback", ok, batch, env.sp.CountCalls("Relaunch", "worker"), env.stderr.String())

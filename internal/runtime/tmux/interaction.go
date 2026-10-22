@@ -31,6 +31,24 @@ func (p *Provider) Respond(name string, response runtime.InteractionResponse) er
 	return p.tm.Respond(name, response)
 }
 
+var _ runtime.FencedInteractionProvider = (*Provider)(nil)
+
+// ResponseFencing reports that tmux fences answers atomically, as it fences
+// input (InputFencing): the answer's keys run inside the pane guard.
+func (p *Provider) ResponseFencing(name string) runtime.InputFencing {
+	return p.InputFencing(name)
+}
+
+// RespondFenced answers as Respond does, with every key it sends (a
+// copy-mode exit, the answer) conditional on the agent pane's fence naming
+// fence's incarnation (DES-O1 §6.2). The captures before and after are
+// reads, not input, so a respawn between them sends nothing.
+func (p *Provider) RespondFenced(ctx context.Context, name string, fence runtime.InputFence, response runtime.InteractionResponse) error {
+	return p.fenced(ctx, name, fence, false, func(ctx context.Context) error {
+		return p.tm.respond(ctx, name, response)
+	})
+}
+
 // ---------------------------------------------------------------------------
 // Pane-based approval detection
 // ---------------------------------------------------------------------------
@@ -532,7 +550,7 @@ func approvalOptionKey(approval *parsedApproval, action string) (string, error) 
 			return label == "no" || strings.HasPrefix(label, "no,") || strings.HasPrefix(label, "no ")
 		}
 	default:
-		return "", fmt.Errorf("unknown action %q", action)
+		return "", fmt.Errorf("%w: unknown action %q", runtime.ErrInteractionResponseInvalid, action)
 	}
 	if err := approvalDenyOnly(approval, action); err != nil {
 		return "", err
@@ -670,11 +688,10 @@ func (d *approvalDedup) clear(session string) {
 // InteractionProvider implementation
 // ---------------------------------------------------------------------------
 
-// Pending checks the tmux pane for an active Claude Code approval prompt or
-// Codex approval overlay.
-// Returns nil with no error if no approval is pending.
+// Pending checks the tmux pane for an active approval or terminal-only human
+// interaction. Returns nil with no error if no interaction is pending.
 func (t *Tmux) Pending(name string) (*runtime.PendingInteraction, error) {
-	approval, err := t.approvalInPane(name)
+	approval, paneText, err := t.readApprovalPane(name)
 	if err != nil {
 		// Pane might not exist (session not started yet or already stopped).
 		// Check for known "can't find" errors vs unexpected failures.
@@ -700,6 +717,15 @@ func (t *Tmux) Pending(name string) (*runtime.PendingInteraction, error) {
 
 	if approval == nil {
 		t.approvalDedup().clear(name)
+		reason := t.classifyLifecycleHumanPrompt(name, name, strings.Split(paneText, "\n"), t.resolveIdlePromptPrefix(name))
+		if reason != "" {
+			hash := sha256.Sum256([]byte(paneText))
+			return &runtime.PendingInteraction{
+				RequestID: fmt.Sprintf("%s%x", humanPromptRequestPrefix, hash[:8]),
+				Kind:      "human-input",
+				Prompt:    "Complete the pending human interaction in the terminal.",
+			}, nil
+		}
 		return nil, nil
 	}
 
@@ -817,23 +843,31 @@ func (t *Tmux) cancelClaudeApproval(ctx context.Context, name string) (handled b
 // pane's geometry, which says where Codex wrapped its rows and whether the
 // capture reaches the overlay's top (parseCodexApprovalOverlay).
 func (t *Tmux) approvalInPane(target string) (*parsedApproval, error) {
+	approval, _, err := t.readApprovalPane(target)
+	return approval, err
+}
+
+// readApprovalPane is approvalInPane that also returns the agent pane's
+// capture, which Pending reads for a terminal-only human interaction when no
+// approval shows (pl-9pye), so that reading costs no second capture.
+func (t *Tmux) readApprovalPane(target string) (*parsedApproval, string, error) {
 	resolved, err := t.agentPaneTarget(target)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	paneText, err := t.CapturePane(resolved, promptObservationLines)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	approval := parseApprovalPrompt(paneText)
 	if approval == nil || !approval.Codex {
-		return approval, nil
+		return approval, paneText, nil
 	}
 	pane, err := t.capturePaneWithGeometry(resolved)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return parseApprovalCapture(pane), nil
+	return parseApprovalCapture(pane), paneText, nil
 }
 
 // capturePaneWithGeometry captures target's screen and the last
@@ -875,36 +909,60 @@ var (
 	respondVerifyTimeout  = 10 * time.Second
 )
 
+// humanPromptRequestPrefix marks a terminal-only human interaction Pending
+// reports (pl-9pye): Respond refuses it, since only the terminal can answer.
+const humanPromptRequestPrefix = "tmux-human-"
+
 // Respond sends the appropriate keystroke to the tmux pane to approve or deny
 // a pending tool approval, then verifies the prompt was consumed.
 //
 // The prompt is the agent's: every capture and the answer key go to its pane
 // (agentPaneTarget), resolved once for this response.
+//
+// A refusal sends nothing, and says why: a session that is gone wraps
+// runtime.ErrSessionNotFound, a pane that could not be read
+// runtime.ErrRuntimeUnavailable, an answer naming a request no longer shown
+// (another prompt, or none) runtime.ErrInteractionGone, and an action the
+// menu does not offer runtime.ErrInteractionActionUnavailable (or, for an
+// action no prompt offers, runtime.ErrInteractionResponseInvalid). An answer
+// naming no request when no prompt shows is a no-op.
 func (t *Tmux) Respond(name string, response runtime.InteractionResponse) error {
-	target, err := t.agentPaneTarget(name)
-	if err != nil {
+	return t.respond(context.Background(), name, response)
+}
+
+// respond is Respond; its keys run under ctx, so inside a fenced operation
+// (Provider.RespondFenced) they go through the pane guard.
+func (t *Tmux) respond(ctx context.Context, name string, response runtime.InteractionResponse) error {
+	if strings.HasPrefix(response.RequestID, humanPromptRequestPrefix) {
+		return runtime.ErrInteractionUnsupported
+	}
+	preVerify := func(err error) error {
 		if errors.Is(err, ErrSessionNotFound) {
 			return fmt.Errorf("pre-verify capture failed: %w: %w", runtime.ErrSessionNotFound, err)
 		}
-		return fmt.Errorf("pre-verify capture failed: %w", err)
+		return fmt.Errorf("pre-verify capture failed: %w: %w", runtime.ErrRuntimeUnavailable, err)
+	}
+	target, err := t.agentPaneTarget(name)
+	if err != nil {
+		return preVerify(err)
 	}
 	// Verify the expected approval is still present before sending keys.
 	current, err := t.approvalInPane(target)
 	if err != nil {
-		if errors.Is(err, ErrSessionNotFound) {
-			return fmt.Errorf("pre-verify capture failed: %w: %w", runtime.ErrSessionNotFound, err)
-		}
-		return fmt.Errorf("pre-verify capture failed: %w", err)
+		return preVerify(err)
 	}
 	if current == nil {
 		t.approvalDedup().clear(name)
-		return nil // prompt already gone
+		if response.RequestID != "" {
+			return fmt.Errorf("approval %s is gone: %w", response.RequestID, runtime.ErrInteractionGone)
+		}
+		return nil // prompt already gone, and the caller named none
 	}
 	// If caller specified a RequestID, verify it matches the current prompt.
 	if response.RequestID != "" {
 		currentID := "tmux-" + approvalHash(current)
 		if currentID != response.RequestID {
-			return fmt.Errorf("approval prompt changed: expected %s, got %s", response.RequestID, currentID)
+			return fmt.Errorf("approval prompt changed: expected %s, got %s: %w", response.RequestID, currentID, runtime.ErrInteractionGone)
 		}
 	}
 
@@ -916,14 +974,18 @@ func (t *Tmux) Respond(name string, response runtime.InteractionResponse) error 
 	// Exit copy-mode first if the pane is parked (the ga-c4w wheel binding),
 	// so the approval keystroke reaches the prompt instead of being swallowed
 	// by copy-mode.
-	t.cancelCopyModeIfParked(context.Background(), target)
+	t.cancelCopyModeIfParked(inputCtx(ctx), target)
 
 	// Send the keystroke once. key is one digit from 1 to 9
 	// (approvalOptionKey), which tmux types as given, so unlike caller text it
 	// needs no runtime.TmuxLiteralArgs encoding (RUNTIME-CONTRACT-011).
-	if _, err := t.run("send-keys", "-t", target, "-l", key); err != nil {
-		if errors.Is(err, ErrSessionNotFound) {
+	// A key that found no session or no server typed nothing.
+	if _, err := t.runCtx(inputCtx(ctx), "send-keys", "-t", target, "-l", key); err != nil {
+		switch {
+		case errors.Is(err, ErrSessionNotFound):
 			return fmt.Errorf("send-keys failed: %w: %w", runtime.ErrSessionNotFound, err)
+		case errors.Is(err, ErrNoServer):
+			return fmt.Errorf("send-keys failed: %w: %w", runtime.ErrRuntimeUnavailable, err)
 		}
 		return fmt.Errorf("send-keys failed: %w", err)
 	}

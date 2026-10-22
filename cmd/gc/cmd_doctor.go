@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -166,6 +167,15 @@ func (c *doltTopologyCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
 		r.FixHint = "reconcile canonical .beads config with deprecated city.toml Dolt settings"
 		return r
 	}
+	// Advisories are drift worth fixing that must not refuse a city start
+	// (ga-298g8t). Doctor is exactly where they belong: visible, actionable, and
+	// unable to strand anything.
+	if advisories := compatDoltDriftAdvisories(c.cityPath, c.cfg); len(advisories) > 0 {
+		r.Status = doctor.StatusWarning
+		r.Message = fmt.Sprintf("canonical/compat Dolt drift (advisory): %s", strings.Join(advisories, "; "))
+		r.FixHint = "run a rig init (or gc reload) to reconcile .beads/config.yaml with the city.toml declaration"
+		return r
+	}
 	r.Status = doctor.StatusOK
 	r.Message = "canonical and deprecated Dolt endpoint config agree"
 	return r
@@ -278,12 +288,24 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 	}
 	register(newProviderCatalogDoctorCheck(cityPath))
 	register(newProviderCatalogReadinessAdvisoryCheck(cityPath))
+	register(newClaudeAccountDeclarationDoctorCheck(cityPath))
 	register(expandedConfigLoadCheck{})
 	register(&doctor.ImplicitImportCacheCheck{})
 	register(&doctor.DeprecatedAttachmentFieldsCheck{})
 	// Reads only ctx.CityPath, so it stays outside the config gate: a broken
 	// city.toml is precisely when session diagnostics need to be visible.
 	register(doctor.NewNudgeUnconfirmedCheck())
+	// ga-7qkj: dolt-drift and the managed-dolt probes read marker files; this
+	// census starts from the process table, so a server that never wrote a
+	// marker (the field orphans) is visible too. It stays outside both gates:
+	// a stale server left after a move to file-backed stores, or behind a
+	// broken city.toml, is exactly when the configuration says none should
+	// exist. Without a clean config only its per-scope policy degrades.
+	var doltServersCfg *config.City
+	if cfgErr == nil {
+		doltServersCfg = cfg
+	}
+	register(newDoltServersCheck(cityPath, doltServersCfg))
 
 	// Config-dependent checks run only when city.toml loaded cleanly. If it
 	// fails, the core config check above reports the parse error.
@@ -318,19 +340,23 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 		register(doctor.NewConfigSemanticsCheck(cfg, filepath.Join(cityPath, "city.toml")))
 		register(doctor.NewDurationRangeCheck(cfg))
 		register(doctor.NewProviderParityCheck(cfg))
+		register(doctor.NewProviderReadinessCheck(cfg))
 		register(doctor.NewFormulaRequirementsCheck(cfg, cityPath))
 		register(doctor.NewNamedAlwaysMinConflictCheck(cfg))
 		register(doctor.NewInstructionsFileCheck(cfg, cityPath))
 		register(doctor.NewServiceSecretsPermsCheck(cfg, cityPath))
-		register(doctor.NewSkillCollisionCheck(cfg, cityPath))
+		register(doctor.NewSkillCollisionCheck(cfg, cityPath, stage1OptInAtScopeRoot(cityPath, cfg)))
 		register(doctor.NewSkillDanglingSinkCheck(doctorSkillStaticSinks(cityPath, cfg), materialize.LegacyOwnedRootsFor(cityPath), liveSessionSinks))
 		registerCityStoreCheck(doctor.NewOrderFiringCurrentCheck(cfg, cityPath,
 			doctor.WithOrderFiringCurrentLastRunFunc(
 				storeGate.OrderLastRun(cityPath, cfg, doctorOrderFiringCurrentLastRunFunc(cityPath, cfg, opts.Stderr))),
 			doctor.WithOrderFiringCurrentInapplicableFunc(func(a orders.Order) (string, bool) {
 				return orderInapplicableBackend(cityPath, cfg, a)
-			})))
+			}),
+			doctor.WithOrderFiringCurrentOpenWorkFunc(
+				storeGate.OrderOpenWork(cityPath, cfg, doctorOrderFiringCurrentOpenWorkFunc(cityPath, cfg, opts.Stderr)))))
 		register(doctor.NewOrderOutcomeHealthyCheck(cfg, cityPath))
+		register(doctor.NewOrderExecTargetCheck(cfg, cityPath))
 		register(newCodexHooksDriftCheck(cityPath, codexHookWorkDirs(cityPath, cfg)))
 		register(doctor.NewRigPackCoverageCheck(cfg, cityPath))
 		register(newPackRuntimesDoctorCheck(cfg))
@@ -385,6 +411,26 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 	register(doctor.NewSupervisorHTTPCheck(opts.SupervisorRunning))
 	register(doctor.NewSupervisorUnitOwnershipCheck(opts.SupervisorRunning, opts.SupervisorPID, opts.SupervisorUnitOwnership))
 	register(doctor.NewSupervisorBinaryCheck(opts.SupervisorRunning, opts.SupervisorPID, opts.SupervisorBinary))
+	// ga-7qkj: reachability is not currency. supervisor-http-api above answers
+	// from the HTTP status code alone, so a supervisor that has served a stale
+	// build for days reads green. This check asks /health what build is
+	// ACTUALLY serving and compares it against the binary on disk, reusing the
+	// same DetectBinaryDrift that `gc start` uses so drift has one definition.
+	// The probe is a closure, not a gathered value: the check is not
+	// warmup-eligible, so an eager fetch would spend a round-trip on every
+	// warm-up scan that filters it out.
+	register(doctor.NewSupervisorBuildDriftCheck(
+		opts.SupervisorRunning,
+		commit,
+		servingSupervisorBuildID,
+		func(local, serving string) bool {
+			return DetectBinaryDrift(local, SupervisorStatus{BuildID: serving})
+		},
+	))
+	// Beads-cache reconcile watch: alarms on the ABSENCE of a reconcile
+	// heartbeat. Registered next to the controller checks because it is a
+	// statement about the RUNNING controller, and it self-skips when none is.
+	register(newBeadsCacheReconcileCheck(cityPath, cfg, controllerRunning))
 
 	// sessionSP is the session provider the session checks read, and the
 	// ownerless-runtimes check after them; sessionSPErr is why there is none.
@@ -407,7 +453,12 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 			} else {
 				register(doctor.NewAgentSessionsCheck(cfg, cityName, st, sp))
 				register(doctor.NewZombieSessionsCheck(cfg, cityName, st, sp))
-				register(doctor.NewOrphanSessionsCheck(cfg, cityName, st, sp))
+				// ga-n2f1ph: a running session is an orphan only when neither a
+				// configured template NOR an open session bead claims its runtime
+				// name. The lister is lazy (no store read unless a running session is
+				// not template-derived) and a failure makes Fix refuse.
+				register(doctor.NewOrphanSessionsCheck(cfg, cityName, st, sp).
+					WithManagedSessionNames(doctorManagedSessionNames(cityPath, cfg, openStoreForCity(cityPath), storeGate)))
 				sessionSP = sp
 			}
 		}
@@ -454,48 +505,53 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 		}
 	}
 
-	// Data checks.
+	// Data checks. Store schema compatibility stays checkable from the raw
+	// city config even when expanded imports fail to load: storeOK is only
+	// cleared by a preflight that ran against a loaded config.
 	if cfgErr == nil && cfg != nil {
 		register(doctor.NewBDSplitStoreCheck(cityPath))
-		if storeOK {
-			registerCityStoreCheck(doctor.NewBeadsStoreCheck(cityPath, openStoreResultForCity(cityPath)))
-			registerCityStoreCheck(newV2RoutedToNamespaceCheck(cfg, cityPath, storeFactory))
-			registerCityStoreCheck(newExecutorIdentityResidueCheck(cfg, cityPath, storeFactory))
-			registerCityStoreCheck(newCensusOwnerLivenessCheck(cfg, cityPath, storeFactory))
-			registerCityStoreCheck(newRunTargetRoutedToBackfillCheck(cfg, cityPath, storeFactory))
-			registerCityStoreCheck(newRouteRecoveryQuarantineCheck(cfg, cityPath, storeFactory))
-			registerCityStoreCheck(newHoldLabelRoutedToCheck(cfg, cityPath, storeFactory))
-			registerCityStoreCheck(newPoolIdleRoutedWorkCheck(cfg, cityPath, storeFactory))
-			registerCityStoreCheck(newV2DemandMigrationsCheck(cfg, cityPath, storeFactory))
-			registerCityStoreCheck(newV2SessionMigrationCheck(cfg, cityPath))
-			if !cityStoreStopped {
-				reconcilerCheck.capabilities = func() ([]v2StoreCapability, error) {
-					store, err := storeFactory(cityPath)
-					if err != nil {
-						return nil, err
-					}
-					routes := cliStorageRoutes(cityPath)
-					return v2ClassStoreCapabilities(resolveSessionStore(routes, store, cfg, cityPath, nil), resolveGraphStore(routes, store, cfg, cityPath, nil), true), nil
+	}
+	if storeOK {
+		registerCityStoreCheck(doctor.NewBeadsStoreCheck(cityPath, openStoreResultForCity(cityPath)))
+	}
+	if cfgErr == nil && cfg != nil && storeOK {
+		registerCityStoreCheck(newV2RoutedToNamespaceCheck(cfg, cityPath, storeFactory))
+		registerCityStoreCheck(newExecutorIdentityResidueCheck(cfg, cityPath, storeFactory))
+		registerCityStoreCheck(newCensusOwnerLivenessCheck(cfg, cityPath, storeFactory))
+		registerCityStoreCheck(newRunTargetRoutedToBackfillCheck(cfg, cityPath, storeFactory))
+		registerCityStoreCheck(newRouteRecoveryQuarantineCheck(cfg, cityPath, storeFactory))
+		registerCityStoreCheck(newHoldLabelRoutedToCheck(cfg, cityPath, storeFactory))
+		registerCityStoreCheck(newPoolIdleRoutedWorkCheck(cfg, cityPath, storeFactory))
+		registerCityStoreCheck(newV2DemandMigrationsCheck(cfg, cityPath, storeFactory))
+		registerCityStoreCheck(newV2SessionMigrationCheck(cfg, cityPath))
+		if !cityStoreStopped {
+			reconcilerCheck.capabilities = func() ([]v2StoreCapability, error) {
+				store, err := storeFactory(cityPath)
+				if err != nil {
+					return nil, err
 				}
+				routes := cliStorageRoutes(cityPath)
+				return v2ClassStoreCapabilities(resolveSessionStore(routes, store, cfg, cityPath, nil), resolveGraphStore(routes, store, cfg, cityPath, nil), true), nil
 			}
-			registerCityStoreCheck(newWorkOptionMetadataMigrationCheck(cfg, cityPath, storeFactory))
-			registerCityStoreCheck(newBacklogDepthCheck(cityPath, storeFactory))
-			registerCityStoreCheck(newOrderTrackingRetentionCheck(cityPath, storeFactory))
-			registerCityStoreCheck(&sessionModelDoctorCheck{cfg: cfg, cityPath: cityPath, newStore: storeFactory})
-			registerCityStoreCheck(newStartupHealthEpisodesCheck(cfg, cityPath, storeFactory))
-			registerCityStoreCheck(newOwnerlessRuntimesCheck(cfg, cityPath, storeFactory, sessionSP, sessionSPErr))
-			// Differential probe: the preflight above just proved the store
-			// reachable with the controller's environment, so a read that
-			// fails under the gate sandbox isolates the sandbox (ga-pqlgh).
-			// The check's message asserts that control ("the same read
-			// succeeded for the controller"), so it needs the preflight to
-			// have actually run and passed — storeOK alone also holds when the
-			// probe was skipped or failed in a non-outage shape, and in both
-			// of those the assertion would be false. On a stopped proxied city
-			// it is listed as not checked, like every other store read.
-			if storePreflightPassed || cityStoreStopped {
-				registerCityStoreCheck(newGateSandboxReadCheck(cityPath))
-			}
+		}
+		registerCityStoreCheck(newWorkOptionMetadataMigrationCheck(cfg, cityPath, storeFactory))
+		registerCityStoreCheck(newBacklogDepthCheck(cityPath, storeFactory))
+		registerCityStoreCheck(newOrderTrackingRetentionCheck(cityPath, storeFactory))
+		registerCityStoreCheck(&sessionModelDoctorCheck{cfg: cfg, cityPath: cityPath, newStore: storeFactory})
+		registerCityStoreCheck(&cloudWakeDoctorCheck{cfg: cfg, cityPath: cityPath, newStore: storeFactory})
+		registerCityStoreCheck(newStartupHealthEpisodesCheck(cfg, cityPath, storeFactory))
+		registerCityStoreCheck(newOwnerlessRuntimesCheck(cfg, cityPath, storeFactory, sessionSP, sessionSPErr))
+		// Differential probe: the preflight above just proved the store
+		// reachable with the controller's environment, so a read that
+		// fails under the gate sandbox isolates the sandbox (ga-pqlgh).
+		// The check's message asserts that control ("the same read
+		// succeeded for the controller"), so it needs the preflight to
+		// have actually run and passed — storeOK alone also holds when the
+		// probe was skipped or failed in a non-outage shape, and in both
+		// of those the assertion would be false. On a stopped proxied city
+		// it is listed as not checked, like every other store read.
+		if storePreflightPassed || cityStoreStopped {
+			registerCityStoreCheck(newGateSandboxReadCheck(cityPath))
 		}
 	}
 	register(newDoctorDoltServerCheck(cityPath, opts.SkipCityDoltCheck))
@@ -517,6 +573,17 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 	register(doctor.NewDoltLogSizeCheckForConfig(cityPath, opts.SkipManagedDoltCheck, cfg, cfgErr))
 	register(doctor.NewDoltConfigCheckForConfig(cityPath, opts.SkipManagedDoltCheck, cfg, cfgErr))
 	register(doctor.NewScopedDoltVersionCheckForConfig(cityPath, opts.SkipManagedDoltCheck, cfg, cfgErr))
+	// City-store local-only remote check (ga-51iq0s). The per-rig registration
+	// below cannot reach this: hq, the city's own beads database, is not a rig,
+	// so the check that hunts off-box Dolt remotes had NO registration able to
+	// inspect the one database that actually carried one (ga-cc4wzn, 22h).
+	//
+	// Deliberately NOT gated on SkipManagedDoltCheck, unlike its siblings above.
+	// Gating is what made this check invisible in the first place, and the check
+	// now reports StatusSkipped when local-only is unconfigured — a visible
+	// "not assessed" beats a silently absent line. A file-backed or external
+	// workspace gets one honest skipped row, which gates nothing.
+	register(doctor.NewCityDoltLocalOnlyRemoteCheck(cityPath, managedDoltDataDir))
 	register(&doctor.EventsLogCheck{})
 	register(doctor.NewEventLogSizeCheck())
 	// bd auto-backup growth canary. bd's auto-backup pipeline (upstream of
@@ -1041,12 +1108,16 @@ type doctorJSONResult struct {
 // advisory-only run gets ok:true from withDefaultSuccessOK, and a blocking
 // failure wraps it in doctorBlockingFailure, whose envelope supplies both.
 type doctorJSONReport struct {
-	Passed         int                `json:"passed"`
-	Warned         int                `json:"warned"`
-	Failed         int                `json:"failed"`
-	BlockingFailed int                `json:"blocking_failed"`
-	Fixed          int                `json:"fixed"`
-	Results        []doctorJSONResult `json:"results"`
+	Passed         int `json:"passed"`
+	Warned         int `json:"warned"`
+	Failed         int `json:"failed"`
+	BlockingFailed int `json:"blocking_failed"`
+	// Skipped counts checks that did NOT assess their subject. These were
+	// previously folded into Passed, so a consumer comparing passed counts
+	// across versions will see passed drop by exactly this much (ga-51iq0s).
+	Skipped int                `json:"skipped"`
+	Fixed   int                `json:"fixed"`
+	Results []doctorJSONResult `json:"results"`
 }
 
 func doctorStatusString(s doctor.CheckStatus) string {
@@ -1057,6 +1128,8 @@ func doctorStatusString(s doctor.CheckStatus) string {
 		return "warning"
 	case doctor.StatusError:
 		return "error"
+	case doctor.StatusSkipped:
+		return "skipped"
 	}
 	return "unknown"
 }
@@ -1077,6 +1150,7 @@ func writeDoctorJSON(w io.Writer, report *doctor.Report) error {
 		Warned:         report.Warned,
 		Failed:         report.Failed,
 		BlockingFailed: report.BlockingFailed,
+		Skipped:        report.Skipped,
 		Fixed:          report.Fixed,
 		Results:        make([]doctorJSONResult, 0, len(report.Results)),
 	}
@@ -1186,4 +1260,33 @@ func openStoreResultForCity(cityPath string) func(string) (beads.StoreOpenResult
 	return func(dirPath string) (beads.StoreOpenResult, error) {
 		return openStoreResultAtForCity(dirPath, cityPath)
 	}
+}
+
+// servingSupervisorBuildIDTimeout bounds the /health probe behind the
+// supervisor-build-drift check. It is deliberately shorter than the drift
+// client's own 5s default: doctor runs this check among many, and a supervisor
+// that cannot answer a localhost health probe in two seconds has already told
+// us something the check reports as not-assessed rather than waiting on.
+const servingSupervisorBuildIDTimeout = 2 * time.Second
+
+// servingSupervisorBuildID reports the build identity the RUNNING supervisor
+// says it is serving, read from /health.
+//
+// An error is returned rather than an empty string whenever the question could
+// not be put to the supervisor, because the caller renders those two states
+// differently: "it answered and reported no identity" is a different fact from
+// "it could not be asked", and collapsing them is how a health check starts
+// reassuring the operator about something it never measured.
+func servingSupervisorBuildID() (doctor.ServingBuild, error) {
+	baseURL, err := supervisorAPIBaseURLHook()
+	if err != nil {
+		return doctor.ServingBuild{}, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), servingSupervisorBuildIDTimeout)
+	defer cancel()
+	status, err := newHTTPSupervisorClient(baseURL).Status(ctx)
+	if err != nil {
+		return doctor.ServingBuild{}, err
+	}
+	return doctor.ServingBuild{BuildID: status.BuildID, UptimeSec: status.UptimeSec}, nil
 }

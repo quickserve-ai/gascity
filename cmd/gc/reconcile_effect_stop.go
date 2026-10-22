@@ -128,9 +128,11 @@ type stalledClaim struct {
 //
 // The execution backstop requests the stop, and its own record is
 // execution_claim_started at the row's current instance token (startedValue),
-// the stamp that already vetoes its drain. Only that keeps the claim:
-// work_started names every claim the hook handed out, and a stamp from an
-// earlier incarnation names one the seat was woken on and never ran, so
+// the stamp that already vetoes its drain, written from a step_started of
+// the claim or from its work_started entry at the row's current generation
+// (workStartedAtGen). Only that keeps the claim: work_started read whole
+// names every claim the hook handed out, at any generation, and a stamp from
+// an earlier incarnation names one the seat was woken on and never ran, so
 // keeping either would leave the seat asleep holding the claim, the
 // assigned-work wake would restart it on it, and the backstop would drain it
 // again: the v5.10x loop.
@@ -500,7 +502,10 @@ func stopFinalizeStep(v txView, work finalizeWork, probeErr error) txStep {
 	// the fresh row in the same CAS, as legacy's ApplySleep splits it: the
 	// cell keeps an operator's hold, a wait's intent and an intent it cannot
 	// read, and clears the idle stop's transient.
-	patch := maps.Clone(choice.Patch)                                                             // a builder may hand back a shared map
+	patch := maps.Clone(choice.Patch) // a builder may hand back a shared map
+	// A restart handoff or fresh cycle rotates or clears the key: the one it
+	// replaces stays findable (ga-oe8h), as legacy's finalize stamps it.
+	session.StampPriorSessionKeyInfo(patch, v.Row)
 	if req, ok := activeStop(v.World.Census.reread(v.It.Key, v.Row, v.Meta)); ok || req.Residue { // the fresh row's stop keys, a residue's too (D4)
 		maps.Copy(patch, stopEndPatch())
 	}

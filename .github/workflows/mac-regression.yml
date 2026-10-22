@@ -76,6 +76,14 @@ concurrency:
 env:
   DOLT_VERSION: "2.2.0"
   BD_VERSION: "v1.3.1"
+  # The fleet bd: the quickserve-ai/beads release go.mod's beads replace names.
+  # Tier A acceptance tests gc's library against it, as Bazel's :acceptance_test
+  # does (MODULE.bazel bd_bin_*_fleet_*); the bd CLI contract steps keep the
+  # upstream BD_VERSION install (CARRY.md, the Beads fleet pin row). Under the
+  # upstream release, TestBeadsProxiedDefaultNativeLane/status-zero-forks forks bd
+  # 4 times (gc-xol7, ga-tkfdsb). scripts/beads_fleet_replace_test.go keeps this
+  # on the replace's tag.
+  FLEET_BD_TAG: "v1.3.1-fleet.20261005.1"
 
 # Tier routing is centralized in the `gate` job below, which always runs
 # and computes run_smoke/run_full/run_review_formulas plus a human-readable
@@ -89,7 +97,9 @@ env:
 jobs:
   runner-policy:
     name: Runner policy
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    # GitHub-hosted on the quickserve-ai fork, which has no Blacksmith
+    # runners (pl-axh9); unchanged upstream.
+    runs-on: ${{ github.repository == 'gastownhall/gascity' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     outputs:
       use_blacksmith: ${{ steps.policy.outputs.use_blacksmith }}
       reason: ${{ steps.policy.outputs.reason }}
@@ -197,8 +207,12 @@ jobs:
             echo "reason=$reason"
           } >>"$GITHUB_OUTPUT"
 
-  # Fast quality gates that Linux runs on every PR. Keep these cheap so a
-  # Mac-parity loop stays interactive.
+  # Quality checks that Linux `CI / required` already runs on every PR.
+  # Informational on Mac: nothing waits on this job and the summary does not
+  # fail on it. Its golangci-lint cache is exact-key-only and on an active
+  # branch the cold run never finishes inside the timeout, so the cache never
+  # saves and every run is cold again (gc-atwr). The job keeps running so a
+  # quiet run can finally save that cache.
   mac-quality:
     name: Mac / quality (lint, fmt, vet, docs)
     needs:
@@ -206,7 +220,7 @@ jobs:
       - gate
     if: needs.gate.outputs.run_smoke == 'true'
     runs-on: ${{ needs.runner-policy.outputs.runner_macos }}
-    timeout-minutes: 35
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
@@ -320,7 +334,7 @@ jobs:
       - gate
     if: needs.gate.outputs.run_smoke == 'true'
     runs-on: ${{ needs.runner-policy.outputs.runner_macos }}
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
@@ -332,13 +346,58 @@ jobs:
           dolt-version: ${{ env.DOLT_VERSION }}
           bd-version: ${{ env.BD_VERSION }}
           install-claude-cli: "true"
+      - name: Install the fleet bd for acceptance
+        id: fleet-bd
+        env:
+          TAG: ${{ env.FLEET_BD_TAG }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/fleet-bd"
+          mkdir -p "$dir"
+          asset="bd-${TAG}-darwin-arm64"
+          base="https://github.com/quickserve-ai/beads/releases/download/${TAG}"
+          curl -fsSL --retry 3 -o "$dir/$asset" "$base/$asset"
+          curl -fsSL --retry 3 -o "$dir/SHA256SUMS" "$base/SHA256SUMS"
+          (cd "$dir" && grep " ${asset}\$" SHA256SUMS | shasum -a 256 -c -)
+          mv "$dir/$asset" "$dir/bd"
+          chmod +x "$dir/bd"
+          "$dir/bd" version
+          echo "path=$dir/bd" >> "$GITHUB_OUTPUT"
       - name: Run acceptance tests (Tier A)
         env:
           # Mac runs acceptance ~3-4x slower than Linux because launchd
           # mediates the supervisor lifecycle; bump the go-test timeout
           # so the whole binary doesn't panic mid-test.
           ACCEPTANCE_TIMEOUT: 20m
+          GC_ACCEPTANCE_BD_BIN: ${{ steps.fleet-bd.outputs.path }}
         run: make test-acceptance-go
+      # The plain go test run above prints the same "ok" whether
+      # TestBeadsProxiedDefaultNativeLane/status-zero-forks passed or skipped
+      # (requireProxiedTooling skips the whole lane when bd or dolt is
+      # missing), so no run recorded which (ga-tkfdsb). Re-run that row
+      # verbosely through the same make target, with the lane's quiescence
+      # precondition and its flag-off positive control, and fail unless go
+      # test reports it PASSED. No if:, so it runs only after Tier A passed
+      # and a Tier A failure stays that step's failure.
+      - name: Prove status-zero-forks passes (not skips) on the Mac
+        env:
+          ACCEPTANCE_TIMEOUT: 20m
+          GC_ACCEPTANCE_BD_BIN: ${{ steps.fleet-bd.outputs.path }}
+        run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/status-zero-forks.log"
+          rc=0
+          # \$\$ reaches make as $$, which make turns into the regex's one $.
+          make test-acceptance-go \
+            ACCEPTANCE_GO_TEST_FLAGS="-v -count=1 -run '^TestBeadsProxiedDefaultNativeLane\$\$/^(precondition-gc-initialised|status-flag-off-still-forks|status-zero-forks)\$\$'" \
+            2>&1 | tee "$log" || rc=$?
+          echo "TestBeadsProxiedDefaultNativeLane result lines:"
+          grep -E -- '--- (PASS|FAIL|SKIP): TestBeadsProxiedDefaultNativeLane' "$log" || echo "(none)"
+          if ! grep -qF -- '--- PASS: TestBeadsProxiedDefaultNativeLane/status-zero-forks' "$log"; then
+            echo "::error::TestBeadsProxiedDefaultNativeLane/status-zero-forks did not report PASS (skipped, failed or never ran; make exited $rc)"
+            exit 1
+          fi
+          exit "$rc"
       - name: Run external bd CLI contract
         run: make test-bd-cli-contract
       - name: Run external bd CLI contract HOME isolation
@@ -391,7 +450,6 @@ jobs:
     needs:
       - runner-policy
       - gate
-      - mac-quality
       - mac-unit
       - mac-acceptance
     if: needs.gate.outputs.run_full == 'true'
@@ -455,7 +513,6 @@ jobs:
     needs:
       - runner-policy
       - gate
-      - mac-quality
       - mac-unit
       - mac-acceptance
     if: needs.gate.outputs.run_full == 'true'
@@ -496,7 +553,6 @@ jobs:
     needs:
       - runner-policy
       - gate
-      - mac-quality
       - mac-unit
       - mac-acceptance
     if: needs.gate.outputs.run_full == 'true'
@@ -563,7 +619,6 @@ jobs:
     needs:
       - runner-policy
       - gate
-      - mac-quality
       - mac-unit
       - mac-acceptance
     if: needs.gate.outputs.run_review_formulas == 'true'
@@ -670,7 +725,7 @@ jobs:
 
           | Job | Result |
           | --- | --- |
-          | Mac / quality | ${QUALITY} |
+          | Mac / quality (informational) | ${QUALITY} |
           | Mac / make test-mac | ${UNIT} |
           | Mac / cmd-gc process | ${CMD_GC} |
           | Mac / acceptance (Tier A) | ${ACCEPTANCE} |
@@ -682,7 +737,7 @@ jobs:
           EOF
 
           fail=0
-          for result in "$QUALITY" "$UNIT" "$CMD_GC" "$ACCEPTANCE" "$INT_PACKAGES" "$INT_REST"; do
+          for result in "$UNIT" "$CMD_GC" "$ACCEPTANCE" "$INT_PACKAGES" "$INT_REST"; do
             # Skipped is acceptable (e.g. when run outside the needs-mac trigger set)
             case "$result" in
               success|skipped|"") ;;

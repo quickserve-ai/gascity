@@ -102,10 +102,12 @@ type agentFile struct {
 	DefaultSlingFormula    *string                 `toml:"default_sling_formula,omitempty"`
 	InjectFragments        []string                `toml:"inject_fragments,omitempty"`
 	AppendFragments        []string                `toml:"append_fragments,omitempty"`
+	OptInSkills            []string                `toml:"opt_in_skills,omitempty"`
 	Attach                 *bool                   `toml:"attach,omitempty"`
 	DependsOn              []string                `toml:"depends_on,omitempty"`
 	ResumeCommand          string                  `toml:"resume_command,omitempty"`
 	WakeMode               string                  `toml:"wake_mode,omitempty"`
+	WakeTransport          string                  `toml:"wake_transport,omitempty"`
 	MouseMode              string                  `toml:"mouse_mode,omitempty"`
 }
 
@@ -960,10 +962,12 @@ func agentConfigFromAgent(agent config.Agent) agentFile {
 		DefaultSlingFormula:    agent.DefaultSlingFormula,
 		InjectFragments:        agent.InjectFragments,
 		AppendFragments:        agent.AppendFragments,
+		OptInSkills:            agent.OptInSkills,
 		Attach:                 agent.Attach,
 		DependsOn:              agent.DependsOn,
 		ResumeCommand:          agent.ResumeCommand,
 		WakeMode:               agent.WakeMode,
+		WakeTransport:          agent.WakeTransport,
 		MouseMode:              agent.MouseMode,
 	}
 }
@@ -1014,10 +1018,12 @@ func isZeroAgentConfig(cfg agentFile) bool {
 		cfg.DefaultSlingFormula == nil &&
 		len(cfg.InjectFragments) == 0 &&
 		len(cfg.AppendFragments) == 0 &&
+		len(cfg.OptInSkills) == 0 &&
 		cfg.Attach == nil &&
 		len(cfg.DependsOn) == 0 &&
 		cfg.ResumeCommand == "" &&
 		cfg.WakeMode == "" &&
+		cfg.WakeTransport == "" &&
 		cfg.MouseMode == ""
 }
 

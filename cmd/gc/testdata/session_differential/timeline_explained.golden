@@ -94,8 +94,6 @@ row:gc-1:state resolved
 === a live quarantined row 29s after wake
 ## 0 seed (+0s)
 @ +0s
-provider:RemoveMeta s-gc-1 legacy="11" v2="" [drain-stop-lag]
-provider:SetMeta s-gc-1 legacy="4" v2="" [drain-stop-lag]
 row:gc-1:effective_sleep_after_idle legacy="off" v2="" [sleep-policy-keys]
 row:gc-1:requested_sleep_after_idle legacy="off" v2="" [sleep-policy-keys]
 row:gc-1:sleep_capability legacy="full" v2="" [sleep-policy-keys]
@@ -104,16 +102,12 @@ row:gc-1:sleep_policy_source legacy="legacy_off" v2="" [sleep-policy-keys]
 ## 1 alive (+29s)
 ## 2 settled (+1m19s)
 @ +39s
-provider:RemoveMeta s-gc-1 resolved
-provider:SetMeta s-gc-1 resolved
 row:gc-1:currently_processing_bead_id legacy="gw-1" v2="" [§12.2#37 current-bead-lag]
 @ +49s
 row:gc-1:currently_processing_bead_id resolved
 === a live quarantined row 31s after wake
 ## 0 seed (+0s)
 @ +0s
-provider:RemoveMeta s-gc-1 legacy="11" v2="" [drain-stop-lag]
-provider:SetMeta s-gc-1 legacy="4" v2="" [drain-stop-lag]
 row:gc-1:effective_sleep_after_idle legacy="off" v2="" [sleep-policy-keys]
 row:gc-1:requested_sleep_after_idle legacy="off" v2="" [sleep-policy-keys]
 row:gc-1:sleep_capability legacy="full" v2="" [sleep-policy-keys]
@@ -121,8 +115,6 @@ row:gc-1:sleep_policy_fingerprint legacy="value=off|class=interactive_resume|sou
 row:gc-1:sleep_policy_source legacy="legacy_off" v2="" [sleep-policy-keys]
 ## 1 alive (+31s)
 @ +30s
-provider:RemoveMeta s-gc-1 resolved
-provider:SetMeta s-gc-1 resolved
 row:gc-1:currently_processing_bead_id legacy="gw-1" v2="" [§12.2#37 current-bead-lag]
 @ +31s
 row:gc-1:currently_processing_bead_id resolved
@@ -153,7 +145,7 @@ runtime:s-gc-1:meta:GC_AGENT resolved
 ## 1 suspend (+40s)
 @ +20s
 provider:RemoveMeta s-gc-1 legacy="6" v2="" [drain-env-clears]
-provider:SetMeta s-gc-1 legacy="4" v2="" [drain-env-clears]
+provider:SetMeta s-gc-1 legacy="3" v2="" [drain-env-clears]
 @ +30s
 provider:RemoveMeta s-gc-1 resolved
 provider:SetMeta s-gc-1 resolved
@@ -322,9 +314,8 @@ runtime:s-gc-1:meta:GC_AGENT resolved
 @ +20s
 event:session.drain_acked_with_assigned_work worker {"bead_id":"gw-1","bead_status":"in_progress","reason":"drain_acked_with_assigned_work","session_id":"gc-1","template":"worker"} legacy="1" v2="" [drain-stop-lag]
 event:session.stopped worker {"reason":"drain acknowledged","session_id":"gc-1","template":"worker"} legacy="1" v2="" [drain-stop-lag]
-event:session.stranded gc-1 {"session_id":"gc-1","session_name":"s-gc-1","template":"worker","work_bead_ids":["gw-1"]} legacy="1" v2="" [drain-stop-lag]
 provider:RemoveMeta s-gc-1 legacy="6" v2="" [drain-env-clears]
-provider:SetMeta s-gc-1 legacy="4" v2="" [drain-env-clears]
+provider:SetMeta s-gc-1 legacy="3" v2="" [drain-env-clears]
 provider:Stop s-gc-1 legacy="1" v2="" [drain-stop-lag]
 row:gc-1:detached_at legacy="" v2="T+0s" [wait-sleep-lag]
 row:gc-1:drain_at legacy="T+20s" v2="" [drain-stop-lag]
@@ -335,12 +326,10 @@ row:gc-1:last_woke_at legacy="" v2="T-1h0m0s" [drain-stop-lag]
 row:gc-1:sleep_reason legacy="idle" v2="" [drain-stop-lag]
 row:gc-1:slept_at legacy="T+20s" v2="" [drain-stop-lag]
 row:gc-1:state legacy="asleep" v2="awake" [drain-stop-lag]
-row:gc-1:stranded_event_emitted_at legacy="T+20s" v2="" [drain-stop-lag]
 runtime:s-gc-1 legacy="" v2="id=gc-1 epoch=1 token=tok-gc-1 alive attached=false" [drain-stop-lag]
 @ +30s
 event:session.drain_acked_with_assigned_work worker {"bead_id":"gw-1","bead_status":"in_progress","reason":"drain_acked_with_assigned_work","session_id":"gc-1","template":"worker"} resolved
 event:session.stopped worker {"reason":"drain acknowledged","session_id":"gc-1","template":"worker"} resolved
-event:session.stranded gc-1 {"session_id":"gc-1","session_name":"s-gc-1","template":"worker","work_bead_ids":["gw-1"]} resolved
 provider:RemoveMeta s-gc-1 resolved
 provider:SetMeta s-gc-1 resolved
 provider:Stop s-gc-1 resolved
@@ -368,19 +357,12 @@ provider:Stop s-gc-1 resolved
 row:gc-1:detached_at resolved
 row:gc-1:drain_at legacy="T+20s" v2="T+30s" [wait-sleep-lag]
 row:gc-1:slept_at legacy="T+20s" v2="T+40s" [wait-sleep-lag]
-row:gc-1:stranded_event_emitted_at legacy="T+20s" v2="" [wait-sleep-lag]
-@ +1m0s
-event:session.stranded gc-1 {"session_id":"gc-1","session_name":"s-gc-1","template":"worker","work_bead_ids":["gw-1"]} legacy="" v2="1" [drain-stop-lag]
-row:gc-1:stranded_event_emitted_at legacy="T+20s" v2="T+1m0s" [wait-sleep-lag]
-@ +1m10s
-event:session.stranded gc-1 {"session_id":"gc-1","session_name":"s-gc-1","template":"worker","work_bead_ids":["gw-1"]} resolved
 @ +1m10s
 provider:RemoveMeta s-gc-1 legacy="5" v2="" [§12.2#38 start-meta-clears]
 row:gc-1:state legacy="active" v2="awake" [wait-sleep-lag]
 @ +1m20s
 provider:RemoveMeta s-gc-1 resolved
 row:gc-1:state resolved
-row:gc-1:stranded_event_emitted_at resolved
 work:gc-2:nudge_id legacy="" v2="wait-gc-2-0-1" [§12.2#58 wait-nudge-bead]
 work:gc-3 legacy="" v2="present" [§12.2#58 wait-nudge-bead]
 work:gc-3:agent legacy="" v2="worker-1" [§12.2#58 wait-nudge-bead]
@@ -511,7 +493,7 @@ row:gc-c:sleep_policy_fingerprint resolved
 @ +5m10s
 event:session.stopped chat {"reason":"drain acknowledged","session_id":"gc-c","template":"chat"} legacy="1" v2="" [idle-sleep-lag]
 provider:RemoveMeta test-city--chat legacy="6" v2="" [idle-sleep-lag]
-provider:SetMeta test-city--chat legacy="4" v2="" [idle-sleep-lag]
+provider:SetMeta test-city--chat legacy="3" v2="" [idle-sleep-lag]
 provider:Stop test-city--chat legacy="1" v2="" [idle-sleep-lag]
 row:gc-c:config_wake_suppressed resolved
 row:gc-c:detached_at legacy="" v2="T+0s" [idle-sleep-lag]
@@ -546,7 +528,7 @@ row:gc-c:detached_at resolved
 @ +4m0s
 event:session.stopped worker {"reason":"drain acknowledged","session_id":"gc-1","template":"worker"} legacy="1" v2="" [drain-stop-lag]
 provider:RemoveMeta s-gc-1 legacy="6" v2="" [drain-env-clears]
-provider:SetMeta s-gc-1 legacy="4" v2="" [drain-env-clears]
+provider:SetMeta s-gc-1 legacy="3" v2="" [drain-env-clears]
 provider:Stop s-gc-1 legacy="1" v2="" [drain-stop-lag]
 row:gc-1:close_reason legacy="session drained: pool slot retired by reconciler" v2="" [drain-stop-lag]
 row:gc-1:closed_at legacy="T+4m0s" v2="" [drain-stop-lag]
@@ -588,7 +570,7 @@ provider:Stop s-gc-1 resolved
 @ +0s
 event:session.stopped worker {"reason":"drain acknowledged","session_id":"gc-1","template":"worker"} legacy="1" v2="" [drain-stop-lag]
 provider:RemoveMeta s-gc-1 legacy="6" v2="" [drain-env-clears]
-provider:SetMeta s-gc-1 legacy="4" v2="" [drain-env-clears]
+provider:SetMeta s-gc-1 legacy="3" v2="" [drain-env-clears]
 provider:Stop s-gc-1 legacy="1" v2="" [drain-stop-lag]
 row:gc-1:close_reason legacy="session drained: pool slot retired by reconciler" v2="" [drain-stop-lag]
 row:gc-1:closed_at legacy="T+0s" v2="" [drain-stop-lag]
@@ -630,7 +612,7 @@ provider:Stop s-gc-1 resolved
 @ +0s
 event:session.stopped worker {"reason":"drain acknowledged","session_id":"gc-1","template":"worker"} legacy="1" v2="" [drain-stop-lag]
 provider:RemoveMeta s-gc-1 legacy="6" v2="" [drain-env-clears]
-provider:SetMeta s-gc-1 legacy="4" v2="" [drain-env-clears]
+provider:SetMeta s-gc-1 legacy="3" v2="" [drain-env-clears]
 provider:Stop s-gc-1 legacy="1" v2="" [drain-stop-lag]
 row:gc-1:close_reason legacy="session drained: pool slot retired by reconciler" v2="" [drain-stop-lag]
 row:gc-1:closed_at legacy="T+0s" v2="" [drain-stop-lag]
@@ -673,7 +655,7 @@ provider:Stop s-gc-1 resolved
 @ +7m0s
 event:session.stopped worker {"reason":"drain acknowledged","session_id":"gc-1","template":"worker"} legacy="1" v2="" [drain-stop-lag]
 provider:RemoveMeta s-gc-1 legacy="6" v2="" [drain-env-clears]
-provider:SetMeta s-gc-1 legacy="4" v2="" [drain-env-clears]
+provider:SetMeta s-gc-1 legacy="3" v2="" [drain-env-clears]
 provider:Stop s-gc-1 legacy="1" v2="" [drain-stop-lag]
 row:gc-1:close_reason legacy="session drained: pool slot retired by reconciler" v2="" [drain-stop-lag]
 row:gc-1:closed_at legacy="T+7m0s" v2="" [drain-stop-lag]
@@ -769,7 +751,7 @@ row:gc-c:config_wake_suppressed legacy="true" v2="" [sleep-policy-keys]
 @ +5m10s
 event:session.stopped chat {"reason":"drain acknowledged","session_id":"gc-c","template":"chat"} legacy="1" v2="" [idle-sleep-lag]
 provider:RemoveMeta test-city--chat legacy="6" v2="" [idle-sleep-lag]
-provider:SetMeta test-city--chat legacy="4" v2="" [idle-sleep-lag]
+provider:SetMeta test-city--chat legacy="3" v2="" [idle-sleep-lag]
 provider:Stop test-city--chat legacy="1" v2="" [idle-sleep-lag]
 row:gc-c:detached_at legacy="" v2="T+0s" [idle-sleep-lag]
 row:gc-c:drain_at legacy="T+5m10s" v2="" [idle-sleep-lag]

@@ -192,6 +192,7 @@ const (
 	FormulaContractMetadataKey           = "gc.formula_contract"
 	FormulaHashMetadataKey               = "gc.formula_hash"
 	FormulaNameMetadataKey               = "gc.formula_name"
+	FormulaPathAgnosticMetadataKey       = "gc.formula_path_agnostic"
 	FormulaSourceMetadataKey             = "gc.formula_source"
 	GCExemptMetadataKey                  = "gc.gc_exempt"
 	Graphv2RootKeyMetadataKey            = "gc.graphv2_root_key"
@@ -214,6 +215,7 @@ const (
 	LastFailureClassMetadataKey         = "gc.last_failure_class"
 	LastFinalizeErrorMetadataKey        = "gc.last_finalize_error"
 	LeaseOwnerMetadataKey               = "gc.lease_owner"
+	LivenessWrittenAtMetadataKey        = "gc.liveness_written_at"
 	LogicalBeadIDMetadataKey            = "gc.logical_bead_id"
 	MaxAttemptsMetadataKey              = "gc.max_attempts"
 	MissingRootBeadIDMetadataKey        = "gc.missing_root_bead_id"
@@ -235,32 +237,66 @@ const (
 	PackRootMetadataKey                 = "gc.pack_root"
 	PackWorkspaceMetadataKey            = "gc.pack_workspace"
 	PerDispatchModelMetadataKey         = "gc.per_dispatch_model"
-	RalphStepIDMetadataKey              = "gc.ralph_step_id"
-	ReasoningMetadataKey                = "gc.reasoning"
-	RequiredArtifactMetadataKey         = "gc.required_artifact"
-	RequiredArtifactsMetadataKey        = "gc.required_artifacts"
-	ReviewGateMetadataKey               = "gc.review_gate"
-	RetryAttemptMetadataKey             = "gc.retry_attempt" // see attempt.go
-	RetryCountMetadataKey               = "gc.retry_count"
-	RetryFromMetadataKey                = "gc.retry_from"
-	RetrySessionRecycledMetadataKey     = "gc.retry_session_recycled"
-	RetryStateMetadataKey               = "gc.retry_state"
-	RigRootMetadataKey                  = "gc.rig_root"
-	RootBeadIDMetadataKey               = "gc.root_bead_id"
-	RootSettleFailedAtMetadataKey       = "gc.root_settle_failed_at"
-	RootSettleFailedMetadataKey         = "gc.root_settle_failed"
-	RootStoreRefMetadataKey             = "gc.root_store_ref"
-	RouteQuarantineMetadataKey          = "gc.route_recovery_quarantined"
-	RouteQuarantineReasonMetadataKey    = "gc.route_recovery_quarantine_reason"
-	RoutedToMetadataKey                 = "gc.routed_to"
-	RunTargetMetadataKey                = "gc.run_target"
-	RuntimeVarsMetadataKey              = "gc.graphv2_vars.v1"
-	ScopeKindMetadataKey                = "gc.scope_kind"
-	ScopeNameMetadataKey                = "gc.scope_name"
-	ScopeRefMetadataKey                 = "gc.scope_ref"
-	ScopeRoleMetadataKey                = "gc.scope_role"
-	SessionAffinityMetadataKey          = "gc.session_affinity"
-	SessionIDMetadataKey                = "gc.session_id"
+	// PrevSessionIDMetadataKey preserves the session back-reference a claim
+	// displaced: when gc hook --claim takes over a bead whose gc.session_id
+	// named a different (no longer live) session, the displaced id is kept
+	// here so recovery can detect the takeover instead of finding the prior
+	// owner erased (ga-pzop1c).
+	PrevSessionIDMetadataKey = "gc.prev_session_id"
+	PRURLMetadataKey         = "gc.pr_url"
+	RalphStepIDMetadataKey   = "gc.ralph_step_id"
+	ReasoningMetadataKey     = "gc.reasoning"
+	// ReleaseDeferredMetadataKey carries the IMMUTABLE obligation a session
+	// close publishes when it withholds the work release because the city config
+	// did not load (ga-dt5ffp). The value is a JSON document — see
+	// cmd/gc/session_release_marker.go — recording the pre-close assignee
+	// identifier set, why the release was withheld, whether the capture was
+	// complete, and which stores were reachable at close time.
+	//
+	// It is written BEFORE the close, never rewritten once complete, and is not
+	// a status field: a drain records its progress under
+	// ReleaseDeferredAckMetadataKey instead, so the obligation and its discharge
+	// never contend for one value.
+	ReleaseDeferredMetadataKey = "gc.release_deferred"
+	// ReleaseDeferredAckMetadataKey is RESERVED for the drain that discharges a
+	// ReleaseDeferredMetadataKey obligation. Nothing writes it yet.
+	//
+	// It is a separate key on purpose. The obligation is immutable, so an
+	// acknowledgement cannot be recorded inside it without reopening the
+	// lost-update hazard the immutability exists to close. The drain must
+	// acknowledge PER GENERATION and PER STORE — a wholesale clear would discard
+	// outstanding rig-store cleanup whenever the rig-store map came back
+	// incomplete, which is exactly the silent drop this design refuses.
+	//
+	// Discharge is recorded by ADDING to this key, never by clearing
+	// ReleaseDeferredMetadataKey. Clearing that key does not mark an obligation
+	// done — it re-arms publication, because an empty value is indistinguishable
+	// from an absent one to both the compare-and-set and the reader.
+	ReleaseDeferredAckMetadataKey    = "gc.release_deferred_ack"
+	RequiredArtifactMetadataKey      = "gc.required_artifact"
+	RequiredArtifactsMetadataKey     = "gc.required_artifacts"
+	ReviewGateMetadataKey            = "gc.review_gate"
+	RetryAttemptMetadataKey          = "gc.retry_attempt" // see attempt.go
+	RetryCountMetadataKey            = "gc.retry_count"
+	RetryFromMetadataKey             = "gc.retry_from"
+	RetrySessionRecycledMetadataKey  = "gc.retry_session_recycled"
+	RetryStateMetadataKey            = "gc.retry_state"
+	RigRootMetadataKey               = "gc.rig_root"
+	RootBeadIDMetadataKey            = "gc.root_bead_id"
+	RootSettleFailedAtMetadataKey    = "gc.root_settle_failed_at"
+	RootSettleFailedMetadataKey      = "gc.root_settle_failed"
+	RootStoreRefMetadataKey          = "gc.root_store_ref"
+	RouteQuarantineMetadataKey       = "gc.route_recovery_quarantined"
+	RouteQuarantineReasonMetadataKey = "gc.route_recovery_quarantine_reason"
+	RoutedToMetadataKey              = "gc.routed_to"
+	RunTargetMetadataKey             = "gc.run_target"
+	RuntimeVarsMetadataKey           = "gc.graphv2_vars.v1"
+	ScopeKindMetadataKey             = "gc.scope_kind"
+	ScopeNameMetadataKey             = "gc.scope_name"
+	ScopeRefMetadataKey              = "gc.scope_ref"
+	ScopeRoleMetadataKey             = "gc.scope_role"
+	SessionAffinityMetadataKey       = "gc.session_affinity"
+	SessionIDMetadataKey             = "gc.session_id"
 	// StrandedMetadataKey ("true"), StrandedSessionMetadataKey (the closed
 	// session's bead ID) and StrandedAssigneeMetadataKey (the claim's assignee
 	// when it was kept) mark a claim a close kept because no lane serves it
@@ -346,10 +382,11 @@ const (
 	// WorkflowExpandedMetadataKey marks a graph.v2 workflow root that was
 	// compiled with real child steps beyond the root itself. Its absence
 	// distinguishes a genuinely root-only (#2763-shape) molecule, whose root
-	// IS the unit of work and must remain claimable via the
-	// RunTargetMetadataKey fallback, from a fully-expanded root whose real
-	// children have all closed and is only waiting on workflow-finalize —
-	// see hookClaimMatchesRoute/hookClaimRoute (#5900).
+	// IS the unit of work and must remain claimable via its RoutedToMetadataKey
+	// or the legacy RunTargetMetadataKey fallback, from an expanded root, which
+	// is a latch closed by workflow-finalize and is never fresh worker demand
+	// through any route, an explicit RoutedToMetadataKey included — see
+	// workflowTopologyIsNonExecutable in cmd/gc (#5900).
 	WorkflowExpandedMetadataKey = "gc.workflow_expanded"
 )
 
@@ -379,6 +416,24 @@ const (
 // variables are written as gc.var.<name>. The suffix is open-world (a
 // user-authored variable name), so it is declared as a prefix, not enumerated.
 const FormulaVarPrefix = Namespace + "var."
+
+// LivenessFencePrefix begins the per-key fence markers the session-liveness
+// machinery commits into VERSIONED metadata whenever a liveness value had to
+// go to bead metadata instead of the non-versioned session_liveness table (a
+// degraded write, a transactional write, or metadata mode). One marker per
+// fenced key — "gc.liveness_fence.state" — whose value is the commit moment;
+// the read overlay drops table rows written at or before it. The suffix is
+// the fenced liveness key, so the family is declared as a prefix. Producer
+// and sole consumer: internal/liveness (which aliases this constant).
+const LivenessFencePrefix = Namespace + "liveness_fence."
+
+// LivenessReadDegradedMetadataKey is stamped by the session-liveness read
+// overlay on a bead it could not overlay although the scope has a liveness
+// store: the liveness fields on that read are committed metadata, which can be
+// stale or absent. Read-side only, never persisted. Producer: the overlay in
+// cmd/gc (via internal/liveness, which aliases this constant); consumer: the
+// session Info projection.
+const LivenessReadDegradedMetadataKey = Namespace + "liveness_read_degraded"
 
 // IdemPrefix is the key prefix for the remote rig-create idempotency record's
 // metadata (gc.idem.kind/city/request_id/digest/state/event_cursor/rig_name,
@@ -456,8 +511,14 @@ const (
 
 	// MoleculeFailedMetadataKey marks the beads of a partially-instantiated
 	// molecule as failed (value "true"). Written best-effort by
-	// internal/molecule markFailed on instantiation error paths; read by
-	// dispatch/sling/cmd/gc to skip or close failed roots.
+	// internal/molecule markFailed on instantiation error paths. Read, through
+	// MoleculeFailed, as a dispatch exclusion: every surface that serves work
+	// to an agent (the hook filter, the control dispatcher's ready scan and
+	// its jq twin) hides a marked bead, every surface that counts pool demand
+	// (the controller's demand predicate, the reconciler's count-form) leaves
+	// it out, convergence's idempotency lookup passes over a marked root, and
+	// the graph.v2 recovery paths close a marked subtree on the next cook of
+	// the same root key (ga-033u0e).
 	MoleculeFailedMetadataKey = "molecule_failed"
 
 	// MergeStrategyMetadataKey records the merge strategy chosen for a slung bead.
@@ -496,6 +557,20 @@ func IsKnownMergeStrategy(s string) bool {
 	return false
 }
 
+// MoleculeFailed reports whether value — a bead's MoleculeFailedMetadataKey
+// entry — marks it as part of a workflow whose instantiation aborted partway.
+//
+// The rule is exact equality with "true", the only value markFailed writes.
+// It is deliberately not trimmed or case-folded: the predicate has two jq
+// twins (the pool-demand count-form in internal/config and the control-ready
+// scan in cmd/gc) that can only compare exactly, and a Go side that accepted
+// more than the shell side would hide a row the shell still counts or serves.
+// Every dispatch-facing reader of the key — serve, count, re-activate — goes
+// through here so those surfaces cannot drift apart again.
+func MoleculeFailed(value string) bool {
+	return value == "true"
+}
+
 // OptionMetadataPrefix is the dynamic non-"gc."-prefixed key prefix under
 // which provider option choices are stored as opt_<OptionsSchema key> (e.g.
 // opt_model, opt_effort) on session and work beads. The suffix is open-world
@@ -509,6 +584,12 @@ const OptionMetadataPrefix = "opt_"
 // declares. The guard test asserts every gc.* metadata literal used in non-test
 // Go resolves to a member of this slice (or a KnownMetadataPrefixes entry).
 var KnownMetadataKeys = []string{
+	ReleaseDeferredMetadataKey,
+	ReleaseDeferredAckMetadataKey,
+	ReleaseProposedAtMetadataKey,
+	ReleaseProposedAssigneeMetadataKey,
+	ReleaseProposedPathMetadataKey,
+	ReleaseProposedReasonMetadataKey,
 	AttemptLogMetadataKey,
 	AttemptMetadataKey,
 	BondMetadataKey,
@@ -587,6 +668,7 @@ var KnownMetadataKeys = []string{
 	FormulaContractMetadataKey,
 	FormulaHashMetadataKey,
 	FormulaNameMetadataKey,
+	FormulaPathAgnosticMetadataKey,
 	FormulaSourceMetadataKey,
 	GCExemptMetadataKey,
 	Graphv2RootKeyMetadataKey,
@@ -600,6 +682,8 @@ var KnownMetadataKeys = []string{
 	LastFailureClassMetadataKey,
 	LastFinalizeErrorMetadataKey,
 	LeaseOwnerMetadataKey,
+	LivenessWrittenAtMetadataKey,
+	LivenessReadDegradedMetadataKey,
 	LogicalBeadIDMetadataKey,
 	MaxAttemptsMetadataKey,
 	MissingRootBeadIDMetadataKey,
@@ -621,6 +705,8 @@ var KnownMetadataKeys = []string{
 	PackRootMetadataKey,
 	PackWorkspaceMetadataKey,
 	PerDispatchModelMetadataKey,
+	PrevSessionIDMetadataKey,
+	PRURLMetadataKey,
 	RalphStepIDMetadataKey,
 	ReasoningMetadataKey,
 	RequiredArtifactMetadataKey,
@@ -696,6 +782,7 @@ var KnownMetadataKeys = []string{
 var KnownMetadataPrefixes = []string{
 	FormulaVarPrefix,
 	IdemPrefix,
+	LivenessFencePrefix,
 }
 
 // SessionAffinityMetadataKeys are the metadata keys that pin a work bead to a

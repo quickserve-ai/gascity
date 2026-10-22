@@ -42,7 +42,7 @@ func TestWrapWithCachingStoreStampsNotificationSource(t *testing.T) {
 	ep := events.NewFake()
 	// A non-cancellable context: the cache pre-primes but starts no
 	// background prime or reconcile.
-	store := wrapWithCachingStore(context.Background(), backing, ep, true)
+	store := wrapWithCachingStore(context.Background(), backing, ep, true, "", "")
 	cache, ok := store.(*beads.CachingStore)
 	if !ok {
 		t.Fatalf("wrapWithCachingStore returned %T, want *beads.CachingStore", store)
@@ -74,7 +74,7 @@ func TestSameValueWriteRecordsNoBeadUpdated(t *testing.T) {
 		t.Fatalf("OpenSQLiteStore: %v", err)
 	}
 	ep := events.NewFake()
-	store := wrapWithCachingStore(context.Background(), backing, ep, true)
+	store := wrapWithCachingStore(context.Background(), backing, ep, true, "", "")
 	b, err := store.Create(beads.Bead{Title: "row"})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -173,7 +173,7 @@ func (s *refreshingCreateStore) Create(b beads.Bead) (beads.Bead, error) {
 func TestCacheChangeRecorderRecordsOneCreateForARefreshRacingTheCreate(t *testing.T) {
 	backing := &refreshingCreateStore{MemStore: beads.NewMemStore()}
 	ep := events.NewFake()
-	store := wrapWithCachingStore(context.Background(), backing, ep, true)
+	store := wrapWithCachingStore(context.Background(), backing, ep, true, "", "")
 	cache, ok := store.(*beads.CachingStore)
 	if !ok {
 		t.Fatalf("wrapWithCachingStore returned %T, want *beads.CachingStore", store)

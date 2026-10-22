@@ -332,11 +332,25 @@ func (s *Store) CreateWait(spec WaitSpec) (WaitInfo, error) {
 		Description: spec.Note,
 		Labels:      []string{WaitBeadLabel, "session:" + spec.SessionID},
 		Metadata:    meta,
+		// Set AT CREATE (see beads.Bead.AwaitType): a session wait is
+		// machinery, and the create seam would otherwise default it to
+		// "human" and page. Today's kinds ("deps", "probe") wait on bead
+		// state; a future timed kind maps to AwaitTimer here.
+		AwaitType: waitAwaitType(spec.Kind),
 	})
 	if err != nil {
 		return WaitInfo{}, err
 	}
 	return WaitInfoFromBead(created), nil
+}
+
+// waitAwaitType maps a wait kind onto bd's await_type vocabulary. Never
+// "human": a wait bead is session machinery whatever its kind.
+func waitAwaitType(kind string) string {
+	if kind == "timer" {
+		return beads.AwaitTimer
+	}
+	return beads.AwaitBead
 }
 
 // retryableWaitMetadata clones the carry-forward metadata for a wait retry. For
@@ -420,6 +434,10 @@ func (s *Store) RetryClosedWait(id, nextAttempt string, now time.Time) (WaitInfo
 		Description: wait.Description,
 		Labels:      append([]string(nil), wait.Labels...),
 		Metadata:    meta,
+		// Re-derived, not copied: a wait minted before await_type existed
+		// carries "" (or "human", from the create seam's default), and copying
+		// that forward would page a human for machinery on every retry.
+		AwaitType: waitAwaitType(w.Kind),
 	})
 	if err != nil {
 		return WaitInfo{}, err

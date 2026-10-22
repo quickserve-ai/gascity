@@ -726,7 +726,21 @@ func LoadWithIncludesOptions(fs fsys.FS, path string, opts LoadOptions, extraInc
 		if err := ApplyPatches(&tail, Patches{Agents: deferredAgentPatches}); err != nil {
 			return nil, nil, fmt.Errorf("applying patches: %w", err)
 		}
+		// ApplyPatches reports an unappliable patch as a warning on the City it
+		// was given, and tail is a temporary: carry its warnings to root so the
+		// re-drain below surfaces them (ga-djvbvp).
+		root.LoadWarnings = appendUnique(root.LoadWarnings, tail.LoadWarnings...)
 	}
+
+	// RE-DRAIN LoadWarnings AFTER PATCH APPLICATION (ga-djvbvp). The two copies
+	// near the start of composition run BEFORE the ApplyPatches calls above, so
+	// a warning recorded while applying a patch — which is where unapplied
+	// patches are now reported instead of aborting the load — would be written
+	// to root.LoadWarnings and never reach provenance. The CLI reads
+	// prov.Warnings, so without this the whole fix would be a silent no-op:
+	// recorded, unsurfaced, and indistinguishable from a clean config.
+	// appendUnique makes the earlier copies harmless to repeat.
+	prov.Warnings = appendUnique(prov.Warnings, root.LoadWarnings...)
 
 	// Apply [agent_defaults] values to all agents (explicit and implicit)
 	// that don't set their own override. Deprecated [agents] aliases are
@@ -793,6 +807,9 @@ func LoadWithIncludesOptions(fs fsys.FS, path string, opts LoadOptions, extraInc
 	if err := ValidateDoltConfig(root, path); err != nil {
 		return nil, nil, err
 	}
+	if err := ValidateMailCrossCity(root, cityRoot); err != nil {
+		return nil, nil, err
+	}
 
 	// Validate cross-entity semantic constraints.
 	if !opts.AllowMissingProviderReferences {
@@ -819,6 +836,14 @@ func LoadWithIncludesOptions(fs fsys.FS, path string, opts LoadOptions, extraInc
 	}
 
 	populateAgentLocalAssetDirs(fs, root, cityRoot)
+
+	// Opt-in skill names resolve against the pack catalogs composed above,
+	// once patches, rig overrides and implicit agents have settled each
+	// agent's opt_in_skills.
+	if err := ValidateOptInSkills(fs, root); err != nil {
+		return nil, nil, fmt.Errorf("%s: %w", path, err)
+	}
+	prov.Warnings = append(prov.Warnings, OptInLayoutWarnings(fs, root)...)
 
 	// Load namepool files for pool agents.
 	loadNamepools(fs, root, cityRoot)

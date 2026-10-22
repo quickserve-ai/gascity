@@ -18,6 +18,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/prguard"
 	"github.com/spf13/cobra"
 )
 
@@ -582,6 +583,13 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
+	// Canonicalize hand-written assignees before forwarding (ga-i44k): known
+	// non-canonical spellings are rewritten to the alias form the find-work
+	// read paths actually match; unrecognized shapes warn but pass through
+	// (cross-town assignees are legitimate). Fail-open — never blocks the
+	// write.
+	bdArgs = canonicalizeBdAssigneeArgs(bdArgs, cityPath, cfg, stderr)
+
 	// Pre-flight exact-ID guard for write-mutating subcommands (gcy-g4o).
 	// bd's fuzzy/substring resolver can silently match a longer ID that
 	// contains the supplied ID as a substring (e.g. "gcy-dv7" → "gcy-wisp-dv78").
@@ -638,6 +646,9 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 					}
 					verifyIDs = unresolved
 				}
+				if code, blocked := guardUnmergedPRClose(bdArgs, writeIDs, guardBeads, store, stderr); blocked {
+					return code
+				}
 			}
 			for _, id := range verifyIDs {
 				bead, getErr := store.Get(id)
@@ -665,6 +676,17 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 	// store/beads the write-ID guard above already opened and read, and the
 	// config the caller already loaded.
 	if runWorkRecordCloseGate(bdArgs, target.ScopeRoot, cityPath, cfg, guardStore, guardBeads, stderr) {
+		return 1
+	}
+
+	// Publish-pointer gate (ga-krso22 / ga-mmvpq1 B5): a bead may not enter
+	// merge_result=pr_published_awaiting_gate without a fetchable pr_url. The
+	// state means "a PR exists and is waiting"; without a re-derivable pointer
+	// nothing that starts from the bead can reach the work, which is how a
+	// published branch becomes invisible and gets rebuilt from scratch
+	// (qc-tdkydo.58). Unlike the work-record gate this enforces by default: the
+	// refusal fires only on a write that would create the hole.
+	if runPublishPointerGate(bdArgs, guardStore, guardBeads, stderr) {
 		return 1
 	}
 
@@ -764,6 +786,9 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 		return bdSilentFallbackExitCode
 	}
 
+	// A close the bd subprocess just made reaches the supervisor's run views
+	// only through the city event log, so announce it (bd_close_events.go).
+	announceBdPassthroughCloses(cityPath, guardStore, guardBeads, bdArgs)
 	return 0
 }
 
@@ -804,6 +829,91 @@ func invalidBdReleaseIfCurrentArg(value string) bool {
 //
 // All returned IDs must be verified via BdStore.Get (exact-ID guard) before
 // the mutation is forwarded to the bd subprocess.
+// bdCloseShape reports whether the bd invocation closes beads, and
+// whether the caller explicitly forced past guards. Two shapes close:
+// `bd close <ids...>` (whose native -f/--force doubles as the guard
+// escape) and `bd update <ids...> --status closed` (no native force
+// flag; GC_FORCE_UNMERGED_CLOSE=1 is the escape). The env escape works
+// for both shapes so scripted lanes have one override.
+func bdCloseShape(args []string) (isClose, forced bool) {
+	if len(args) == 0 {
+		return false, false
+	}
+	envForced := strings.TrimSpace(os.Getenv("GC_FORCE_UNMERGED_CLOSE")) == "1"
+	switch args[0] {
+	case "close":
+		for _, arg := range args[1:] {
+			if arg == "--" {
+				break
+			}
+			if arg == "-f" || arg == "--force" {
+				return true, true
+			}
+		}
+		return true, envForced
+	case "update":
+		for i := 1; i < len(args); i++ {
+			arg := args[i]
+			if arg == "--" {
+				break
+			}
+			closed := false
+			if arg == "--status" && i+1 < len(args) {
+				closed = strings.EqualFold(args[i+1], "closed")
+			} else if strings.HasPrefix(arg, "--status=") {
+				closed = strings.EqualFold(strings.TrimPrefix(arg, "--status="), "closed")
+			}
+			if closed {
+				return true, envForced
+			}
+		}
+	}
+	return false, false
+}
+
+// guardUnmergedPRClose enforces the qc-p45lz invariant on the CLI lane:
+// refuse to forward a bead close to bd when the bead's recorded PR is
+// confirmed unmerged. Fail-open everywhere else — store misses,
+// unparseable URLs, gh/network failures all warn and proceed, so closes
+// never depend on GitHub availability. Returns (exitCode, true) when
+// the close is blocked; the command has not been forwarded to bd yet,
+// so a block leaves every bead untouched.
+func guardUnmergedPRClose(bdArgs []string, ids []string, fetched map[string]beads.Bead, store beads.Store, stderr io.Writer) (int, bool) {
+	if !prguard.Enabled() {
+		return 0, false
+	}
+	isClose, forced := bdCloseShape(bdArgs)
+	if !isClose || forced {
+		return 0, false
+	}
+	for _, id := range ids {
+		// The write-ID guard already read every id (one batched bd show for a
+		// bulk close); only an id it could not resolve costs a Get here.
+		bead, ok := fetched[id]
+		if !ok {
+			var err error
+			bead, err = store.Get(id)
+			if err != nil {
+				// Absent/ephemeral/projection-lag rows: same fall-through
+				// contract as the collision guard above.
+				continue
+			}
+		}
+		if prguard.MetadataPRURL(bead.Metadata) == "" {
+			continue
+		}
+		res := prguard.CheckBeadClosable(bead.Metadata, nil, 5*time.Second)
+		if res.Note != "" {
+			fmt.Fprintf(stderr, "gc bd: warning: %s: %s\n", id, res.Note) //nolint:errcheck // best-effort stderr
+		}
+		if res.Verdict == prguard.Block {
+			fmt.Fprintf(stderr, "gc bd: refusing to close %s — its PR %s is %s, not merged. Closing now would orphan the PR (no open bead drives the merge gate; see qc-p45lz). Merge the PR first, or override with --force (bd close) / GC_FORCE_UNMERGED_CLOSE=1.\n", id, res.PRURL, res.State) //nolint:errcheck // best-effort stderr
+			return 1, true
+		}
+	}
+	return 0, false
+}
+
 func bdMutationWriteIDs(args []string) (ids []string, ok bool, ambiguous bool) {
 	if len(args) == 0 {
 		return nil, false, false

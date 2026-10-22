@@ -2239,7 +2239,7 @@ export default {
 		t.Fatal("legacy OMP object-export hook was preserved; expected managed upgrade")
 	}
 	for _, want := range []string{
-		"const GC_OMP_HOOK_VERSION = 2",
+		"const GC_OMP_HOOK_VERSION = 6",
 		`export default function gascityOmpExtension(pi: ExtensionAPI)`,
 		`pi.on("session_start"`,
 		`pi.on("session_compact"`,
@@ -2259,9 +2259,27 @@ export default {
 	}
 }
 
+func TestInstallOMPHookPrioritizesManagedGCBinariesOverHomebrew(t *testing.T) {
+	fs := fsys.NewFake()
+
+	if err := Install(fs, "/city", "/work", []string{"omp"}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+
+	data := string(fs.Files["/work/.omp/hooks/gc-hook.ts"])
+	managedIndex := strings.Index(data, `${process.env.HOME}/go/bin:${process.env.HOME}/.local/bin`)
+	homebrewIndex := strings.Index(data, "/opt/homebrew/bin")
+	if managedIndex == -1 || homebrewIndex == -1 {
+		t.Fatalf("OMP hook PATH missing managed or Homebrew entries:\n%s", data)
+	}
+	if managedIndex > homebrewIndex {
+		t.Fatalf("OMP hook resolves Homebrew before managed gc binaries:\n%s", data)
+	}
+}
+
 func TestOMPHookNeedsUpgradeComparesParsedVersion(t *testing.T) {
 	current := []byte(`// Gas City hooks for Oh My Pi (OMP).
-const GC_OMP_HOOK_VERSION = 2;
+const GC_OMP_HOOK_VERSION = 6;
 function logRunFailure(args: string[], cwd: string | undefined, err: unknown) {}
 function providerSessionEnv(ctx: { sessionManager?: { getSessionId?: () => string } }): Record<string, string> {}
 export default function gascityOmpExtension(pi: ExtensionAPI) {
@@ -2273,8 +2291,8 @@ GC_PROVIDER_SESSION_ID;
 GC_PROVIDER_SESSION_ID_REQUIRED;
 stdio: ["ignore", "pipe", "inherit"];
 `)
-	stale := bytes.Replace(current, []byte("GC_OMP_HOOK_VERSION = 2"), []byte("GC_OMP_HOOK_VERSION = 1"), 1)
-	future := bytes.Replace(current, []byte("GC_OMP_HOOK_VERSION = 2"), []byte("GC_OMP_HOOK_VERSION = 3"), 1)
+	stale := bytes.Replace(current, []byte("GC_OMP_HOOK_VERSION = 6"), []byte("GC_OMP_HOOK_VERSION = 5"), 1)
+	future := bytes.Replace(current, []byte("GC_OMP_HOOK_VERSION = 6"), []byte("GC_OMP_HOOK_VERSION = 7"), 1)
 	missingRequiredProvider := bytes.Replace(current, []byte("GC_PROVIDER_SESSION_ID_REQUIRED;\n"), nil, 1)
 
 	if !ompHookNeedsUpgrade(stale) {
@@ -2766,5 +2784,50 @@ func TestInstallEmpty(t *testing.T) {
 	}
 	if len(fs.Files) != 0 {
 		t.Errorf("Install(nil) should not write files; got %v", fs.Files)
+	}
+}
+
+// TestInstalledWorkDirPathsMatchesInstall pins InstalledWorkDirPaths to what
+// Install really writes into the work dir, provider by provider: the overlay
+// staging caller skips exactly these paths to leave them to the installer, so
+// a path Install writes but the set omits would get two writers, and a path
+// the set names but Install never writes would get none on the tick.
+func TestInstalledWorkDirPathsMatchesInstall(t *testing.T) {
+	for _, provider := range SupportedProviders() {
+		t.Run(provider, func(t *testing.T) {
+			fs := fsys.NewFake()
+			if err := Install(fs, "/city", "/work", []string{provider}); err != nil {
+				t.Fatalf("Install(%s): %v", provider, err)
+			}
+			written := make(map[string]bool)
+			for p := range fs.Files {
+				if rel, ok := strings.CutPrefix(filepath.ToSlash(p), "/work/"); ok {
+					written[rel] = true
+				}
+			}
+			got := InstalledWorkDirPaths([]string{provider}, nil)
+			for rel := range written {
+				if !got[rel] {
+					t.Errorf("Install(%s) wrote %q, missing from InstalledWorkDirPaths %v", provider, rel, got)
+				}
+			}
+			for rel := range got {
+				if !written[rel] {
+					t.Errorf("InstalledWorkDirPaths(%s) names %q, which Install did not write (wrote %v)", provider, rel, written)
+				}
+			}
+		})
+	}
+	if got := InstalledWorkDirPaths([]string{"no-such-provider"}, nil); len(got) != 0 {
+		t.Errorf("InstalledWorkDirPaths(unsupported) = %v, want empty", got)
+	}
+	resolver := func(name string) string {
+		if name == "my-codex" {
+			return "codex"
+		}
+		return ""
+	}
+	if got := InstalledWorkDirPaths([]string{"my-codex"}, resolver); !got[".codex/hooks.json"] {
+		t.Errorf("InstalledWorkDirPaths(my-codex -> codex) = %v, want .codex/hooks.json", got)
 	}
 }

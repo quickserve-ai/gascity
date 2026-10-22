@@ -33,9 +33,36 @@ func TestReleasePoliciesTable(t *testing.T) {
 		releaseOrphan:         {statuses: []string{"open", "in_progress"}, lane: laneDirect, pool: true},
 		releaseRetired:        {statuses: []string{"open", "in_progress"}, lane: laneCarried, seatRoute: true},
 		releaseLadder:         {statuses: []string{"in_progress"}, lane: laneCarried, seatRoute: true},
+		// The carry's drain-ack teardown (ga-x99xh0).
+		releaseDrainAckTeardown: {statuses: []string{"open", "in_progress"}, lane: laneCarried, seatRoute: true},
 	}
 	if !reflect.DeepEqual(releasePolicies, want) {
 		t.Fatalf("releasePolicies = %+v\nwant %+v", releasePolicies, want)
+	}
+}
+
+// TestEveryReleasePolicyHasAnAuditPath: every path with a release policy (the
+// table above pins that set) labels its audit line and the proposal a withheld
+// release stamps (gc.release_proposed_path), and no two paths share a label. A
+// path with no label wrote an empty proposed path (the work ladder's did, fork
+// PR #302 review).
+func TestEveryReleasePolicyHasAnAuditPath(t *testing.T) {
+	seen := map[string]releaseWhy{}
+	for why := range releasePolicies {
+		label := releaseAuditPaths[why]
+		if strings.TrimSpace(label) == "" {
+			t.Errorf("release path %d has a policy but no audit path label", why)
+			continue
+		}
+		if other, dup := seen[label]; dup {
+			t.Errorf("release paths %d and %d share the audit path label %q", other, why, label)
+		}
+		seen[label] = why
+	}
+	for why := range releaseAuditPaths {
+		if _, ok := releasePolicies[why]; !ok {
+			t.Errorf("audit path label for release path %d, which has no release policy", why)
+		}
 	}
 }
 
@@ -197,7 +224,7 @@ func TestReleasePathsKeepEveryStrand(t *testing.T) {
 		for _, sc := range strandCases {
 			assigned = append(assigned, c.claim[sc.name])
 		}
-		releaseConfirmedOrphanSessionWork(c.cfg, c.store, nil, assigned, nil, c.info())
+		releaseConfirmedOrphanSessionWork(c.cfg, c.store, nil, assigned, nil, nil, c.info())
 		c.assertStrandTable(t, "open")
 	})
 	t.Run("dead assignee", func(t *testing.T) {
