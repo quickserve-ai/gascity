@@ -334,6 +334,11 @@ type memoryOrderDispatcher struct {
 	gateBackoffUntil     map[string]time.Time
 	openWorkSuppression  map[string]orderOpenWorkSuppression
 
+	// storeCallBudget bounds each store call a dispatch tick makes before the
+	// store is treated as dark for the rest of the tick (ga-rs4ddy). Zero means
+	// defaultOrderStoreCallBudget.
+	storeCallBudget time.Duration
+
 	dispatchCtx    context.Context
 	dispatchCancel context.CancelFunc
 
