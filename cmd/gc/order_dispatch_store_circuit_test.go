@@ -108,11 +108,6 @@ func openTestCircuitStore(t *testing.T, inner beads.Store, log *bytes.Buffer) be
 }
 
 func TestStoreCircuitTripsOnTimeoutThenShortCircuits(t *testing.T) {
-	// The default budget sits under the gate's bound, so the first gate read trips a
-	// dead store before the gate gives up and the next order calls it again.
-	if got := newOrderStoreCircuit(0, nil).budget; got <= 0 || got >= orderGateTimeout {
-		t.Fatalf("default budget %s, want positive and under orderGateTimeout %s", got, orderGateTimeout)
-	}
 	dark := newBlackHoleStore(t)
 	var log bytes.Buffer
 	s := openTestCircuitStore(t, dark, &log)

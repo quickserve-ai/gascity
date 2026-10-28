@@ -24,9 +24,7 @@ type orderStoreCircuit struct {
 
 func newOrderStoreCircuit(budget time.Duration, stderr io.Writer) *orderStoreCircuit {
 	if budget <= 0 {
-		// Under the gate's own bound, so the first call trips the store before the
-		// gate abandons it and the next order starts a second blocking call.
-		budget = orderGateTimeout * 3 / 4
+		budget = 10 * time.Second
 	}
 	return &orderStoreCircuit{budget: budget, stderr: stderr, dark: make(map[string]error)}
 }

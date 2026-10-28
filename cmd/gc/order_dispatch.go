@@ -334,7 +334,7 @@ type memoryOrderDispatcher struct {
 	gateBackoffUntil     map[string]time.Time
 	openWorkSuppression  map[string]orderOpenWorkSuppression
 
-	// storeCallBudget bounds each store read of a tick (ga-rs4ddy); 0 = 3/4 of orderGateTimeout.
+	// storeCallBudget bounds each store read of a tick (ga-rs4ddy); 0 = 10s.
 	storeCallBudget time.Duration
 
 	dispatchCtx    context.Context
