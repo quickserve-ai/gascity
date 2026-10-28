@@ -43,26 +43,40 @@ unique_words = $(if $1,$(firstword $1) $(call unique_words,$(filter-out $(firstw
 # `brew --prefix icu4c` names the formula's CURRENT version whether or not it
 # is installed (it answered icu4c@79 while only @77/@78 were installed), so
 # the prefix is used only when its include/unicode/regex.h exists; otherwise
-# the linked keg $(brew --prefix)/opt/icu4c is tried. Each query's first
-# stdout line must be an absolute path. When Homebrew answers but neither
-# candidate has the header, make warns at parse time and `build` stops in
-# check-icu, instead of the go-icu-regex compile failing minutes later.
-# ICU_PREFIX=<dir> on the command line (or make -e) chooses one explicitly.
+# the linked keg $(brew --prefix)/opt/icu4c is tried. A query counts only if
+# it exits 0, and only its first stdout line that is an absolute path is
+# used. When Homebrew answers but neither candidate has the header, make
+# warns at parse time and `build` stops in check-icu (unless CGO_ENABLED=0),
+# instead of the go-icu-regex compile failing minutes later.
+# ICU_PREFIX=<dir> on the command line, or with make -e, chooses one
+# explicitly and skips detection; ICU_PREFIX= (empty) adds no ICU flags.
 ifeq ($(shell uname),Darwin)
-ifneq ($(filter undefined environment,$(origin ICU_PREFIX)),)
-_ICU_LOOKUP := $(shell f=$$(brew --prefix icu4c 2>/dev/null | head -n 1); \
-	r=$$(brew --prefix 2>/dev/null | head -n 1); \
+# make -e: origin reads "environment override" on make 4.x but plain
+# "environment" on 3.81, so also look for the e flag in MAKEFLAGS' flag word
+# (its first word, when that is neither an assignment nor a long option).
+_ICU_MF1 := $(firstword $(MAKEFLAGS))
+_ICU_E_FLAG := $(if $(findstring =,$(_ICU_MF1)),,$(if $(filter -%,$(_ICU_MF1)),,$(findstring e,$(_ICU_MF1))))
+_ICU_ORIGIN := $(origin ICU_PREFIX)
+ifneq ($(filter undefined environment,$(_ICU_ORIGIN)),)
+ifeq ($(findstring override,$(_ICU_ORIGIN))$(if $(filter environment,$(_ICU_ORIGIN)),$(_ICU_E_FLAG)),)
+_ICU_LOOKUP := $(shell f=$$(brew --prefix icu4c 2>/dev/null) || f=; \
+	f=$$(printf '%s\n' "$$f" | sed -n '/^\//{p;q;}'); \
+	r=$$(brew --prefix 2>/dev/null) || r=; \
+	r=$$(printf '%s\n' "$$r" | sed -n '/^\//{p;q;}'); \
 	case "$$r" in (/*) l="$$r/opt/icu4c" ;; (*) l= ;; esac; \
 	for p in "$$f" "$$l"; do \
 		case "$$p" in (/*) if [ -f "$$p/include/unicode/regex.h" ]; then printf '%s' "$$p"; exit 0; fi ;; esac; \
 	done; \
-	if [ -n "$$f$$l" ]; then printf '!icu-missing: %s/include (brew --prefix icu4c) or %s/include (linked keg)' "$${f:-(no answer)}" "$${l:-(no Homebrew root)}"; fi)
+	fh=$${f:+$$f/include}; lh=$${l:+$$l/include}; \
+	if [ -n "$$f$$l" ]; then printf '!icu-missing: %s (brew --prefix icu4c) or %s (linked keg)' "$${fh:-no answer}" "$${lh:-no Homebrew root}"; fi)
 ifeq ($(filter !icu-missing:,$(firstword $(_ICU_LOOKUP))),)
 ICU_PREFIX := $(_ICU_LOOKUP)
 else
 ICU_PREFIX :=
 _ICU_MISSING := icu4c header unicode/regex.h not found in $(filter-out !icu-missing:,$(_ICU_LOOKUP)); install icu4c or pass ICU_PREFIX=<dir>
+export _ICU_MISSING
 $(warning $(_ICU_MISSING))
+endif
 endif
 endif
 ifneq ($(ICU_PREFIX),)
@@ -166,9 +180,10 @@ bazel-tmpdir:
 ## directory entry instead, so any process already running the old binary keeps
 ## its own intact inode.
 ## check-icu: stop a native build when Homebrew answers but no icu4c candidate
-## has unicode/regex.h (see the ICU_PREFIX block above). A no-op otherwise.
+## has unicode/regex.h (see the ICU_PREFIX block above). A no-op otherwise, and
+## a no-op for CGO_ENABLED=0 builds, which never compile go-icu-regex.
 check-icu:
-	@$(if $(_ICU_MISSING),echo "error: $(_ICU_MISSING)" >&2; exit 1,:)
+	@$(if $(filter 0,$(CGO_ENABLED)),:,if [ -n "$$_ICU_MISSING" ]; then printf 'error: %s\n' "$$_ICU_MISSING" >&2; exit 1; fi)
 
 build: check-icu
 	@mkdir -p $(BUILD_DIR)
