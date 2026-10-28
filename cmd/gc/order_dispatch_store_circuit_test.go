@@ -47,6 +47,7 @@ func TestOrderDispatchStoreCircuitDarkRigDoesNotStallCityOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 	dark := newBlackHoleStore(t)
+	const budget = 200 * time.Millisecond
 	cityStore := beads.NewMemStore()
 	fired := make(chan string, 8)
 	rigOrder := func(name string) orders.Order {
@@ -69,7 +70,7 @@ func TestOrderDispatchStoreCircuitDarkRigDoesNotStallCityOrder(t *testing.T) {
 		},
 		rec:             events.Discard,
 		stderr:          &bytes.Buffer{},
-		storeCallBudget: 200 * time.Millisecond,
+		storeCallBudget: budget,
 		cfg:             &config.City{Rigs: []config.Rig{{Name: "frontend", Path: rigDir}}},
 	}
 
@@ -86,8 +87,8 @@ func TestOrderDispatchStoreCircuitDarkRigDoesNotStallCityOrder(t *testing.T) {
 		if dir != cityDir {
 			t.Fatalf("first fired order ran in %q, want the city order in %q", dir, cityDir)
 		}
-	case <-time.After(time.Second):
-		t.Fatalf("city order not dispatched within 1s of the pass starting (dark store calls so far: %d)", dark.calls.Load())
+	case <-time.After(budget + budget/2): // one budget on the dark store, half again for the city order's own work
+		t.Fatalf("city order not dispatched within one %s budget of the pass starting (dark store calls so far: %d)", budget, dark.calls.Load())
 	}
 	select {
 	case <-passDone:

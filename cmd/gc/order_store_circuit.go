@@ -24,7 +24,9 @@ type orderStoreCircuit struct {
 
 func newOrderStoreCircuit(budget time.Duration, stderr io.Writer) *orderStoreCircuit {
 	if budget <= 0 {
-		budget = 10 * time.Second
+		// Past the store's own read bound, so a slow but live store, which answers
+		// inside it (vp-gprv dispatches through that), never trips; only a hang does.
+		budget = beads.ReadCommandTimeout() + 5*time.Second
 	}
 	return &orderStoreCircuit{budget: budget, stderr: stderr, dark: make(map[string]error)}
 }
