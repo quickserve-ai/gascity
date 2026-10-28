@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -161,3 +162,90 @@ func (s slowCreateStore) Create(b beads.Bead) (beads.Bead, error) {
 	time.Sleep(s.delay)
 	return s.Store.Create(b)
 }
+
+// A trip wakes a call already waiting on the store (ga-rs4ddy slice 2): after
+// the 8s gate abandons one order's read, the next order's read must not wait
+// out its own full budget once the first call trips the store.
+func TestStoreCircuitTripWakesWaitingCall(t *testing.T) {
+	waiting, c := newBlackHoleStore(t), newOrderStoreCircuit(10*time.Second, io.Discard)
+	w, err := c.open("w", func() (beads.Store, error) { return waiting, nil })
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	woke := make(chan error, 1)
+	go func() { _, err := w.Get("x-1"); woke <- err }()
+	for waiting.calls.Load() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	c.trip("w", errors.New("tripped by an earlier call"))
+	select {
+	case err := <-woke:
+		if !errors.Is(err, errStoreDark) {
+			t.Fatalf("woken call = %v, want errStoreDark", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("a call waiting on the store was not woken by the trip")
+	}
+}
+
+// A store still hung from an earlier tick must not take a fresh blocking call
+// every tick (ga-rs4ddy slice 2): the hung calls would grow by one per tick.
+func TestOrderDispatchStoreCircuitHungStoreDoesNotLeakACallPerTick(t *testing.T) {
+	cityDir := t.TempDir()
+	rigDir := filepath.Join(cityDir, "frontend")
+	if err := os.MkdirAll(rigDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dark := newBlackHoleStore(t)
+	m := &memoryOrderDispatcher{
+		aa:              []orders.Order{{Name: "rig-a", Rig: "frontend", Trigger: "cooldown", Interval: "1m", Exec: "true", Timeout: "1m"}},
+		storeFn:         func(execStoreTarget) (beads.Store, error) { return dark, nil },
+		rec:             events.Discard,
+		stderr:          io.Discard,
+		storeCallBudget: 100 * time.Millisecond,
+		cfg:             &config.City{Rigs: []config.Rig{{Name: "frontend", Path: rigDir}}},
+	}
+	const ticks = 8
+	for i := 0; i < ticks; i++ {
+		m.gateBackoffUntil = nil // a 30s production tick outlives the 24s gate backoff
+		m.dispatch(context.Background(), cityDir, time.Now())
+	}
+	if got := dark.calls.Load(); got >= ticks {
+		t.Fatalf("hung store received %d blocking calls over %d ticks, want the outstanding calls capped", got, ticks)
+	}
+}
+
+// The store open runs under the budget (ga-rs4ddy slice 2), and a handle that
+// arrives after the open was abandoned is closed, not leaked.
+func TestStoreCircuitOpenIsBudgetedAndClosesLateHandle(t *testing.T) {
+	release, late := make(chan struct{}), &closeRecordingStore{Store: beads.NewMemStore(), closed: make(chan struct{})}
+	unblock := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(unblock)
+	c := newOrderStoreCircuit(100*time.Millisecond, io.Discard)
+	opened := make(chan error, 1)
+	go func() {
+		_, err := c.open("k", func() (beads.Store, error) { <-release; return late, nil })
+		opened <- err
+	}()
+	select {
+	case err := <-opened:
+		if !errors.Is(err, errStoreDark) {
+			t.Fatalf("hung open = %v, want errStoreDark", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("a hung store open was not bounded by the budget")
+	}
+	unblock()
+	select {
+	case <-late.closed:
+	case <-time.After(time.Second):
+		t.Fatal("the handle that arrived after its open was abandoned was never closed")
+	}
+}
+
+type closeRecordingStore struct {
+	beads.Store
+	closed chan struct{}
+}
+
+func (s *closeRecordingStore) CloseStore() error { close(s.closed); return nil }
