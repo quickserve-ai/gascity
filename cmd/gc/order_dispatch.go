@@ -336,6 +336,9 @@ type memoryOrderDispatcher struct {
 
 	// storeCallBudget bounds each store read of a tick (ga-rs4ddy); 0 = the bd read bound + 5s.
 	storeCallBudget time.Duration
+	// storeCalls carries each store's abandoned calls across ticks, so a store
+	// still hung from an earlier tick starts the next one dark (ga-rs4ddy).
+	storeCalls orderStoreCalls
 
 	dispatchCtx    context.Context
 	dispatchCancel context.CancelFunc
@@ -631,6 +634,7 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 	stores := make(map[string]beads.Store)
 	// One dark store costs the tick at most one call budget (ga-rs4ddy).
 	circuit := newOrderStoreCircuit(m.storeCallBudget, m.stderr)
+	circuit.calls = &m.storeCalls
 	// inFlight counts the dispatchOne goroutines launched by THIS tick that
 	// still hold handles from `stores`. The per-tick handles must not be closed
 	// until those goroutines finish using them: on a native store, CloseStore is
