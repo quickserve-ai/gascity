@@ -108,6 +108,11 @@ func openTestCircuitStore(t *testing.T, inner beads.Store, log *bytes.Buffer) be
 }
 
 func TestStoreCircuitTripsOnTimeoutThenShortCircuits(t *testing.T) {
+	// The default budget sits under the gate's bound, so the first gate read trips a
+	// dead store before the gate gives up and the next order calls it again.
+	if got := newOrderStoreCircuit(0, nil).budget; got <= 0 || got >= orderGateTimeout {
+		t.Fatalf("default budget %s, want positive and under orderGateTimeout %s", got, orderGateTimeout)
+	}
 	dark := newBlackHoleStore(t)
 	var log bytes.Buffer
 	s := openTestCircuitStore(t, dark, &log)
@@ -125,12 +130,13 @@ func TestStoreCircuitTripsOnTimeoutThenShortCircuits(t *testing.T) {
 
 func TestStoreCircuitTripsOnUnreachableNotOnNotFound(t *testing.T) {
 	var log bytes.Buffer
-	healthy := openTestCircuitStore(t, beads.NewMemStore(), &log)
+	// Its Create commits after the budget, and a write is never abandoned.
+	healthy := openTestCircuitStore(t, slowCreateStore{beads.NewMemStore(), 300 * time.Millisecond}, &log)
 	if _, err := healthy.Get("missing-1"); !errors.Is(err, beads.ErrNotFound) || log.Len() != 0 {
 		t.Fatalf("Get(missing) = %v (log %q), want ErrNotFound and no trip", err, log.String())
 	}
 	if _, err := healthy.Create(beads.Bead{Title: "still reachable"}); err != nil {
-		t.Fatalf("Create after not-found = %v, want success", err)
+		t.Fatalf("slow Create after not-found = %v, want its committed result", err)
 	}
 	down := openTestCircuitStore(t, &getErrStore{beads.NewMemStore(), errors.New("dial tcp 10.0.0.9:3307: connection refused")}, &log)
 	if _, err := down.Get("x-1"); err == nil || errors.Is(err, errStoreDark) {
@@ -147,4 +153,15 @@ func TestStoreCircuitTripsOnUnreachableNotOnNotFound(t *testing.T) {
 	if _, err := c.open("k", open); !errors.Is(err, errStoreDark) || opens != 1 {
 		t.Fatalf("second open = %v after %d opens, want errStoreDark and one open", err, opens)
 	}
+}
+
+// slowCreateStore commits a Create only after a delay longer than the budget.
+type slowCreateStore struct {
+	beads.Store
+	delay time.Duration
+}
+
+func (s slowCreateStore) Create(b beads.Bead) (beads.Bead, error) {
+	time.Sleep(s.delay)
+	return s.Store.Create(b)
 }

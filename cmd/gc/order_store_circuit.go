@@ -24,7 +24,9 @@ type orderStoreCircuit struct {
 
 func newOrderStoreCircuit(budget time.Duration, stderr io.Writer) *orderStoreCircuit {
 	if budget <= 0 {
-		budget = 10 * time.Second
+		// Under the gate's own bound, so the first call trips the store before the
+		// gate abandons it and the next order starts a second blocking call.
+		budget = orderGateTimeout * 3 / 4
 	}
 	return &orderStoreCircuit{budget: budget, stderr: stderr, dark: make(map[string]error)}
 }
@@ -90,7 +92,7 @@ func circuitCall[T any](s *circuitStore, fn func() (T, error)) (T, error) {
 }
 
 // circuitStore implements beads.Store in full and deliberately does not embed
-// it, so no method can reach the store without the budget.
+// it, so no method can reach the store without the circuit.
 type circuitStore struct {
 	in  beads.Store
 	key string
@@ -105,8 +107,7 @@ func unwrapCircuitStore(store beads.Store) beads.Store {
 	return store
 }
 
-// Handles keeps beads.HandlesFor routing identical to the raw store (a
-// CachingStore's Live reader reads its backing) with every read budgeted.
+// Handles keeps beads.HandlesFor routing identical to the raw store, reads budgeted.
 func (s *circuitStore) Handles() beads.StoreHandles {
 	h := beads.HandlesFor(s.in)
 	return beads.StoreHandles{Cached: circuitReader{s, h.Cached}, Live: circuitReader{s, h.Live}, Writer: s}
@@ -120,103 +121,92 @@ type circuitReader struct {
 func (c circuitReader) Get(id string) (beads.Bead, error) {
 	return circuitCall(c.s, func() (beads.Bead, error) { return c.r.Get(id) })
 }
-
 func (c circuitReader) List(q beads.ListQuery) ([]beads.Bead, error) {
 	return circuitCall(c.s, func() ([]beads.Bead, error) { return c.r.List(q) })
 }
-
 func (c circuitReader) Ready(q ...beads.ReadyQuery) ([]beads.Bead, error) {
 	return circuitCall(c.s, func() ([]beads.Bead, error) { return c.r.Ready(q...) })
 }
-
 func (c circuitReader) DepList(id, dir string) ([]beads.Dep, error) {
 	return circuitCall(c.s, func() ([]beads.Dep, error) { return c.r.DepList(id, dir) })
 }
 
-func (s *circuitStore) do(fn func() error) error {
-	_, err := circuitCall(s, func() (struct{}, error) { return struct{}{}, fn() })
-	return err
+// circuitWrite runs a write unbudgeted (an abandoned write can still commit, e.g. a
+// tracking bead with no run); a dark store refuses it, and tick reads trip first.
+func circuitWrite[T any](s *circuitStore, fn func() (T, error)) (T, error) {
+	var zero T
+	if err := s.c.darkErr(s.key); err != nil {
+		return zero, err
+	}
+	v, err := fn()
+	if err != nil && isBeadStoreUnreachable(err) && !beads.IsTimeoutError(err) {
+		s.c.trip(s.key, err)
+	}
+	return v, err
 }
 
-func (s *circuitStore) Close(id string) error { return s.do(func() error { return s.in.Close(id) }) }
-
+func (s *circuitStore) do(fn func() error) error {
+	_, err := circuitWrite(s, func() (struct{}, error) { return struct{}{}, fn() })
+	return err
+}
+func (s *circuitStore) Close(id string) error  { return s.do(func() error { return s.in.Close(id) }) }
 func (s *circuitStore) Reopen(id string) error { return s.do(func() error { return s.in.Reopen(id) }) }
-
 func (s *circuitStore) Delete(id string) error { return s.do(func() error { return s.in.Delete(id) }) }
 func (s *circuitStore) Ping() error            { return s.do(s.in.Ping) }
-
 func (s *circuitStore) Update(id string, opts beads.UpdateOpts) error {
 	return s.do(func() error { return s.in.Update(id, opts) })
 }
-
 func (s *circuitStore) SetMetadata(id, key, value string) error {
 	return s.do(func() error { return s.in.SetMetadata(id, key, value) })
 }
-
 func (s *circuitStore) SetMetadataBatch(id string, kvs map[string]string) error {
 	return s.do(func() error { return s.in.SetMetadataBatch(id, kvs) })
 }
-
 func (s *circuitStore) SetLocalString(id, key, value string) error {
 	return s.do(func() error { return s.in.SetLocalString(id, key, value) })
 }
-
 func (s *circuitStore) Tx(msg string, fn func(tx beads.Tx) error) error {
 	return s.do(func() error { return s.in.Tx(msg, fn) })
 }
-
 func (s *circuitStore) DepAdd(issue, dependsOn, depType string) error {
 	return s.do(func() error { return s.in.DepAdd(issue, dependsOn, depType) })
 }
-
 func (s *circuitStore) DepRemove(issue, dependsOn string) error {
 	return s.do(func() error { return s.in.DepRemove(issue, dependsOn) })
 }
-
 func (s *circuitStore) Create(b beads.Bead) (beads.Bead, error) {
-	return circuitCall(s, func() (beads.Bead, error) { return s.in.Create(b) })
+	return circuitWrite(s, func() (beads.Bead, error) { return s.in.Create(b) })
 }
-
 func (s *circuitStore) Get(id string) (beads.Bead, error) {
 	return circuitCall(s, func() (beads.Bead, error) { return s.in.Get(id) })
 }
-
 func (s *circuitStore) CloseAll(ids []string, md map[string]string) (int, error) {
-	return circuitCall(s, func() (int, error) { return s.in.CloseAll(ids, md) })
+	return circuitWrite(s, func() (int, error) { return s.in.CloseAll(ids, md) })
 }
-
 func (s *circuitStore) GetLocalString(id, key string) (string, error) {
 	return circuitCall(s, func() (string, error) { return s.in.GetLocalString(id, key) })
 }
-
 func (s *circuitStore) DepList(id, dir string) ([]beads.Dep, error) {
 	return circuitCall(s, func() ([]beads.Dep, error) { return s.in.DepList(id, dir) })
 }
-
 func (s *circuitStore) List(q beads.ListQuery) ([]beads.Bead, error) {
 	return circuitCall(s, func() ([]beads.Bead, error) { return s.in.List(q) })
 }
-
 func (s *circuitStore) ListOpen(status ...string) ([]beads.Bead, error) {
 	return circuitCall(s, func() ([]beads.Bead, error) { return s.in.ListOpen(status...) })
 }
-
 func (s *circuitStore) Ready(q ...beads.ReadyQuery) ([]beads.Bead, error) {
 	return circuitCall(s, func() ([]beads.Bead, error) { return s.in.Ready(q...) })
 }
-
 func (s *circuitStore) Children(parent string, opts ...beads.QueryOpt) ([]beads.Bead, error) {
 	return circuitCall(s, func() ([]beads.Bead, error) { return s.in.Children(parent, opts...) })
 }
-
 func (s *circuitStore) ListByLabel(label string, limit int, opts ...beads.QueryOpt) ([]beads.Bead, error) {
 	return circuitCall(s, func() ([]beads.Bead, error) { return s.in.ListByLabel(label, limit, opts...) })
 }
-
 func (s *circuitStore) ListByAssignee(assignee, status string, limit int) ([]beads.Bead, error) {
 	return circuitCall(s, func() ([]beads.Bead, error) { return s.in.ListByAssignee(assignee, status, limit) })
 }
-
 func (s *circuitStore) ListByMetadata(f map[string]string, limit int, opts ...beads.QueryOpt) ([]beads.Bead, error) {
 	return circuitCall(s, func() ([]beads.Bead, error) { return s.in.ListByMetadata(f, limit, opts...) })
 }
