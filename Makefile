@@ -38,9 +38,25 @@ unique_words = $(if $1,$(firstword $1) $(call unique_words,$(filter-out $(firstw
 # keg-only under Homebrew, so its headers/libs are not on the default CGO
 # search path. Point CGO at them when icu4c is present. This is a no-op on
 # Linux and other platforms (where system ICU, e.g. libicu-dev, is found
-# normally) and a no-op on macOS when icu4c is not installed.
+# normally) and a no-op on macOS without Homebrew.
+#
+# `brew --prefix icu4c` names the formula's CURRENT version whether or not it
+# is installed (it answered icu4c@79 while only @77/@78 were installed), so
+# the prefix is used only when its include/unicode/regex.h exists; otherwise
+# the linked keg $(brew --prefix)/opt/icu4c is tried. When Homebrew answers
+# but neither has the header, stop here instead of failing minutes later in
+# the go-icu-regex compile. Pass ICU_PREFIX=<dir> to choose one explicitly.
 ifeq ($(shell uname),Darwin)
-ICU_PREFIX := $(shell brew --prefix icu4c 2>/dev/null)
+ifeq ($(origin ICU_PREFIX),undefined)
+_ICU_FORMULA_PREFIX := $(shell brew --prefix icu4c 2>/dev/null)
+_ICU_LINKED_PREFIX := $(if $(_ICU_FORMULA_PREFIX),$(shell brew --prefix 2>/dev/null)/opt/icu4c)
+ICU_PREFIX := $(firstword $(foreach p,$(_ICU_FORMULA_PREFIX) $(_ICU_LINKED_PREFIX),$(if $(wildcard $(p)/include/unicode/regex.h),$(p))))
+ifeq ($(ICU_PREFIX),)
+ifneq ($(_ICU_FORMULA_PREFIX),)
+$(error icu4c header unicode/regex.h not found in $(_ICU_FORMULA_PREFIX)/include (brew --prefix icu4c) or $(_ICU_LINKED_PREFIX)/include (linked keg); install icu4c or pass ICU_PREFIX=<dir>)
+endif
+endif
+endif
 ifneq ($(ICU_PREFIX),)
 CGO_CPPFLAGS += -I$(ICU_PREFIX)/include
 CGO_LDFLAGS += -L$(ICU_PREFIX)/lib
