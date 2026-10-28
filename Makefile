@@ -63,22 +63,25 @@ _ICU_E_FLAG := $(if $(findstring =,$(_ICU_MF1)),,$(if $(filter -%,$(_ICU_MF1)),,
 _ICU_ORIGIN := $(origin ICU_PREFIX)
 ifneq ($(filter undefined environment,$(_ICU_ORIGIN)),)
 ifeq ($(findstring override,$(_ICU_ORIGIN))$(if $(filter environment,$(_ICU_ORIGIN)),$(_ICU_E_FLAG)),)
-_ICU_LOOKUP := $(shell f=$$(brew --prefix icu4c 2>/dev/null) || f=; \
-	f=$$(printf '%s\n' "$$f" | awk '/^\//{n++; p=$$0} END{if (n == 1) print p}'); \
-	r=$$(brew --prefix 2>/dev/null) || r=; \
-	r=$$(printf '%s\n' "$$r" | awk '/^\//{n++; p=$$0} END{if (n == 1) print p}'); \
+_ICU_LOOKUP := $(shell q() { out=$$(brew --prefix "$$@" 2>/dev/null); st=$$?; \
+		n=$$(printf '%s\n' "$$out" | grep -c '^/'); v=; why=; \
+		if [ "$$st" -ne 0 ]; then why="failed (exit $$st)"; \
+		elif [ "$$n" -eq 1 ]; then v=$$(printf '%s\n' "$$out" | grep '^/'); \
+		elif [ "$$n" -eq 0 ]; then why="printed no absolute path"; \
+		else why="printed $$n absolute paths"; fi; }; \
+	q icu4c; f=$$v; fw=$$why; q; r=$$v; rw=$$why; \
 	case "$$r" in (/*) l="$$r/opt/icu4c" ;; (*) l= ;; esac; \
 	for p in "$$f" "$$l"; do \
 		case "$$p" in (/*) if [ -f "$$p/include/unicode/regex.h" ]; then printf '%s' "$$p"; exit 0; fi ;; esac; \
 	done; \
-	fh=$${f:+$$f/include}; lh=$${l:+$$l/include}; \
-	if [ -n "$$f$$l" ]; then printf '!icu-missing: %s (brew --prefix icu4c) or %s (linked keg)' "$${fh:-no answer}" "$${lh:-no Homebrew root}"; \
-	elif command -v brew >/dev/null 2>&1; then printf '!icu-missing: (no usable answer from brew --prefix icu4c or brew --prefix)'; fi)
+	if [ -n "$$f" ]; then fd="$$f/include (brew --prefix icu4c)"; else fd="no candidate: brew --prefix icu4c $$fw"; fi; \
+	if [ -n "$$l" ]; then ld="$$l/include (linked keg)"; else ld="no linked keg: brew --prefix $$rw"; fi; \
+	if [ -n "$$f$$l" ] || command -v brew >/dev/null 2>&1; then printf '!icu-missing: %s; %s' "$$fd" "$$ld"; fi)
 ifeq ($(filter !icu-missing:,$(firstword $(_ICU_LOOKUP))),)
 ICU_PREFIX := $(_ICU_LOOKUP)
 else
 ICU_PREFIX :=
-override _ICU_MISSING := icu4c header unicode/regex.h not found in $(filter-out !icu-missing:,$(_ICU_LOOKUP)); install icu4c or pass ICU_PREFIX=<dir>
+override _ICU_MISSING := icu4c header unicode/regex.h not found: $(filter-out !icu-missing:,$(_ICU_LOOKUP)); install icu4c or pass ICU_PREFIX=<dir>
 export _ICU_MISSING
 $(warning $(_ICU_MISSING))
 endif
