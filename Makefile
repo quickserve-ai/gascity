@@ -193,7 +193,11 @@ bazel-tmpdir:
 check-icu:
 	@$(if $(filter 0,$(CGO_ENABLED)),:,if [ -n "$$_ICU_MISSING" ]; then printf 'error: %s\n' "$$_ICU_MISSING" >&2; exit 1; fi)
 
+# A prerequisite-only rule, so `build:` below keeps its recipe directly under a
+# bare target line (scripts/build_provenance_test.go parses that shape).
 build: check-icu
+
+build:
 	@mkdir -p $(BUILD_DIR)
 	@set -e; \
 		tmp="$(BUILD_DIR)/.$(BINARY).build.$$$$"; \
