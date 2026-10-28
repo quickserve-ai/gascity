@@ -437,6 +437,7 @@ go_library(
         "order_dispatch_seam.go",
         "order_outcome.go",
         "order_store.go",
+        "order_store_circuit.go",
         "order_wisp_watchdog.go",
         "orders_lane.go",
         "path_util.go",

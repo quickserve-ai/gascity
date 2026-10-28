@@ -334,9 +334,7 @@ type memoryOrderDispatcher struct {
 	gateBackoffUntil     map[string]time.Time
 	openWorkSuppression  map[string]orderOpenWorkSuppression
 
-	// storeCallBudget bounds each store call a dispatch tick makes before the
-	// store is treated as dark for the rest of the tick (ga-rs4ddy). Zero means
-	// defaultOrderStoreCallBudget.
+	// storeCallBudget bounds each store call of a tick (ga-rs4ddy); 0 = 10s.
 	storeCallBudget time.Duration
 
 	dispatchCtx    context.Context
@@ -631,6 +629,8 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 	}
 
 	stores := make(map[string]beads.Store)
+	// One dark store costs the tick at most one call budget (ga-rs4ddy).
+	circuit := newOrderStoreCircuit(m.storeCallBudget, m.stderr)
 	// inFlight counts the dispatchOne goroutines launched by THIS tick that
 	// still hold handles from `stores`. The per-tick handles must not be closed
 	// until those goroutines finish using them: on a native store, CloseStore is
@@ -645,7 +645,7 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 		go func() {
 			inFlight.Wait()
 			for _, st := range stores {
-				if err := closeBeadStoreHandle(st); err != nil {
+				if err := closeBeadStoreHandle(unwrapCircuitStore(st)); err != nil {
 					logDispatchError(m.stderr, "gc: order dispatch: closing store: %v", err)
 				}
 			}
@@ -695,7 +695,7 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 		storeKey := orderStoreTargetKey(target)
 		store, ok := stores[storeKey]
 		if !ok {
-			store, err = m.storeFn(target)
+			store, err = circuit.open(storeKey, func() (beads.Store, error) { return m.storeFn(target) })
 			if err != nil {
 				logDispatchError(m.stderr, "gc: order dispatch: opening %s store for %s: %v", target.ScopeKind, a.ScopedName(), err)
 				continue
@@ -703,7 +703,7 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 			stores[storeKey] = store
 		}
 
-		legacyStore, legacyOK := m.legacyCityStoreForTarget(cityPath, target, stores)
+		legacyStore, legacyOK := m.legacyCityStoreForTarget(cityPath, target, stores, circuit)
 		if !legacyOK {
 			continue
 		}
@@ -1129,7 +1129,8 @@ func (m *memoryOrderDispatcher) launchResolvedDispatch(ctx context.Context, stor
 		return orders.OrderRun{}, err
 	}
 	m.addInflight()
-	m.launchDispatchOne(ctx, store, target, a, cityPath, trackingRun.ID, vars, execEnv, onDone)
+	// The goroutine outlives the tick's circuit, so it gets the raw handle.
+	m.launchDispatchOne(ctx, unwrapCircuitStore(store), target, a, cityPath, trackingRun.ID, vars, execEnv, onDone)
 	return trackingRun, nil
 }
 
@@ -1464,7 +1465,7 @@ func indexStoreKey(storeKeys []string, index int) string {
 	return fmt.Sprintf("store:%d", index)
 }
 
-func (m *memoryOrderDispatcher) legacyCityStoreForTarget(cityPath string, target execStoreTarget, stores map[string]beads.Store) (beads.Store, bool) {
+func (m *memoryOrderDispatcher) legacyCityStoreForTarget(cityPath string, target execStoreTarget, stores map[string]beads.Store, circuit *orderStoreCircuit) (beads.Store, bool) {
 	if !legacyOrderCityFallbackNeeded(cityPath, target) {
 		return nil, true
 	}
@@ -1473,7 +1474,7 @@ func (m *memoryOrderDispatcher) legacyCityStoreForTarget(cityPath string, target
 	if store, ok := stores[key]; ok {
 		return store, true
 	}
-	store, err := m.storeFn(legacyTarget)
+	store, err := circuit.open(key, func() (beads.Store, error) { return m.storeFn(legacyTarget) })
 	if err != nil {
 		logDispatchError(m.stderr, "gc: order dispatch: opening legacy city store for rig order fallback: %v", err)
 		return nil, false
