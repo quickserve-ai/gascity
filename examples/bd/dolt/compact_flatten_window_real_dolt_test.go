@@ -152,6 +152,42 @@ func TestCompactScriptRealDoltWriterAfterFlattenDoesNotQuarantine(t *testing.T) 
 	}
 }
 
+// hq's steady state: a standing uncommitted cell on a checked table before
+// the run starts (production hq carries one in config). Preflight reads it
+// live, the flatten's -Am commits it, and the pinned per-table reads match.
+// Only the database hash moves against the committed root, and the
+// committed-root drift proof admits it as absorbed working-set state: the run
+// defers full GC, does not quarantine, and the dirty value lands in the
+// flatten commit.
+func TestCompactScriptRealDoltStandingDirtyCellIsAbsorbedNotQuarantined(t *testing.T) {
+	realDolt, err := exec.LookPath("dolt")
+	if err != nil {
+		t.Skipf("dolt not found: %v", err)
+	}
+	shimDir := flattenWindowShim(t, realDolt)
+	cityPath, dataDir, port := setupFlattenWindowDB(t, realDolt)
+	doltServerQueryForCompactTest(t, realDolt, port, "UPDATE beads SET name = 'dirty' WHERE id = 2")
+	if rows := doltServerQueryForCompactTest(t, realDolt, port, "SELECT COUNT(*) FROM dolt_status"); len(rows) != 1 || rows[0] == "0" {
+		t.Fatalf("setup should leave the working set dirty, dolt_status rows = %q", rows)
+	}
+
+	out, err := runFlattenWindowCompact(t, realDolt, shimDir, cityPath, dataDir, port)
+	marker := filepath.Join(cityPath, ".gc", "runtime", "packs", "dolt", "compact-quarantine", "beads")
+	if _, statErr := os.Stat(marker); statErr == nil {
+		data, _ := os.ReadFile(marker)
+		t.Fatalf("a standing dirty cell quarantined the database:\nmarker:\n%s\noutput:\n%s", data, out)
+	}
+	if err != nil {
+		t.Fatalf("compact failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "absorbed working-set state committed by the flatten") {
+		t.Fatalf("the dirty cell should be admitted as absorbed working-set state:\n%s", out)
+	}
+	if rows := doltServerQueryForCompactTest(t, realDolt, port, "SELECT name FROM beads AS OF 'HEAD' WHERE id = 2"); len(rows) != 1 || rows[0] != "dirty" {
+		t.Fatalf("the flatten commit should carry the dirty value, got %q\n%s", rows, out)
+	}
+}
+
 // Controls: a content change folded into the flatten commit itself (an
 // uncommitted working-set write, after preflight, that the flatten's -Am
 // commits) is real drift between the preflight snapshot and the flatten. It
