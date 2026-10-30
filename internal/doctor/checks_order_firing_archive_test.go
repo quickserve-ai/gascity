@@ -298,7 +298,7 @@ func TestOrderFiringCurrent_StartOlderThanNewestArchiveIsInconclusive(t *testing
 		t.Fatalf("message = %q, want it to say the result is inconclusive, not stale", result.Message)
 	}
 	details := strings.Join(result.Details, "\n")
-	if !strings.Contains(details, "silent: never fired; controller start is older than the newest event archive (inconclusive)") {
+	if !strings.Contains(details, "silent: never fired; no controller start in the active event log or the newest event archive (inconclusive)") {
 		t.Fatalf("details = %v, want the never-fired order reported inconclusive", result.Details)
 	}
 	routine := strings.Join(check.routineDetails, "\n")
@@ -346,30 +346,58 @@ func TestOrderFiringCurrent_ControllerStartIsLastInSequence(t *testing.T) {
 	}
 }
 
-// TestOrderFiringCurrent_NoStartInOnlyArchiveKeepsPredatesVerdict: with one
-// archive, the active log and the newest archive are every retained log, so a
-// start found in neither predates them all, exactly as before the bound.
-func TestOrderFiringCurrent_NoStartInOnlyArchiveKeepsPredatesVerdict(t *testing.T) {
+// TestOrderFiringCurrent_MissingStartIsInconclusiveAtAnyArchiveCount: the
+// check inspects only the active log and the newest archive, so when neither
+// holds a controller.started the start is unknown, whatever the archive count,
+// and a never-fired order whose store answers zero is inconclusive (advisory)
+// (pl-yhyw review r2). With zero or one archive the two sources are every
+// retained log, but a start found in neither is still not observed: the
+// controller may have started before them, or never.
+func TestOrderFiringCurrent_MissingStartIsInconclusiveAtAnyArchiveCount(t *testing.T) {
 	now := time.Date(2026, 10, 30, 0, 0, 0, 0, time.UTC)
-	cityPath, cfg := orderFiringTestCity(t)
-	writeOrderFiringTestOrder(t, cityPath, "silent", "cooldown", "1h")
-	writeOrderFiringArchive(t, cityPath, "20261029T235635Z", 101, 200,
-		orderFiringEventLine(190, events.OrderFired, "other", now.Add(-20*time.Minute)))
-	writeOrderFiringTestEvents(t, cityPath,
-		events.Event{Type: events.OrderFired, Subject: "other", Ts: now.Add(-3 * time.Minute)},
-	)
+	for _, tc := range []struct {
+		name     string
+		archives int
+		fired    bool // another order's firing in the active log
+	}{
+		{"no archive, firing in active log", 0, true},
+		{"no archive, no firing", 0, false},
+		{"one archive, firing in active log", 1, true},
+		{"one archive, no firing", 1, false},
+		{"several archives, firing in active log", 3, true},
+		{"several archives, no firing", 3, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cityPath, cfg := orderFiringTestCity(t)
+			writeOrderFiringTestOrder(t, cityPath, "silent", "cooldown", "1h")
+			for i := 0; i < tc.archives; i++ {
+				first := uint64(100*i + 1)
+				stamp := now.Add(time.Duration(i-tc.archives) * time.Hour).Format("20060102T150405Z")
+				writeOrderFiringArchive(t, cityPath, stamp, first, first+99,
+					orderFiringEventLine(first+10, events.OrderCompleted, "other", now.Add(time.Duration(i-tc.archives)*time.Hour)))
+			}
+			active := events.Event{Type: events.OrderCompleted, Subject: "other", Ts: now.Add(-3 * time.Minute)}
+			if tc.fired {
+				active.Type = events.OrderFired
+			}
+			writeOrderFiringTestEvents(t, cityPath, active)
 
-	check := NewOrderFiringCurrentCheck(cfg, cityPath, WithOrderFiringCurrentLastRunFunc(func(orders.Order) (time.Time, error) {
-		return time.Time{}, nil
-	}))
-	check.clock = func() time.Time { return now }
-	result := check.Run(&CheckContext{CityPath: cityPath})
+			check := NewOrderFiringCurrentCheck(cfg, cityPath, WithOrderFiringCurrentLastRunFunc(func(orders.Order) (time.Time, error) {
+				return time.Time{}, nil
+			}))
+			check.clock = func() time.Time { return now }
+			result := check.Run(&CheckContext{CityPath: cityPath})
 
-	if result.Status != StatusError || result.Severity != SeverityBlocking {
-		t.Fatalf("status = %v severity = %v, want blocking error; msg = %s; details = %v", result.Status, result.Severity, result.Message, result.Details)
-	}
-	if !strings.Contains(strings.Join(result.Details, "\n"), "controller start predates the active event log and every retained archive") {
-		t.Fatalf("details = %v, want the predates-every-log verdict", result.Details)
+			if result.Status != StatusError || result.Severity != SeverityAdvisory {
+				t.Fatalf("status = %v severity = %v, want advisory error; msg = %s; details = %v", result.Status, result.Severity, result.Message, result.Details)
+			}
+			if !strings.Contains(result.Message, "inconclusive") {
+				t.Fatalf("message = %q, want it to say the result is inconclusive", result.Message)
+			}
+			if !strings.Contains(strings.Join(result.Details, "\n"), "silent: never fired; no controller start in the active event log or the newest event archive (inconclusive)") {
+				t.Fatalf("details = %v, want the never-fired order reported inconclusive", result.Details)
+			}
+		})
 	}
 }
 

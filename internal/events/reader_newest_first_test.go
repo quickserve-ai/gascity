@@ -166,18 +166,3 @@ func TestReadNewestArchiveTypesRequiresTypes(t *testing.T) {
 		t.Fatal("err = nil, want an error for no types")
 	}
 }
-
-func TestArchiveCount(t *testing.T) {
-	path, _, _ := newestFirstFixture(t)
-	if n, err := ArchiveCount(path); err != nil || n != 3 {
-		t.Fatalf("ArchiveCount = %d, %v; want 3 archives", n, err)
-	}
-	empty := filepath.Join(t.TempDir(), "events.jsonl")
-	if n, err := ArchiveCount(empty); err != nil || n != 0 {
-		t.Fatalf("ArchiveCount with no archives = %d, %v; want 0", n, err)
-	}
-	missing := filepath.Join(t.TempDir(), "gone", "events.jsonl")
-	if n, err := ArchiveCount(missing); err != nil || n != 0 {
-		t.Fatalf("ArchiveCount with a missing directory = %d, %v; want 0", n, err)
-	}
-}

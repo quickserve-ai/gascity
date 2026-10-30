@@ -174,22 +174,3 @@ func ReadNewestArchiveTypes(path string, types []string) ([]Event, error) {
 	}
 	return evts, nil
 }
-
-// ArchiveCount reports how many retained archives sit beside the log at path.
-// A missing directory counts as none. A reader that took the newest archive
-// with ReadNewestArchiveTypes and then counts learns whether older retained
-// history went unread. Counting after the read errs toward "older history
-// exists": a rotation in between adds a newer archive and raises the count,
-// and retention reaps only archives past their age, which are no longer
-// retained history.
-func ArchiveCount(path string) (int, error) {
-	dir := filepath.Dir(path)
-	archives, err := archiveFilesIn(dir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return 0, nil
-		}
-		return 0, fmt.Errorf("listing event archives in %q: %w", dir, err)
-	}
-	return len(archives), nil
-}

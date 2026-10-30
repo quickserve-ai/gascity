@@ -48,9 +48,9 @@ func TestOrderFiringCurrent_NeverFired_BeyondUptime(t *testing.T) {
 
 // TestOrderFiringCurrent_NeverFired_StartRotatedOut pins the honesty half of
 // the bounded read (ga-22tvtm): when controller.started has rotated out of the
-// active log but firings prove the controller runs, a never-fired order must
-// NOT classify under the "controller start unknown" OK branch — the controller
-// started before the log window, so no first-cycle grace can apply.
+// active log, a never-fired order must NOT classify under an OK branch. The
+// start was not observed, so the order is inconclusive (advisory), never
+// silently green (pl-yhyw review r2).
 func TestOrderFiringCurrent_NeverFired_StartRotatedOut(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
 	cityPath, cfg := orderFiringTestCity(t)
@@ -67,30 +67,28 @@ func TestOrderFiringCurrent_NeverFired_StartRotatedOut(t *testing.T) {
 	if result.Status != StatusError {
 		t.Fatalf("status = %v, want error; msg = %s; details = %v", result.Status, result.Message, result.Details)
 	}
-	// Cron stays advisory for the same ga-97qngx reason as the known-uptime
-	// never-fired path.
 	if result.Severity != SeverityAdvisory {
 		t.Fatalf("Severity = %v, want SeverityAdvisory", result.Severity)
 	}
-	if !strings.Contains(strings.Join(result.Details, "\n"), "controller start predates the active event log") {
-		t.Fatalf("details = %v, want start-predates-log message", result.Details)
+	if !strings.Contains(strings.Join(result.Details, "\n"), "no controller start in the active event log or the newest event archive (inconclusive)") {
+		t.Fatalf("details = %v, want the inconclusive never-fired message", result.Details)
 	}
 }
 
 // TestOrderFiringCurrent_NeverFired_NoEventsAtAll: an active log with no
-// firings and no start gives no evidence the controller ever ran —
-// controller-down is its own doctor finding, so per-order alarms stay quiet.
+// firings and no start does not show when, or whether, the controller started,
+// so a never-fired order is inconclusive (advisory), not OK (pl-yhyw review r2).
 func TestOrderFiringCurrent_NeverFired_NoEventsAtAll(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
 	cityPath, cfg := orderFiringTestCity(t)
 	writeOrderFiringTestOrder(t, cityPath, "mol-dog-stale-db", "cron", "0 */4 * * *")
 
 	result := runOrderFiringCurrentTest(t, cfg, cityPath, now)
-	if result.Status != StatusOK {
-		t.Fatalf("status = %v, want OK; msg = %s; details = %v", result.Status, result.Message, result.Details)
+	if result.Status != StatusError || result.Severity != SeverityAdvisory {
+		t.Fatalf("status = %v severity = %v, want advisory error; msg = %s; details = %v", result.Status, result.Severity, result.Message, result.Details)
 	}
-	if !strings.Contains(strings.Join(result.Details, "\n"), "controller start unknown") {
-		t.Fatalf("details = %v, want controller-start-unknown message", result.Details)
+	if !strings.Contains(strings.Join(result.Details, "\n"), "no controller start in the active event log or the newest event archive (inconclusive)") {
+		t.Fatalf("details = %v, want the inconclusive never-fired message", result.Details)
 	}
 }
 
@@ -654,7 +652,7 @@ func TestOrderFiringCurrent_CaveatedOKIsNotRoutine(t *testing.T) {
 		{"never fired, first cycle", time.Time{}, now.Add(-time.Hour), false},
 	}
 	for _, tc := range cases {
-		status, _, _, routine := classifyOrderFiring(order, now, 4*time.Hour, tc.lastFired, tc.start, false)
+		status, _, _, routine := classifyOrderFiring(order, now, 4*time.Hour, tc.lastFired, tc.start)
 		if status != StatusOK || routine != tc.wantRoutine {
 			t.Errorf("%s: status=%v routine=%v, want OK routine=%v", tc.name, status, routine, tc.wantRoutine)
 		}
