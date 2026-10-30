@@ -526,6 +526,11 @@ func TestParkEnvVarOverridesTheDeclarationFile(t *testing.T) {
 	if strings.Contains(out, `"state": "parked"`) {
 		t.Fatalf("the file was consulted even though the env override was set:\n%s", out)
 	}
+	// Absence of "parked" alone would also pass on empty or broken output; the
+	// unparked pair must still be reported, as unverified.
+	if !strings.Contains(out, `"name": "app@origin", "state": "unknown"`) {
+		t.Fatalf("app@origin is not reported as unknown under the override:\n%s", out)
+	}
 }
 
 // TestSyncReadsTheParkDeclarationFile pins that the OTHER caller of the shared
