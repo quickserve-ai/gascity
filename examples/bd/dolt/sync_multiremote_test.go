@@ -30,6 +30,7 @@ package dolt_test
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -83,6 +84,24 @@ exit 0
 // every assertion below still exercises the per-remote loop.
 func runMultiRemoteSync(t *testing.T, binDir string) (log, out, freshnessDir string) {
 	t.Helper()
+	log, out, _, freshnessDir = runMultiRemoteSyncEnv(t, binDir)
+	return log, out, freshnessDir
+}
+
+// runMultiRemoteSyncEnv is runMultiRemoteSync with extra environment and the
+// sync's own exit code, which the parked-remote case turns on: the point of
+// skipping a parked remote is that the run SUCCEEDS.
+func runMultiRemoteSyncEnv(t *testing.T, binDir string, extraEnv ...string) (log, out string, exitCode int, freshnessDir string) {
+	t.Helper()
+	return runMultiRemoteSyncEnvCity(t, binDir, nil, extraEnv...)
+}
+
+// runMultiRemoteSyncEnvCity is runMultiRemoteSyncEnv with a hook to write files
+// into the city before sync runs. The park DECLARATION FILE lives in the city
+// (ga-p2xtt4), so a test of the file source needs the city path the harness
+// creates, not just its environment.
+func runMultiRemoteSyncEnvCity(t *testing.T, binDir string, seedCity func(*testing.T, string), extraEnv ...string) (log, out string, exitCode int, freshnessDir string) {
+	t.Helper()
 	root := repoRoot(t)
 	port, cleanup := startReachableTCPListener(t)
 	defer cleanup()
@@ -105,8 +124,21 @@ func runMultiRemoteSync(t *testing.T, binDir string) (log, out, freshnessDir str
 		"GC_DOLT_PASSWORD=",
 		"GC_DOLT_REMOTE_APP=origin,probe",
 	)
-	raw, _ := cmd.CombinedOutput()
-	return readLog(t, filepath.Join(binDir, "dolt.log")), string(raw),
+	if seedCity != nil {
+		seedCity(t, cityPath)
+	}
+	cmd.Env = append(cmd.Env, extraEnv...)
+	raw, err := cmd.CombinedOutput()
+	code := 0
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			code = exitErr.ExitCode()
+		} else {
+			t.Fatalf("run sync: %v", err)
+		}
+	}
+	return readLog(t, filepath.Join(binDir, "dolt.log")), string(raw), code,
 		filepath.Join(cityPath, ".gc", "runtime", "packs", "dolt", "backup-freshness")
 }
 
@@ -223,8 +255,19 @@ exit 0
 // invisible to it — which kills the mutant but proves the wrong thing.
 func runMirrorHealth(t *testing.T, remotes []string, freshRemotes []string, parked, legacyRemote string) string {
 	t.Helper()
+	return runMirrorHealthParkFile(t, remotes, freshRemotes, parked, "", legacyRemote)
+}
+
+// runMirrorHealthParkFile is runMirrorHealth plus parkFile, the contents of the
+// city's park declaration file. Empty means the file is not created at all,
+// which is the state of a city that has parked nothing.
+func runMirrorHealthParkFile(t *testing.T, remotes []string, freshRemotes []string, parked, parkFile, legacyRemote string) string {
+	t.Helper()
 	root := repoRoot(t)
 	cityPath := t.TempDir()
+	if parkFile != "" {
+		writeParkDeclaration(t, cityPath, parkFile)
+	}
 	dataDir := filepath.Join(cityPath, ".beads", "dolt")
 	if err := os.MkdirAll(filepath.Join(dataDir, "app", ".dolt"), 0o755); err != nil {
 		t.Fatal(err)
@@ -358,5 +401,157 @@ func TestHealthParkIsPerRemoteNotPerDatabase(t *testing.T) {
 	}
 	if m := originMirrors(t, out); m.State == "ok" || !m.Stale {
 		t.Fatalf("a database-level park entry cleared the verdict:\n%s", out)
+	}
+}
+
+// TestSyncSkipsAParkedRemoteAndStillSucceeds pins the other half of parking.
+//
+// Health already excludes a parked pair from the durability verdict. Sync did
+// not: it still fetched the abandoned mirror, still failed on it, and that
+// failure is the run's exit code — so dolt-remotes-patrol reported exec-failed
+// on EVERY cycle while the live mirror was being pushed perfectly. An alarm
+// that is always red cannot tell anyone that a remote we still care about has
+// broken.
+//
+// PRE-FIX FAILURE (verified by removing the park check from sync_selected_remotes):
+// the log contains DOLT_FETCH('origin' and the run exits 1.
+func TestSyncSkipsAParkedRemoteAndStillSucceeds(t *testing.T) {
+	binDir := t.TempDir()
+	fakeDoltTwoRemotes(t, binDir)
+	log, out, code, freshnessDir := runMultiRemoteSyncEnv(t, binDir,
+		"GC_DOLT_MIRROR_PARKED=app/origin=corrupt remote-side; gated on a federation decision")
+
+	if strings.Contains(log, "DOLT_FETCH('origin'") {
+		t.Fatalf("a parked remote was contacted anyway.\nlog:\n%s", log)
+	}
+	if code != 0 {
+		t.Fatalf("sync exited %d with only a PARKED remote failing; the patrol reads this as a failed run.\nout:\n%s", code, out)
+	}
+	// Parking is not silence: the skip must be visible, with its reason.
+	if !strings.Contains(out, "parked remote origin") || !strings.Contains(out, "corrupt remote-side") {
+		t.Fatalf("the parked remote was skipped without saying so, or without its reason.\nout:\n%s", out)
+	}
+	// The remote that is NOT parked must still be pushed and stamped.
+	if !strings.Contains(log, "DOLT_PUSH('probe'") {
+		t.Fatalf("parking one remote suppressed the live one.\nlog:\n%s\nout:\n%s", log, out)
+	}
+	if _, err := os.Stat(filepath.Join(freshnessDir, "app@probe")); err != nil {
+		t.Fatalf("live remote not stamped while a sibling was parked: %v\nout:\n%s", err, out)
+	}
+}
+
+// writeParkDeclaration writes the city's park declaration file — the source
+// mirror_park_reason reads when GC_DOLT_MIRROR_PARKED is not set, which is
+// every invocation a person makes.
+func writeParkDeclaration(t *testing.T, cityPath, content string) {
+	t.Helper()
+	dir := filepath.Join(cityPath, "config", "dolt")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "mirrors-parked"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestHealthReadsTheParkDeclarationFileWithNoEnvVar is the ga-p2xtt4
+// mutant-killer, and it is the state this city was actually in.
+//
+// The park reached health only through GC_DOLT_MIRROR_PARKED, which is set in
+// [order.env] for two patrols. Order env does not reach a command a person
+// runs, so `gc dolt health` typed by a human or an agent reported qcore's
+// deliberately abandoned mirror as "unknown" and the whole aggregate as STALE
+// — the same false alarm, from the same decision, that cost three agents a
+// night, now on the read path everyone uses.
+//
+// Note the reason carries a COMMA. The env form is comma-separated, so a comma
+// there silently truncates the reason; the file form is line-based and does
+// not. Testing with one pins the difference rather than leaving it in a
+// comment.
+//
+// PRE-FIX FAILURE (verified against a runtime.sh with the file branch removed):
+// app@origin reads "unknown" and the origin_mirrors verdict is not ok.
+func TestHealthReadsTheParkDeclarationFileWithNoEnvVar(t *testing.T) {
+	out := runMirrorHealthParkFile(t, []string{"origin", "probe"}, []string{"probe"}, "",
+		"app/origin=corrupt remote-side, re-seed gated on a federation decision\n", "")
+	if !strings.Contains(out, `"name": "app@origin", "state": "parked"`) {
+		t.Fatalf("the city declared this remote parked and health did not see it:\n%s", out)
+	}
+	if !strings.Contains(out, "corrupt remote-side, re-seed gated on a federation decision") {
+		t.Fatalf("the park reason did not survive the file (comma truncation?):\n%s", out)
+	}
+	if m := originMirrors(t, out); m.State != "ok" || m.Stale {
+		t.Fatalf("a declared park did not clear the verdict, so the false STALE remains:\n%s", out)
+	}
+}
+
+// TestHealthDoesNotParkWhatTheDeclarationFileDoesNotName is the other
+// direction, and it is the one that matters most: a check that answered
+// "parked" whenever the file merely EXISTS would pass the test above while
+// hiding every genuinely dead mirror in the city.
+func TestHealthDoesNotParkWhatTheDeclarationFileDoesNotName(t *testing.T) {
+	out := runMirrorHealthParkFile(t, []string{"origin", "probe"}, []string{"probe"}, "",
+		"other/origin=a park for a different database\n", "")
+	if strings.Contains(out, `"state": "parked"`) {
+		t.Fatalf("a park for another database parked this one:\n%s", out)
+	}
+	if m := originMirrors(t, out); m.State == "ok" && !m.Stale {
+		t.Fatalf("an unverified, unparked remote still read healthy:\n%s", out)
+	}
+}
+
+// TestACommentedOutParkDoesNotPark pins that un-parking works by commenting the
+// line out — the obvious way anyone will do it. A parser that ignored the `#`
+// would leave a mirror silently unmonitored after someone believed they had
+// re-armed it.
+func TestACommentedOutParkDoesNotPark(t *testing.T) {
+	out := runMirrorHealthParkFile(t, []string{"origin", "probe"}, []string{"probe"}, "",
+		"# park lifted 2026-08-17, mirror re-seeded\n# app/origin=corrupt remote-side\n\n", "")
+	if strings.Contains(out, `"state": "parked"`) {
+		t.Fatalf("a commented-out park still parked the remote:\n%s", out)
+	}
+	if m := originMirrors(t, out); m.State == "ok" && !m.Stale {
+		t.Fatalf("a commented-out park still cleared the verdict:\n%s", out)
+	}
+}
+
+// TestParkEnvVarOverridesTheDeclarationFile pins the precedence. The env var is
+// the override, so when it is set the file is not consulted at all — otherwise
+// an order could never narrow a park, and the two sources would union into
+// something neither one declares.
+func TestParkEnvVarOverridesTheDeclarationFile(t *testing.T) {
+	out := runMirrorHealthParkFile(t, []string{"origin", "probe"}, []string{"probe"},
+		"other/origin=an override that parks nothing here",
+		"app/origin=the file would park this one\n", "")
+	if strings.Contains(out, `"state": "parked"`) {
+		t.Fatalf("the file was consulted even though the env override was set:\n%s", out)
+	}
+}
+
+// TestSyncReadsTheParkDeclarationFile pins that the OTHER caller of the shared
+// parser honors the same source. Sync skipping a parked remote is what keeps
+// dolt-remotes-patrol out of permanent exec-failed; if only health read the
+// file, moving the declaration out of [order.env] would re-arm that.
+func TestSyncReadsTheParkDeclarationFile(t *testing.T) {
+	binDir := t.TempDir()
+	fakeDoltTwoRemotes(t, binDir)
+	log, out, code, freshnessDir := runMultiRemoteSyncEnvCity(t, binDir, func(t *testing.T, cityPath string) {
+		writeParkDeclaration(t, cityPath, "app/origin=corrupt remote-side, gated on a federation decision\n")
+	})
+
+	if strings.Contains(log, "DOLT_FETCH('origin'") {
+		t.Fatalf("a remote parked by the declaration file was contacted anyway.\nlog:\n%s", log)
+	}
+	if code != 0 {
+		t.Fatalf("sync exited %d with only a file-parked remote failing; the patrol reads this as a failed run.\nout:\n%s", code, out)
+	}
+	if !strings.Contains(out, "parked remote origin") || !strings.Contains(out, "corrupt remote-side") {
+		t.Fatalf("the parked remote was skipped without saying so, or without its reason.\nout:\n%s", out)
+	}
+	if !strings.Contains(log, "DOLT_PUSH('probe'") {
+		t.Fatalf("a file-declared park suppressed the live remote.\nlog:\n%s\nout:\n%s", log, out)
+	}
+	if _, err := os.Stat(filepath.Join(freshnessDir, "app@probe")); err != nil {
+		t.Fatalf("live remote not stamped while a sibling was parked by the file: %v\nout:\n%s", err, out)
 	}
 }
