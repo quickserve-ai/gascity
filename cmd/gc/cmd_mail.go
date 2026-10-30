@@ -1367,6 +1367,33 @@ func orderMailSenderIdentity() string {
 	return mail.OrderSenderPrefix + scope + "/" + name
 }
 
+// unverifiedOrderSender reports whether sender is an order:<scope>/<name>
+// that this process is not the run of (ga-7lmivm.1). Only a caller with no
+// session identity gets here with one: a live seat's --from order: is refused
+// by mailSenderAuthorizedCached on send. The claim is kept and marked, never
+// refused, because identity-less automation signs this way.
+func unverifiedOrderSender(sender string) bool {
+	return strings.HasPrefix(sender, mail.OrderSenderPrefix) && sender != orderMailSenderIdentity()
+}
+
+// unverifiedSenderMetadata is the metadata that marks an unverified
+// order:<scope>/<name> sender, or nil when sender is verified or not an order.
+func unverifiedSenderMetadata(sender string) map[string]string {
+	if !unverifiedOrderSender(sender) {
+		return nil
+	}
+	return map[string]string{mail.FromUnverifiedMetadataKey: "true"}
+}
+
+// withUnverifiedBanner prefixes body with [mail.UnverifiedSenderBanner] when
+// metadata marks the sender unverified.
+func withUnverifiedBanner(sender, body string, metadata map[string]string) string {
+	if metadata[mail.FromUnverifiedMetadataKey] != "true" {
+		return body
+	}
+	return mail.UnverifiedSenderBanner(sender) + "\n\n" + body
+}
+
 // orderMailRunMetadata is the metadata that ties a message to the order run
 // that sent it, or nil when sender is not this process's own order identity.
 func orderMailRunMetadata(sender string) map[string]string {
@@ -2615,6 +2642,11 @@ func cmdMailSendJSONFull(args []string, notify bool, all bool, from string, to s
 			return 1
 		}
 	}
+	if from != "" {
+		// An explicit order:<scope>/<name> that is not this process's own run
+		// is marked, with or without a store (ga-7lmivm.1).
+		runMetadata = unverifiedSenderMetadata(sender)
+	}
 
 	var nf nudgeFunc
 	if notify && store != nil {
@@ -2810,6 +2842,7 @@ func doMailSendJSONRun(mp mail.Provider, rec events.Recorder, validRecipients ma
 		fmt.Fprintf(stderr, "gc mail send: unknown recipient %q\n", to) //nolint:errcheck // best-effort stderr
 		return 1
 	}
+	body = withUnverifiedBanner(sender, body, runMetadata)
 
 	var (
 		m          mail.Message
@@ -2818,7 +2851,7 @@ func doMailSendJSONRun(mp mail.Provider, rec events.Recorder, validRecipients ma
 	)
 	ms, canStampRun := mp.(mail.MetadataSender)
 	if runMetadata != nil && !canStampRun {
-		fmt.Fprintln(stderr, "gc mail send: mail provider cannot record the sending order run on the message") //nolint:errcheck // best-effort stderr
+		fmt.Fprintln(stderr, "gc mail send: mail provider cannot record the message metadata (the sending order run, or the unverified-sender mark; the body banner still shows it)") //nolint:errcheck // best-effort stderr
 	}
 	switch {
 	case dedupKey != "" && runMetadata != nil && canStampRun:
@@ -2960,6 +2993,7 @@ func doMailSendAllCoverageRun(mp mail.Provider, rec events.Recorder, validRecipi
 	} else {
 		body = args[0]
 	}
+	body = withUnverifiedBanner(sender, body, runMetadata)
 
 	// Collect recipients in sorted order for deterministic output.
 	var recipients []string
@@ -2987,7 +3021,7 @@ func doMailSendAllCoverageRun(mp mail.Provider, rec events.Recorder, validRecipi
 	var unconfirmedRecipients []mailUnconfirmedRecipient
 	ms, canStampRun := mp.(mail.MetadataSender)
 	if runMetadata != nil && !canStampRun {
-		fmt.Fprintln(stderr, "gc mail send --all: mail provider cannot record the sending order run on the message") //nolint:errcheck // best-effort stderr
+		fmt.Fprintln(stderr, "gc mail send --all: mail provider cannot record the message metadata (the sending order run, or the unverified-sender mark; the body banner still shows it)") //nolint:errcheck // best-effort stderr
 	}
 	for _, to := range recipients {
 		var m mail.Message
@@ -3430,6 +3464,13 @@ func cmdMailReplyFromJSON(args []string, from, subject, message string, notify b
 	if body == "" && len(args) > 1 {
 		body = strings.Join(args[1:], " ")
 	}
+	// An explicit order:<scope>/<name> that is not this process's own run is
+	// marked, here before any cross-city qualification (ga-7lmivm.1).
+	var replyMetadata map[string]string
+	if explicitFrom {
+		replyMetadata = unverifiedSenderMetadata(sender)
+		body = withUnverifiedBanner(sender, body, replyMetadata)
+	}
 
 	// A reply into a foreign-origin thread crosses cities: refuse --notify
 	// before any write, and store this city's sender city-qualified so
@@ -3485,7 +3526,7 @@ func cmdMailReplyFromJSON(args []string, from, subject, message string, notify b
 		fmt.Fprintf(stderr, "gc mail reply: --notify requested but no city store available; nudge skipped: %v\n", notifySetupErr) //nolint:errcheck // best-effort stderr
 	}
 
-	return doMailReplyJSON(mp, rec, args[0], sender, subject, body, nf, jsonOut, stdout, stderr)
+	return doMailReplyJSONMetadata(mp, rec, args[0], sender, subject, body, nf, replyMetadata, jsonOut, stdout, stderr)
 }
 
 // doMailReply creates a reply to an existing message.
@@ -3494,7 +3535,21 @@ func doMailReply(mp mail.Provider, rec events.Recorder, id, sender, subject, bod
 }
 
 func doMailReplyJSON(mp mail.Provider, rec events.Recorder, id, sender, subject, body string, nudgeFn nudgeFunc, jsonOut bool, stdout, stderr io.Writer) int {
-	reply, err := mp.Reply(id, sender, subject, body)
+	return doMailReplyJSONMetadata(mp, rec, id, sender, subject, body, nudgeFn, nil, jsonOut, stdout, stderr)
+}
+
+// doMailReplyJSONMetadata is doMailReplyJSON with metadata stamped on the
+// reply when the provider can ([mail.MetadataReplier]).
+func doMailReplyJSONMetadata(mp mail.Provider, rec events.Recorder, id, sender, subject, body string, nudgeFn nudgeFunc, metadata map[string]string, jsonOut bool, stdout, stderr io.Writer) int {
+	var (
+		reply mail.Message
+		err   error
+	)
+	if mr, ok := mp.(mail.MetadataReplier); ok && metadata != nil {
+		reply, err = mr.ReplyWithMetadata(id, sender, subject, body, metadata)
+	} else {
+		reply, err = mp.Reply(id, sender, subject, body)
+	}
 	telemetry.RecordMailOp(context.Background(), "reply", err)
 	if err != nil {
 		if code := classifyMailWriteFailure(stderr, "gc mail reply", err); code != 0 {

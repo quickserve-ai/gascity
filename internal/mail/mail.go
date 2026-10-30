@@ -64,6 +64,12 @@ const (
 	// FromOrderRunMetadataKey stores the tracking bead of the order run that
 	// sent the message, so a reader can go from a mail to the run.
 	FromOrderRunMetadataKey = "mail.from_order_run"
+	// FromUnverifiedMetadataKey is "true" on a message whose sender is an
+	// order:<scope>/<name> claimed by a process that is not that order's own
+	// run: a terminal, a systemd unit, a seat with its GC_* identity unset
+	// (ga-7lmivm.1). The claim is kept, never refused; this mark and the body
+	// banner make it visible.
+	FromUnverifiedMetadataKey = "mail.from_unverified"
 	// OrderSenderPrefix begins the sender of mail an order sends:
 	// order:<scope>/<name>. An order has no mailbox, so nothing is delivered
 	// to such an address.
@@ -98,6 +104,19 @@ func IsOrderSender(addr string) bool {
 // MetadataSender is an optional [Provider] capability: send with extra
 // metadata stamped on the message in the same write that creates it. The
 // extra keys must not collide with the provider's own routing keys.
+// UnverifiedSenderBanner is the first line of the body of a message whose
+// order:<scope>/<name> sender is unverified (see [FromUnverifiedMetadataKey]).
+// It is written into the stored body, so every reader shows it.
+func UnverifiedSenderBanner(from string) string {
+	return "[unverified sender: " + from + " was claimed by a process that is not that order's run]"
+}
+
+// MetadataReplier is implemented by providers that can stamp metadata on a
+// reply when it is created, as [MetadataSender] does for a send.
+type MetadataReplier interface {
+	ReplyWithMetadata(id, from, subject, body string, metadata map[string]string) (Message, error)
+}
+
 type MetadataSender interface {
 	SendWithMetadata(from, to, subject, body string, metadata map[string]string) (Message, error)
 	SendDedupedWithMetadata(from, to, subject, body, key string, metadata map[string]string) (msg Message, suppressed bool, err error)
