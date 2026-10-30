@@ -38,9 +38,55 @@ unique_words = $(if $1,$(firstword $1) $(call unique_words,$(filter-out $(firstw
 # keg-only under Homebrew, so its headers/libs are not on the default CGO
 # search path. Point CGO at them when icu4c is present. This is a no-op on
 # Linux and other platforms (where system ICU, e.g. libicu-dev, is found
-# normally) and a no-op on macOS when icu4c is not installed.
+# normally) and a no-op on macOS without Homebrew.
+#
+# `brew --prefix icu4c` names the formula's CURRENT version whether or not it
+# is installed (it answered icu4c@79 while only @77/@78 were installed), so
+# the prefix is used only when its include/unicode/regex.h exists; otherwise
+# the linked keg $(brew --prefix)/opt/icu4c is tried. A query counts only if
+# it exits 0 and its stdout holds exactly one absolute-path line; Homebrew
+# present with neither query usable counts as missing. When Homebrew answers
+# but neither candidate has the header, make warns at parse time and `build`
+# stops in check-icu (unless CGO_ENABLED=0),
+# instead of the go-icu-regex compile failing minutes later.
+# ICU_PREFIX=<dir> on the command line, or with make -e, chooses one
+# explicitly and skips detection; ICU_PREFIX= (empty) adds no ICU flags.
+# Private: set only below, so a value inherited from a parent make or the
+# environment never stops check-icu.
+override _ICU_MISSING :=
 ifeq ($(shell uname),Darwin)
-ICU_PREFIX := $(shell brew --prefix icu4c 2>/dev/null)
+# make -e: origin reads "environment override" on make 4.x but plain
+# "environment" on 3.81, so also look for the e flag in MAKEFLAGS' flag word
+# (its first word, when that is neither an assignment nor a long option).
+_ICU_MF1 := $(firstword $(MAKEFLAGS))
+_ICU_E_FLAG := $(if $(findstring =,$(_ICU_MF1)),,$(if $(filter -%,$(_ICU_MF1)),,$(findstring e,$(_ICU_MF1))))
+_ICU_ORIGIN := $(origin ICU_PREFIX)
+ifneq ($(filter undefined environment,$(_ICU_ORIGIN)),)
+ifeq ($(findstring override,$(_ICU_ORIGIN))$(if $(filter environment,$(_ICU_ORIGIN)),$(_ICU_E_FLAG)),)
+_ICU_LOOKUP := $(shell q() { out=$$(brew --prefix "$$@" 2>/dev/null); st=$$?; \
+		n=$$(printf '%s\n' "$$out" | grep -c '^/'); v=; why=; \
+		if [ "$$st" -ne 0 ]; then why="failed (exit $$st)"; \
+		elif [ "$$n" -eq 1 ]; then v=$$(printf '%s\n' "$$out" | grep '^/'); \
+		elif [ "$$n" -eq 0 ]; then why="printed no absolute path"; \
+		else why="printed $$n absolute paths"; fi; }; \
+	q icu4c; f=$$v; fw=$$why; q; r=$$v; rw=$$why; \
+	case "$$r" in (/*) l="$$r/opt/icu4c" ;; (*) l= ;; esac; \
+	for p in "$$f" "$$l"; do \
+		case "$$p" in (/*) if [ -f "$$p/include/unicode/regex.h" ]; then printf '%s' "$$p"; exit 0; fi ;; esac; \
+	done; \
+	if [ -n "$$f" ]; then fd="$$f/include (brew --prefix icu4c)"; else fd="no candidate: brew --prefix icu4c $$fw"; fi; \
+	if [ -n "$$l" ]; then ld="$$l/include (linked keg)"; else ld="no linked keg: brew --prefix $$rw"; fi; \
+	if [ -n "$$f$$l" ] || command -v brew >/dev/null 2>&1; then printf '!icu-missing: %s; %s' "$$fd" "$$ld"; fi)
+ifeq ($(filter !icu-missing:,$(firstword $(_ICU_LOOKUP))),)
+ICU_PREFIX := $(_ICU_LOOKUP)
+else
+ICU_PREFIX :=
+override _ICU_MISSING := icu4c header unicode/regex.h not found: $(filter-out !icu-missing:,$(_ICU_LOOKUP)); install icu4c or pass ICU_PREFIX=<dir>
+export _ICU_MISSING
+$(warning $(_ICU_MISSING))
+endif
+endif
+endif
 ifneq ($(ICU_PREFIX),)
 CGO_CPPFLAGS += -I$(ICU_PREFIX)/include
 CGO_LDFLAGS += -L$(ICU_PREFIX)/lib
@@ -105,7 +151,7 @@ endif
 endif
 endif
 
-.PHONY: build check check-all check-bd check-docker check-docs check-dolt check-hooks check-eventexport-isolation check-gomod-replace check-core-boundary check-native-dependency-surface check-routed-test-rows check-split-topology-rows check-atomic-binary-swap check-version-tag lint lint-changed lint-affected lint-full lint-golangci vet-go fmt-check fmt-check-changed fmt vet test test-ci-policy test-mac test-fast-parallel test-fsys-darwin-compile test-herdr-live test-pack-registry-live test-native-doltlite-beads test-cmd-gc-process test-cmd-gc-process-shard test-cmd-gc-process-parallel test-productmetrics-testhook test-worker-core test-worker-core-phase2 test-worker-core-phase2-all test-worker-core-phase2-real-transport setup-worker-inference test-worker-inference test-worker-inference-phase3 test-acceptance test-beads-topology-matrix test-bd-cli-contract test-bd-cli-contract-home-isolation test-bd-conditional-release-contract test-acceptance-b test-acceptance-split-storage test-acceptance-c test-acceptance-all test-tutorial-goldens test-tutorial-regression test-tutorial test-integration test-integration-shards test-integration-shards-parallel test-integration-shards-cover test-integration-packages test-integration-packages-cover test-integration-review-formulas test-integration-review-formulas-cover test-integration-review-formulas-basic test-integration-review-formulas-basic-cover test-integration-review-formulas-retries test-integration-review-formulas-retries-cover test-integration-review-formulas-recovery test-integration-review-formulas-recovery-cover test-integration-bdstore test-integration-bdstore-cover test-integration-rest test-integration-rest-cover test-integration-rest-smoke test-integration-rest-smoke-cover test-integration-rest-full test-integration-rest-full-cover test-local-full-parallel test-mail-wisp-insert test-mcp-mail test-openclaw-bridge test-docker test-k8s test-cover test-cover-mac test-cover-noncmdgc test-cover-cmdgc-shard cover check-self-contained install install-tools install-buildx install-oasdiff openapi-breaking-check setup clean generate check-schema complexity complexity-diff complexity-check complexity-update docker-base docker-agent docker-controller docs-dev diagrams-excalidraw dashboard-build dashboard-build-npm dashboard-generate-client dashboard-lock dashboard-dev dashboard-check dashboard-check-npm dashboard-ci dashboard-smoke dashboard-e2e-go dashboard-e2e-play dashboard-e2e
+.PHONY: build check-icu check check-all check-bd check-docker check-docs check-dolt check-hooks check-eventexport-isolation check-gomod-replace check-core-boundary check-native-dependency-surface check-routed-test-rows check-split-topology-rows check-atomic-binary-swap check-version-tag lint lint-changed lint-affected lint-full lint-golangci vet-go fmt-check fmt-check-changed fmt vet test test-ci-policy test-mac test-fast-parallel test-fsys-darwin-compile test-herdr-live test-pack-registry-live test-native-doltlite-beads test-cmd-gc-process test-cmd-gc-process-shard test-cmd-gc-process-parallel test-productmetrics-testhook test-worker-core test-worker-core-phase2 test-worker-core-phase2-all test-worker-core-phase2-real-transport setup-worker-inference test-worker-inference test-worker-inference-phase3 test-acceptance test-beads-topology-matrix test-bd-cli-contract test-bd-cli-contract-home-isolation test-bd-conditional-release-contract test-acceptance-b test-acceptance-split-storage test-acceptance-c test-acceptance-all test-tutorial-goldens test-tutorial-regression test-tutorial test-integration test-integration-shards test-integration-shards-parallel test-integration-shards-cover test-integration-packages test-integration-packages-cover test-integration-review-formulas test-integration-review-formulas-cover test-integration-review-formulas-basic test-integration-review-formulas-basic-cover test-integration-review-formulas-retries test-integration-review-formulas-retries-cover test-integration-review-formulas-recovery test-integration-review-formulas-recovery-cover test-integration-bdstore test-integration-bdstore-cover test-integration-rest test-integration-rest-cover test-integration-rest-smoke test-integration-rest-smoke-cover test-integration-rest-full test-integration-rest-full-cover test-local-full-parallel test-mail-wisp-insert test-mcp-mail test-openclaw-bridge test-docker test-k8s test-cover test-cover-mac test-cover-noncmdgc test-cover-cmdgc-shard cover check-self-contained install install-tools install-buildx install-oasdiff openapi-breaking-check setup clean generate check-schema complexity complexity-diff complexity-check complexity-update docker-base docker-agent docker-controller docs-dev diagrams-excalidraw dashboard-build dashboard-build-npm dashboard-generate-client dashboard-lock dashboard-dev dashboard-check dashboard-check-npm dashboard-ci dashboard-smoke dashboard-e2e-go dashboard-e2e-play dashboard-e2e
 .PHONY: check-release-dist-ignore
 .PHONY: bazel-tmpdir test-go check-go check-all-go check-docs-go test-acceptance-go test-integration-go
 
@@ -141,6 +187,16 @@ bazel-tmpdir:
 ## against the stale cached cdhash ("Code Signature Invalid"). Renaming swaps the
 ## directory entry instead, so any process already running the old binary keeps
 ## its own intact inode.
+## check-icu: stop a native build when Homebrew answers but no icu4c candidate
+## has unicode/regex.h (see the ICU_PREFIX block above). A no-op otherwise, and
+## a no-op for CGO_ENABLED=0 builds, which never compile go-icu-regex.
+check-icu:
+	@$(if $(filter 0,$(CGO_ENABLED)),:,if [ -n "$$_ICU_MISSING" ]; then printf 'error: %s\n' "$$_ICU_MISSING" >&2; exit 1; fi)
+
+# A prerequisite-only rule, so `build:` below keeps its recipe directly under a
+# bare target line (scripts/build_provenance_test.go parses that shape).
+build: check-icu
+
 build:
 	@mkdir -p $(BUILD_DIR)
 	@set -e; \

@@ -13,7 +13,9 @@ this tool:
   5. updates the examples/gastown pins (pack.toml, city.toml, packs.lock),
   6. updates the pinned-import examples in docs/guides/gastown-config-recipes.md.
 
---check verifies all of the above without modifying the checkout.
+--check verifies all of the above without modifying the checkout; with
+--pinned it verifies against the registry releases the pins name instead
+of the latest ones.
 
 Note on the go.mod version form: `go get module@commit` resolves to whatever
 version Go derives for that commit -- a tag pointing at exactly that commit,
@@ -54,6 +56,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repo", default=DEFAULT_GASCITY_PACKS_REPO)
     parser.add_argument("--registry", help="path to registry.toml; defaults to <repo>/registry.toml")
     parser.add_argument("--check", action="store_true", help="verify without modifying the checkout")
+    parser.add_argument(
+        "--pinned",
+        action="store_true",
+        help="with --check: verify against the registry releases the pins name, not the latest ones",
+    )
     return parser.parse_args()
 
 
@@ -63,9 +70,17 @@ def main() -> int:
     public_packs = (repo_root / PUBLIC_PACKS_GO).resolve()
     require_within(repo_root, public_packs)
 
+    if args.pinned and not args.check:
+        raise SystemExit("--pinned is only valid with --check")
+
     with maybe_clone_repo(args.repo) as packs_repo:
         registry_path = Path(args.registry).resolve() if args.registry else packs_repo / "registry.toml"
-        release = latest_registry_release(registry_path)
+        if args.pinned:
+            release = pinned_registry_release(
+                registry_path, PACK_NAME, pinned_commit(public_packs, "PublicGastownPackVersion")
+            )
+        else:
+            release = latest_registry_release(registry_path)
         pack_path = source_pack_path(release["source"])
         if not pack_path:
             raise SystemExit(f"{PACK_NAME}: registry source does not include a pack path: {release['source']}")
@@ -78,7 +93,12 @@ def main() -> int:
         # The gascity pack is embedded from the SAME module pin, so its
         # canonical pin must stay in lockstep: the module tree at the
         # gastown pin must match the latest gascity registry release.
-        gascity_release = latest_registry_release(registry_path, "gascity")
+        if args.pinned:
+            gascity_release = pinned_registry_release(
+                registry_path, "gascity", pinned_commit(public_packs, "PublicGascityPackVersion")
+            )
+        else:
+            gascity_release = latest_registry_release(registry_path, "gascity")
 
     if args.check:
         errors = check_local_state(repo_root, public_packs, release)
@@ -87,8 +107,9 @@ def main() -> int:
             for error in errors:
                 print(error, file=sys.stderr)
             return 1
+        which = "pinned" if args.pinned else "latest"
         print(
-            f"gastown pins match registry release "
+            f"gastown pins match {which} registry release "
             f"{release['version']} ({release['commit'][:12]})"
         )
         return 0
@@ -210,6 +231,41 @@ def latest_registry_release(registry_path: Path, pack_name: str = PACK_NAME) -> 
     ]
     if not releases:
         raise SystemExit(f"{pack_name}: registry has no non-withdrawn releases")
+    release = max(releases, key=lambda item: semver_key(item.get("version", "")))
+    return {
+        "source": pack["source"],
+        "version": release["version"],
+        "ref": release["ref"],
+        "commit": release["commit"],
+        "hash": release["hash"],
+    }
+
+
+def pinned_commit(public_packs: Path, const_name: str) -> str:
+    text = public_packs.read_text(encoding="utf-8")
+    match = re.search(rf'\b{const_name}\s*=\s*"sha:([0-9a-f]+)"', text)
+    if not match:
+        raise SystemExit(f"{const_name}: no sha: pin found in {public_packs}")
+    return match.group(1)
+
+
+def pinned_registry_release(registry_path: Path, pack_name: str, commit: str) -> dict[str, str]:
+    """The non-withdrawn registry release of pack_name at commit (the highest
+    version when content-identical tags share it). A pin that names no such
+    release is an error: it is not a release the registry vouches for."""
+    with registry_path.open("rb") as handle:
+        catalog = tomllib.load(handle)
+    matches = [pack for pack in catalog.get("pack", []) if pack.get("name") == pack_name]
+    if len(matches) != 1:
+        raise SystemExit(f"registry must contain exactly one {pack_name!r} pack entry, got {len(matches)}")
+    pack = matches[0]
+    releases = [
+        release
+        for release in pack.get("release", [])
+        if not release.get("withdrawn", False) and release.get("commit") == commit
+    ]
+    if not releases:
+        raise SystemExit(f"{pack_name}: pinned commit {commit} is not a non-withdrawn registry release")
     release = max(releases, key=lambda item: semver_key(item.get("version", "")))
     return {
         "source": pack["source"],
