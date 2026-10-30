@@ -16,7 +16,10 @@ PACK_DIR="${GC_PACK_DIR:-$(CDPATH= cd -- "$(dirname "${BASH_SOURCE[0]}")/../.." 
 # shellcheck disable=SC1091
 . "$PACK_DIR/assets/scripts/_bounded.sh"
 # _backup_stamp.sh carries write_local_backup_sync_stamp (ga-g3p5rm): the
-# local-backup freshness stamp mol-dog-doctor.sh dates.
+# local-backup freshness stamp mol-dog-doctor.sh dates. It writes under
+# PACK_STATE_DIR, which runtime.sh sets and nothing exports, and does nothing at
+# all without it, so this script must set it the way runtime.sh does.
+PACK_STATE_DIR="${GC_PACK_STATE_DIR:-${GC_CITY_RUNTIME_DIR:-$GC_CITY_PATH/.gc/runtime}/packs/dolt}"
 . "$PACK_DIR/assets/scripts/_backup_stamp.sh"
 # shellcheck disable=SC1091
 . "$PACK_DIR/assets/scripts/_notify.sh"

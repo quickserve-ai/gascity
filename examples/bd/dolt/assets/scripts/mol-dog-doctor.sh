@@ -238,11 +238,23 @@ if [ "${ORPHAN_COUNT:-0}" -gt 0 ]; then
     ORPHAN_WARN=" [WARN: $ORPHAN_COUNT orphan DBs detected — run gc dolt cleanup]"
 fi
 
+# Succeed when a database has a Dolt backup registered: named <db>-backup, or at
+# this database's URL under the artifact dir under any name, because `bd backup
+# init` names its backup `default`. The URL is spelled the way mol-dog-backup.sh
+# spells it. `dolt backup -v` prints "name url {params}".
+backup_registered_for_db() {
+    local city_abs
+    city_abs=$(cd "$GC_CITY_PATH" 2>/dev/null && pwd -P) || city_abs="$GC_CITY_PATH"
+    (cd "$2" && run_bounded 30 dolt backup -v 2>/dev/null) \
+        | BACKUP_NAME="$1-backup" BACKUP_URL="file://${GC_BACKUP_ARTIFACT_DIR:-$city_abs/.dolt-backup}/$1" \
+            awk '$1 == ENVIRON["BACKUP_NAME"] || $2 == ENVIRON["BACKUP_URL"] { found = 1 } END { exit !found }'
+}
+
 # Backup freshness: check each database's newest restorable backup, dated by
 # the newer of the backup remote's manifest (backup_commit_mtime_for_db) and
 # the last successful sync's stamp (ga-g3p5rm). See the loop below.
-# Every user database is in scope. DBs without a configured <db>-backup
-# remote are reported as a coverage gap rather than silently excluded —
+# Every user database is in scope. DBs without a registered backup
+# are reported as a coverage gap rather than silently excluded —
 # the exclusion is how unconfigured production DBs went unbacked-up until
 # journal corruption made them unrecoverable (#3176). mol-dog-backup.sh
 # auto-configures the remote on its next run, so this warning self-heals
@@ -252,7 +264,7 @@ BACKUP_STALE_ITEMS=""
 for db in $USER_DBS; do
     db_dir="$DOLT_DATA_DIR/$db"
     if [ -d "$db_dir/.dolt" ]; then
-        if (cd "$db_dir" && run_bounded 30 dolt backup 2>/dev/null | awk '{print $1}' | grep -qx "${db}-backup"); then
+        if backup_registered_for_db "$db" "$db_dir"; then
             BACKUP_ELIGIBLE_DBS="$BACKUP_ELIGIBLE_DBS $db"
         else
             append_backup_stale "$db backup remote missing"
