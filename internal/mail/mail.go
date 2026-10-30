@@ -84,15 +84,21 @@ const (
 	// job). It is claimed the way "controller" is: freely by a caller with no
 	// session identity, refused from a live session that is not it, and never
 	// marked unverified, because no gc run stands behind it to check. A
-	// service has no mailbox, so nothing is delivered to such an address.
+	// service has no mailbox: gc mail send and reply refuse to address one,
+	// bare or city-qualified. Other mail creators do not check yet
+	// (ga-7lmivm.1.2).
 	ServiceSenderPrefix = "service:"
 )
 
-// IsServiceSender reports whether addr is a service sender address,
-// service:<name>, whose name is non-empty and made only of letters, digits,
-// '.', '_' and '-'.
+// IsServiceSender reports whether addr is a service sender address, bare
+// (service:<name>) or as a cross-city send stores it (<city>/service:<name>),
+// whose name is non-empty and made only of letters, digits, '.', '_' and '-'.
 func IsServiceSender(addr string) bool {
-	name, ok := strings.CutPrefix(strings.TrimSpace(addr), ServiceSenderPrefix)
+	addr = strings.TrimSpace(addr)
+	if city, rest, ok := strings.Cut(addr, "/"); ok && city != "" && !strings.Contains(city, ":") {
+		addr = rest
+	}
+	name, ok := strings.CutPrefix(addr, ServiceSenderPrefix)
 	if !ok || name == "" {
 		return false
 	}

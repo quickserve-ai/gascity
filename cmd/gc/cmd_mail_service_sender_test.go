@@ -46,45 +46,52 @@ func TestCmdMailSend_SeatServiceFromIsRefused(t *testing.T) {
 	}
 }
 
-// A service has no mailbox: mail to one is refused before anything is written.
+// A service has no mailbox: mail to one is refused before anything is
+// written, bare or city-qualified (the qualified form must not leave as a
+// peer-city address).
 func TestCmdMailSend_ToServiceIsRefused(t *testing.T) {
 	clearMailIdentityEnv(t)
 	cityPath, _ := orderSenderTestCity(t)
 
-	var stdout, stderr bytes.Buffer
-	if code := cmdMailSend([]string{"service:westeros-pressure", "to a service"}, false, false, "", "", "", "", &stdout, &stderr); code == 0 {
-		t.Fatalf("send to service: = 0, want a refusal; stdout=%s", stdout.String())
-	}
-	if !strings.Contains(stderr.String(), "service sender, which has no mailbox") {
-		t.Fatalf("stderr = %q, want the no-mailbox refusal", stderr.String())
-	}
-	if n := len(messageBeadsByBody(t, cityPath, "to a service")); n != 0 {
-		t.Fatalf("messages = %d, want none written", n)
+	for _, to := range []string{"service:westeros-pressure", "peer/service:westeros-pressure"} {
+		var stdout, stderr bytes.Buffer
+		if code := cmdMailSend([]string{to, "to a service " + to}, false, false, "human", "", "", "", &stdout, &stderr); code == 0 {
+			t.Fatalf("send to %s = 0, want a refusal; stdout=%s", to, stdout.String())
+		}
+		if !strings.Contains(stderr.String(), "service sender, which has no mailbox") {
+			t.Fatalf("send to %s: stderr = %q, want the no-mailbox refusal", to, stderr.String())
+		}
+		if n := len(messageBeadsByBody(t, cityPath, "to a service "+to)); n != 0 {
+			t.Fatalf("send to %s: messages = %d, want none written", to, n)
+		}
 	}
 }
 
-// Nor can a service's mail be replied to: the reply would go nowhere.
+// Nor can a service's mail be replied to, bare or city-qualified: the reply
+// would go nowhere.
 func TestCmdMailReply_ToServiceIsRefused(t *testing.T) {
 	clearMailIdentityEnv(t)
 	cityPath, seat := orderSenderTestCity(t)
-	var stdout, stderr bytes.Buffer
-	if code := cmdMailSend([]string{seat.ID, "page to answer"}, false, false, "service:westeros-verdicts", "", "", "", &stdout, &stderr); code != 0 {
-		t.Fatalf("seed send = %d; stderr=%s", code, stderr.String())
-	}
-	orig := messageBeadsByBody(t, cityPath, "page to answer")
-	if len(orig) != 1 {
-		t.Fatalf("seed messages = %d, want 1", len(orig))
-	}
+	for _, from := range []string{"service:westeros-verdicts", "peer/service:westeros-verdicts"} {
+		var stdout, stderr bytes.Buffer
+		if code := cmdMailSend([]string{seat.ID, "page to answer " + from}, false, false, from, "", "", "", &stdout, &stderr); code != 0 {
+			t.Fatalf("seed send from %s = %d; stderr=%s", from, code, stderr.String())
+		}
+		orig := messageBeadsByBody(t, cityPath, "page to answer "+from)
+		if len(orig) != 1 {
+			t.Fatalf("seed messages from %s = %d, want 1", from, len(orig))
+		}
 
-	stdout.Reset()
-	stderr.Reset()
-	if code := cmdMailReplyFromJSON([]string{orig[0].ID}, "", "", "a reply", false, false, &stdout, &stderr); code == 0 {
-		t.Fatalf("reply to a service = 0, want a refusal; stdout=%s", stdout.String())
-	}
-	if !strings.Contains(stderr.String(), "no mailbox") {
-		t.Fatalf("stderr = %q, want the no-mailbox refusal", stderr.String())
-	}
-	if n := len(messageBeadsByBody(t, cityPath, "a reply")); n != 0 {
-		t.Fatalf("messages = %d, want none written", n)
+		stdout.Reset()
+		stderr.Reset()
+		if code := cmdMailReplyFromJSON([]string{orig[0].ID}, "human", "", "a reply to "+from, false, false, &stdout, &stderr); code == 0 {
+			t.Fatalf("reply to %s = 0, want a refusal; stdout=%s", from, stdout.String())
+		}
+		if !strings.Contains(stderr.String(), "no mailbox") {
+			t.Fatalf("reply to %s: stderr = %q, want the no-mailbox refusal", from, stderr.String())
+		}
+		if n := len(messageBeadsByBody(t, cityPath, "a reply to "+from)); n != 0 {
+			t.Fatalf("reply to %s: messages = %d, want none written", from, n)
+		}
 	}
 }

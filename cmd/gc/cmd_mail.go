@@ -1570,6 +1570,11 @@ func resolveMailRecipientIdentityCached(cityPath string, cfg *config.City, sessS
 	if normalized := normalizeNamedSessionTarget(identifier); normalized == "" || normalized == "human" {
 		return "human", nil
 	}
+	// A service has no mailbox in any city: refuse it, bare or qualified,
+	// before a peer-city address returns as written below.
+	if mail.IsServiceSender(identifier) {
+		return "", mail.ServiceNoMailboxError(identifier)
+	}
 	roster := mailCityRosterFor(cfg, cityPath)
 	switch kind, addr := roster.ResolveCityAddress(identifier); kind {
 	case mail.CityAddressForeign:
@@ -1603,9 +1608,6 @@ func resolveMailRecipientIdentityCached(cityPath string, cfg *config.City, sessS
 	}
 	if mail.IsOrderSender(identifier) {
 		return "", mail.OrderNoMailboxError(identifier)
-	}
-	if mail.IsServiceSender(identifier) {
-		return "", mail.ServiceNoMailboxError(identifier)
 	}
 	resolved, err := resolveMailIdentityWithConfigCached(cityPath, cfg, sessStore, identifier, cache)
 	if err != nil {
