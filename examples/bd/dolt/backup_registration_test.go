@@ -86,6 +86,21 @@ func TestBackupOrderStampsTheDestinationBdReports(t *testing.T) {
 	}
 }
 
+// The destination comes from the preflight, so a status call that fails after the
+// sync cannot cost a good sync its stamp.
+func TestBackupOrderStampsWithoutAStatusCallAfterTheSync(t *testing.T) {
+	cityPath := resolvedTempDir(t)
+	binDir := t.TempDir()
+	gc := writeBackupFakeGC(t, binDir)
+
+	mustRunBackupOrder(t, binDir, cityPath, "FAKE_CONFIGURED_DBS=prod")
+
+	if n := strings.Count(gc.log(t), "backup status"); n != 1 {
+		t.Fatalf("backup status called %d times, want the one preflight:\n%s", n, gc.log(t))
+	}
+	readStamp(t, filepath.Join(cityPath, ".gc", "runtime", "packs", "dolt", "local-backup-freshness", "prod"))
+}
+
 // With nothing to say where the sync went, there is nothing to stamp.
 func TestBackupOrderDoesNotStampARemoteDestination(t *testing.T) {
 	cityPath := resolvedTempDir(t)
@@ -187,6 +202,12 @@ func TestDoctorReadsAURLWithSpaces(t *testing.T) {
 	gcLog = runDoctorWithBackupListing(t, "default file://CITY/.dolt-backup/hq other {}")
 	if !strings.Contains(gcLog, "hq backup remote missing") {
 		t.Fatalf("a longer path must not match on its first word:\n%s", gcLog)
+	}
+
+	// Only the last brace group is the params; a path may hold one of its own.
+	gcLog = runDoctorWithBackupListing(t, "default file://CITY/.dolt-backup/hq {old}/hq {}")
+	if !strings.Contains(gcLog, "hq backup remote missing") {
+		t.Fatalf("a longer path must not match on a brace group inside it:\n%s", gcLog)
 	}
 }
 

@@ -253,7 +253,7 @@ fi
 backup_registered_for_db() {
     (cd "$2" && run_bounded 30 dolt backup -v 2>/dev/null) \
         | BACKUP_NAME="$1-backup" BACKUP_URL="file://$BACKUP_SYNC_DEST/$1" awk '
-            { n = $1; sub(/^[^[:space:]]+[[:space:]]+/, ""); sub(/[[:space:]]+\{.*\}[[:space:]]*$/, "") }
+            { n = $1; sub(/^[^[:space:]]+[[:space:]]+/, ""); sub(/[[:space:]]+\{[^{}]*\}[[:space:]]*$/, "") }
             n == ENVIRON["BACKUP_NAME"] || $0 == ENVIRON["BACKUP_URL"] { found = 1 }
             END { exit !found }'
 }
