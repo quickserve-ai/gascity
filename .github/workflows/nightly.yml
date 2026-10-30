@@ -157,9 +157,10 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  # Catches registry-side drift: a new gastown release published to
-  # gascity-packs makes the local pins stale without any PR to trigger
-  # the pack-gate pin check in ci.yml.
+  # The only report of registry-side drift: a new gastown release published
+  # to gascity-packs makes the local pins stale. ci.yml's pack-gate checks
+  # the pins against the release they name (--pinned), so it does not see
+  # a newer release; this job checks against the latest one.
   bundled-pack-pins:
     name: Bundled gastown pack pin check
     runs-on: ubuntu-latest
