@@ -29,20 +29,21 @@ import (
 
 // remoteMailIdentity returns the identity part of the default remote sender:
 // the first non-empty of GC_ALIAS, GC_AGENT, GC_SESSION_ID, else the running
-// order (order:<scope>/<name>), else "human". The
-// alias/agent names lead because they are meaningful to a peer city; a bare
-// session id (the local default, see defaultMailIdentityCandidates) is opaque
-// outside the city that minted it.
+// order (order:<scope>/<name>), else "". The alias/agent names lead because
+// they are meaningful to a peer city; a bare session id (the local default,
+// see defaultMailIdentityCandidates) is opaque outside the city that minted it.
+//
+// It has no "human" fallback, for the reason defaultMailSenderCandidates has
+// none: a process with no identity must not mail a peer city as the operator
+// (ga-u5dz0g, the cross-town half of ga-fi21sm). "" means refuse a send or
+// reply; only the default inbox read falls back (remoteMailInboxOwner).
 func remoteMailIdentity() string {
 	for _, k := range []string{"GC_ALIAS", "GC_AGENT", "GC_SESSION_ID"} {
 		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
 			return v
 		}
 	}
-	if order := orderMailSenderIdentity(); order != "" {
-		return order
-	}
-	return "human"
+	return orderMailSenderIdentity()
 }
 
 // localCityNameForRemoteMail returns the effective name of the LOCAL city the
@@ -68,15 +69,47 @@ func localCityNameForRemoteMail() string {
 // remoteMailSender resolves the sender for a remote mail mutation: an explicit
 // --from (whitespace-trimmed, otherwise as given), else
 // "<local city>/<identity>" (identity alone when no local city is
-// discoverable). The peer stores an unknown sender literally; if the peer
-// happens to have a session whose alias equals this string (a rig named after
-// the sending city), its beadmail binds the message to that session — so a
-// peer must not name a rig after a city that mails it (see the runbook).
-func remoteMailSender(from string) string {
+// discoverable). It returns false when there is no --from and no identity:
+// the caller refuses with noMailSenderIdentity before anything is posted. The
+// peer stores an unknown sender literally; if the peer happens to have a
+// session whose alias equals this string (a rig named after the sending
+// city), its beadmail binds the message to that session — so a peer must not
+// name a rig after a city that mails it (see the runbook).
+func remoteMailSender(from string) (string, bool) {
 	if from = strings.TrimSpace(from); from != "" {
-		return from
+		return from, true
 	}
 	id := remoteMailIdentity()
+	if id == "" {
+		return "", false
+	}
+	return qualifyRemoteMailIdentity(id), true
+}
+
+// noRemoteMailReplySenderIdentity is the remote reply's refusal for a process
+// with no identity. It is noMailSenderIdentity without the --from advice: a
+// remote reply refuses any --from, so the only remedy is a seat or an order.
+func noRemoteMailReplySenderIdentity() string {
+	return "gc mail reply: no sender identity: GC_SESSION_ID, GC_ALIAS and GC_AGENT are unset and this is not an order run " +
+		"(GC_ORDER_SCOPE and GC_ORDER_NAME unset); refusing to send as \"human\", the operator's own address. " +
+		"A remote-city reply cannot name its own sender, so reply from a seat or an order"
+}
+
+// remoteMailInboxOwner is the mailbox a remote `gc mail inbox` with no
+// argument reads: this client's qualified sender identity, or "human" when
+// the process has none. Reading keeps the human fallback that sending lost,
+// as the local reader's defaultMailIdentityCandidates does.
+func remoteMailInboxOwner() string {
+	id := remoteMailIdentity()
+	if id == "" {
+		id = "human"
+	}
+	return qualifyRemoteMailIdentity(id)
+}
+
+// qualifyRemoteMailIdentity prefixes id with the local city's name, or
+// returns it alone when no local city is discoverable.
+func qualifyRemoteMailIdentity(id string) string {
 	if city := localCityNameForRemoteMail(); city != "" {
 		return city + "/" + id
 	}
@@ -133,7 +166,10 @@ func cmdMailSendRemote(c *api.Client, target *remoteTarget, args []string, notif
 	if derivedSubject == "" {
 		return fail("invalid_arguments", "gc mail send: usage: gc mail send <to> <body>  OR  gc mail send <to> -s <subject> [-m <body>] (a non-blank subject or body is required)")
 	}
-	sender := remoteMailSender(from)
+	sender, ok := remoteMailSender(from)
+	if !ok {
+		return fail("no_sender_identity", noMailSenderIdentity("gc mail send"))
+	}
 	if !jsonOut {
 		fmt.Fprintln(stderr, formatRemoteTarget(target)) //nolint:errcheck // best-effort stderr
 	}
@@ -182,7 +218,12 @@ func cmdMailReplyRemote(c *api.Client, target *remoteTarget, args []string, subj
 	if body == "" && len(args) > 1 {
 		body = strings.Join(args[1:], " ")
 	}
-	sender := remoteMailSender("")
+	// A remote reply takes no --from (the caller refuses it), so a process
+	// with no identity has no override here: it must run from a seat or order.
+	sender, ok := remoteMailSender("")
+	if !ok {
+		return fail("no_sender_identity", noRemoteMailReplySenderIdentity())
+	}
 	if !jsonOut {
 		fmt.Fprintln(stderr, formatRemoteTarget(target)) //nolint:errcheck // best-effort stderr
 	}
@@ -247,7 +288,7 @@ func cmdMailInboxRemote(c *api.Client, target *remoteTarget, args []string, json
 		recipient = strings.TrimSpace(args[0])
 	}
 	if recipient == "" {
-		recipient = remoteMailSender("")
+		recipient = remoteMailInboxOwner()
 	}
 	if !jsonOut {
 		fmt.Fprintln(stderr, formatRemoteTarget(target)) //nolint:errcheck // best-effort stderr

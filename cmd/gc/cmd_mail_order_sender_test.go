@@ -278,11 +278,12 @@ func TestResolveMailRecipient_RefusesOrderAddress(t *testing.T) {
 	}
 }
 
-// A remote (--context) send from an order signs as the order, not human.
+// A remote (--context) send from an order signs as the order, not human; with
+// no identity at all there is none (ga-u5dz0g), so the send is refused.
 func TestRemoteMailIdentity_FallsBackToOrder(t *testing.T) {
 	clearMailIdentityEnv(t)
-	if got := remoteMailIdentity(); got != "human" {
-		t.Fatalf("no identity: %q, want human", got)
+	if got := remoteMailIdentity(); got != "" {
+		t.Fatalf("no identity: %q, want none", got)
 	}
 	setOrderEnv(t, "city", "deacon-watch", "pc-run1")
 	if got := remoteMailIdentity(); got != "order:city/deacon-watch" {
