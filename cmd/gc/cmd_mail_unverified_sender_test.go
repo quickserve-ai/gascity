@@ -127,11 +127,9 @@ func TestCmdMailSend_SeatFromOrderStillRefused(t *testing.T) {
 	}
 }
 
-// Reply does not authorize an explicit --from, so a reply claiming an order is
-// marked from any caller, a live seat included.
-func TestCmdMailReply_OrderFromIsMarked(t *testing.T) {
-	clearMailIdentityEnv(t)
-	cityPath, _ := orderSenderTestCity(t)
+// seedReplyTarget sends one message from the seat "worker" and returns it.
+func seedReplyTarget(t *testing.T, cityPath string) beads.Bead {
+	t.Helper()
 	t.Setenv("GC_AGENT", "worker")
 	var stdout, stderr bytes.Buffer
 	if code := cmdMailSend([]string{"human", "original"}, false, false, "", "", "", "", &stdout, &stderr); code != 0 {
@@ -141,21 +139,51 @@ func TestCmdMailReply_OrderFromIsMarked(t *testing.T) {
 	if len(orig) != 1 {
 		t.Fatalf("seed messages = %d, want 1", len(orig))
 	}
+	return orig[0]
+}
 
-	if code := cmdMailReplyFromJSON([]string{orig[0].ID}, "order:city/deacon-watch", "", "seat reply", false, false, &stdout, &stderr); code != 0 {
-		t.Fatalf("seat reply --from order: = %d; stderr=%s", code, stderr.String())
-	}
+// Reply now authorizes an explicit --from as send does: a live seat may claim
+// only its own identity, so an order, human or controller is refused and
+// nothing is written. It used to resolve with authorize=false (ga-7lmivm.1).
+func TestCmdMailReply_SeatForeignFromRefused(t *testing.T) {
 	clearMailIdentityEnv(t)
-	if code := cmdMailReplyFromJSON([]string{orig[0].ID}, "order:city/deacon-watch", "", "terminal reply", false, false, &stdout, &stderr); code != 0 {
+	cityPath, _ := orderSenderTestCity(t)
+	orig := seedReplyTarget(t, cityPath)
+
+	for _, from := range []string{"order:city/deacon-watch", "human", "controller"} {
+		var stdout, stderr bytes.Buffer
+		if code := cmdMailReplyFromJSON([]string{orig.ID}, from, "", "forged reply "+from, false, false, &stdout, &stderr); code == 0 {
+			t.Fatalf("seat reply --from %s = 0, want a refusal; stdout=%s", from, stdout.String())
+		}
+		if !strings.Contains(stderr.String(), "does not match this session's own identity") {
+			t.Fatalf("--from %s: stderr = %q, want the identity refusal", from, stderr.String())
+		}
+		if n := len(messageBeadsByBody(t, cityPath, "forged reply "+from)); n != 0 {
+			t.Fatalf("--from %s: messages = %d, want none written", from, n)
+		}
+	}
+	var stdout, stderr bytes.Buffer
+	if code := cmdMailReplyFromJSON([]string{orig.ID}, "worker", "", "own reply", false, false, &stdout, &stderr); code != 0 {
+		t.Fatalf("seat reply --from its own identity = %d; stderr=%s", code, stderr.String())
+	}
+}
+
+// An identity-less caller may still reply as an order; the claim is marked.
+func TestCmdMailReply_IdentityLessOrderFromIsMarked(t *testing.T) {
+	clearMailIdentityEnv(t)
+	cityPath, _ := orderSenderTestCity(t)
+	orig := seedReplyTarget(t, cityPath)
+	clearMailIdentityEnv(t)
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdMailReplyFromJSON([]string{orig.ID}, "order:city/deacon-watch", "", "terminal reply", false, false, &stdout, &stderr); code != 0 {
 		t.Fatalf("identity-less reply --from order: = %d; stderr=%s", code, stderr.String())
 	}
-	for _, needle := range []string{"seat reply", "terminal reply"} {
-		got := messageBeadsByBody(t, cityPath, needle)
-		if len(got) != 1 {
-			t.Fatalf("%s messages = %d, want 1", needle, len(got))
-		}
-		assertUnverifiedMark(t, got[0], "order:city/deacon-watch")
+	got := messageBeadsByBody(t, cityPath, "terminal reply")
+	if len(got) != 1 {
+		t.Fatalf("messages = %d, want 1", len(got))
 	}
+	assertUnverifiedMark(t, got[0], "order:city/deacon-watch")
 }
 
 // The unverified mark rides only on an order: sender this process is not.

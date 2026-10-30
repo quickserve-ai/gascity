@@ -3415,7 +3415,9 @@ func cmdMailReplyFromJSON(args []string, from, subject, message string, notify b
 	var cityPath string
 	var cfg *config.City
 	var notifySetupErr error
-	if sender != "human" || notify {
+	// An explicit --from always opens the store: it is authorized below,
+	// "human" included, exactly as gc mail send does (ga-7lmivm.1).
+	if sender != "human" || notify || explicitFrom {
 		switch {
 		case strings.HasPrefix(providerName, "exec:"):
 			var err error
@@ -3442,9 +3444,12 @@ func cmdMailReplyFromJSON(args []string, from, subject, message string, notify b
 			}
 			cfg, _ = loadCityConfig(cityPath, stderr)
 		}
-		if sender != "human" && store != nil {
+		if store != nil && (explicitFrom || sender != "human") {
 			if explicitFrom {
-				resolved, ok := resolveExplicitMailSender(mailCityRosterFor(cfg, cityPath), cityPath, cfg, cliSessionStore(store, cfg, cityPath), sender, nil, stderr, "gc mail reply", false)
+				// authorize: a live seat may claim only its own identity on a
+				// reply, as on a send; an identity-less caller may claim any,
+				// and an order: claim is marked below (ga-7lmivm.1).
+				resolved, ok := resolveExplicitMailSender(mailCityRosterFor(cfg, cityPath), cityPath, cfg, cliSessionStore(store, cfg, cityPath), sender, nil, stderr, "gc mail reply", true)
 				if !ok {
 					return 1
 				}
