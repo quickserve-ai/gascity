@@ -17,7 +17,6 @@ package dolt_test
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -40,10 +39,9 @@ func runIdentityScript(t *testing.T, script, dbName string, writeFake func(*test
 	doltLog := writeFake(t, binDir)
 	_ = writeSyncFakeBeadsBD(t, cityPath)
 
-	cmd := exec.Command("sh", append([]string{filepath.Join(root, script), "--db", dbName}, args...)...)
 	// filteredEnv drops every inherited GC_* and DOLT_* key, so a knob set on the
 	// city that runs this test cannot decide it.
-	cmd.Env = append(filteredEnv(),
+	env := append(filteredEnv(),
 		"PATH="+binDir+":"+os.Getenv("PATH"),
 		"GC_CITY_PATH="+cityPath,
 		"GC_PACK_DIR="+root,
@@ -52,8 +50,7 @@ func runIdentityScript(t *testing.T, script, dbName string, writeFake func(*test
 		"GC_DOLT_USER=root",
 		"GC_DOLT_PASSWORD=",
 	)
-	cmd.Env = append(cmd.Env, extraEnv...)
-	out, err := cmd.CombinedOutput()
+	out, err := newPackScriptCmd(root, script, append(env, extraEnv...), append([]string{"--db", dbName}, args...)...).CombinedOutput()
 	data, readErr := os.ReadFile(doltLog)
 	if readErr != nil {
 		t.Fatalf("read fake dolt log: %v", readErr)
