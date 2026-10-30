@@ -302,6 +302,22 @@ func TestHealthFailedCatalogReadKeepsEveryArtifact(t *testing.T) {
 	}
 }
 
+// The backup order covers bead scopes, so a test database left live on the server
+// has no backup by design and must not pin the reading at stale.
+func TestHealthIgnoresALiveTestDatabase(t *testing.T) {
+	cityPath := t.TempDir()
+	writeBackupArtifact(t, filepath.Join(cityPath, ".dolt-backup"), "hq", time.Minute)
+
+	backups, out := runHealthBackupsLive(t, cityPath, []string{"hq", "testdb_0616a0a02c32"}, []string{"hq", "testdb_0616a0a02c32"})
+
+	if backups.DoltStale == nil || *backups.DoltStale {
+		t.Fatalf("dolt_stale = %v, want false: a live test database is not a gap\n%s", backups.DoltStale, out)
+	}
+	if len(backups.Databases) != 1 || backups.Databases[0].Name != "hq" {
+		t.Fatalf("dolt_databases = %+v, want hq alone\n%s", backups.Databases, out)
+	}
+}
+
 // A city that takes no backups has nothing to measure: live databases must not
 // turn an unmeasured report into a stale one.
 func TestHealthLiveDatabasesDoNotInventABackupPlane(t *testing.T) {

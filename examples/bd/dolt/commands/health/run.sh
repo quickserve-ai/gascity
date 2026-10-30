@@ -404,6 +404,9 @@ if [ -d "$backup_artifact_dir" ]; then
   # different destinations compare equal.
   backup_city_abs=$(cd "$GC_CITY_PATH" 2>/dev/null && pwd -P) || backup_city_abs="$GC_CITY_PATH"
   backup_stamp_dest="${GC_BACKUP_ARTIFACT_DIR:-$backup_city_abs/.dolt-backup}"
+  while [ "${backup_stamp_dest%/}" != "$backup_stamp_dest" ] && [ "$backup_stamp_dest" != "/" ]; do
+    backup_stamp_dest="${backup_stamp_dest%/}"
+  done
   for bdir in "$backup_artifact_dir"/*/; do
     [ -d "$bdir" ] || continue
     bname="$(basename "$bdir")"
@@ -417,7 +420,9 @@ if [ -d "$backup_artifact_dir" ]; then
     backup_names="$backup_names $bname"
   done
   if [ -n "$backup_names" ] && [ "$server_reachable" = true ] && [ "$is_external" != true ]; then
-    backup_live=$(external_database_names)
+    # The backup order covers bead scopes, so a live test database has no backup by
+    # design and must not read as a gap. Same pattern as mol-dog-doctor.sh's orphans.
+    backup_live=$(external_database_names | grep -viE '^(testdb_|beads_t|beads_pt|beads_vr|doctest_|doctortest_)' || true)
     [ -z "$backup_live" ] || backup_names="$backup_live"
   fi
   for bname in $backup_names; do
