@@ -512,6 +512,17 @@ sync_selected_remotes() {
     last_fail_reason=""
     ssr_remote_rc=0
     if valid_remote_name "$ssr_remote"; then
+      # A parked remote is one we have already decided to abandon (ga-3o5xrw).
+      # Do not fetch it, do not push it, and above all do not fail on it: an
+      # abandoned mirror that returns non-zero every cycle holds the patrol
+      # permanently exec-failed, and a signal that is always red says nothing
+      # when a remote we DO care about breaks. Printed, never silent — the same
+      # rule health follows.
+      ssr_park=$(mirror_park_reason "$ssr_db" "$ssr_remote")
+      if [ -n "$ssr_park" ]; then
+        echo "  $ssr_db: skipped parked remote $ssr_remote ($ssr_park)"
+        continue
+      fi
       "$@" "$ssr_remote" "$ssr_url" </dev/null || ssr_remote_rc=$?
     else
       echo "  $ssr_db: ERROR: invalid remote name: $ssr_remote" >&2
