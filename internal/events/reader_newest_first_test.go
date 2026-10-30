@@ -107,3 +107,62 @@ func TestWalkFilteredTypesNewestFirstMissingLog(t *testing.T) {
 		t.Fatalf("missing log: err=%v calls=%d, want nil and 0", err, calls)
 	}
 }
+
+// TestReadNewestArchiveTypesReadsOnlyTheNewestArchive pins the bound: the
+// newest archive is decoded and nothing older is opened. The older archive is
+// not gzip, so opening it would fail the read.
+func TestReadNewestArchiveTypesReadsOnlyTheNewestArchive(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "events.jsonl")
+	if err := os.WriteFile(filepath.Join(dir, "events.jsonl.archive-20260901T000000Z-seq-1-10.gz"), []byte("not gzip"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ts := time.Date(2026, 9, 10, 0, 0, 0, 0, time.UTC)
+	writeArchiveWithEvents(t, dir, "20260910T000000Z", 11, 14,
+		Event{Seq: 11, Type: OrderFired, Subject: "a", Ts: ts},
+		Event{Seq: 12, Type: OrderCompleted, Subject: "a", Ts: ts},
+		Event{Seq: 13, Type: ControllerStarted, Ts: ts},
+		Event{Seq: 14, Type: OrderFired, Subject: "b", Ts: ts},
+	)
+	if err := os.WriteFile(path, []byte(`{"seq":15,"type":"order.fired","subject":"c","ts":"2026-09-11T00:00:00Z","actor":"t"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := ReadNewestArchiveTypes(path, []string{OrderFired, ControllerStarted})
+	if err != nil {
+		t.Fatalf("ReadNewestArchiveTypes opened an archive older than the newest: %v", err)
+	}
+	var seqs []uint64
+	for _, e := range got {
+		seqs = append(seqs, e.Seq)
+	}
+	if fmt.Sprint(seqs) != "[11 13 14]" {
+		t.Fatalf("seqs = %v, want [11 13 14]: the newest archive's matching events only, active log excluded", seqs)
+	}
+}
+
+func TestReadNewestArchiveTypesWithoutArchives(t *testing.T) {
+	dir := t.TempDir()
+	for _, path := range []string{filepath.Join(dir, "events.jsonl"), filepath.Join(dir, "missing", "events.jsonl")} {
+		got, err := ReadNewestArchiveTypes(path, []string{OrderFired})
+		if err != nil || len(got) != 0 {
+			t.Fatalf("%s: got %v, err %v; want no events and no error", path, got, err)
+		}
+	}
+}
+
+func TestReadNewestArchiveTypesReportsAnUnreadableNewestArchive(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "events.jsonl.archive-20260901T000000Z-seq-1-10.gz"), []byte("not gzip"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadNewestArchiveTypes(filepath.Join(dir, "events.jsonl"), []string{OrderFired}); err == nil {
+		t.Fatal("err = nil, want the unreadable archive reported")
+	}
+}
+
+func TestReadNewestArchiveTypesRequiresTypes(t *testing.T) {
+	if _, err := ReadNewestArchiveTypes(filepath.Join(t.TempDir(), "events.jsonl"), nil); err == nil {
+		t.Fatal("err = nil, want an error for no types")
+	}
+}
