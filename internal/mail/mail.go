@@ -64,11 +64,13 @@ const (
 	// FromOrderRunMetadataKey stores the tracking bead of the order run that
 	// sent the message, so a reader can go from a mail to the run.
 	FromOrderRunMetadataKey = "mail.from_order_run"
-	// FromUnverifiedMetadataKey is "true" on a message whose sender is an
-	// order:<scope>/<name> claimed by a process that is not that order's own
-	// run: a terminal, a systemd unit, a seat with its GC_* identity unset
-	// (ga-7lmivm.1). The claim is kept, never refused; this mark and the body
-	// banner make it visible.
+	// FromUnverifiedMetadataKey is "true" on a message whose order sender
+	// (bare or city-qualified) does not match the order the sending process's
+	// environment declares: a terminal, a systemd unit, a seat with its GC_*
+	// identity unset (ga-7lmivm.1). The claim is kept, never refused; this
+	// mark and the body banner make it visible. It is a mismatch check, not
+	// authentication: a process can declare any order, so an absent mark
+	// proves nothing about origin.
 	FromUnverifiedMetadataKey = "mail.from_unverified"
 	// OrderSenderPrefix begins the sender of mail an order sends:
 	// order:<scope>/<name>. An order has no mailbox, so nothing is delivered
@@ -105,7 +107,7 @@ func IsOrderSender(addr string) bool {
 // order:<scope>/<name> sender is unverified (see [FromUnverifiedMetadataKey]).
 // It is written into the stored body, so every reader shows it.
 func UnverifiedSenderBanner(from string) string {
-	return "[unverified sender: " + from + " was claimed by a process that is not that order's run]"
+	return "[unverified sender: " + from + " does not match the order the sending process declares]"
 }
 
 // MetadataReplier is implemented by providers that can stamp metadata on a

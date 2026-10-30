@@ -88,8 +88,55 @@ func TestCmdMailSend_OwnOrderRunIsNotMarked(t *testing.T) {
 		if len(got) != 1 {
 			t.Fatalf("%s messages = %d, want 1", needle, len(got))
 		}
+		if got[0].From != "order:city/deacon-watch" {
+			t.Fatalf("%s From = %q, want order:city/deacon-watch", needle, got[0].From)
+		}
+		if run := got[0].Metadata[mail.FromOrderRunMetadataKey]; run != "pc-run1" {
+			t.Fatalf("%s %s = %q, want pc-run1", needle, mail.FromOrderRunMetadataKey, run)
+		}
 		assertNoUnverifiedMark(t, got[0])
 	}
+}
+
+// A DEFAULT sender naming an order (GC_AGENT, with no order declared in the
+// environment) is marked like an explicit --from: the mark used to run only
+// on --from, so this went out unmarked (ga-7lmivm.1, cross-family read F1).
+func TestCmdMailSend_DefaultOrderSenderIsMarked(t *testing.T) {
+	clearMailIdentityEnv(t)
+	cityPath, seat := orderSenderTestCity(t)
+	t.Setenv("GC_AGENT", "order:city/town-claude-inbox")
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdMailSend([]string{seat.ID, "default sender"}, false, false, "", "", "", "", &stdout, &stderr); code != 0 {
+		t.Fatalf("cmdMailSend() = %d; stderr=%s", code, stderr.String())
+	}
+	got := messageBeadsByBody(t, cityPath, "default sender")
+	if len(got) != 1 {
+		t.Fatalf("messages = %d, want 1", len(got))
+	}
+	if got[0].From != "order:city/town-claude-inbox" {
+		t.Fatalf("From = %q, want order:city/town-claude-inbox", got[0].From)
+	}
+	assertUnverifiedMark(t, got[0], "order:city/town-claude-inbox")
+}
+
+// The same for a reply with no --from (F1).
+func TestCmdMailReply_DefaultOrderSenderIsMarked(t *testing.T) {
+	clearMailIdentityEnv(t)
+	cityPath, _ := orderSenderTestCity(t)
+	orig := seedReplyTarget(t, cityPath)
+	clearMailIdentityEnv(t)
+	t.Setenv("GC_AGENT", "order:city/town-claude-inbox")
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdMailReplyFromJSON([]string{orig.ID}, "", "", "default reply", false, false, &stdout, &stderr); code != 0 {
+		t.Fatalf("default-sender reply = %d; stderr=%s", code, stderr.String())
+	}
+	got := messageBeadsByBody(t, cityPath, "default reply")
+	if len(got) != 1 {
+		t.Fatalf("messages = %d, want 1", len(got))
+	}
+	assertUnverifiedMark(t, got[0], "order:city/town-claude-inbox")
 }
 
 // Another order's name from inside an order run is not that run: marked.
@@ -186,7 +233,8 @@ func TestCmdMailReply_IdentityLessOrderFromIsMarked(t *testing.T) {
 	assertUnverifiedMark(t, got[0], "order:city/deacon-watch")
 }
 
-// The unverified mark rides only on an order: sender this process is not.
+// The unverified mark rides on any order sender, bare or city-qualified,
+// that does not match the order this process declares.
 func TestUnverifiedSenderMetadata(t *testing.T) {
 	clearMailIdentityEnv(t)
 	setOrderEnv(t, "city", "deacon-watch", "")
@@ -196,6 +244,11 @@ func TestUnverifiedSenderMetadata(t *testing.T) {
 	}{
 		{"order:city/deacon-watch", false},
 		{"order:city/other", true},
+		{" order:city/deacon-watch ", false},
+		// City-qualified: never this process's own (bare) identity (F2).
+		{"westeros/order:city/deacon-watch", true},
+		{"westeros/order:city/other", true},
+		{"westeros/worker", false},
 		{"human", false},
 		{"worker", false},
 		{"controller", false},

@@ -1367,13 +1367,17 @@ func orderMailSenderIdentity() string {
 	return mail.OrderSenderPrefix + scope + "/" + name
 }
 
-// unverifiedOrderSender reports whether sender is an order:<scope>/<name>
-// that this process is not the run of (ga-7lmivm.1). Only a caller with no
-// session identity gets here with one: a live seat's --from order: is refused
-// by mailSenderAuthorizedCached on send. The claim is kept and marked, never
-// refused, because identity-less automation signs this way.
+// unverifiedOrderSender reports whether sender is an order sender, bare
+// (order:<scope>/<name>) or city-qualified (<city>/order:<scope>/<name>), that
+// does not match the order this process's environment declares
+// (GC_ORDER_SCOPE/GC_ORDER_NAME; ga-7lmivm.1). A qualified sender never
+// matches: this process's own identity is bare. The check is a mismatch
+// against declared environment, not authentication: any local process can
+// set those variables, so an ABSENT mark proves nothing about origin. The
+// claim is kept and marked, never refused, because identity-less automation
+// signs this way.
 func unverifiedOrderSender(sender string) bool {
-	return strings.HasPrefix(sender, mail.OrderSenderPrefix) && sender != orderMailSenderIdentity()
+	return mail.IsOrderSender(sender) && strings.TrimSpace(sender) != orderMailSenderIdentity()
 }
 
 // unverifiedSenderMetadata is the metadata that marks an unverified
@@ -2643,9 +2647,15 @@ func cmdMailSendJSONFull(args []string, notify bool, all bool, from string, to s
 		}
 	}
 	if from != "" {
-		// An explicit order:<scope>/<name> that is not this process's own run
-		// is marked, with or without a store (ga-7lmivm.1).
-		runMetadata = unverifiedSenderMetadata(sender)
+		// An explicit sender that is this process's own order is tied to its
+		// run, as the default sender is.
+		runMetadata = orderMailRunMetadata(sender)
+	}
+	// Any order sender, explicit or default (GC_AGENT/GC_ALIAS can name
+	// one), that does not match this process's declared order is marked,
+	// with or without a store (ga-7lmivm.1).
+	if md := unverifiedSenderMetadata(sender); md != nil {
+		runMetadata = md
 	}
 
 	var nf nudgeFunc
@@ -3469,13 +3479,11 @@ func cmdMailReplyFromJSON(args []string, from, subject, message string, notify b
 	if body == "" && len(args) > 1 {
 		body = strings.Join(args[1:], " ")
 	}
-	// An explicit order:<scope>/<name> that is not this process's own run is
-	// marked, here before any cross-city qualification (ga-7lmivm.1).
-	var replyMetadata map[string]string
-	if explicitFrom {
-		replyMetadata = unverifiedSenderMetadata(sender)
-		body = withUnverifiedBanner(sender, body, replyMetadata)
-	}
+	// An order sender, explicit or default, that does not match this
+	// process's declared order is marked, here before any cross-city
+	// qualification (ga-7lmivm.1).
+	replyMetadata := unverifiedSenderMetadata(sender)
+	body = withUnverifiedBanner(sender, body, replyMetadata)
 
 	// A reply into a foreign-origin thread crosses cities: refuse --notify
 	// before any write, and store this city's sender city-qualified so
