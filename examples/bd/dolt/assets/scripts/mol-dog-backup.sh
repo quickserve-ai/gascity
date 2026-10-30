@@ -27,6 +27,10 @@ PACK_STATE_DIR="${GC_PACK_STATE_DIR:-${GC_CITY_RUNTIME_DIR:-$GC_CITY_PATH/.gc/ru
 CITY_ABS="$(cd "$GC_CITY_PATH" 2>/dev/null && pwd -P || printf '%s\n' "$GC_CITY_PATH")"
 OFFSITE_PATH="${GC_BACKUP_OFFSITE_PATH:-}"
 BACKUP_ARTIFACT_DIR="${GC_BACKUP_ARTIFACT_DIR:-$CITY_ABS/.dolt-backup}"
+# Dolt stores a backup URL without a trailing slash; match its spelling.
+while [ "${BACKUP_ARTIFACT_DIR%/}" != "$BACKUP_ARTIFACT_DIR" ] && [ "$BACKUP_ARTIFACT_DIR" != "/" ]; do
+    BACKUP_ARTIFACT_DIR="${BACKUP_ARTIFACT_DIR%/}"
+done
 BACKUP_LOCK_FILE="${GC_DOLT_BACKUP_LOCK_FILE:-$CITY_ABS/.gc/runtime/packs/dolt/backup-sync.lock}"
 BACKUP_LOCK_WAIT_SECONDS="${GC_DOLT_BACKUP_LOCK_WAIT_SECONDS:-5}"
 # Wall-clock bound for one `bd backup sync` attempt, and how many attempts a
@@ -392,8 +396,15 @@ $db
         SYNCED=$((SYNCED + 1))
         # Stamp ONLY on exit 0 (ga-g3p5rm). The doctor dog dates each database's
         # local backup from this stamp and never from an artifact mtime, because
-        # a killed sync writes chunk files on the failure path too.
-        write_local_backup_sync_stamp "$db" "$BACKUP_ARTIFACT_DIR"
+        # a killed sync writes chunk files on the failure path too. The stamp
+        # names the destination bd reports, which a registration made elsewhere
+        # can make different from the artifact dir: readers bind on it, so it
+        # must say where the sync went. No reading, no stamp.
+        synced_url=$(scope_bd_bounded "$BACKUP_BD_TIMEOUT_SECS" backup status --json 2>/dev/null | jq -r '.dolt.backup_url // empty' 2>/dev/null || true)
+        case "$synced_url" in
+            file://*/"$db") write_local_backup_sync_stamp "$db" "$(printf '%s' "${synced_url#file://}" | sed 's|/[^/]*$||')" ;;
+            *) echo "backup: $SCOPE_LABEL: synced, but bd reports no local destination; no stamp written" >&2 ;;
+        esac
     else
         append_failed_db "$db(sync failed)"
         append_failed_detail "$db" "$sync_failure_detail"

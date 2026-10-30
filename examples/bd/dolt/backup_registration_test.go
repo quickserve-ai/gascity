@@ -7,6 +7,7 @@ package dolt_test
 // and left the doctor's freshness loop.
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -70,6 +71,35 @@ func TestBackupOrderStampsUnderTheOrdersPackStateDir(t *testing.T) {
 	readStamp(t, filepath.Join(stateDir, "local-backup-freshness", "prod"))
 }
 
+// Readers bind a stamp to its destination, so it must say where the sync went,
+// not where this script expected it to go.
+func TestBackupOrderStampsTheDestinationBdReports(t *testing.T) {
+	cityPath := resolvedTempDir(t)
+	binDir := t.TempDir()
+	writeBackupFakeGC(t, binDir)
+
+	mustRunBackupOrder(t, binDir, cityPath, "FAKE_CONFIGURED_DBS=prod", "FAKE_BACKUP_URL=file:///elsewhere/prod")
+
+	stamp := readStamp(t, filepath.Join(cityPath, ".gc", "runtime", "packs", "dolt", "local-backup-freshness", "prod"))
+	if !strings.Contains(stamp, "artifact_dir=/elsewhere\n") {
+		t.Fatalf("stamp must name the reported destination:\n%s", stamp)
+	}
+}
+
+// With nothing to say where the sync went, there is nothing to stamp.
+func TestBackupOrderDoesNotStampARemoteDestination(t *testing.T) {
+	cityPath := resolvedTempDir(t)
+	binDir := t.TempDir()
+	writeBackupFakeGC(t, binDir)
+
+	mustRunBackupOrder(t, binDir, cityPath, "FAKE_CONFIGURED_DBS=prod", "FAKE_BACKUP_URL=https://doltremoteapi.dolthub.com/acme/prod")
+
+	stamp := filepath.Join(cityPath, ".gc", "runtime", "packs", "dolt", "local-backup-freshness", "prod")
+	if _, err := os.Stat(stamp); !os.IsNotExist(err) {
+		t.Fatalf("no local destination, no stamp (stat err=%v)", err)
+	}
+}
+
 func TestBackupOrderDoesNotStampAFailedSync(t *testing.T) {
 	cityPath := resolvedTempDir(t)
 	binDir := t.TempDir()
@@ -86,9 +116,14 @@ func TestBackupOrderDoesNotStampAFailedSync(t *testing.T) {
 
 // runDoctorWithBackupListing runs the doctor for one database whose `dolt backup
 // -v` prints listing, with its artifact directory holding a 2 h old manifest.
-func runDoctorWithBackupListing(t *testing.T, listing string) string {
+func runDoctorWithBackupListing(t *testing.T, listing string, extraEnv ...string) string {
 	t.Helper()
 	cityPath := resolvedTempDir(t)
+	return runDoctorInCity(t, cityPath, listing, extraEnv...)
+}
+
+func runDoctorInCity(t *testing.T, cityPath, listing string, extraEnv ...string) string {
+	t.Helper()
 	dataDir := filepath.Join(cityPath, "dolt-data")
 	if err := os.MkdirAll(filepath.Join(dataDir, "hq", ".dolt"), 0o755); err != nil {
 		t.Fatalf("mkdir db: %v", err)
@@ -114,7 +149,7 @@ case "$*" in
 esac
 exit 0
 `)
-	runDogScript(t, "mol-dog-doctor.sh", binDir, cityPath, dataDir, doctorBackupStaleEnv)
+	runDogScript(t, "mol-dog-doctor.sh", binDir, cityPath, dataDir, append([]string{doctorBackupStaleEnv}, extraEnv...)...)
 	gcLog, err := os.ReadFile(gcLogPath)
 	if err != nil {
 		t.Fatalf("read gc log: %v", err)
@@ -139,5 +174,42 @@ func TestDoctorStillReportsABackupPointedElsewhere(t *testing.T) {
 
 	if !strings.Contains(gcLog, "hq backup remote missing") {
 		t.Fatalf("a backup at another URL must read as missing:\n%s", gcLog)
+	}
+}
+
+// Dolt prints the URL unquoted, so it runs up to the params, spaces included.
+func TestDoctorReadsAURLWithSpaces(t *testing.T) {
+	gcLog := runDoctorWithBackupListing(t, "default file:///backup space/hq {}", "GC_BACKUP_ARTIFACT_DIR=/backup space")
+	if strings.Contains(gcLog, "hq backup remote missing") {
+		t.Fatalf("a URL with a space read as missing:\n%s", gcLog)
+	}
+
+	gcLog = runDoctorWithBackupListing(t, "default file://CITY/.dolt-backup/hq other {}")
+	if !strings.Contains(gcLog, "hq backup remote missing") {
+		t.Fatalf("a longer path must not match on its first word:\n%s", gcLog)
+	}
+}
+
+// Dolt cleans a trailing slash out of a registered URL.
+func TestDoctorMatchesADestinationGivenWithATrailingSlash(t *testing.T) {
+	gcLog := runDoctorWithBackupListing(t, "default file:///backup/hq {}", "GC_BACKUP_ARTIFACT_DIR=/backup/")
+	if strings.Contains(gcLog, "hq backup remote missing") {
+		t.Fatalf("a trailing slash read as missing:\n%s", gcLog)
+	}
+}
+
+// A sync to another destination says nothing about this one, however recent.
+func TestDoctorIgnoresAStampForAnotherDestination(t *testing.T) {
+	cityPath := resolvedTempDir(t)
+	stampDir := filepath.Join(cityPath, ".gc", "runtime", "packs", "dolt", "local-backup-freshness")
+	if err := os.MkdirAll(stampDir, 0o755); err != nil {
+		t.Fatalf("mkdir stamp dir: %v", err)
+	}
+	writeTestFile(t, filepath.Join(stampDir, "hq"), fmt.Sprintf("synced_at_epoch=%d\nartifact_dir=/elsewhere\n", time.Now().Unix()))
+
+	gcLog := runDoctorInCity(t, cityPath, "default file://CITY/.dolt-backup/hq {}")
+
+	if !strings.Contains(gcLog, "hq backup is") {
+		t.Fatalf("a fresh stamp for another destination hid a stale backup:\n%s", gcLog)
 	}
 }
