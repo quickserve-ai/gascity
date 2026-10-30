@@ -352,20 +352,23 @@ func TestOrderFiringCurrent_ControllerStartIsLastInSequence(t *testing.T) {
 // and a never-fired order whose store answers zero is inconclusive (advisory)
 // (pl-yhyw review r2). With zero or one archive the two sources are every
 // retained log, but a start found in neither is still not observed: the
-// controller may have started before them, or never.
+// controller may have started before them, or never. The one exception is the
+// row with no archive and no firing: nothing shows the controller ever ran, so
+// the order stays OK and controller-down is left to its own doctor finding.
 func TestOrderFiringCurrent_MissingStartIsInconclusiveAtAnyArchiveCount(t *testing.T) {
 	now := time.Date(2026, 10, 30, 0, 0, 0, 0, time.UTC)
 	for _, tc := range []struct {
 		name     string
 		archives int
 		fired    bool // another order's firing in the active log
+		neverRan bool // nothing shows the controller ever ran
 	}{
-		{"no archive, firing in active log", 0, true},
-		{"no archive, no firing", 0, false},
-		{"one archive, firing in active log", 1, true},
-		{"one archive, no firing", 1, false},
-		{"several archives, firing in active log", 3, true},
-		{"several archives, no firing", 3, false},
+		{"no archive, firing in active log", 0, true, false},
+		{"no archive, no firing", 0, false, true},
+		{"one archive, firing in active log", 1, true, false},
+		{"one archive, no firing", 1, false, false},
+		{"several archives, firing in active log", 3, true, false},
+		{"several archives, no firing", 3, false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cityPath, cfg := orderFiringTestCity(t)
@@ -388,6 +391,15 @@ func TestOrderFiringCurrent_MissingStartIsInconclusiveAtAnyArchiveCount(t *testi
 			check.clock = func() time.Time { return now }
 			result := check.Run(&CheckContext{CityPath: cityPath})
 
+			if tc.neverRan {
+				if result.Status != StatusOK {
+					t.Fatalf("status = %v, want OK; msg = %s; details = %v", result.Status, result.Message, result.Details)
+				}
+				if !strings.Contains(strings.Join(result.Details, "\n"), "silent: never fired (controller start unknown)") {
+					t.Fatalf("details = %v, want controller-start-unknown message", result.Details)
+				}
+				return
+			}
 			if result.Status != StatusError || result.Severity != SeverityAdvisory {
 				t.Fatalf("status = %v severity = %v, want advisory error; msg = %s; details = %v", result.Status, result.Severity, result.Message, result.Details)
 			}

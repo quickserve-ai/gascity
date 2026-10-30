@@ -246,6 +246,11 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext) *CheckResult {
 			if err != nil {
 				return orderFiringControllerStart{}, err
 			}
+			// No archive, no start and no firing: nothing shows the controller
+			// ever ran. That is not an inconclusive order; see classifyOrderFiring.
+			if got.unknown && len(firedEvents) == 0 && archive.load().archives == 0 {
+				got = orderFiringControllerStart{}
+			}
 			start, startResolved = got, true
 		}
 		return start, nil
@@ -297,10 +302,10 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext) *CheckResult {
 			routine  bool
 		)
 		if started.unknown {
-			// Neither the active log nor the newest archive holds a start, so
-			// whether the order is past its first cycle cannot be told,
-			// whatever the archive count. Inconclusive stays advisory, like a
-			// timed-out run (#4895).
+			// An archive or a firing shows the controller has run, but neither
+			// the active log nor the newest archive holds a start, so whether
+			// the order is past its first cycle cannot be told. Inconclusive
+			// stays advisory, like a timed-out run (#4895).
 			status, severity = StatusError, SeverityAdvisory
 			detail = fmt.Sprintf("%s: never fired; no controller start in the active event log or the newest event archive (inconclusive)", orderDisplayName(order))
 			inconclusive++
@@ -663,7 +668,8 @@ func (c *OrderFiringCurrentCheck) activeControllerStartedAt(eventPath string) (t
 // orderFiringControllerStart is the controller start that dates a never-fired
 // order. unknown means neither the active log nor the newest archive holds
 // one, so the start cannot be told: it may lie in an older archive, before
-// every retained log, or nowhere.
+// every retained log, or nowhere. A zero at with unknown false means nothing
+// shows the controller ever ran.
 type orderFiringControllerStart struct {
 	at      time.Time
 	unknown bool
@@ -712,19 +718,21 @@ func (a *orderFiringNewestArchive) load() orderFiringArchiveEvidence {
 }
 
 // orderFiringArchiveEvidence is what one read of the newest event archive
-// yielded: its order firings, its last controller start, or why it could not
-// be read.
+// yielded: its order firings, its last controller start, how many archives are
+// retained, or why it could not be read.
 type orderFiringArchiveEvidence struct {
-	fired   []events.Event
-	started time.Time
-	err     error
+	fired    []events.Event
+	started  time.Time
+	archives int
+	err      error
 }
 
 // readOrderFiringNewestArchive reads the order firings and controller starts in
 // the newest event archive, the one archive a fresh rotation leaves the
 // evidence in. The controller start is the last one in sequence order, as
 // events.LatestArchivedMatch picks it, so a clock stepped back between two
-// starts does not hand back the earlier one.
+// starts does not hand back the earlier one. Archives are counted after the
+// read (see events.ArchiveCount), so a rotation in between counts as an archive.
 func readOrderFiringNewestArchive(read orderFiringArchiveReadFunc, eventPath string) orderFiringArchiveEvidence {
 	archived, err := read(eventPath, []string{events.OrderFired, events.ControllerStarted})
 	if err != nil {
@@ -739,6 +747,11 @@ func readOrderFiringNewestArchive(read orderFiringArchiveReadFunc, eventPath str
 			out.started = event.Ts
 		}
 	}
+	count, err := events.ArchiveCount(eventPath)
+	if err != nil {
+		return orderFiringArchiveEvidence{err: err}
+	}
+	out.archives = count
 	return out
 }
 
@@ -884,9 +897,10 @@ func classifyOrderFiring(order orders.Order, now time.Time, expected time.Durati
 	name := orderDisplayName(order)
 	if lastFired.IsZero() {
 		if controllerStarted.IsZero() {
-			// Run reports a start it did not observe as inconclusive and never
-			// passes a zero one; this keeps a zero time from reading as
-			// decades of uptime.
+			// Nothing shows the controller ever ran. Controller-down is its own
+			// finding, and one alarm per order would only restate it. Run reports
+			// a start it could not find on a controller that has run as
+			// inconclusive, without reaching here.
 			return StatusOK, SeverityBlocking, fmt.Sprintf("%s: never fired (controller start unknown)", name), false
 		}
 		uptime := nonNegativeDuration(now.Sub(controllerStarted))

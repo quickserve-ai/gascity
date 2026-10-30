@@ -76,19 +76,19 @@ func TestOrderFiringCurrent_NeverFired_StartRotatedOut(t *testing.T) {
 }
 
 // TestOrderFiringCurrent_NeverFired_NoEventsAtAll: an active log with no
-// firings and no start does not show when, or whether, the controller started,
-// so a never-fired order is inconclusive (advisory), not OK (pl-yhyw review r2).
+// firings and no start gives no evidence the controller ever ran —
+// controller-down is its own doctor finding, so per-order alarms stay quiet.
 func TestOrderFiringCurrent_NeverFired_NoEventsAtAll(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
 	cityPath, cfg := orderFiringTestCity(t)
 	writeOrderFiringTestOrder(t, cityPath, "mol-dog-stale-db", "cron", "0 */4 * * *")
 
 	result := runOrderFiringCurrentTest(t, cfg, cityPath, now)
-	if result.Status != StatusError || result.Severity != SeverityAdvisory {
-		t.Fatalf("status = %v severity = %v, want advisory error; msg = %s; details = %v", result.Status, result.Severity, result.Message, result.Details)
+	if result.Status != StatusOK {
+		t.Fatalf("status = %v, want OK; msg = %s; details = %v", result.Status, result.Message, result.Details)
 	}
-	if !strings.Contains(strings.Join(result.Details, "\n"), "no controller start in the active event log or the newest event archive (inconclusive)") {
-		t.Fatalf("details = %v, want the inconclusive never-fired message", result.Details)
+	if !strings.Contains(strings.Join(result.Details, "\n"), "controller start unknown") {
+		t.Fatalf("details = %v, want controller-start-unknown message", result.Details)
 	}
 }
 
