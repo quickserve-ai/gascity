@@ -315,7 +315,13 @@ const (
 	// Blacksmith on gastownhall/gascity and ubuntu-latest anywhere else, since
 	// the quickserve-ai fork has no Blacksmith runners. Reviewed delta: that
 	// one runs-on value, no new job, step, trigger or permission.
-	expectedCIExecutionHash     = "42c0c3d0eeba0e9b2aea22ea73bd1bdb076154f07b998b5daf9c3b519741c1da"
+	// Carry (ga-q1mfri, freeze d): the pack-gate pin-check step runs
+	// `scripts/update-bundled-gastown-pack --check --pinned` (pins against the
+	// registry release they name) instead of `--check` (against the latest),
+	// so upstream releases no longer fail a PR's required gate; nightly.yml's
+	// bundled-pack-pins keeps the latest-release check. Reviewed delta: that
+	// one step command; no new job, trigger, permission or needs edge.
+	expectedCIExecutionHash     = "176b514f1fa622ce43b240dba18b147cc8ed59befac7934c05642e8cfe5e0dfb"
 	expectedNightlyTriggersHash = "0a4400a09ac567e90adf8be1232eef1f14e36efd8dba3e143aa6e36f5b7a36f5"
 	// Nightly: reviewed delta Beads v1.3.0-rc.2 -> v1.3.0, then (round3 review,
 	// completeness) one new job, beads-proxied-perf: ubuntu-latest,
