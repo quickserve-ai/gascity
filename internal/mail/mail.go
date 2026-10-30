@@ -101,9 +101,6 @@ func IsOrderSender(addr string) bool {
 	return ok && city != "" && !strings.Contains(city, ":") && strings.HasPrefix(rest, OrderSenderPrefix)
 }
 
-// MetadataSender is an optional [Provider] capability: send with extra
-// metadata stamped on the message in the same write that creates it. The
-// extra keys must not collide with the provider's own routing keys.
 // UnverifiedSenderBanner is the first line of the body of a message whose
 // order:<scope>/<name> sender is unverified (see [FromUnverifiedMetadataKey]).
 // It is written into the stored body, so every reader shows it.
@@ -117,6 +114,9 @@ type MetadataReplier interface {
 	ReplyWithMetadata(id, from, subject, body string, metadata map[string]string) (Message, error)
 }
 
+// MetadataSender is an optional [Provider] capability: send with extra
+// metadata stamped on the message in the same write that creates it. The
+// extra keys must not collide with the provider's own routing keys.
 type MetadataSender interface {
 	SendWithMetadata(from, to, subject, body string, metadata map[string]string) (Message, error)
 	SendDedupedWithMetadata(from, to, subject, body, key string, metadata map[string]string) (msg Message, suppressed bool, err error)
