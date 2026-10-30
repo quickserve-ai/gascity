@@ -1227,7 +1227,7 @@ func defaultMailIdentity() string {
 const controllerMailIdentity = "controller"
 
 func reservedMailSenderIdentity(identifier string) (string, bool) {
-	if id := strings.TrimSpace(identifier); strings.HasPrefix(id, mail.OrderSenderPrefix) {
+	if id := strings.TrimSpace(identifier); strings.HasPrefix(id, mail.OrderSenderPrefix) || mail.IsServiceSender(id) {
 		return id, true
 	}
 	switch normalizeNamedSessionTarget(identifier) {
@@ -1603,6 +1603,9 @@ func resolveMailRecipientIdentityCached(cityPath string, cfg *config.City, sessS
 	}
 	if mail.IsOrderSender(identifier) {
 		return "", mail.OrderNoMailboxError(identifier)
+	}
+	if mail.IsServiceSender(identifier) {
+		return "", mail.ServiceNoMailboxError(identifier)
 	}
 	resolved, err := resolveMailIdentityWithConfigCached(cityPath, cfg, sessStore, identifier, cache)
 	if err != nil {

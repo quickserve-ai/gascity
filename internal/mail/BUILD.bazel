@@ -28,6 +28,7 @@ go_test(
         "fake_conformance_test.go",
         "order_sender_test.go",
         "resolve_test.go",
+        "service_sender_test.go",
         "testenv_import_test.go",
     ],
     embed = [":mail"],

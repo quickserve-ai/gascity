@@ -911,6 +911,9 @@ func (p *Provider) ReplyWithMetadata(id, from, subject, body string, extra map[s
 	if mail.IsOrderSender(to) {
 		return mail.Message{}, fmt.Errorf("beadmail reply: message %s: %w", id, mail.OrderNoMailboxError(to))
 	}
+	if mail.IsServiceSender(to) {
+		return mail.Message{}, fmt.Errorf("beadmail reply: message %s: %w", id, mail.ServiceNoMailboxError(to))
+	}
 	toDisplay := strings.TrimSpace(original.Metadata[fromDisplayMetadataKey])
 	if toDisplay == "" {
 		toDisplay = strings.TrimSpace(original.From)

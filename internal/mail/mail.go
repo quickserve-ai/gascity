@@ -76,7 +76,38 @@ const (
 	// order:<scope>/<name>. An order has no mailbox, so nothing is delivered
 	// to such an address.
 	OrderSenderPrefix = config.OrderAddressSegment + ":"
+	// ServiceSenderPrefix begins the sender of mail a process outside gc
+	// sends under a declared name: service:<name> (a systemd unit, a cron
+	// job). It is claimed the way "controller" is: freely by a caller with no
+	// session identity, refused from a live session that is not it, and never
+	// marked unverified, because no gc run stands behind it to check. A
+	// service has no mailbox, so nothing is delivered to such an address.
+	ServiceSenderPrefix = "service:"
 )
+
+// IsServiceSender reports whether addr is a service sender address,
+// service:<name>, whose name is non-empty and made only of letters, digits,
+// '.', '_' and '-'.
+func IsServiceSender(addr string) bool {
+	name, ok := strings.CutPrefix(strings.TrimSpace(addr), ServiceSenderPrefix)
+	if !ok || name == "" {
+		return false
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '_', r == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// ServiceNoMailboxError is the refusal for mail addressed to a service
+// sender, or a reply to one: a service has no mailbox.
+func ServiceNoMailboxError(addr string) error {
+	return fmt.Errorf("%s is a service sender, which has no mailbox; mail the seat that owns the service", strings.TrimSpace(addr))
+}
 
 // OrderNoMailboxError is the refusal for mail addressed to an order, or a
 // reply to one: an order has no mailbox. It names where to write instead, so an
