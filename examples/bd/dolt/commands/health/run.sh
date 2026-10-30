@@ -271,8 +271,10 @@ db_commit_and_open_counts() {
 # is the authoritative catalog for a remote endpoint (su-deol8). The CSV header
 # and system databases are filtered; unsafe identifiers are skipped.
 external_database_names() {
+  # A read that fails partway names only some databases, and a caller taking that
+  # as the list loses the rest, so a failed read yields no names at all.
   _show_csv=$(run_bounded 5 dolt $conn_args sql --result-format csv \
-    -q "SHOW DATABASES;" 2>/dev/null || true)
+    -q "SHOW DATABASES;" 2>/dev/null) || return 0
   printf '%s\n' "$_show_csv" | while IFS= read -r _raw; do
     _name=$(printf '%s' "$_raw" | tr -d '\r' | sed 's/^"//; s/"$//')
     [ -n "$_name" ] || continue
@@ -374,12 +376,34 @@ now=$(date +%s)
 # directory holds no manifest yet is measured and reported stale: never
 # having been backed up is a known-bad state, not an unknown one.
 #
-# The manifest's mtime is the age of the newest restorable backup. `dolt backup
-# sync` writes chunk data first and adopts it by rewriting the manifest last,
-# so a sync cut off in between leaves chunks newer than anything the manifest
-# references, and the newest file of any kind would date a backup that does
-# not exist.
+# A local managed server that names its databases replaces that set, once the
+# artifact directory holds anything at all, at the cost of the one SHOW DATABASES
+# below. An artifact directory outlives its database, so a city that has run
+# tests against its server keeps dozens of dead ones that would pin this reading
+# at stale for good; and a live database the backup order never reached has no
+# directory for a scan to find. The list must be the server's own: pruning on the
+# data-dir scan in db_info would drop a database from coverage whenever that
+# directory is not the one the server serves. No answer keeps the scan, which can
+# over-report stale but cannot lose a database. An external server's databases
+# say nothing about local artifacts, so that case keeps the scan too.
+#
+# A backup is dated by the manifest's mtime or the database's sync stamp,
+# whichever is newer. `dolt backup sync` writes chunk data first and adopts it by
+# rewriting the manifest last, so a sync cut off in between leaves chunks newer
+# than anything the manifest references, and the newest file of any kind would
+# date a backup that does not exist. A sync with nothing new leaves the manifest
+# alone, so the stamp is what dates a quiet database. It counts only while a
+# manifest exists, because it dates a backup rather than standing in for one, and
+# only when it names this artifact directory and a past ten-digit epoch: a sync to
+# another destination says nothing about this one, and a future stamp would read
+# fresh long after it should have gone stale.
+backup_names=""
 if [ -d "$backup_artifact_dir" ]; then
+  # The destination mol-dog-backup writes into a stamp, spelled the way it spells
+  # it. Compared as an exact string, so a failed canonicalization cannot make two
+  # different destinations compare equal.
+  backup_city_abs=$(cd "$GC_CITY_PATH" 2>/dev/null && pwd -P) || backup_city_abs="$GC_CITY_PATH"
+  backup_stamp_dest="${GC_BACKUP_ARTIFACT_DIR:-$backup_city_abs/.dolt-backup}"
   for bdir in "$backup_artifact_dir"/*/; do
     [ -d "$bdir" ] || continue
     bname="$(basename "$bdir")"
@@ -390,9 +414,29 @@ if [ -d "$backup_artifact_dir" ]; then
         ;;
       *) continue ;;
     esac
+    backup_names="$backup_names $bname"
+  done
+  if [ -n "$backup_names" ] && [ "$server_reachable" = true ] && [ "$is_external" != true ]; then
+    backup_live=$(external_database_names)
+    [ -z "$backup_live" ] || backup_names="$backup_live"
+  fi
+  for bname in $backup_names; do
+    bdir="$backup_artifact_dir/$bname/"
     backup_measured=true
     db_newest=0
-    [ -f "${bdir}manifest" ] && db_newest=$(path_mtime "${bdir}manifest")
+    if [ -f "${bdir}manifest" ]; then
+      db_newest=$(path_mtime "${bdir}manifest")
+      db_synced=$(sed -n 's/^synced_at_epoch=//p' "$LOCAL_BACKUP_FRESHNESS_DIR/$bname" 2>/dev/null | head -1 || true)
+      db_synced_to=$(sed -n 's/^artifact_dir=//p' "$LOCAL_BACKUP_FRESHNESS_DIR/$bname" 2>/dev/null | head -1 || true)
+      case "$db_synced" in
+        [1-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]) ;;
+        *) db_synced=0 ;;
+      esac
+      if [ "$db_synced" -gt "$db_newest" ] && [ "$db_synced" -le "$now" ] \
+        && [ "$db_synced_to" = "$backup_stamp_dest" ]; then
+        db_newest="$db_synced"
+      fi
+    fi
     if [ "$db_newest" -le 0 ]; then
       db_age=-1
       db_stale=true
