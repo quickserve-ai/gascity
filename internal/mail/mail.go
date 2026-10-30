@@ -70,7 +70,10 @@ const (
 	// identity unset (ga-7lmivm.1). The claim is kept, never refused; this
 	// mark and the body banner make it visible. It is a mismatch check, not
 	// authentication: a process can declare any order, so an absent mark
-	// proves nothing about origin.
+	// proves nothing about origin. Only gc mail send and gc mail reply on the
+	// local store set it today; mail made by gc handoff, a remote send or
+	// reply, the HTTP API or a provider called directly is not classified
+	// (ga-7lmivm.1.2).
 	FromUnverifiedMetadataKey = "mail.from_unverified"
 	// OrderSenderPrefix begins the sender of mail an order sends:
 	// order:<scope>/<name>. An order has no mailbox, so nothing is delivered
@@ -105,7 +108,8 @@ func IsOrderSender(addr string) bool {
 
 // UnverifiedSenderBanner is the first line of the body of a message whose
 // order:<scope>/<name> sender is unverified (see [FromUnverifiedMetadataKey]).
-// It is written into the stored body, so every reader shows it.
+// It is written into the stored body, so every reader that shows the body
+// shows it; summaries that omit the body omit it too.
 func UnverifiedSenderBanner(from string) string {
 	return "[unverified sender: " + from + " does not match the order the sending process declares]"
 }
