@@ -356,6 +356,11 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext) *CheckResult {
 			result.Message = "scheduled orders inconclusive: a never-fired order's controller start is older than the newest event archive"
 		}
 	}
+	if got := archive.evidence; archive.loaded && got.err != nil {
+		// The store answered for the orders the archive would have; the
+		// verdict stands, but a damaged archive is not left to verbose output.
+		result.Message += fmt.Sprintf("; newest event archive unreadable (%v)", got.err)
+	}
 	if blockingErrors == 0 && advisoryErrors > 0 {
 		result.Severity = SeverityAdvisory
 	}

@@ -346,6 +346,65 @@ func TestOrderFiringCurrent_ControllerStartIsLastInSequence(t *testing.T) {
 	}
 }
 
+// TestOrderFiringCurrent_NoStartInOnlyArchiveKeepsPredatesVerdict: with one
+// archive, the active log and the newest archive are every retained log, so a
+// start found in neither predates them all, exactly as before the bound.
+func TestOrderFiringCurrent_NoStartInOnlyArchiveKeepsPredatesVerdict(t *testing.T) {
+	now := time.Date(2026, 10, 30, 0, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	writeOrderFiringTestOrder(t, cityPath, "silent", "cooldown", "1h")
+	writeOrderFiringArchive(t, cityPath, "20261029T235635Z", 101, 200,
+		orderFiringEventLine(190, events.OrderFired, "other", now.Add(-20*time.Minute)))
+	writeOrderFiringTestEvents(t, cityPath,
+		events.Event{Type: events.OrderFired, Subject: "other", Ts: now.Add(-3 * time.Minute)},
+	)
+
+	check := NewOrderFiringCurrentCheck(cfg, cityPath, WithOrderFiringCurrentLastRunFunc(func(orders.Order) (time.Time, error) {
+		return time.Time{}, nil
+	}))
+	check.clock = func() time.Time { return now }
+	result := check.Run(&CheckContext{CityPath: cityPath})
+
+	if result.Status != StatusError || result.Severity != SeverityBlocking {
+		t.Fatalf("status = %v severity = %v, want blocking error; msg = %s; details = %v", result.Status, result.Severity, result.Message, result.Details)
+	}
+	if !strings.Contains(strings.Join(result.Details, "\n"), "controller start predates the active event log and every retained archive") {
+		t.Fatalf("details = %v, want the predates-every-log verdict", result.Details)
+	}
+}
+
+// TestOrderFiringCurrent_UnreadableNewestArchiveWhenStartNeededIsAnError: a
+// never-fired order needs the controller start, the active log has none, and
+// the newest archive cannot be read. The check fails as it did before the
+// bound rather than guessing the start.
+func TestOrderFiringCurrent_UnreadableNewestArchiveWhenStartNeededIsAnError(t *testing.T) {
+	now := time.Date(2026, 10, 30, 0, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	writeOrderFiringTestOrder(t, cityPath, "silent", "cooldown", "1h")
+	if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityPath, ".gc", "events.jsonl.archive-20261029T235635Z-seq-1-100.gz"), []byte("not gzip"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeOrderFiringTestEvents(t, cityPath,
+		events.Event{Type: events.OrderFired, Subject: "other", Ts: now.Add(-3 * time.Minute)},
+	)
+
+	check := NewOrderFiringCurrentCheck(cfg, cityPath, WithOrderFiringCurrentLastRunFunc(func(orders.Order) (time.Time, error) {
+		return time.Time{}, nil
+	}))
+	check.clock = func() time.Time { return now }
+	result := check.Run(&CheckContext{CityPath: cityPath})
+
+	if result.Status != StatusError || result.Severity != SeverityBlocking {
+		t.Fatalf("status = %v severity = %v, want blocking error; msg = %s", result.Status, result.Severity, result.Message)
+	}
+	if !strings.HasPrefix(result.Message, "read controller start events:") {
+		t.Fatalf("message = %q, want the controller-start read error", result.Message)
+	}
+}
+
 // TestOrderFiringCurrent_StaleArchivedFiringStillAsksTheStore: a firing in the
 // newest archive that is itself overdue is not enough evidence on its own, so
 // the authoritative store lookup still decides, exactly as for a stale firing
@@ -476,6 +535,10 @@ func TestOrderFiringCurrent_UnreadableNewestArchiveFallsBackToTheStore(t *testin
 	}
 	if !strings.Contains(strings.Join(result.Details, "\n"), "newest event archive unreadable") {
 		t.Fatalf("details = %v, want the unreadable archive named", result.Details)
+	}
+	// Details print only in verbose mode; the summary line must carry it too.
+	if !strings.Contains(result.Message, "newest event archive unreadable") {
+		t.Fatalf("message = %q, want the unreadable archive named outside verbose details", result.Message)
 	}
 }
 
