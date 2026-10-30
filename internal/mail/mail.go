@@ -64,6 +64,17 @@ const (
 	// FromOrderRunMetadataKey stores the tracking bead of the order run that
 	// sent the message, so a reader can go from a mail to the run.
 	FromOrderRunMetadataKey = "mail.from_order_run"
+	// FromUnverifiedMetadataKey is "true" on a message whose order sender
+	// (bare or city-qualified) does not match the order the sending process's
+	// environment declares: a terminal, a systemd unit, a seat with its GC_*
+	// identity unset (ga-7lmivm.1). The claim is kept, never refused; this
+	// mark and the body banner make it visible. It is a mismatch check, not
+	// authentication: a process can declare any order, so an absent mark
+	// proves nothing about origin. Only gc mail send and gc mail reply on the
+	// local store set it today; mail made by gc handoff, a remote send or
+	// reply, the HTTP API or a provider called directly is not classified
+	// (ga-7lmivm.1.2).
+	FromUnverifiedMetadataKey = "mail.from_unverified"
 	// OrderSenderPrefix begins the sender of mail an order sends:
 	// order:<scope>/<name>. An order has no mailbox, so nothing is delivered
 	// to such an address.
@@ -93,6 +104,20 @@ func IsOrderSender(addr string) bool {
 	}
 	city, rest, ok := strings.Cut(addr, "/")
 	return ok && city != "" && !strings.Contains(city, ":") && strings.HasPrefix(rest, OrderSenderPrefix)
+}
+
+// UnverifiedSenderBanner is the first line of the body of a message whose
+// order:<scope>/<name> sender is unverified (see [FromUnverifiedMetadataKey]).
+// It is written into the stored body, so every reader that shows the body
+// shows it; summaries that omit the body omit it too.
+func UnverifiedSenderBanner(from string) string {
+	return "[unverified sender: " + from + " does not match the order the sending process declares]"
+}
+
+// MetadataReplier is implemented by providers that can stamp metadata on a
+// reply when it is created, as [MetadataSender] does for a send.
+type MetadataReplier interface {
+	ReplyWithMetadata(id, from, subject, body string, metadata map[string]string) (Message, error)
 }
 
 // MetadataSender is an optional [Provider] capability: send with extra

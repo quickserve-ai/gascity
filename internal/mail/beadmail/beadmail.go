@@ -887,6 +887,12 @@ func (p *Provider) CheckAutoHandoffs(recipients []string) ([]mail.Message, error
 // original, sets ReplyTo to the original's ID. Reply is addressed to the
 // original sender.
 func (p *Provider) Reply(id, from, subject, body string) (mail.Message, error) {
+	return p.ReplyWithMetadata(id, from, subject, body, nil)
+}
+
+// ReplyWithMetadata implements [mail.MetadataReplier]: Reply, with extra
+// metadata stamped on the reply bead when it is created.
+func (p *Provider) ReplyWithMetadata(id, from, subject, body string, extra map[string]string) (mail.Message, error) {
 	original, err := p.store.Get(id)
 	if err != nil {
 		return mail.Message{}, beadmailError("reply", err)
@@ -921,6 +927,9 @@ func (p *Provider) Reply(id, from, subject, body string) (mail.Message, error) {
 	}
 	if toDisplay != "" {
 		metadata[toDisplayMetadataKey] = toDisplay
+	}
+	for k, v := range extra {
+		metadata[k] = v
 	}
 
 	threadID := extractLabel(original.Labels, "thread:")

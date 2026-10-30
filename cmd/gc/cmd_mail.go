@@ -1367,6 +1367,37 @@ func orderMailSenderIdentity() string {
 	return mail.OrderSenderPrefix + scope + "/" + name
 }
 
+// unverifiedOrderSender reports whether sender is an order sender, bare
+// (order:<scope>/<name>) or city-qualified (<city>/order:<scope>/<name>), that
+// does not match the order this process's environment declares
+// (GC_ORDER_SCOPE/GC_ORDER_NAME; ga-7lmivm.1). A qualified sender never
+// matches: this process's own identity is bare. The check is a mismatch
+// against declared environment, not authentication: any local process can
+// set those variables, so an ABSENT mark proves nothing about origin. The
+// claim is kept and marked, never refused, because identity-less automation
+// signs this way.
+func unverifiedOrderSender(sender string) bool {
+	return mail.IsOrderSender(sender) && strings.TrimSpace(sender) != orderMailSenderIdentity()
+}
+
+// unverifiedSenderMetadata is the metadata that marks an unverified
+// order:<scope>/<name> sender, or nil when sender is verified or not an order.
+func unverifiedSenderMetadata(sender string) map[string]string {
+	if !unverifiedOrderSender(sender) {
+		return nil
+	}
+	return map[string]string{mail.FromUnverifiedMetadataKey: "true"}
+}
+
+// withUnverifiedBanner prefixes body with [mail.UnverifiedSenderBanner] when
+// metadata marks the sender unverified.
+func withUnverifiedBanner(sender, body string, metadata map[string]string) string {
+	if metadata[mail.FromUnverifiedMetadataKey] != "true" {
+		return body
+	}
+	return mail.UnverifiedSenderBanner(sender) + "\n\n" + body
+}
+
 // orderMailRunMetadata is the metadata that ties a message to the order run
 // that sent it, or nil when sender is not this process's own order identity.
 func orderMailRunMetadata(sender string) map[string]string {
@@ -2615,6 +2646,17 @@ func cmdMailSendJSONFull(args []string, notify bool, all bool, from string, to s
 			return 1
 		}
 	}
+	if from != "" {
+		// An explicit sender that is this process's own order is tied to its
+		// run, as the default sender is.
+		runMetadata = orderMailRunMetadata(sender)
+	}
+	// Any order sender, explicit or default (GC_AGENT/GC_ALIAS can name
+	// one), that does not match this process's declared order is marked,
+	// with or without a store (ga-7lmivm.1).
+	if md := unverifiedSenderMetadata(sender); md != nil {
+		runMetadata = md
+	}
 
 	var nf nudgeFunc
 	if notify && store != nil {
@@ -2810,6 +2852,7 @@ func doMailSendJSONRun(mp mail.Provider, rec events.Recorder, validRecipients ma
 		fmt.Fprintf(stderr, "gc mail send: unknown recipient %q\n", to) //nolint:errcheck // best-effort stderr
 		return 1
 	}
+	body = withUnverifiedBanner(sender, body, runMetadata)
 
 	var (
 		m          mail.Message
@@ -2818,7 +2861,7 @@ func doMailSendJSONRun(mp mail.Provider, rec events.Recorder, validRecipients ma
 	)
 	ms, canStampRun := mp.(mail.MetadataSender)
 	if runMetadata != nil && !canStampRun {
-		fmt.Fprintln(stderr, "gc mail send: mail provider cannot record the sending order run on the message") //nolint:errcheck // best-effort stderr
+		fmt.Fprintln(stderr, "gc mail send: mail provider cannot record the message metadata (the sending order run, or the unverified-sender mark; the body banner still shows it)") //nolint:errcheck // best-effort stderr
 	}
 	switch {
 	case dedupKey != "" && runMetadata != nil && canStampRun:
@@ -2960,6 +3003,7 @@ func doMailSendAllCoverageRun(mp mail.Provider, rec events.Recorder, validRecipi
 	} else {
 		body = args[0]
 	}
+	body = withUnverifiedBanner(sender, body, runMetadata)
 
 	// Collect recipients in sorted order for deterministic output.
 	var recipients []string
@@ -2987,7 +3031,7 @@ func doMailSendAllCoverageRun(mp mail.Provider, rec events.Recorder, validRecipi
 	var unconfirmedRecipients []mailUnconfirmedRecipient
 	ms, canStampRun := mp.(mail.MetadataSender)
 	if runMetadata != nil && !canStampRun {
-		fmt.Fprintln(stderr, "gc mail send --all: mail provider cannot record the sending order run on the message") //nolint:errcheck // best-effort stderr
+		fmt.Fprintln(stderr, "gc mail send --all: mail provider cannot record the message metadata (the sending order run, or the unverified-sender mark; the body banner still shows it)") //nolint:errcheck // best-effort stderr
 	}
 	for _, to := range recipients {
 		var m mail.Message
@@ -3381,7 +3425,9 @@ func cmdMailReplyFromJSON(args []string, from, subject, message string, notify b
 	var cityPath string
 	var cfg *config.City
 	var notifySetupErr error
-	if sender != "human" || notify {
+	// An explicit --from always opens the store: it is authorized below,
+	// "human" included, exactly as gc mail send does (ga-7lmivm.1).
+	if sender != "human" || notify || explicitFrom {
 		switch {
 		case strings.HasPrefix(providerName, "exec:"):
 			var err error
@@ -3408,9 +3454,12 @@ func cmdMailReplyFromJSON(args []string, from, subject, message string, notify b
 			}
 			cfg, _ = loadCityConfig(cityPath, stderr)
 		}
-		if sender != "human" && store != nil {
+		if store != nil && (explicitFrom || sender != "human") {
 			if explicitFrom {
-				resolved, ok := resolveExplicitMailSender(mailCityRosterFor(cfg, cityPath), cityPath, cfg, cliSessionStore(store, cfg, cityPath), sender, nil, stderr, "gc mail reply", false)
+				// authorize: a live seat may claim only its own identity on a
+				// reply, as on a send; an identity-less caller may claim any,
+				// and an order: claim is marked below (ga-7lmivm.1).
+				resolved, ok := resolveExplicitMailSender(mailCityRosterFor(cfg, cityPath), cityPath, cfg, cliSessionStore(store, cfg, cityPath), sender, nil, stderr, "gc mail reply", true)
 				if !ok {
 					return 1
 				}
@@ -3430,6 +3479,11 @@ func cmdMailReplyFromJSON(args []string, from, subject, message string, notify b
 	if body == "" && len(args) > 1 {
 		body = strings.Join(args[1:], " ")
 	}
+	// An order sender, explicit or default, that does not match this
+	// process's declared order is marked, here before any cross-city
+	// qualification (ga-7lmivm.1).
+	replyMetadata := unverifiedSenderMetadata(sender)
+	body = withUnverifiedBanner(sender, body, replyMetadata)
 
 	// A reply into a foreign-origin thread crosses cities: refuse --notify
 	// before any write, and store this city's sender city-qualified so
@@ -3485,7 +3539,7 @@ func cmdMailReplyFromJSON(args []string, from, subject, message string, notify b
 		fmt.Fprintf(stderr, "gc mail reply: --notify requested but no city store available; nudge skipped: %v\n", notifySetupErr) //nolint:errcheck // best-effort stderr
 	}
 
-	return doMailReplyJSON(mp, rec, args[0], sender, subject, body, nf, jsonOut, stdout, stderr)
+	return doMailReplyJSONMetadata(mp, rec, args[0], sender, subject, body, nf, replyMetadata, jsonOut, stdout, stderr)
 }
 
 // doMailReply creates a reply to an existing message.
@@ -3494,7 +3548,21 @@ func doMailReply(mp mail.Provider, rec events.Recorder, id, sender, subject, bod
 }
 
 func doMailReplyJSON(mp mail.Provider, rec events.Recorder, id, sender, subject, body string, nudgeFn nudgeFunc, jsonOut bool, stdout, stderr io.Writer) int {
-	reply, err := mp.Reply(id, sender, subject, body)
+	return doMailReplyJSONMetadata(mp, rec, id, sender, subject, body, nudgeFn, nil, jsonOut, stdout, stderr)
+}
+
+// doMailReplyJSONMetadata is doMailReplyJSON with metadata stamped on the
+// reply when the provider can ([mail.MetadataReplier]).
+func doMailReplyJSONMetadata(mp mail.Provider, rec events.Recorder, id, sender, subject, body string, nudgeFn nudgeFunc, metadata map[string]string, jsonOut bool, stdout, stderr io.Writer) int {
+	var (
+		reply mail.Message
+		err   error
+	)
+	if mr, ok := mp.(mail.MetadataReplier); ok && metadata != nil {
+		reply, err = mr.ReplyWithMetadata(id, sender, subject, body, metadata)
+	} else {
+		reply, err = mp.Reply(id, sender, subject, body)
+	}
 	telemetry.RecordMailOp(context.Background(), "reply", err)
 	if err != nil {
 		if code := classifyMailWriteFailure(stderr, "gc mail reply", err); code != 0 {
