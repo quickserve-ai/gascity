@@ -23,7 +23,9 @@
 #      tag; see "History protection" below); all data stays staged.
 #   3. Commit everything as a single "compaction: flatten history" commit.
 #   4. Re-check post-flatten row counts, table value hashes, and database
-#      value hash. Row-count increases are treated as concurrent-writer
+#      value hash, read as of the flatten's own commit (taken from
+#      DOLT_COMMIT's result), so a writer that commits after the flatten
+#      cannot drift them. Row-count increases are treated as concurrent-writer
 #      evidence and allowed to continue only when table and database value
 #      hashes stay stable. Same-count table hash drift, table-list drift,
 #      or row-count decrease without a proven concurrent writer is
@@ -912,21 +914,36 @@ version_dirty_dolt_ignore() {
   return 0
 }
 
-# row_count — COUNT(*) for one table. Returns "" on error.
+# revision_db DB [COMMIT] — the database name a probe reads: DB itself (the
+# live working set), or the read-only revision database DB/COMMIT, whose
+# tables and HEAD are that commit's and cannot move under a later writer.
+revision_db() {
+  if [ -n "${2:-}" ]; then
+    printf '%s/%s\n' "$1" "$2"
+  else
+    printf '%s\n' "$1"
+  fi
+}
+
+# row_count DB TABLE [COMMIT] — COUNT(*) for one table, live or as of COMMIT.
+# Returns "" on error.
 row_count() {
   db="$1"
   table="$2"
-  query_single_cell "$db" "row count probe failed for table=$table" \
+  query_single_cell "$(revision_db "$db" "${3:-}")" "row count probe failed for table=$table" \
     "SELECT COUNT(*) FROM \`$table\`"
 }
 
+# table_value_hash DB TABLE [COMMIT] — DOLT_HASHOF_TABLE, live or as of COMMIT.
 table_value_hash() {
   db="$1"
   table="$2"
-  query_single_cell "$db" "table value hash probe failed for table=$table" \
+  query_single_cell "$(revision_db "$db" "${3:-}")" "table value hash probe failed for table=$table" \
     "SELECT DOLT_HASHOF_TABLE('$table')"
 }
 
+# db_value_hash DB [COMMIT] — database value hash of HEAD, or of COMMIT (in the
+# revision database DB/COMMIT, HEAD is COMMIT).
 db_value_hash() {
   db="$1"
   # Pinned to the committed root: the bare working-set hash also covers
@@ -934,7 +951,7 @@ db_value_hash() {
   # movement — a guaranteed false quarantine on a busy db. The flatten only
   # rewrites committed history, so the committed root is the surface whose
   # preservation this hash must prove.
-  query_single_cell "$db" "database value hash probe failed" \
+  query_single_cell "$(revision_db "$db" "${2:-}")" "database value hash probe failed" \
     "SELECT DOLT_HASHOF_DB('HEAD')"
 }
 
@@ -1224,8 +1241,12 @@ preflight_counts() {
   return "$preflight_failed"
 }
 
-# verify_counts — re-count/re-hash and compare against the pre-flight file.
-# Row-count decreases fail. Row-count increases are recorded as concurrent
+# verify_counts DB PREFLIGHT [COMMIT] — re-count/re-hash and compare against
+# the pre-flight file. With COMMIT (the flatten's own commit) the count and
+# hash probes read that commit, so a writer that commits after the flatten
+# cannot drift them; without it they read the live working set. The
+# table-list comparison reads live either way. Row-count
+# decreases fail. Row-count increases are recorded as concurrent
 # writer evidence only when the table value hash stays stable. Any table hash
 # drift is quarantined before full GC because row-count gain alone cannot prove
 # pre-flight rows remain reachable. Sets category flags plus
@@ -1233,6 +1254,7 @@ preflight_counts() {
 verify_counts() {
   db="$1"
   preflight="$2"
+  verify_at="${3:-}"
   fail=0
   verify_counts_saw_gain=0
   verify_counts_saw_gain_hash_drift=0
@@ -1254,7 +1276,7 @@ verify_counts() {
     rest=${line#* }
     expected=${rest%% *}
     expected_hash=${rest#* }
-    if ! actual=$(row_count "$db" "$t"); then
+    if ! actual=$(row_count "$db" "$t" "$verify_at"); then
       printf 'compact: db=%s post-flatten row count failed for table=%s\n' "$db" "$t" >&2
       verify_counts_saw_probe_failure=1
       if [ "$fail" -eq 0 ]; then
@@ -1276,7 +1298,7 @@ verify_counts() {
         continue
         ;;
     esac
-    if ! actual_hash=$(table_value_hash "$db" "$t"); then
+    if ! actual_hash=$(table_value_hash "$db" "$t" "$verify_at"); then
       printf 'compact: db=%s post-flatten table value hash failed for table=%s\n' "$db" "$t" >&2
       verify_counts_saw_probe_failure=1
       if [ "$fail" -eq 0 ]; then
@@ -2788,6 +2810,7 @@ flatten_database() {
   verify_counts_failure_guidance=""
   head=""
   head_before_reset=""
+  flatten_commit=""
   flatten_head=""
   post_verify_head=""
   final_verify_head=""
@@ -3275,10 +3298,20 @@ flatten_database() {
   # is never rewritten.
   reset_rc=0
   reset_err_tmp=$(mktemp)
+  reset_out_tmp=$(mktemp)
   dolt_query "$db" "
     CALL DOLT_RESET('--soft', '$flatten_base');
     CALL DOLT_COMMIT('-Am', '$compact_flatten_message');
-  " >/dev/null 2>"$reset_err_tmp" || reset_rc=$?
+  " >"$reset_out_tmp" 2>"$reset_err_tmp" || reset_rc=$?
+  # The flatten's own commit, from DOLT_COMMIT's result row: the 32-char
+  # base32 cell under its "hash" header (DOLT_RESET prints a "status" table
+  # first). A later HASHOF('HEAD') probe cannot give it
+  # on a busy db: a writer that commits between the flatten and the probe
+  # (hq 2026-09-27, two bd updates 1-2s after the flatten) becomes "the
+  # flatten", hides from the writer-race gate, and its UPDATE reads as a
+  # same-count hash drift. Empty when the row cannot be parsed.
+  flatten_commit=$(awk -F'|' 'NF >= 3 { v = $2; gsub(/[ \t]/, "", v); if (v == "hash") { inhash = 1; next } if (inhash && length(v) == 32 && v !~ /[^0-9a-v]/) { h = v; n++ } } END { if (n == 1) print h }' "$reset_out_tmp")
+  rm -f "$reset_out_tmp"
 
   if [ "$reset_rc" -ne 0 ]; then
     printf 'compact: db=%s flatten failed rc=%s — restoring pre-flatten HEAD=%s\n' \
@@ -3291,7 +3324,15 @@ flatten_database() {
   fi
   rm -f "$reset_err_tmp"
 
-  flatten_head=$(head_commit "$db" || true)
+  # Verification reads the flatten commit itself, never the live tables, so
+  # only the flatten can change the counts and hashes it compares (the
+  # table-list check still reads live). Without a parsed commit it falls back
+  # to the HEAD probe and live reads, the previous behaviour and its races.
+  if [ -n "$flatten_commit" ]; then
+    flatten_head="$flatten_commit"
+  else
+    flatten_head=$(head_commit "$db" || true)
+  fi
   if [ -z "$flatten_head" ]; then
     printf 'compact: db=%s post-flatten HEAD probe failed — quarantine and investigate before GC\n' \
       "$db" >&2
@@ -3304,7 +3345,7 @@ flatten_database() {
   fi
 
   verify_counts_rc=0
-  verify_counts "$db" "$preflight_tmp" || verify_counts_rc=$?
+  verify_counts "$db" "$preflight_tmp" "$flatten_commit" || verify_counts_rc=$?
 
   # Writer-race gate (local-verify HEAD-stability). A normal MVCC writer (the
   # beads/mail workload) can commit to this db inside the flatten window, which
@@ -3331,7 +3372,12 @@ flatten_database() {
     writer_race_detected=1
     compacted_from_head="$head_before_reset"
   fi
-  if [ -n "$flatten_head" ] && [ -n "$post_verify_head" ] && [ "$post_verify_head" != "$flatten_head" ]; then
+  # Once verify reads the flatten commit itself, a writer that commits after
+  # it changed nothing verify read, so it cannot explain any drift: a mismatch
+  # is then inside the flatten commit and must not be excused as writer data.
+  # Only the pre-reset signal above (a commit the flatten absorbed) still
+  # counts. A later writer only delays full GC (the final fence below).
+  if [ -z "$flatten_commit" ] && [ -n "$flatten_head" ] && [ -n "$post_verify_head" ] && [ "$post_verify_head" != "$flatten_head" ]; then
     writer_race_detected=1
   fi
 
@@ -3464,7 +3510,7 @@ flatten_database() {
     return 1
   fi
   pre_db_hash_head=$(head_commit "$db" || true)
-  if ! postflight_hash=$(db_value_hash "$db"); then
+  if ! postflight_hash=$(db_value_hash "$db" "$flatten_commit"); then
     printf 'compact: db=%s post-flatten value hash probe failed — quarantine and investigate before GC\n' \
       "$db" >&2
     write_quarantine_marker "$db" "post-flatten value hash probe failed" || {
@@ -3490,14 +3536,18 @@ flatten_database() {
   fi
   post_db_hash_head=$(head_commit "$db" || true)
   db_hash_writer_race_detected=0
-  if [ -n "$flatten_head" ] && [ -n "$pre_db_hash_head" ] && [ "$pre_db_hash_head" != "$flatten_head" ]; then
-    db_hash_writer_race_detected=1
-  fi
-  if [ -n "$flatten_head" ] && [ -n "$post_db_hash_head" ] && [ "$post_db_hash_head" != "$flatten_head" ]; then
-    db_hash_writer_race_detected=1
-  fi
-  if [ -n "$pre_db_hash_head" ] && [ -n "$post_db_hash_head" ] && [ "$post_db_hash_head" != "$pre_db_hash_head" ]; then
-    db_hash_writer_race_detected=1
+  # HEAD movement around the hash probe explains drift only when the probe
+  # read live HEAD; pinned to the flatten commit, a later writer cannot move it.
+  if [ -z "$flatten_commit" ]; then
+    if [ -n "$flatten_head" ] && [ -n "$pre_db_hash_head" ] && [ "$pre_db_hash_head" != "$flatten_head" ]; then
+      db_hash_writer_race_detected=1
+    fi
+    if [ -n "$flatten_head" ] && [ -n "$post_db_hash_head" ] && [ "$post_db_hash_head" != "$flatten_head" ]; then
+      db_hash_writer_race_detected=1
+    fi
+    if [ -n "$pre_db_hash_head" ] && [ -n "$post_db_hash_head" ] && [ "$post_db_hash_head" != "$pre_db_hash_head" ]; then
+      db_hash_writer_race_detected=1
+    fi
   fi
   if [ "$db_hash_writer_race_detected" = "1" ]; then
     writer_race_detected=1
