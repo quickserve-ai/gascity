@@ -60,8 +60,9 @@ func TestCmdMailReply_ExplicitFromResolvesLikeSend(t *testing.T) {
 	}
 }
 
-// gc handoff --target --from human hands off as the operator even from a
-// seat; a self-handoff mails as the session, so --from is refused there.
+// gc handoff --target --from human hands off as the operator from an
+// identity-less caller, and is refused from a seat (ga-7lmivm.1); a
+// self-handoff mails as the session, so --from is refused there.
 func TestCmdHandoff_FromNamesTargetSender(t *testing.T) {
 	clearMailIdentityEnv(t)
 	t.Setenv("GC_BEADS", "file")
@@ -97,7 +98,7 @@ func TestCmdHandoff_FromNamesTargetSender(t *testing.T) {
 	// A live seat may claim only its own identity, as on a send or reply
 	// (ga-7lmivm.1): claiming the operator or an order is refused.
 	t.Setenv("GC_ALIAS", "sender")
-	for _, from := range []string{"human", "order:city/town-claude-inbox"} {
+	for _, from := range []string{"human", "order:city/town-claude-inbox", "service:westeros-pressure"} {
 		stderr.Reset()
 		if code := cmdHandoffRemoteFrom([]string{"forged " + from}, "recipient", from, false, &stdout, &stderr); code == 0 {
 			t.Fatalf("seat handoff --from %s = 0, want a refusal; stdout=%s", from, stdout.String())

@@ -1227,7 +1227,7 @@ func defaultMailIdentity() string {
 const controllerMailIdentity = "controller"
 
 func reservedMailSenderIdentity(identifier string) (string, bool) {
-	if id := strings.TrimSpace(identifier); strings.HasPrefix(id, mail.OrderSenderPrefix) {
+	if id := strings.TrimSpace(identifier); strings.HasPrefix(id, mail.OrderSenderPrefix) || mail.IsServiceSender(id) {
 		return id, true
 	}
 	switch normalizeNamedSessionTarget(identifier) {
@@ -1321,9 +1321,10 @@ func mailSendUsageError(args []string, all bool, to, subject, message string, st
 // identity can and must be checked. Shared by send, reply and handoff so they
 // resolve the same --from values. authorize applies upstream #4857's
 // own-identity check (gc mail send) to local and foreign senders alike, so a
-// live session cannot send as a peer city's address; reply and handoff
-// --target keep the carry's rule (fork #205), under which a seat may name
-// "human".
+// live session cannot send as a peer city's address. Send, reply and
+// handoff --target all authorize (ga-7lmivm.1): a seat may claim only its own
+// identity, and an identity-less caller may name any sender, "human"
+// included.
 func resolveExplicitMailSender(roster mail.CityRoster, cityPath string, cfg *config.City, sessStore beads.Store, sender string, cache *mailIdentitySessionCache, stderr io.Writer, cmdName string, authorize bool) (string, bool) {
 	kind, addr := roster.ResolveCityAddress(sender)
 	if kind == mail.CityAddressForeign {
@@ -1570,15 +1571,27 @@ func resolveMailRecipientIdentityCached(cityPath string, cfg *config.City, sessS
 	if normalized := normalizeNamedSessionTarget(identifier); normalized == "" || normalized == "human" {
 		return "human", nil
 	}
+	// A service has no mailbox in any city: refuse it, bare or qualified,
+	// as written and again as the roster normalizes it (a trailing slash,
+	// a local-city prefix), before a peer-city address returns below.
+	if mail.IsServiceSender(identifier) {
+		return "", mail.ServiceNoMailboxError(identifier)
+	}
 	roster := mailCityRosterFor(cfg, cityPath)
 	switch kind, addr := roster.ResolveCityAddress(identifier); kind {
 	case mail.CityAddressForeign:
+		if mail.IsServiceSender(addr) {
+			return "", mail.ServiceNoMailboxError(addr)
+		}
 		// A peer city's address is canonical as written; its identity can
 		// only be checked by that city, so the session store is never
 		// consulted.
 		return addr, nil
 	case mail.CityAddressLocal:
 		// <local city>/<addr> and <addr> are one mailbox.
+		if mail.IsServiceSender(addr) {
+			return "", mail.ServiceNoMailboxError(addr)
+		}
 		identifier = addr
 		if normalized := normalizeNamedSessionTarget(identifier); normalized == "" || normalized == "human" {
 			return "human", nil

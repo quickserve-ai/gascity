@@ -1187,6 +1187,7 @@ go_test(
         "cmd_mail_order_sender_test.go",
         "cmd_mail_ref_test.go",
         "cmd_mail_send_all_failures_test.go",
+        "cmd_mail_service_sender_test.go",
         "cmd_mail_test.go",
         "cmd_mail_unverified_sender_test.go",
         "cmd_maintenance_test.go",

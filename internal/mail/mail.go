@@ -79,7 +79,46 @@ const (
 	// order:<scope>/<name>. An order has no mailbox, so nothing is delivered
 	// to such an address.
 	OrderSenderPrefix = config.OrderAddressSegment + ":"
+	// ServiceSenderPrefix begins the sender of mail a process outside gc
+	// sends under a declared name: service:<name> (a systemd unit, a cron
+	// job). It is claimed the way "controller" is: freely by a caller with no
+	// session identity, refused from a live session that is not it, and never
+	// marked unverified, because no gc run stands behind it to check. A
+	// service has no mailbox: a store-backed local gc mail send refuses to
+	// address one, bare or city-qualified, and a beadmail reply refuses to
+	// answer one. A storeless or exec-provider send or reply, a remote send,
+	// the HTTP API and a provider called directly do not check yet
+	// (ga-7lmivm.1.2).
+	ServiceSenderPrefix = "service:"
 )
+
+// IsServiceSender reports whether addr is a service sender address, bare
+// (service:<name>) or as a cross-city send stores it (<city>/service:<name>),
+// whose name is non-empty and made only of letters, digits, '.', '_' and '-'.
+func IsServiceSender(addr string) bool {
+	addr = strings.TrimSpace(addr)
+	if city, rest, ok := strings.Cut(addr, "/"); ok && city != "" && !strings.Contains(city, ":") {
+		addr = rest
+	}
+	name, ok := strings.CutPrefix(addr, ServiceSenderPrefix)
+	if !ok || name == "" {
+		return false
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '_', r == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// ServiceNoMailboxError is the refusal for mail addressed to a service
+// sender, or a reply to one: a service has no mailbox.
+func ServiceNoMailboxError(addr string) error {
+	return fmt.Errorf("%s is a service sender, which has no mailbox; mail the seat that owns the service", strings.TrimSpace(addr))
+}
 
 // OrderNoMailboxError is the refusal for mail addressed to an order, or a
 // reply to one: an order has no mailbox. It names where to write instead, so an
