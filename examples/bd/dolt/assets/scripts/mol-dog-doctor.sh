@@ -33,6 +33,13 @@ LATENCY_WARN_MS="${GC_DOCTOR_LATENCY_WARN_MS:-$(( ${GC_DOCTOR_LATENCY_WARN_S:-1}
 CONN_WARN_PCT="${GC_DOCTOR_CONN_WARN_PCT:-80}"
 BACKUP_STALE_S="${GC_DOCTOR_BACKUP_STALE_S:-43200}"  # 2x 6h backup interval
 BACKUP_ARTIFACT_DIR="${GC_BACKUP_ARTIFACT_DIR:-$GC_CITY_PATH/.dolt-backup}"
+# Where mol-dog-backup.sh syncs, spelled the way it spells it: the name it
+# registers a backup's URL under and writes into a sync stamp.
+BACKUP_SYNC_DEST_CITY=$(cd "$GC_CITY_PATH" 2>/dev/null && pwd -P) || BACKUP_SYNC_DEST_CITY="$GC_CITY_PATH"
+BACKUP_SYNC_DEST="${GC_BACKUP_ARTIFACT_DIR:-$BACKUP_SYNC_DEST_CITY/.dolt-backup}"
+while [ "${BACKUP_SYNC_DEST%/}" != "$BACKUP_SYNC_DEST" ] && [ "$BACKUP_SYNC_DEST" != "/" ]; do
+    BACKUP_SYNC_DEST="${BACKUP_SYNC_DEST%/}"
+done
 # Advisory dedup state (#3409): records the signature of the last-sent [MEDIUM]
 # advisory so a persistent condition collapses into one rolling alert instead of
 # a fresh bead every 5-min tick. DOLT_STATE_DIR is set by runtime.sh.
@@ -238,11 +245,24 @@ if [ "${ORPHAN_COUNT:-0}" -gt 0 ]; then
     ORPHAN_WARN=" [WARN: $ORPHAN_COUNT orphan DBs detected — run gc dolt cleanup]"
 fi
 
+# Succeed when a database has a Dolt backup registered: named <db>-backup, or at
+# this database's URL under the sync destination under any name, because `bd
+# backup init` names its backup `default`. `dolt backup -v` prints "name url
+# {params}" with the URL unquoted, so the URL is what lies between the first field
+# and the params, spaces included.
+backup_registered_for_db() {
+    (cd "$2" && run_bounded 30 dolt backup -v 2>/dev/null) \
+        | BACKUP_NAME="$1-backup" BACKUP_URL="file://$BACKUP_SYNC_DEST/$1" awk '
+            { n = $1; sub(/^[^[:space:]]+[[:space:]]+/, ""); sub(/[[:space:]]+\{[^{}]*\}[[:space:]]*$/, "") }
+            n == ENVIRON["BACKUP_NAME"] || $0 == ENVIRON["BACKUP_URL"] { found = 1 }
+            END { exit !found }'
+}
+
 # Backup freshness: check each database's newest restorable backup, dated by
 # the newer of the backup remote's manifest (backup_commit_mtime_for_db) and
 # the last successful sync's stamp (ga-g3p5rm). See the loop below.
-# Every user database is in scope. DBs without a configured <db>-backup
-# remote are reported as a coverage gap rather than silently excluded —
+# Every user database is in scope. DBs without a registered backup
+# are reported as a coverage gap rather than silently excluded —
 # the exclusion is how unconfigured production DBs went unbacked-up until
 # journal corruption made them unrecoverable (#3176). mol-dog-backup.sh
 # auto-configures the remote on its next run, so this warning self-heals
@@ -252,7 +272,7 @@ BACKUP_STALE_ITEMS=""
 for db in $USER_DBS; do
     db_dir="$DOLT_DATA_DIR/$db"
     if [ -d "$db_dir/.dolt" ]; then
-        if (cd "$db_dir" && run_bounded 30 dolt backup 2>/dev/null | awk '{print $1}' | grep -qx "${db}-backup"); then
+        if backup_registered_for_db "$db" "$db_dir"; then
             BACKUP_ELIGIBLE_DBS="$BACKUP_ELIGIBLE_DBS $db"
         else
             append_backup_stale "$db backup remote missing"
@@ -299,8 +319,11 @@ if [ -n "$BACKUP_ELIGIBLE_DBS" ]; then
             if backup_has_manifest_for_db "$db"; then
                 BACKUP_STAMP_COUNTS=1
                 if [ -f "$LOCAL_BACKUP_FRESHNESS_DIR/$db" ]; then
-                    BACKUP_SYNCED_AT=$(sed -n 's/^synced_at_epoch=//p' \
-                        "$LOCAL_BACKUP_FRESHNESS_DIR/$db" 2>/dev/null | head -1 || true)
+                    # A sync to another destination says nothing about this one.
+                    if [ "$(sed -n 's/^artifact_dir=//p' "$LOCAL_BACKUP_FRESHNESS_DIR/$db" 2>/dev/null | head -1 || true)" = "$BACKUP_SYNC_DEST" ]; then
+                        BACKUP_SYNCED_AT=$(sed -n 's/^synced_at_epoch=//p' \
+                            "$LOCAL_BACKUP_FRESHNESS_DIR/$db" 2>/dev/null | head -1 || true)
+                    fi
                 fi
             fi
             case "$BACKUP_SYNCED_AT" in ''|*[!0-9]*) BACKUP_SYNCED_AT=0 ;; esac
