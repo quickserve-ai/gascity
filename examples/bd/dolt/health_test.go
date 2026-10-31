@@ -867,7 +867,12 @@ exit 1
 // JSON-mode assertions that must not see stray stderr) vs
 // CombinedOutput() (for human-mode assertions and failure messages).
 func newHealthScriptCmd(root string, env []string, args ...string) *exec.Cmd {
-	cmd := exec.Command("sh", append([]string{filepath.Join(root, healthScript)}, args...)...)
+	return newPackScriptCmd(root, healthScript, env, args...)
+}
+
+// newPackScriptCmd is newHealthScriptCmd for any script in this pack.
+func newPackScriptCmd(root, script string, env []string, args ...string) *exec.Cmd {
+	cmd := exec.Command("sh", append([]string{filepath.Join(root, script)}, args...)...)
 	cmd.Env = env
 	return cmd
 }
