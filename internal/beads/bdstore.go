@@ -33,6 +33,10 @@ const (
 // The dir argument sets the working directory; name and args specify the command.
 type CommandRunner func(dir, name string, args ...string) ([]byte, error)
 
+// ReadCommandTimeout bounds one bd read-only subcommand: a read still pending
+// past it is hung, not slow (the order dispatch store circuit, ga-rs4ddy).
+func ReadCommandTimeout() time.Duration { return bdReadCommandTimeout }
+
 var (
 	bdCommandTimeout = 120 * time.Second
 	// bdReadCommandTimeout bounds bd read-only subcommands (count, list,
