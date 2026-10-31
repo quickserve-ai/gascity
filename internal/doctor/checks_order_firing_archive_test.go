@@ -211,19 +211,21 @@ func TestOrderFiringCurrent_FreshRotationReadsNewestArchiveNotTheStore(t *testin
 	}
 }
 
-// TestOrderFiringCurrent_NeverFiredStillFindsArchivedControllerStart keeps the
-// never-fired verdict whole: when an order has no firing in any source, the
-// controller start is still looked up through the archives, two back here.
-func TestOrderFiringCurrent_NeverFiredStillFindsArchivedControllerStart(t *testing.T) {
+// TestOrderFiringCurrent_NeverFiredFindsControllerStartInNewestArchive keeps
+// the never-fired verdict whole when the controller start sits in the newest
+// archive: it dates the never-fired order. The older archive is truncated, so
+// decoding it would fail the run.
+func TestOrderFiringCurrent_NeverFiredFindsControllerStartInNewestArchive(t *testing.T) {
 	now := time.Date(2026, 10, 30, 0, 0, 0, 0, time.UTC)
 	cityPath, cfg := orderFiringTestCity(t)
 	writeOrderFiringTestOrder(t, cityPath, "cleanup-cooldown", "cooldown", "1h")
 	writeOrderFiringTestOrder(t, cityPath, "silent", "cooldown", "1h")
 
-	writeOrderFiringArchive(t, cityPath, "20261027T110659Z", 1, 100,
-		orderFiringEventLine(5, events.ControllerStarted, "", now.Add(-48*time.Hour)))
+	writeTruncatedOrderFiringArchive(t, cityPath, "20261027T110659Z", 1, 100,
+		orderFiringEventLine(5, events.ControllerStarted, "", now.Add(-72*time.Hour)))
 	writeOrderFiringArchive(t, cityPath, "20261029T235635Z", 101, 200,
-		orderFiringEventLine(190, events.OrderFired, "cleanup-cooldown", now.Add(-20*time.Minute)))
+		orderFiringEventLine(110, events.ControllerStarted, "", now.Add(-48*time.Hour))+
+			orderFiringEventLine(190, events.OrderFired, "cleanup-cooldown", now.Add(-20*time.Minute)))
 	writeOrderFiringTestEvents(t, cityPath,
 		events.Event{Type: events.OrderCompleted, Subject: "cleanup-cooldown", Ts: now.Add(-3 * time.Minute)},
 	)
@@ -243,10 +245,104 @@ func TestOrderFiringCurrent_NeverFiredStillFindsArchivedControllerStart(t *testi
 		t.Fatalf("status = %v severity = %v, want blocking error; msg = %s; details = %v", result.Status, result.Severity, result.Message, result.Details)
 	}
 	if !strings.Contains(strings.Join(result.Details, "\n"), "silent: never fired since controller start 48h ago") {
-		t.Fatalf("details = %v, want the archived controller start to date the never-fired order", result.Details)
+		t.Fatalf("details = %v, want the newest archive's controller start to date the never-fired order", result.Details)
 	}
 	if fmt.Sprint(lookedUp) != "[silent]" {
 		t.Fatalf("store lookups = %v, want [silent] only", lookedUp)
+	}
+}
+
+// TestOrderFiringCurrent_StartOlderThanNewestArchiveIsInconclusive is the
+// never-fired path that still walked archives (pl-yhyw review r1, P1): every
+// order but one fired in the newest archive, the store has no run for that
+// one, and the last controller start is two archives back. The check reads
+// only the active log and the newest archive, once; with no start in either
+// and older archives unread, the start is unknown and the never-fired order is
+// inconclusive (advisory), not a reason to decode older archives. The older
+// archives are truncated, so decoding either fails the run.
+func TestOrderFiringCurrent_StartOlderThanNewestArchiveIsInconclusive(t *testing.T) {
+	now := time.Date(2026, 10, 30, 0, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	writeOrderFiringTestOrder(t, cityPath, "cleanup-cooldown", "cooldown", "1h")
+	writeOrderFiringTestOrder(t, cityPath, "four-hourly", "cron", "0 */4 * * *")
+	writeOrderFiringTestOrder(t, cityPath, "silent", "cooldown", "1h")
+
+	writeTruncatedOrderFiringArchive(t, cityPath, "20261027T110659Z", 1, 100,
+		orderFiringEventLine(5, events.ControllerStarted, "", now.Add(-64*time.Hour)))
+	writeTruncatedOrderFiringArchive(t, cityPath, "20261028T110659Z", 101, 200,
+		orderFiringEventLine(150, events.OrderFired, "four-hourly", now.Add(-30*time.Hour)))
+	writeOrderFiringArchive(t, cityPath, "20261029T235635Z", 201, 300,
+		orderFiringEventLine(250, events.OrderFired, "four-hourly", now.Add(-2*time.Hour))+
+			orderFiringEventLine(290, events.OrderFired, "cleanup-cooldown", now.Add(-20*time.Minute)))
+	writeOrderFiringTestEvents(t, cityPath,
+		events.Event{Type: events.OrderCompleted, Subject: "cleanup-cooldown", Ts: now.Add(-3 * time.Minute)},
+	)
+
+	var lookedUp []string
+	var mu sync.Mutex
+	check := NewOrderFiringCurrentCheck(cfg, cityPath, WithOrderFiringCurrentLastRunFunc(func(order orders.Order) (time.Time, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		lookedUp = append(lookedUp, order.ScopedName())
+		return time.Time{}, nil
+	}))
+	var archiveReads atomic.Int32
+	countOrderFiringArchiveReads(check, &archiveReads)
+	check.clock = func() time.Time { return now }
+	result := check.Run(&CheckContext{CityPath: cityPath})
+
+	if result.Status != StatusError || result.Severity != SeverityAdvisory {
+		t.Fatalf("status = %v severity = %v, want advisory error; msg = %s; details = %v", result.Status, result.Severity, result.Message, result.Details)
+	}
+	if !strings.Contains(result.Message, "inconclusive") {
+		t.Fatalf("message = %q, want it to say the result is inconclusive, not stale", result.Message)
+	}
+	details := strings.Join(result.Details, "\n")
+	if !strings.Contains(details, "silent: never fired; controller start is older than the newest event archive (inconclusive)") {
+		t.Fatalf("details = %v, want the never-fired order reported inconclusive", result.Details)
+	}
+	routine := strings.Join(check.routineDetails, "\n")
+	for _, want := range []string{"cleanup-cooldown: last fired 20m ago", "four-hourly: last fired 2h ago"} {
+		if !strings.Contains(routine, want) {
+			t.Fatalf("routine = %v, want %q: the current orders' classification is unchanged", check.routineDetails, want)
+		}
+	}
+	if fmt.Sprint(lookedUp) != "[silent]" {
+		t.Fatalf("store lookups = %v, want [silent] only", lookedUp)
+	}
+	if n := archiveReads.Load(); n != 1 {
+		t.Fatalf("newest-archive reads = %d, want exactly 1", n)
+	}
+}
+
+// TestOrderFiringCurrent_ControllerStartIsLastInSequence: the start that dates
+// a never-fired order is the last controller.started in sequence order, as
+// events.LatestArchivedMatch picks it, not the greatest timestamp (pl-yhyw
+// review r1, P2). A clock stepped back between two starts must not hand the
+// never-fired order a first-cycle grace it no longer has.
+func TestOrderFiringCurrent_ControllerStartIsLastInSequence(t *testing.T) {
+	now := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	writeOrderFiringTestOrder(t, cityPath, "silent", "cooldown", "1h")
+
+	writeOrderFiringArchive(t, cityPath, "20261030T113500Z", 101, 200,
+		orderFiringEventLine(110, events.ControllerStarted, "", time.Date(2026, 10, 30, 11, 30, 0, 0, time.UTC))+
+			orderFiringEventLine(120, events.ControllerStarted, "", time.Date(2026, 10, 30, 7, 0, 0, 0, time.UTC)))
+	writeOrderFiringTestEvents(t, cityPath,
+		events.Event{Type: events.OrderCompleted, Subject: "other", Ts: now.Add(-3 * time.Minute)},
+	)
+
+	check := NewOrderFiringCurrentCheck(cfg, cityPath, WithOrderFiringCurrentLastRunFunc(func(orders.Order) (time.Time, error) {
+		return time.Time{}, nil
+	}))
+	check.clock = func() time.Time { return now }
+	result := check.Run(&CheckContext{CityPath: cityPath})
+
+	if result.Status != StatusError || result.Severity != SeverityBlocking {
+		t.Fatalf("status = %v severity = %v, want blocking error; msg = %s; details = %v", result.Status, result.Severity, result.Message, result.Details)
+	}
+	if !strings.Contains(strings.Join(result.Details, "\n"), "silent: never fired since controller start 5h ago") {
+		t.Fatalf("details = %v, want the start at seq 120 (07:00) to date the order", result.Details)
 	}
 }
 
@@ -380,5 +476,15 @@ func TestOrderFiringCurrent_UnreadableNewestArchiveFallsBackToTheStore(t *testin
 	}
 	if !strings.Contains(strings.Join(result.Details, "\n"), "newest event archive unreadable") {
 		t.Fatalf("details = %v, want the unreadable archive named", result.Details)
+	}
+}
+
+// countOrderFiringArchiveReads wraps the check's newest-archive reader so a
+// test can assert how many times an archive was decompressed.
+func countOrderFiringArchiveReads(check *OrderFiringCurrentCheck, reads *atomic.Int32) {
+	read := check.readArchive
+	check.readArchive = func(path string, types []string) ([]events.Event, error) {
+		reads.Add(1)
+		return read(path, types)
 	}
 }
