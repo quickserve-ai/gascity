@@ -100,6 +100,27 @@ describe('confirmed — the one confirmable claim', () => {
     });
   });
 
+  it('labels a human-input interaction (question dialog or draft) as such, not as an approval', () => {
+    // fork PR 243: Pending now reports a question dialog, permission prompt or
+    // unsent draft with kind "human-input", which the runtime cannot answer;
+    // the pane must not call it an approval prompt.
+    const model = select(
+      [entry()],
+      [session()],
+      [
+        {
+          ...approvalProbe('qcore/archer', { prompt: 'Complete the pending human interaction in the terminal.' }),
+          kind: 'human-input',
+        },
+      ],
+    );
+    expect(model.confirmed).toHaveLength(1);
+    expect(model.confirmed[0]).toMatchObject({
+      verification: 'confirmed',
+      reasonLabel: 'question or draft in the terminal',
+    });
+  });
+
   it('leaves a claude question unconfirmed when the probe answered supported+none', () => {
     // The tmux probe greps APPROVAL MARKERS only: a real AskUserQuestion shows
     // none, and so does a busy session. The negative proves nothing.
