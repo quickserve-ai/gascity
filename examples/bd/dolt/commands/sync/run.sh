@@ -52,6 +52,11 @@
 #                     push to when a database has several, or to permit
 #                     pushing to a non-file:// remote (see Remote resolution).
 #                     A comma-separated list pushes each listed remote.
+#   GC_DOLT_REMOTE_USER_<DB>_<REMOTE>     (optional) — the username this
+#                     database presents to that remote for DOLT_FETCH and
+#                     DOLT_PUSH; see remote_identity_sql_args in runtime.sh. Unset
+#                     changes nothing. The CLI fallback below cannot carry it:
+#                     `dolt push` authenticates from dolt's own credential store.
 #   GC_DOLT_SYNC_PUSH_TIMEOUT_SECS
 #     (default: 1800) — wall-clock bound for SQL-mode remote push. Increase for
 #                     slow links or large first pushes (a multi-GB first push to
@@ -587,6 +592,14 @@ sync_remote_sql() {
   remote_name="$4"
   remote_url="$5"
 
+  # Resolved once for this (database, remote) pair and reused by the fetch and
+  # both push shapes below, so all three present the SAME identity.
+  remote_ident=$(remote_identity_sql_args "$name" "$remote_name") || {
+    echo "  $name: ERROR: invalid remote identity for remote $remote_name" >&2
+    last_fail_reason="invalid remote identity for remote $remote_name"
+    return 1
+  }
+
   # gc-6ommo: fast-forward-only-or-refuse. Unless --force, fetch the remote and
   # classify local vs remotes/<remote>/<remote_branch>. Push only on a
   # fast-forward (ahead-only, or a first push where the remote branch does not
@@ -604,7 +617,7 @@ sync_remote_sql() {
       return 1
     }
     fetch_rc=0
-    dolt_sql "USE \`$name\`; CALL DOLT_FETCH('$remote_name', '$remote_branch')" "$fetch_timeout" \
+    dolt_sql "USE \`$name\`; CALL DOLT_FETCH(${remote_ident}'$remote_name', '$remote_branch')" "$fetch_timeout" \
       >/dev/null 2>"$fetch_err_tmp" || fetch_rc=$?
     if [ "$fetch_rc" -ne 0 ] && { grep -q "no branches found in remote" "$fetch_err_tmp" 2>/dev/null || grep -q "invalid ref spec" "$fetch_err_tmp" 2>/dev/null; }; then
       # The remote has no such branch: an empty remote ("no branches found in
@@ -696,9 +709,9 @@ sync_remote_sql() {
   fi
 
   if [ "$force" = true ]; then
-    push_query="USE \`$name\`; CALL DOLT_PUSH('--force', '--set-upstream', '$remote_name', '$refspec_arg')"
+    push_query="USE \`$name\`; CALL DOLT_PUSH(${remote_ident}'--force', '--set-upstream', '$remote_name', '$refspec_arg')"
   else
-    push_query="USE \`$name\`; CALL DOLT_PUSH('$remote_name', '$refspec_arg')"
+    push_query="USE \`$name\`; CALL DOLT_PUSH(${remote_ident}'$remote_name', '$refspec_arg')"
   fi
   push_rc=0
   # Guard mktemp: under `set -e` a bare `$(mktemp)` failure (unwritable or
