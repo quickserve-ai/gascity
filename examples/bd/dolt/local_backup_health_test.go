@@ -35,24 +35,24 @@ func writeBackupArtifact(t *testing.T, artifactDir, db string, age time.Duration
 	return dir
 }
 
-// writeBackupSyncStamp writes the stamp mol-dog-backup leaves after a sync exits 0.
-func writeBackupSyncStamp(t *testing.T, cityPath, db string, at time.Time) {
+// writeBackupSyncStamp writes the stamp mol-dog-backup leaves for hq after a sync exits 0.
+func writeBackupSyncStamp(t *testing.T, cityPath string, at time.Time) {
 	t.Helper()
 	physical, err := filepath.EvalSymlinks(cityPath)
 	if err != nil {
 		t.Fatalf("resolve city path: %v", err)
 	}
-	writeRawBackupStamp(t, cityPath, db, fmt.Sprintf("%d", at.Unix()), filepath.Join(physical, ".dolt-backup"))
+	writeRawBackupStamp(t, cityPath, fmt.Sprintf("%d", at.Unix()), filepath.Join(physical, ".dolt-backup"))
 }
 
-func writeRawBackupStamp(t *testing.T, cityPath, db, epoch, artifactDir string) {
+func writeRawBackupStamp(t *testing.T, cityPath, epoch, artifactDir string) {
 	t.Helper()
 	dir := filepath.Join(cityPath, ".gc", "runtime", "packs", "dolt", "local-backup-freshness")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatalf("mkdir stamp dir: %v", err)
 	}
 	body := fmt.Sprintf("synced_at_epoch=%s\nartifact_dir=%s\n", epoch, artifactDir)
-	if err := os.WriteFile(filepath.Join(dir, db), []byte(body), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "hq"), []byte(body), 0o644); err != nil {
 		t.Fatalf("write stamp: %v", err)
 	}
 }
@@ -73,7 +73,7 @@ func backupByName(t *testing.T, backups backupsReport, out []byte, name string) 
 func TestHealthDatesABackupFromItsSyncStamp(t *testing.T) {
 	cityPath := t.TempDir()
 	writeBackupArtifact(t, filepath.Join(cityPath, ".dolt-backup"), "hq", 72*time.Hour)
-	writeBackupSyncStamp(t, cityPath, "hq", time.Now().Add(-time.Hour))
+	writeBackupSyncStamp(t, cityPath, time.Now().Add(-time.Hour))
 
 	backups, out := runHealthBackupsJSON(t, cityPath)
 
@@ -110,7 +110,7 @@ func TestHealthRejectsAStampThatCannotDateThisBackup(t *testing.T) {
 				}
 				dest = filepath.Join(physical, ".dolt-backup")
 			}
-			writeRawBackupStamp(t, cityPath, "hq", stamp[0], dest)
+			writeRawBackupStamp(t, cityPath, stamp[0], dest)
 
 			backups, out := runHealthBackupsJSON(t, cityPath)
 
@@ -141,12 +141,12 @@ func TestHealthMatchesTheStampSpellingOfTheBackupOrder(t *testing.T) {
 	if err := os.Symlink(elsewhere, filepath.Join(physical, ".dolt-backup")); err != nil {
 		t.Fatalf("link artifact dir: %v", err)
 	}
-	writeBackupSyncStamp(t, link, "hq", time.Now().Add(-time.Hour))
+	writeBackupSyncStamp(t, link, time.Now().Add(-time.Hour))
 
 	backups, out := runHealthBackupsJSON(t, link)
 
 	if _, stale := backupByName(t, backups, out, "hq"); stale {
-		t.Fatalf("a stamp the backup order wrote was not recognised\n%s", out)
+		t.Fatalf("a stamp the backup order wrote was not recognized\n%s", out)
 	}
 }
 
@@ -158,7 +158,7 @@ func TestHealthFailedSyncDoesNotFreshenABackup(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "chunk-from-a-killed-sync"), []byte("x"), 0o644); err != nil {
 		t.Fatalf("write chunk: %v", err)
 	}
-	writeBackupSyncStamp(t, cityPath, "hq", time.Now().Add(-72*time.Hour))
+	writeBackupSyncStamp(t, cityPath, time.Now().Add(-72*time.Hour))
 
 	backups, out := runHealthBackupsJSON(t, cityPath)
 
@@ -174,7 +174,7 @@ func TestHealthStampWithoutManifestIsNeverBackedUp(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(cityPath, ".dolt-backup", "hq"), 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	writeBackupSyncStamp(t, cityPath, "hq", time.Now())
+	writeBackupSyncStamp(t, cityPath, time.Now())
 
 	backups, out := runHealthBackupsJSON(t, cityPath)
 
