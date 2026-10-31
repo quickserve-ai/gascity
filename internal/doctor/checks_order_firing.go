@@ -246,6 +246,11 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext) *CheckResult {
 			if err != nil {
 				return orderFiringControllerStart{}, err
 			}
+			// No archive, no start and no firing: nothing shows the controller
+			// ever ran. That is not an inconclusive order; see classifyOrderFiring.
+			if got.unknown && len(firedEvents) == 0 && archive.load().archives == 0 {
+				got = orderFiringControllerStart{}
+			}
 			start, startResolved = got, true
 		}
 		return start, nil
@@ -297,20 +302,15 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext) *CheckResult {
 			routine  bool
 		)
 		if started.unknown {
-			// The start is in an archive this check does not read, so whether
+			// An archive or a firing shows the controller has run, but neither
+			// the active log nor the newest archive holds a start, so whether
 			// the order is past its first cycle cannot be told. Inconclusive
 			// stays advisory, like a timed-out run (#4895).
 			status, severity = StatusError, SeverityAdvisory
-			detail = fmt.Sprintf("%s: never fired; controller start is older than the newest event archive (inconclusive)", orderDisplayName(order))
+			detail = fmt.Sprintf("%s: never fired; no controller start in the active event log or the newest event archive (inconclusive)", orderDisplayName(order))
 			inconclusive++
 		} else {
-			// No controller start in the active log or the only retained
-			// archive, while the active log holds firings, means the controller
-			// runs but started before every retained log — not that it never
-			// ran. See classifyOrderFiring for why the two must not classify
-			// alike.
-			startPredatesRetainedLogs := started.at.IsZero() && len(firedEvents) > 0
-			status, severity, detail, routine = classifyOrderFiring(order, now, expected, lastFired, started.at, startPredatesRetainedLogs)
+			status, severity, detail, routine = classifyOrderFiring(order, now, expected, lastFired, started.at)
 		}
 		worst = worseStatus(worst, status)
 		if routine {
@@ -353,8 +353,13 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext) *CheckResult {
 	case StatusError:
 		result.Message = "scheduled orders are stale"
 		if blockingErrors == 0 && advisoryErrors == inconclusive {
-			result.Message = "scheduled orders inconclusive: a never-fired order's controller start is older than the newest event archive"
+			result.Message = "scheduled orders inconclusive: no controller start in the active event log or the newest event archive dates a never-fired order"
 		}
+	}
+	if got := archive.evidence; archive.loaded && got.err != nil {
+		// The store answered for the orders the archive would have; the
+		// verdict stands, but a damaged archive is not left to verbose output.
+		result.Message += fmt.Sprintf("; newest event archive unreadable (%v)", got.err)
 	}
 	if blockingErrors == 0 && advisoryErrors > 0 {
 		result.Severity = SeverityAdvisory
@@ -661,9 +666,10 @@ func (c *OrderFiringCurrentCheck) activeControllerStartedAt(eventPath string) (t
 }
 
 // orderFiringControllerStart is the controller start that dates a never-fired
-// order. A zero at with unknown false means no retained log holds a start;
-// unknown means neither the active log nor the newest archive holds one while
-// older archives went unread, so the start cannot be told.
+// order. unknown means neither the active log nor the newest archive holds
+// one, so the start cannot be told: it may lie in an older archive, before
+// every retained log, or nowhere. A zero at with unknown false means nothing
+// shows the controller ever ran.
 type orderFiringControllerStart struct {
 	at      time.Time
 	unknown bool
@@ -683,7 +689,7 @@ func controllerStartFrom(active time.Time, archive *orderFiringNewestArchive) (o
 	if !got.started.IsZero() {
 		return orderFiringControllerStart{at: got.started}, nil
 	}
-	return orderFiringControllerStart{unknown: got.olderUnread}, nil
+	return orderFiringControllerStart{unknown: true}, nil
 }
 
 // orderFiringNewestArchive reads the newest event archive at most once per run,
@@ -712,13 +718,13 @@ func (a *orderFiringNewestArchive) load() orderFiringArchiveEvidence {
 }
 
 // orderFiringArchiveEvidence is what one read of the newest event archive
-// yielded: its order firings, its last controller start, whether older
-// archives went unread, or why it could not be read.
+// yielded: its order firings, its last controller start, how many archives are
+// retained, or why it could not be read.
 type orderFiringArchiveEvidence struct {
-	fired       []events.Event
-	started     time.Time
-	olderUnread bool
-	err         error
+	fired    []events.Event
+	started  time.Time
+	archives int
+	err      error
 }
 
 // readOrderFiringNewestArchive reads the order firings and controller starts in
@@ -726,8 +732,7 @@ type orderFiringArchiveEvidence struct {
 // evidence in. The controller start is the last one in sequence order, as
 // events.LatestArchivedMatch picks it, so a clock stepped back between two
 // starts does not hand back the earlier one. Archives are counted after the
-// read (see events.ArchiveCount), so a count of one means no older archive is
-// retained.
+// read (see events.ArchiveCount), so a rotation in between counts as an archive.
 func readOrderFiringNewestArchive(read orderFiringArchiveReadFunc, eventPath string) orderFiringArchiveEvidence {
 	archived, err := read(eventPath, []string{events.OrderFired, events.ControllerStarted})
 	if err != nil {
@@ -746,7 +751,7 @@ func readOrderFiringNewestArchive(read orderFiringArchiveReadFunc, eventPath str
 	if err != nil {
 		return orderFiringArchiveEvidence{err: err}
 	}
-	out.olderUnread = count > 1
+	out.archives = count
 	return out
 }
 
@@ -888,28 +893,15 @@ func latestOrderFiredAt(evts []events.Event, subject string) time.Time {
 // "fired within its interval" case: an OK that carries a caveat (never fired,
 // start unknown or within the first cycle) is not routine, because it says the
 // check could not fully judge.
-func classifyOrderFiring(order orders.Order, now time.Time, expected time.Duration, lastFired, controllerStarted time.Time, startPredatesRetainedLogs bool) (status CheckStatus, severity CheckSeverity, detail string, routine bool) {
+func classifyOrderFiring(order orders.Order, now time.Time, expected time.Duration, lastFired, controllerStarted time.Time) (status CheckStatus, severity CheckSeverity, detail string, routine bool) {
 	name := orderDisplayName(order)
 	if lastFired.IsZero() {
 		if controllerStarted.IsZero() {
-			// Two very different situations produce a zero start. With no
-			// firings either, the controller may simply never have run —
-			// controller-down is its own finding, and one alarm per order
-			// would only restate it. With firings present, the controller is
-			// running and started before every retained log, longer ago than
-			// any first-cycle grace could cover. Reporting OK there is the
-			// silent-green path: a never-fired order on a long-running
-			// controller is exactly the scheduler blindness this check exists
-			// to catch (ga-22tvtm).
-			if !startPredatesRetainedLogs {
-				return StatusOK, SeverityBlocking, fmt.Sprintf("%s: never fired (controller start unknown)", name), false
-			}
-			// Cron stays advisory for the same cron-scheduler reason as the
-			// known-uptime path below (ga-97qngx); cooldown stays blocking.
-			if order.Trigger == "cron" {
-				return StatusError, SeverityAdvisory, fmt.Sprintf("%s: never fired; controller start predates the active event log and every retained archive (no first-cycle grace)", name), false
-			}
-			return StatusError, SeverityBlocking, fmt.Sprintf("%s: never fired; controller start predates the active event log and every retained archive (no first-cycle grace)", name), false
+			// Nothing shows the controller ever ran. Controller-down is its own
+			// finding, and one alarm per order would only restate it. Run reports
+			// a start it could not find on a controller that has run as
+			// inconclusive, without reaching here.
+			return StatusOK, SeverityBlocking, fmt.Sprintf("%s: never fired (controller start unknown)", name), false
 		}
 		uptime := nonNegativeDuration(now.Sub(controllerStarted))
 		if uptime >= expected+expected/2 {
