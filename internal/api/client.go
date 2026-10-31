@@ -28,6 +28,7 @@ import (
 	"github.com/gastownhall/gascity/internal/api/apierr"
 	"github.com/gastownhall/gascity/internal/api/genclient"
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/extmsg"
 	"github.com/gastownhall/gascity/internal/mail"
@@ -309,6 +310,9 @@ type Client struct {
 	// request, never captured. nil means no grant is attached (a city that
 	// authenticates on X-GC-Request alone, or one fronted by a bearer edge).
 	grantSource GrantSource
+	// mailReadTimeout is this client's budget for one mail read; zero means
+	// config.DefaultMailReadTimeout. See SetMailReadTimeout.
+	mailReadTimeout time.Duration
 }
 
 // IsRemote reports whether this client targets a remote city over the control
@@ -333,24 +337,37 @@ const sessionMessageTimeout = 4 * time.Minute
 // defaultClientTimeout is the overall HTTP timeout for control-plane client
 // calls. The read paths (ListBeads, GetBead, GetStatus, ListConvoys, ...) pass
 // context.Background() and rely solely on this ceiling (mail reads carry their
-// own mailReadClientTimeout deadline),
+// own mail read budget, see SetMailReadTimeout),
 // and several of them federate the city store plus every rig store — a
 // dolt-backed rig store can take many seconds, so a 10s ceiling false-timed-out
 // healthy-but-slow federated reads. Most calls return in milliseconds; this
 // only bounds the slow federated reads and genuinely hung requests.
 const defaultClientTimeout = 60 * time.Second
 
-// mailReadClientTimeout is the per-request deadline for mail reads
-// (ListMailInboxPage, GetMail, CountMail). It must exceed the server's
-// defaultMailReadDeadline (25s) so a typed store_slow problem detail arrives
-// before the client abandons the request (ga-x49mfh), and must not exceed
-// defaultClientTimeout or remoteResponseHeaderTimeout, which would otherwise
-// cut the request first. Only mail reads use it; other calls are unchanged.
-const mailReadClientTimeout = 30 * time.Second
+// SetMailReadTimeout sets this client's budget for one mail read
+// (ListMailInboxPage, GetMail, CountMail): the city's [mail] read_timeout. The
+// server derives its own store deadline from the same key, 5s shorter, so its
+// typed store_slow answer arrives before this budget runs out (pl-lzd). A
+// non-positive value restores config.DefaultMailReadTimeout. A remote client
+// takes its budget from RemoteOptions.MailReadTimeout instead, which also
+// widens the transport's header timeout to match.
+func (c *Client) SetMailReadTimeout(d time.Duration) {
+	if c != nil {
+		c.mailReadTimeout = d
+	}
+}
+
+// mailReadBudget returns this client's budget for one mail read.
+func (c *Client) mailReadBudget() time.Duration {
+	if c != nil && c.mailReadTimeout > 0 {
+		return c.mailReadTimeout
+	}
+	return config.DefaultMailReadTimeout
+}
 
 // mailReadContext returns the request context for a mail read call.
-func mailReadContext() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), mailReadClientTimeout)
+func (c *Client) mailReadContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), c.mailReadBudget())
 }
 
 // SessionSubmitResponse is the domain-facing shape of a session submit result.
@@ -1259,21 +1276,21 @@ func (c *Client) ListMailInbox(agent, rig string) (CachedRead[MailListView], err
 // one page per call, so a caller that wants the whole mailbox loops until
 // NextCursor is empty.
 func (c *Client) ListMailInboxPage(agent, rig, cursor string, limit int) (CachedRead[MailListView], error) {
-	ctx, cancel := mailReadContext()
+	ctx, cancel := c.mailReadContext()
 	defer cancel()
 	return c.listMailInboxPage(ctx, agent, rig, cursor, limit)
 }
 
 // ListMailInboxWithTimeout is ListMailInbox bounded by timeout instead of
-// mailReadClientTimeout, for a caller that must give up sooner than a full
+// the client's mail read budget, for a caller that must give up sooner than a full
 // mail read is allowed to take without shortening that deadline for every
 // other mail read (ga-c3omvr: the prompt-submit inject hook's probe). A
-// non-positive timeout uses mailReadClientTimeout. A request cut off by the
+// non-positive timeout uses the client's mail read budget. A request cut off by the
 // timeout fails as a transport error (IsConnError), the same as any other
 // abandoned request.
 func (c *Client) ListMailInboxWithTimeout(agent, rig string, timeout time.Duration) (CachedRead[MailListView], error) {
 	if timeout <= 0 {
-		timeout = mailReadClientTimeout
+		timeout = c.mailReadBudget()
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -1325,7 +1342,7 @@ func (c *Client) GetMail(id, rig string) (CachedRead[mail.Message], error) {
 	if rig != "" {
 		params.Rig = &rig
 	}
-	ctx, cancel := mailReadContext()
+	ctx, cancel := c.mailReadContext()
 	defer cancel()
 	resp, err := c.cw.GetV0CityByCityNameMailByIdWithResponse(ctx, c.cityName, id, params)
 	if err != nil {
@@ -1515,7 +1532,7 @@ func (c *Client) CountMail(agent, rig string) (CachedRead[MailCountView], error)
 	if rig != "" {
 		params.Rig = &rig
 	}
-	ctx, cancel := mailReadContext()
+	ctx, cancel := c.mailReadContext()
 	defer cancel()
 	resp, err := c.cw.GetV0CityByCityNameMailCountWithResponse(ctx, c.cityName, params)
 	if err != nil {
