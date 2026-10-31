@@ -854,16 +854,17 @@ func assignedReadyServeScript() string {
 		`fi; `
 }
 
-// The assignee-scoped ephemeral probe remains hold-transparent for existence
-// checks. In the serving query, capture its early exit in a subshell and apply
-// the same hold filter before returning any work to the hook. The candidate
-// read runs in the parent shell, ahead of the subshell, so the per-query
-// snapshot memo (ephemeralStatusSnapshotShell, #5712) survives into the next
-// identity instead of being re-scanned inside every subshell.
+// assignedReadyEphemeralServeScript is the serving form of the assignee-scoped
+// ephemeral fallback. It drops dispatch holds from the candidate stream BEFORE
+// the fast and slow cuts take their first row and before either can exit, so a
+// held head (oldest first) cannot hide the unheld assignment behind it. The
+// existence probe (ephemeralAssignedReadyProbeScript) stays hold-transparent.
+// The candidate read is the same raw snapshot either way, so the per-query
+// memo (ephemeralStatusSnapshotShell, #5712) is shared and survives into the
+// next identity.
 func assignedReadyEphemeralServeScript(shellVar string, topo QueryTopology) string {
-	read, filter := ephemeralAssignedReadyProbeParts(shellVar, topo)
-	return read + `r=$(` + filter + `); ` +
-		assignedReadyServeScript()
+	read, filter := ephemeralAssignedReadyProbeParts(shellVar, topo, true)
+	return read + filter
 }
 
 func standardAssignedReadyWorkQueryScript(topo QueryTopology) string {
@@ -1024,16 +1025,21 @@ func ephemeralAssignedInProgressProbeScriptDeferringGraphAnchor(shellVar string,
 // through the same fast and slow filters: `bd query status=open` is not a
 // readiness query, since dependency-blocked issues keep status "open".
 func ephemeralAssignedReadyProbeScript(shellVar string, topo QueryTopology) string {
-	read, filter := ephemeralAssignedReadyProbeParts(shellVar, topo)
+	read, filter := ephemeralAssignedReadyProbeParts(shellVar, topo, false)
 	return read + filter
 }
 
 // ephemeralAssignedReadyProbeParts splits the probe into its candidate read and
-// the filter-and-serve script that consumes it, so a caller that runs the
-// filter in a subshell can keep the read (and its memo) in the parent shell.
-func ephemeralAssignedReadyProbeParts(shellVar string, topo QueryTopology) (read, filter string) {
-	fastFilter := legacyEphemeralReadyFilterJQ(`select((.assignee // "") == $id)`, 1, false)
-	slowFilter := ephemeralReadyDependencyCandidateFilterJQ(`select((.assignee // "") == $id)`, 1, false)
+// the filter-and-serve script that consumes it. excludeHolds drops dispatch
+// holds in the candidate selector itself, ahead of both first-row cuts; the
+// serving fallback sets it, the hold-transparent existence probe does not.
+func ephemeralAssignedReadyProbeParts(shellVar string, topo QueryTopology, excludeHolds bool) (read, filter string) {
+	selector := `select((.assignee // "") == $id)`
+	if excludeHolds {
+		selector += excludeHoldLabelsJQClause()
+	}
+	fastFilter := legacyEphemeralReadyFilterJQ(selector, 1, false)
+	slowFilter := ephemeralReadyDependencyCandidateFilterJQ(selector, 1, false)
 	candidatesVar := "open_ephemeral"
 	read = ephemeralStatusSnapshotShell(candidatesVar, "open")
 	if topo.includeEphemeralReady() {
