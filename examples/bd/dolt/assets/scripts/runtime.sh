@@ -187,6 +187,48 @@ is_local_dolt_host() {
   esac
 }
 
+# remote_identity_sql_args <db> <remote> prints the leading "'--user', '<user>', "
+# fragment for a DOLT_FETCH/DOLT_PUSH/DOLT_PULL call, or nothing when no identity
+# is configured, so an unconfigured call is byte-identical to one written without
+# this helper. The username comes from GC_DOLT_REMOTE_USER_<DB>_<REMOTE>.
+#
+# The server-side DOLT_* procedures authenticate to a remote as the LOCAL SQL
+# session user unless told otherwise; this pack connects as GC_DOLT_USER (root), so
+# a remotesapi hub that knows a different account denies every fetch, push and pull
+# with nothing naming identity as the cause (ga-tj1bgl).
+#
+# Both halves of the key are uppercased with '-' and '.' folded to '_' (qcore +
+# origin -> GC_DOLT_REMOTE_USER_QCORE_ORIGIN). Scoping is per (database, remote)
+# with deliberately NO global fallback: remote names are not unique across
+# databases, so a city-wide identity would silently attach a hub account to
+# unrelated local mirrors.
+#
+# A username that is not a plausible account name is refused, so a typo cannot be
+# spliced into SQL. It is read by assignment, never through $(...): command
+# substitution strips trailing newlines, which would pass "cherub<newline>" as
+# cherub and a bare newline as no identity at all, reaching the remote as the
+# session user instead of refusing.
+#
+# THE PASSWORD IS NEVER EMITTED HERE: it comes from the dolt SERVER process
+# environment (DOLT_REMOTE_PASSWORD), because argv is world-readable via ps.
+remote_identity_sql_args() {
+  risa_key="$(printf '%s' "$1" | tr 'a-z.-' 'A-Z__')_$(printf '%s' "$2" | tr 'a-z.-' 'A-Z__')"
+  # Guard the eval: anything outside [A-Z0-9_] cannot be an env key, and this
+  # case is the only thing between a database/remote name and shell expansion.
+  case "$risa_key" in
+    *[!A-Z0-9_]*) return 0 ;;
+  esac
+  eval "risa_user=\${GC_DOLT_REMOTE_USER_$risa_key:-}"
+  [ -n "$risa_user" ] || return 0
+  case "$risa_user" in
+    *[!A-Za-z0-9_.-]*)
+      printf 'gc dolt: refusing remote user %s for %s/%s (allowed A-Za-z0-9_.-)\n' "$risa_user" "$1" "$2" >&2
+      return 1
+      ;;
+  esac
+  printf "'--user', '%s', " "$risa_user"
+}
+
 # beads_config_value <config.yaml> <section.field> prints a two-part dotted
 # bd config key's value in either spelling bd reads: the flat top-level
 # `section.field: v` gc writes, or the nested `section:` / `  field: v` that

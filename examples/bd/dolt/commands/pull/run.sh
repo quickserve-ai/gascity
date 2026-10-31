@@ -6,7 +6,10 @@
 # Pulls the configured remote's `main` branch in both SQL and CLI modes.
 #
 # Environment: GC_CITY_PATH, GC_DOLT_PORT, GC_DOLT_USER, GC_DOLT_PASSWORD,
-# GC_DOLT_REMOTE_<DB> (select among multiple remotes), GC_DOLT_PULL_ALLOW_REMOTE_<DB>=1 (permit a non-file:// pull)
+# GC_DOLT_REMOTE_<DB> (select among multiple remotes), GC_DOLT_PULL_ALLOW_REMOTE_<DB>=1 (permit a non-file:// pull),
+# GC_DOLT_REMOTE_USER_<DB>_<REMOTE> (username presented to that remote; see remote_identity_sql_args in runtime.sh).
+# The identity is a procedure argument, so it applies in SQL mode only: the
+# no-server CLI fallback authenticates from dolt's own credential store.
 set -e
 
 : "${GC_DOLT_USER:=root}"
@@ -172,7 +175,12 @@ pull_database_sql() {
     return 1
   fi
 
-  if dolt_sql "USE \`$name\`; CALL DOLT_PULL('$remote_name', 'main')" >/dev/null 2>&1; then
+  remote_ident=$(remote_identity_sql_args "$name" "$remote_name") || {
+    echo "  $name: ERROR: invalid remote identity for remote $remote_name" >&2
+    return 1
+  }
+
+  if dolt_sql "USE \`$name\`; CALL DOLT_PULL(${remote_ident}'$remote_name', 'main')" >/dev/null 2>&1; then
     echo "  $name: pulled from $remote_url"
     return 0
   fi
