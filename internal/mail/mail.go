@@ -84,8 +84,10 @@ const (
 	// job). It is claimed the way "controller" is: freely by a caller with no
 	// session identity, refused from a live session that is not it, and never
 	// marked unverified, because no gc run stands behind it to check. A
-	// service has no mailbox: gc mail send and reply refuse to address one,
-	// bare or city-qualified. Other mail creators do not check yet
+	// service has no mailbox: a store-backed local gc mail send refuses to
+	// address one, bare or city-qualified, and a beadmail reply refuses to
+	// answer one. A storeless or exec-provider send or reply, a remote send,
+	// the HTTP API and a provider called directly do not check yet
 	// (ga-7lmivm.1.2).
 	ServiceSenderPrefix = "service:"
 )

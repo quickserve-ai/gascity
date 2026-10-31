@@ -95,3 +95,22 @@ func TestCmdMailReply_ToServiceIsRefused(t *testing.T) {
 		}
 	}
 }
+
+// With a cross-city roster on, the roster normalizes an address (a trailing
+// slash, the local city's prefix) before it decides; the service refusal must
+// hold for the normalized form too, peer and local alike.
+func TestCmdMailSend_ToNormalizedServiceIsRefused(t *testing.T) {
+	cityPath := writeCrossCityTestCity(t)
+	for _, to := range []string{"gastown/service:x/", "qlandia/service:x/", "qlandia/service:x"} {
+		var stdout, stderr bytes.Buffer
+		if code := cmdMailSend([]string{to, "normalized " + to}, false, false, "human", "", "", "", &stdout, &stderr); code == 0 {
+			t.Fatalf("send to %s = 0, want a refusal; stdout=%s", to, stdout.String())
+		}
+		if !strings.Contains(stderr.String(), "service sender, which has no mailbox") {
+			t.Fatalf("send to %s: stderr = %q, want the no-mailbox refusal", to, stderr.String())
+		}
+		if n := len(messageBeadsByBody(t, cityPath, "normalized "+to)); n != 0 {
+			t.Fatalf("send to %s: messages = %d, want none written", to, n)
+		}
+	}
+}

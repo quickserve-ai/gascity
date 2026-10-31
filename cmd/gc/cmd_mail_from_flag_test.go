@@ -60,8 +60,9 @@ func TestCmdMailReply_ExplicitFromResolvesLikeSend(t *testing.T) {
 	}
 }
 
-// gc handoff --target --from human hands off as the operator even from a
-// seat; a self-handoff mails as the session, so --from is refused there.
+// gc handoff --target --from human hands off as the operator from an
+// identity-less caller, and is refused from a seat (ga-7lmivm.1); a
+// self-handoff mails as the session, so --from is refused there.
 func TestCmdHandoff_FromNamesTargetSender(t *testing.T) {
 	clearMailIdentityEnv(t)
 	t.Setenv("GC_BEADS", "file")
