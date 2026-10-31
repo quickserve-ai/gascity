@@ -59,6 +59,11 @@ type OrderFiringCurrentOption func(*OrderFiringCurrentCheck)
 // implements, and the reason the limit is load-bearing here.
 type orderFiringEventReadFunc func(path string, filter events.Filter, limit int) ([]events.Event, error)
 
+// orderFiringArchiveReadFunc reads the events of the given types from the
+// newest event archive beside path, in sequence order: the shape of
+// events.ReadNewestArchiveTypes.
+type orderFiringArchiveReadFunc func(path string, types []string) ([]events.Event, error)
+
 // WithOrderFiringCurrentLastRunFunc lets callers provide the same order-run
 // history source used by `gc order history` so doctor can classify manual runs.
 func WithOrderFiringCurrentLastRunFunc(fn OrderFiringCurrentLastRunFunc) OrderFiringCurrentOption {
@@ -80,6 +85,7 @@ type OrderFiringCurrentCheck struct {
 	openWork       OrderFiringCurrentOpenWorkFunc
 	historyTimeout time.Duration
 	readEvents     orderFiringEventReadFunc
+	readArchive    orderFiringArchiveReadFunc
 }
 
 // NewOrderFiringCurrentCheck creates a check for cron and cooldown order freshness.
@@ -90,6 +96,7 @@ func NewOrderFiringCurrentCheck(cfg *config.City, cityPath string, opts ...Order
 		clock:          time.Now,
 		historyTimeout: orderFiringHistoryTimeout,
 		readEvents:     events.ReadFilteredTail,
+		readArchive:    events.ReadNewestArchiveTypes,
 	}
 	for _, opt := range opts {
 		opt(check)
@@ -215,36 +222,35 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext) *CheckResult {
 	// that filled its limit missed firings in the active log itself, so the
 	// archive behind it is older still and the store answers as before.
 	evidence := firedEvents
-	var archive orderFiringArchiveEvidence
+	archive := c.newestArchive(eventPath)
 	if len(pending) > 0 && len(firedEvents) < orderFiringEventTailLimit {
-		archive = readOrderFiringNewestArchive(eventPath)
-		if archive.err != nil {
-			result.Details = append(result.Details, fmt.Sprintf("newest event archive unreadable (%v); the order-run store answered instead", archive.err))
-		} else if len(archive.fired) > 0 {
-			evidence = append(append(make([]events.Event, 0, len(archive.fired)+len(firedEvents)), archive.fired...), firedEvents...)
+		if got := archive.load(); got.err != nil {
+			result.Details = append(result.Details, fmt.Sprintf("newest event archive unreadable (%v); the order-run store answered instead", got.err))
+		} else if len(got.fired) > 0 {
+			evidence = append(append(make([]events.Event, 0, len(got.fired)+len(firedEvents)), got.fired...), firedEvents...)
 			pending = c.pendingLastRunOrders(allOrders, evidence, suspendedRigs, cronIntervals, now)
 		}
 	}
 	lastRunFor := c.prefetchedLastRunFunc(pending)
 
 	// The controller start dates only an order with no firing at all, so it is
-	// looked up the first time one turns up. On a city whose controller has
-	// outlived the active log, that lookup walks archives (pl-yhyw).
+	// resolved the first time one turns up, from the active log and the newest
+	// archive only (pl-yhyw).
 	var (
-		startedAt     time.Time
+		start         orderFiringControllerStart
 		startResolved bool
 	)
-	controllerStart := func() (time.Time, error) {
-		if startResolved {
-			return startedAt, nil
+	controllerStart := func() (orderFiringControllerStart, error) {
+		if !startResolved {
+			got, err := controllerStartFrom(activeStartedAt, archive)
+			if err != nil {
+				return orderFiringControllerStart{}, err
+			}
+			start, startResolved = got, true
 		}
-		at, err := c.controllerStartedAt(eventPath, activeStartedAt, archive)
-		if err != nil {
-			return time.Time{}, err
-		}
-		startedAt, startResolved = at, true
-		return startedAt, nil
+		return start, nil
 	}
+	inconclusive := 0
 
 	for _, order := range allOrders {
 		if order.Trigger != "cron" && order.Trigger != "cooldown" {
@@ -274,7 +280,7 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext) *CheckResult {
 			blockingErrors++
 			continue
 		}
-		var started time.Time
+		var started orderFiringControllerStart
 		if lastFired.IsZero() {
 			if started, err = controllerStart(); err != nil {
 				return &CheckResult{
@@ -284,12 +290,28 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext) *CheckResult {
 				}
 			}
 		}
-		// No controller start in the active log or any retained archive, while
-		// the active log holds firings, means the controller runs but started
-		// before every retained log — not that it never ran. See
-		// classifyOrderFiring for why the two must not classify alike.
-		startPredatesRetainedLogs := started.IsZero() && len(firedEvents) > 0
-		status, severity, detail, routine := classifyOrderFiring(order, now, expected, lastFired, started, startPredatesRetainedLogs)
+		var (
+			status   CheckStatus
+			severity CheckSeverity
+			detail   string
+			routine  bool
+		)
+		if started.unknown {
+			// The start is in an archive this check does not read, so whether
+			// the order is past its first cycle cannot be told. Inconclusive
+			// stays advisory, like a timed-out run (#4895).
+			status, severity = StatusError, SeverityAdvisory
+			detail = fmt.Sprintf("%s: never fired; controller start is older than the newest event archive (inconclusive)", orderDisplayName(order))
+			inconclusive++
+		} else {
+			// No controller start in the active log or the only retained
+			// archive, while the active log holds firings, means the controller
+			// runs but started before every retained log — not that it never
+			// ran. See classifyOrderFiring for why the two must not classify
+			// alike.
+			startPredatesRetainedLogs := started.at.IsZero() && len(firedEvents) > 0
+			status, severity, detail, routine = classifyOrderFiring(order, now, expected, lastFired, started.at, startPredatesRetainedLogs)
+		}
 		worst = worseStatus(worst, status)
 		if routine {
 			routineCurrent++
@@ -330,6 +352,9 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext) *CheckResult {
 		result.Message = "scheduled orders are overdue"
 	case StatusError:
 		result.Message = "scheduled orders are stale"
+		if blockingErrors == 0 && advisoryErrors == inconclusive {
+			result.Message = "scheduled orders inconclusive: a never-fired order's controller start is older than the newest event archive"
+		}
 	}
 	if blockingErrors == 0 && advisoryErrors > 0 {
 		result.Severity = SeverityAdvisory
@@ -602,78 +627,109 @@ func (c *OrderFiringCurrentCheck) readEventTail(path string, filter events.Filte
 	return read(path, filter, limit)
 }
 
-// latestControllerStartedAt reports the newest controller start. The tail read
-// finds it within a few lines on any city whose controller has started since
-// the log last rotated. Only when the active log holds no controller start at
-// all does it look in the archives, and then it stops at the newest archive
-// holding one.
+// latestControllerStartedAt reports the newest controller start the check can
+// see: the active log's, else the newest archive's, else zero.
 //
-// The archive leg deliberately does not use an unbounded read. That walk
-// gunzips and decodes every retained archive, and its cost grows with every
-// rotation: on a city with 70 archives it measured over 110 seconds of CPU,
-// inside `gc doctor` and inside the supervisor's order-dispatch pass. The
-// condition that reaches this leg — an active log with no controller start —
-// persists for as long as the controller stays up across rotations, so the
-// walk was paid on every invocation rather than rarely.
+// Older archives are never read for it. That walk gunzips and decodes archive
+// after archive, and its cost grows with the time since the supervisor last
+// started, not with log size: two archives back it was 259 MB decompressed and
+// timed the check out on every sweep (pl-yhyw); on a city with 70 archives a
+// full walk measured over 110 seconds of CPU.
 func (c *OrderFiringCurrentCheck) latestControllerStartedAt(eventPath string) (time.Time, error) {
 	active, err := c.activeControllerStartedAt(eventPath)
 	if err != nil {
 		return time.Time{}, err
 	}
-	return c.controllerStartedAt(eventPath, active, orderFiringArchiveEvidence{})
+	start, err := controllerStartFrom(active, c.newestArchive(eventPath))
+	if err != nil {
+		return time.Time{}, err
+	}
+	return start.at, nil
 }
 
-// activeControllerStartedAt reports the newest controller start in the active
+// activeControllerStartedAt reports the last controller start in the active
 // log, or zero when it holds none.
 func (c *OrderFiringCurrentCheck) activeControllerStartedAt(eventPath string) (time.Time, error) {
 	startEvents, err := c.readEventTail(eventPath, events.Filter{Type: events.ControllerStarted}, 1)
 	if err != nil {
 		return time.Time{}, err
 	}
-	var latest time.Time
-	for _, event := range startEvents {
-		if event.Ts.After(latest) {
-			latest = event.Ts
-		}
-	}
-	return latest, nil
-}
-
-// controllerStartedAt completes latestControllerStartedAt from the active
-// log's answer. A start the newest-archive read already saw is that archive's
-// newest one, the answer LatestArchivedMatch would give, so no archive is
-// decoded a second time for it.
-func (c *OrderFiringCurrentCheck) controllerStartedAt(eventPath string, active time.Time, archive orderFiringArchiveEvidence) (time.Time, error) {
-	if !active.IsZero() {
-		return active, nil
-	}
-	if !archive.started.IsZero() {
-		return archive.started, nil
-	}
-	archived, found, err := events.LatestArchivedMatch(eventPath, events.Filter{Type: events.ControllerStarted})
-	if err != nil {
-		return time.Time{}, err
-	}
-	if !found {
+	if len(startEvents) == 0 {
 		return time.Time{}, nil
 	}
-	return archived.Ts, nil
+	return startEvents[len(startEvents)-1].Ts, nil
+}
+
+// orderFiringControllerStart is the controller start that dates a never-fired
+// order. A zero at with unknown false means no retained log holds a start;
+// unknown means neither the active log nor the newest archive holds one while
+// older archives went unread, so the start cannot be told.
+type orderFiringControllerStart struct {
+	at      time.Time
+	unknown bool
+}
+
+// controllerStartFrom resolves the controller start from the active log's
+// answer and, failing that, the newest archive. An unreadable archive is an
+// error here, because the caller needs the start.
+func controllerStartFrom(active time.Time, archive *orderFiringNewestArchive) (orderFiringControllerStart, error) {
+	if !active.IsZero() {
+		return orderFiringControllerStart{at: active}, nil
+	}
+	got := archive.load()
+	if got.err != nil {
+		return orderFiringControllerStart{}, got.err
+	}
+	if !got.started.IsZero() {
+		return orderFiringControllerStart{at: got.started}, nil
+	}
+	return orderFiringControllerStart{unknown: got.olderUnread}, nil
+}
+
+// orderFiringNewestArchive reads the newest event archive at most once per run,
+// whether the firings or the controller start asked for it first.
+type orderFiringNewestArchive struct {
+	path     string
+	read     orderFiringArchiveReadFunc
+	loaded   bool
+	evidence orderFiringArchiveEvidence
+}
+
+func (c *OrderFiringCurrentCheck) newestArchive(eventPath string) *orderFiringNewestArchive {
+	read := c.readArchive
+	if read == nil {
+		read = events.ReadNewestArchiveTypes
+	}
+	return &orderFiringNewestArchive{path: eventPath, read: read}
+}
+
+func (a *orderFiringNewestArchive) load() orderFiringArchiveEvidence {
+	if !a.loaded {
+		a.evidence = readOrderFiringNewestArchive(a.read, a.path)
+		a.loaded = true
+	}
+	return a.evidence
 }
 
 // orderFiringArchiveEvidence is what one read of the newest event archive
-// yielded: its order firings, its newest controller start, or why it could
-// not be read.
+// yielded: its order firings, its last controller start, whether older
+// archives went unread, or why it could not be read.
 type orderFiringArchiveEvidence struct {
-	fired   []events.Event
-	started time.Time
-	err     error
+	fired       []events.Event
+	started     time.Time
+	olderUnread bool
+	err         error
 }
 
-// readOrderFiringNewestArchive reads the order firings and controller starts in the
-// newest event archive, the one archive a fresh rotation leaves the evidence
-// in.
-func readOrderFiringNewestArchive(eventPath string) orderFiringArchiveEvidence {
-	archived, err := events.ReadNewestArchiveTypes(eventPath, []string{events.OrderFired, events.ControllerStarted})
+// readOrderFiringNewestArchive reads the order firings and controller starts in
+// the newest event archive, the one archive a fresh rotation leaves the
+// evidence in. The controller start is the last one in sequence order, as
+// events.LatestArchivedMatch picks it, so a clock stepped back between two
+// starts does not hand back the earlier one. Archives are counted after the
+// read (see events.ArchiveCount), so a count of one means no older archive is
+// retained.
+func readOrderFiringNewestArchive(read orderFiringArchiveReadFunc, eventPath string) orderFiringArchiveEvidence {
+	archived, err := read(eventPath, []string{events.OrderFired, events.ControllerStarted})
 	if err != nil {
 		return orderFiringArchiveEvidence{err: err}
 	}
@@ -683,11 +739,14 @@ func readOrderFiringNewestArchive(eventPath string) orderFiringArchiveEvidence {
 		case events.OrderFired:
 			out.fired = append(out.fired, event)
 		case events.ControllerStarted:
-			if event.Ts.After(out.started) {
-				out.started = event.Ts
-			}
+			out.started = event.Ts
 		}
 	}
+	count, err := events.ArchiveCount(eventPath)
+	if err != nil {
+		return orderFiringArchiveEvidence{err: err}
+	}
+	out.olderUnread = count > 1
 	return out
 }
 
