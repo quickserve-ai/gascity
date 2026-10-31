@@ -2048,6 +2048,11 @@
           "type": "string",
           "description": "UnreadRetentionTTL is how long a never-read mail bead stays open before\nthe nudge-mail sweep closes it. Empty or \"0\" disables the unread-mail\nphase; it is opt-in so unread mail is never closed by default."
         },
+        "read_timeout": {
+          "type": "string",
+          "description": "ReadTimeout is how long a client waits for one mail read through the\nAPI (a Go duration, default 30s, at most 60s). The server's own\ndeadline for the store read behind it is derived from this value, 5s\nshorter, so its typed store_slow answer arrives first. Raise it when a\nslow mail store makes reads time out; a client reaching this city\nthrough a named context sets that context's mail_read_timeout to match.",
+          "default": "30s"
+        },
         "crosscity": {
           "$ref": "#/$defs/MailCrossCityConfig",
           "description": "CrossCity enables city-qualified mail addressing (\u003ccity\u003e/\u003caddress\u003e).\nAbsent means disabled: every recipient resolves exactly as today."

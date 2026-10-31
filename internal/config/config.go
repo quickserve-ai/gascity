@@ -2006,6 +2006,13 @@ type MailConfig struct {
 	// the nudge-mail sweep closes it. Empty or "0" disables the unread-mail
 	// phase; it is opt-in so unread mail is never closed by default.
 	UnreadRetentionTTL string `toml:"unread_retention_ttl,omitempty"`
+	// ReadTimeout is how long a client waits for one mail read through the
+	// API (a Go duration, default 30s, at most 60s). The server's own
+	// deadline for the store read behind it is derived from this value, 5s
+	// shorter, so its typed store_slow answer arrives first. Raise it when a
+	// slow mail store makes reads time out; a client reaching this city
+	// through a named context sets that context's mail_read_timeout to match.
+	ReadTimeout string `toml:"read_timeout,omitempty" jsonschema:"default=30s"`
 	// CrossCity enables city-qualified mail addressing (<city>/<address>).
 	// Absent means disabled: every recipient resolves exactly as today.
 	CrossCity *MailCrossCityConfig `toml:"crosscity,omitempty"`
