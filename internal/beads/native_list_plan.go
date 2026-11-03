@@ -39,13 +39,14 @@ import (
 // without a server: each request costs one backend listing, and a request that
 // NativeListRequestKeyed reports as unkeyed reads the whole ledger.
 func NativeListPlan(query ListQuery) []issueops.ListRequest {
-	return nativeListPlan(query, nativeListDefaultPushableTypes)
+	return nativeListPlan(query, nativeListDefaultPushableTypes, "")
 }
 
-// nativeListPlan is NativeListPlan over a store's own pushable type set. A nil
-// set pushes no type at all.
-func nativeListPlan(query ListQuery, pushableTypes map[string]bool) []issueops.ListRequest {
-	base := nativeListRequestFromListQuery(query, pushableTypes)
+// nativeListPlan is NativeListPlan over a store's own pushable type set and
+// not-closed status set. A nil type set pushes no type at all; an empty status
+// set pushes no not-closed predicate.
+func nativeListPlan(query ListQuery, pushableTypes map[string]bool, notClosed string) []issueops.ListRequest {
+	base := nativeListRequestFromListQuery(query, pushableTypes, notClosed)
 	assignees := nativeListFanOutAssignees(query)
 	if len(assignees) == 0 {
 		return nativeListIDChunks(base, query.IDs)
@@ -197,6 +198,89 @@ func (s *NativeDoltStore) loadListPushableTypes(ctx context.Context) {
 		return
 	}
 	s.listPushableTypes = pushable
+}
+
+// nativeListBuiltinNotClosedStatuses is bd's built-in status vocabulary less
+// closed. mapBdStatus folds every bd status but closed and in_progress into
+// gc's "open", so gc's not-closed default is exactly every bd status but
+// closed. pinned and hooked are listed for a second reason: naming either in
+// the request's Status lifts the pinned-flag predicate, as AllFlag lifts the
+// status exclusions (see issueops.ListRequest.Status).
+var nativeListBuiltinNotClosedStatuses = []string{"open", "in_progress", "blocked", "deferred", "pinned", "hooked"}
+
+// nativeListNotClosedStatusFor returns the not-closed OR set for a scope whose
+// status.custom setting is customSetting, and false when the setting does not
+// parse. The setting is bd's comma-separated list, each entry a name with an
+// optional ":category" (the category never makes a status closed to gc:
+// mapBdStatus reads the name). A custom status that a listing left out would be
+// hidden from every no-Status read of the scope, so anything this cannot read
+// as a plain name pushes nothing rather than guessing.
+func nativeListNotClosedStatusFor(customSetting string) (string, bool) {
+	statuses := append([]string(nil), nativeListBuiltinNotClosedStatuses...)
+	seen := make(map[string]bool, len(statuses))
+	for _, status := range statuses {
+		seen[status] = true
+	}
+	for _, entry := range strings.Split(customSetting, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		name, _, _ := strings.Cut(entry, ":")
+		name = strings.TrimSpace(name)
+		if name == "closed" || !nativeListStatusNameOK(name) {
+			return "", false
+		}
+		if !seen[name] {
+			seen[name] = true
+			statuses = append(statuses, name)
+		}
+	}
+	return strings.Join(statuses, ","), true
+}
+
+// nativeListStatusNameOK reports whether name is a plain status name: letters,
+// digits, underscore and hyphen. It is the request's OR-set separator and the
+// SQL it reaches that make anything else unsafe to pass on.
+func nativeListStatusNameOK(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, r := range name {
+		if !(r == '_' || r == '-' || ('a' <= r && r <= 'z') || ('A' <= r && r <= 'Z') || ('0' <= r && r <= '9')) {
+			return false
+		}
+	}
+	return true
+}
+
+// loadListNotClosedStatus sets the store's not-closed status set from its
+// scope's status.custom setting, read through the workspace-config role as
+// loadListPushableTypes reads types.infra. It runs once, at open: a custom
+// status an operator adds later is not in the set of a store already open, and
+// its rows are hidden from that store's no-Status listings until the process
+// restarts. A setting that cannot be read or parsed leaves the set empty, and
+// the store then pushes no not-closed predicate (the full read it always made).
+//
+// THE SAME RESIDUE as types.infra: a status.custom kept only in a server's
+// config.yaml is invisible to the workspace-config role, so its statuses are
+// missing from the set; such a status must also be stored as the setting.
+func (s *NativeDoltStore) loadListNotClosedStatus(ctx context.Context) {
+	settings, err := s.storage.WorkspaceConfig()
+	if err == nil {
+		var result issueops.SettingResult
+		result, err = settings.GetSetting(ctx, issueops.GetSettingRequest{Key: issueops.SettingKeyStatusCustom})
+		if err == nil {
+			set, ok := nativeListNotClosedStatusFor(result.Value)
+			if ok {
+				s.listNotClosedStatus = set
+				return
+			}
+			err = fmt.Errorf("status.custom %q does not parse as a status list", result.Value)
+		}
+	}
+	s.listLogger().Warn("native bead store: cannot read the scope's status.custom setting; listing without the not-closed pushdown for this store",
+		"prefix", s.idPrefix, "err", err)
 }
 
 // nativeListTypeRefused reports whether err is the role refusing a pushed

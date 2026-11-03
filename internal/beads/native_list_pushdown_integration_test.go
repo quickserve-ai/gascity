@@ -241,3 +241,82 @@ func TestNativeDoltStoreListPushdownHonorsTheScopeInfraTypes(t *testing.T) {
 		}
 	}
 }
+
+// The not-closed pushdown against REAL storage on a scope with custom statuses:
+// a no-Status listing sent as the scope's not-closed OR set answers exactly
+// what the unpushed query answers, every custom and built-in non-closed status
+// included, on both tiers.
+func TestNativeDoltStoreListNotClosedPushdownAgainstRealStorage(t *testing.T) {
+	store := openRealNativeDoltStoreForFacade(t, "notclosed-test")
+	ctx := context.Background()
+	if err := store.storage.SetConfig(ctx, "types.custom", strings.Join(RequiredCustomTypes, ",")); err != nil {
+		t.Fatalf("register gc types: %v", err)
+	}
+	if err := store.storage.SetConfig(ctx, "status.custom", "staged_ready:wip,launched"); err != nil {
+		t.Fatalf("register custom statuses: %v", err)
+	}
+	store.loadListPushableTypes(ctx)
+	store.loadListNotClosedStatus(ctx)
+	if want := "open,in_progress,blocked,deferred,pinned,hooked,staged_ready,launched"; store.listNotClosedStatus != want {
+		t.Fatalf("listNotClosedStatus = %q, want %q", store.listNotClosedStatus, want)
+	}
+	statuses := []string{"open", "in_progress", "blocked", "deferred", "pinned", "hooked", "staged_ready", "launched", "closed"}
+	seeded := 0
+	for _, ephemeral := range []bool{false, true} {
+		for _, status := range statuses {
+			created, err := store.Create(Bead{Title: "status " + status, Type: "task", Ephemeral: ephemeral, Labels: []string{"seed"}})
+			if err != nil {
+				t.Fatalf("Create(%s): %v", status, err)
+			}
+			seeded++
+			switch status {
+			case "open":
+			case "closed":
+				if err := store.Close(created.ID); err != nil {
+					t.Fatalf("Close(%s): %v", created.ID, err)
+				}
+			default:
+				st := status
+				if err := store.Update(created.ID, UpdateOpts{Status: &st}); err != nil {
+					t.Fatalf("Update(%s, %s): %v", created.ID, status, err)
+				}
+			}
+		}
+	}
+	all, err := store.List(ListQuery{AllowScan: true, IncludeClosed: true, TierMode: TierBoth})
+	if err != nil {
+		t.Fatalf("List(all): %v", err)
+	}
+	if len(all) != seeded {
+		t.Fatalf("List(all) = %d rows, want the %d seeded", len(all), seeded)
+	}
+	for _, query := range []ListQuery{
+		{AllowScan: true, TierMode: TierBoth},
+		{AllowScan: true, TierMode: TierBoth, Live: true},
+		{AllowScan: true, TierMode: TierIssues},
+		{AllowScan: true, TierMode: TierWisps},
+		{Label: "seed", TierMode: TierBoth},
+	} {
+		got, err := store.List(query)
+		if err != nil {
+			t.Fatalf("List(%+v): %v", query, err)
+		}
+		want := ApplyListQuery(all, query)
+		if gotIDs, wantIDs := sortedBeadIDs(got), sortedBeadIDs(want); !slices.Equal(gotIDs, wantIDs) {
+			t.Errorf("List(%+v)\n got  %v\n want %v", query, gotIDs, wantIDs)
+		}
+		for _, b := range got {
+			if b.Status == "closed" {
+				t.Errorf("List(%+v) returned closed %s", query, b.ID)
+			}
+		}
+	}
+	// The only whole-ledger read is the test's own List(all): every no-Status
+	// listing above went out keyed by the not-closed set.
+	if stats := listRequestStatsForTest(t, store); stats.Unkeyed != 1 {
+		t.Fatalf("ListRequestStatsOf = %+v, want 1 whole-ledger read (the List(all))", stats)
+	}
+	if got := ApplyListQuery(all, ListQuery{AllowScan: true, TierMode: TierBoth}); len(got) != seeded-2 {
+		t.Fatalf("the unpushed answer has %d rows, want every seed but the two closed (%d)", len(got), seeded-2)
+	}
+}
