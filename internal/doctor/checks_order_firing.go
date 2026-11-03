@@ -64,6 +64,11 @@ type orderFiringEventReadFunc func(path string, filter events.Filter, limit int)
 // events.ReadNewestArchiveTypes.
 type orderFiringArchiveReadFunc func(path string, types []string) ([]events.Event, error)
 
+// orderFiringActiveReadFunc reads the order firings in the WHOLE active log at
+// path, and no archive: the shape of readActiveOrderFirings. It returns at
+// least each subject's newest firing; older firings may be folded away.
+type orderFiringActiveReadFunc func(path string) ([]events.Event, error)
+
 // WithOrderFiringCurrentLastRunFunc lets callers provide the same order-run
 // history source used by `gc order history` so doctor can classify manual runs.
 func WithOrderFiringCurrentLastRunFunc(fn OrderFiringCurrentLastRunFunc) OrderFiringCurrentOption {
@@ -86,6 +91,7 @@ type OrderFiringCurrentCheck struct {
 	historyTimeout time.Duration
 	readEvents     orderFiringEventReadFunc
 	readArchive    orderFiringArchiveReadFunc
+	readActive     orderFiringActiveReadFunc
 }
 
 // NewOrderFiringCurrentCheck creates a check for cron and cooldown order freshness.
@@ -97,6 +103,7 @@ func NewOrderFiringCurrentCheck(cfg *config.City, cityPath string, opts ...Order
 		historyTimeout: orderFiringHistoryTimeout,
 		readEvents:     events.ReadFilteredTail,
 		readArchive:    events.ReadNewestArchiveTypes,
+		readActive:     readActiveOrderFirings,
 	}
 	for _, opt := range opts {
 		opt(check)
@@ -215,19 +222,36 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext) *CheckResult {
 	// the expected intervals — and therefore which orders need a lookup — are
 	// identical to what the loop derives for itself.
 	pending := c.pendingLastRunOrders(allOrders, firedEvents, suspendedRigs, cronIntervals, now)
-	// A tail short of its limit is the whole active log's firings. When that
-	// still leaves orders pending, the log is younger than their intervals, as
-	// right after a rotation, and the newest archive holds their firings: one
-	// archive read instead of a store round-trip per order (pl-yhyw). A tail
-	// that filled its limit missed firings in the active log itself, so the
-	// archive behind it is older still and the store answers as before.
+	// A tail short of its limit is the whole active log's firings. A tail that
+	// filled its limit missed older firings in the active log itself, and on a
+	// busy city it fills within hours of a rotation: about 12 firings a minute
+	// filled 2000 in under 3 h on 2026-11-03, after which 31 of 133 orders fell
+	// to store round-trips (65 s serial) and the check timed out on every sweep
+	// until the next rotation (pl-tfwh). So a full tail with orders still
+	// pending is followed by ONE read of the whole active log's firings: a
+	// filtered pass that decodes only order.fired lines, folded to the newest
+	// firing per order.
 	evidence := firedEvents
+	activeWhole := len(firedEvents) < orderFiringEventTailLimit
+	if len(pending) > 0 && !activeWhole {
+		if fired, err := c.readActiveFirings(eventPath); err != nil {
+			result.Details = append(result.Details, fmt.Sprintf("active event log unreadable past its tail (%v); the order-run store answered instead", err))
+		} else {
+			evidence, activeWhole = fired, true
+			pending = c.pendingLastRunOrders(allOrders, evidence, suspendedRigs, cronIntervals, now)
+		}
+	}
+	// With the whole active log's firings in hand, orders still pending are
+	// older than the log, as right after a rotation, and the newest archive
+	// holds their firings: one archive read instead of a store round-trip per
+	// order (pl-yhyw). Only when the active log could not be read whole is the
+	// archive behind it skipped, since what it missed lies in the active log.
 	archive := c.newestArchive(eventPath)
-	if len(pending) > 0 && len(firedEvents) < orderFiringEventTailLimit {
+	if len(pending) > 0 && activeWhole {
 		if got := archive.load(); got.err != nil {
 			result.Details = append(result.Details, fmt.Sprintf("newest event archive unreadable (%v); the order-run store answered instead", got.err))
 		} else if len(got.fired) > 0 {
-			evidence = append(append(make([]events.Event, 0, len(got.fired)+len(firedEvents)), got.fired...), firedEvents...)
+			evidence = append(append(make([]events.Event, 0, len(got.fired)+len(evidence)), got.fired...), evidence...)
 			pending = c.pendingLastRunOrders(allOrders, evidence, suspendedRigs, cronIntervals, now)
 		}
 	}
@@ -630,6 +654,49 @@ func (c *OrderFiringCurrentCheck) readEventTail(path string, filter events.Filte
 		read = events.ReadFilteredTail
 	}
 	return read(path, filter, limit)
+}
+
+// readActiveFirings reads the whole active log's order firings through the
+// check's reader, defaulting to readActiveOrderFirings.
+func (c *OrderFiringCurrentCheck) readActiveFirings(path string) ([]events.Event, error) {
+	read := c.readActive
+	if read == nil {
+		read = readActiveOrderFirings
+	}
+	return read(path)
+}
+
+// readActiveOrderFirings returns the newest order.fired event per subject in
+// the active log at path, reading no archive. The walk skips every line that
+// does not name order.fired before decoding it, so the cost is one pass over
+// the file plus a decode per firing; on the 69 MB / 50k-line log of 2026-11-03
+// with 7,773 firings it is well under a second, where a full decode of every
+// line (ga-klv's 36 s) or a store round-trip per order is not.
+func readActiveOrderFirings(path string) ([]events.Event, error) {
+	newest := make(map[string]events.Event)
+	read := false
+	err := events.WalkFilteredTypesNewestFirst(path, events.Filter{}, []string{events.OrderFired}, func(evts []events.Event, _ time.Time) bool {
+		// The walk hands over the active log first and stops when told to,
+		// before any archive is opened.
+		read = true
+		for _, e := range evts {
+			if cur, ok := newest[e.Subject]; !ok || e.Ts.After(cur.Ts) {
+				newest[e.Subject] = e
+			}
+		}
+		return false
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !read {
+		return nil, nil
+	}
+	out := make([]events.Event, 0, len(newest))
+	for _, e := range newest {
+		out = append(out, e)
+	}
+	return out, nil
 }
 
 // latestControllerStartedAt reports the newest controller start the check can

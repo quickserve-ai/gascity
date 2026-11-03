@@ -507,11 +507,122 @@ func TestOrderFiringCurrent_NoArchiveReadWhenTheActiveLogAnswers(t *testing.T) {
 	}
 }
 
-// TestOrderFiringCurrent_FullTailSkipsTheArchive: a tail that filled its limit
-// came from an active log long enough that the archive behind it is older than
-// what the tail missed, so the store answers instead of an archive read.
-func TestOrderFiringCurrent_FullTailSkipsTheArchive(t *testing.T) {
-	now := time.Date(2026, 10, 30, 0, 0, 0, 0, time.UTC)
+// fullTailOrderFiringEvents is an active log whose order.fired tail fills its
+// limit with recent noise, with head firings older than that tail before it:
+// the shape of a busy city's log a few hours after a rotation (pl-tfwh).
+func fullTailOrderFiringEvents(now time.Time, head ...events.Event) []events.Event {
+	evts := []events.Event{{Type: events.ControllerStarted, Ts: now.Add(-24 * time.Hour)}}
+	evts = append(evts, head...)
+	for i := 0; i < orderFiringEventTailLimit+500; i++ {
+		evts = append(evts, events.Event{Type: events.OrderFired, Subject: fmt.Sprintf("noise-%d", i%16), Ts: now.Add(-time.Minute)})
+	}
+	return evts
+}
+
+// orderFiringNamedLastRun answers every store lookup with a fresh run and
+// records which orders asked.
+func orderFiringNamedLastRun(now time.Time, mu *sync.Mutex, asked *[]string) OrderFiringCurrentLastRunFunc {
+	return func(order orders.Order) (time.Time, error) {
+		mu.Lock()
+		*asked = append(*asked, order.ScopedName())
+		mu.Unlock()
+		return now.Add(-10 * time.Minute), nil
+	}
+}
+
+// TestOrderFiringCurrent_FullTailReadsTheWholeActiveLogNotTheStore is the
+// shape that timed the check out from about 14:55Z on 2026-11-03 until the next
+// rotation (pl-tfwh): long-interval orders fired early in the active log, then
+// more than a full tail of other firings came after them. Their firings must
+// come from one read of the whole active log, with no store round-trip, and
+// within a budget a store fan-out cannot meet. The archive is not gzip, so the
+// check must not need it either.
+func TestOrderFiringCurrent_FullTailReadsTheWholeActiveLogNotTheStore(t *testing.T) {
+	now := time.Date(2026, 11, 3, 23, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	writeOrderFiringTestOrder(t, cityPath, "six-hourly", "cron", "0 */6 * * *")
+	writeOrderFiringTestOrder(t, cityPath, "slow-cooldown", "cooldown", "4h")
+	if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityPath, ".gc", "events.jsonl.archive-20261103T120922Z-seq-1-100.gz"), []byte("not gzip"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	evts := fullTailOrderFiringEvents(now,
+		events.Event{Type: events.OrderFired, Subject: "six-hourly", Ts: now.Add(-5 * time.Hour)},
+		events.Event{Type: events.OrderFired, Subject: "slow-cooldown", Ts: now.Add(-3 * time.Hour)},
+	)
+	// Bulk of a real log: lines that are not firings, which the read must pass
+	// over without decoding (2026-11-03: 50k lines, 7.8k of them firings).
+	for i := 0; i < 40000; i++ {
+		evts = append(evts, events.Event{Type: "bead.updated", Subject: fmt.Sprintf("ga-%d", i), Ts: now.Add(-time.Minute)})
+	}
+	writeOrderFiringTestEvents(t, cityPath, evts...)
+
+	var calls atomic.Int32
+	check := NewOrderFiringCurrentCheck(cfg, cityPath, WithOrderFiringCurrentLastRunFunc(orderFiringRefusingLastRun(&calls)))
+	check.clock = func() time.Time { return now }
+	start := time.Now()
+	result := check.Run(&CheckContext{CityPath: cityPath})
+	elapsed := time.Since(start)
+
+	if result.Status != StatusOK || len(result.Details) != 0 {
+		t.Fatalf("status = %v details = %v, want ok with no details; msg = %s", result.Status, result.Details, result.Message)
+	}
+	if n := calls.Load(); n != 0 {
+		t.Fatalf("store lookups = %d, want 0: the active log holds every firing", n)
+	}
+	routine := strings.Join(check.routineDetails, "\n")
+	for _, want := range []string{"six-hourly: last fired 5h ago", "slow-cooldown: last fired 3h ago"} {
+		if !strings.Contains(routine, want) {
+			t.Fatalf("routine = %v, want %q", check.routineDetails, want)
+		}
+	}
+	if budget := time.Second; elapsed > budget {
+		t.Fatalf("check took %s on a full tail, want under %s", elapsed, budget)
+	}
+}
+
+// TestOrderFiringCurrent_FullTailThenNewestArchiveThenTheStore: once the whole
+// active log has been read, an order fired only before the rotation is answered
+// by the newest archive, and only an order in neither asks the store.
+func TestOrderFiringCurrent_FullTailThenNewestArchiveThenTheStore(t *testing.T) {
+	now := time.Date(2026, 11, 3, 23, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	writeOrderFiringTestOrder(t, cityPath, "archived-daily", "cron", "0 4 * * *")
+	writeOrderFiringTestOrder(t, cityPath, "weekly", "cron", "0 14 * * 4")
+	writeOrderFiringArchive(t, cityPath, "20261103T120922Z", 1, 100,
+		orderFiringEventLine(50, events.OrderFired, "archived-daily", now.Add(-19*time.Hour)))
+	writeOrderFiringTestEvents(t, cityPath, fullTailOrderFiringEvents(now)...)
+
+	var mu sync.Mutex
+	var asked []string
+	var archiveReads atomic.Int32
+	check := NewOrderFiringCurrentCheck(cfg, cityPath, WithOrderFiringCurrentLastRunFunc(orderFiringNamedLastRun(now, &mu, &asked)))
+	countOrderFiringArchiveReads(check, &archiveReads)
+	check.clock = func() time.Time { return now }
+	result := check.Run(&CheckContext{CityPath: cityPath})
+
+	if result.Status != StatusOK {
+		t.Fatalf("status = %v, want ok; msg = %s; details = %v", result.Status, result.Message, result.Details)
+	}
+	if strings.Join(asked, ",") != "weekly" {
+		t.Fatalf("store lookups = %v, want only [weekly]: archived-daily is in the newest archive", asked)
+	}
+	if n := archiveReads.Load(); n != 1 {
+		t.Fatalf("newest-archive reads = %d, want 1", n)
+	}
+	if !strings.Contains(strings.Join(check.routineDetails, "\n"), "archived-daily: last fired 19h ago") {
+		t.Fatalf("routine = %v, want archived-daily dated by the archive", check.routineDetails)
+	}
+}
+
+// TestOrderFiringCurrent_FullTailUnreadableActiveLogFallsBackToTheStore: the
+// whole-log read only spares store round-trips. If it fails, the pending
+// orders go to the store as before, the archive behind the log is not read
+// (what the tail missed lies in the active log), and the detail says why.
+func TestOrderFiringCurrent_FullTailUnreadableActiveLogFallsBackToTheStore(t *testing.T) {
+	now := time.Date(2026, 11, 3, 23, 0, 0, 0, time.UTC)
 	cityPath, cfg := orderFiringTestCity(t)
 	writeOrderFiringTestOrder(t, cityPath, "cleanup-cooldown", "cooldown", "1h")
 	if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
@@ -520,25 +631,64 @@ func TestOrderFiringCurrent_FullTailSkipsTheArchive(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(cityPath, ".gc", "events.jsonl.archive-20261029T235635Z-seq-1-100.gz"), []byte("not gzip"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	evts := []events.Event{{Type: events.ControllerStarted, Ts: now.Add(-24 * time.Hour)}}
-	for i := 0; i < orderFiringEventTailLimit; i++ {
-		evts = append(evts, events.Event{Type: events.OrderFired, Subject: fmt.Sprintf("noise-%d", i%16), Ts: now.Add(-time.Minute)})
-	}
-	writeOrderFiringTestEvents(t, cityPath, evts...)
+	writeOrderFiringTestEvents(t, cityPath, fullTailOrderFiringEvents(now)...)
 
-	var calls atomic.Int32
-	check := NewOrderFiringCurrentCheck(cfg, cityPath, WithOrderFiringCurrentLastRunFunc(func(orders.Order) (time.Time, error) {
-		calls.Add(1)
-		return now.Add(-10 * time.Minute), nil
-	}))
+	var mu sync.Mutex
+	var asked []string
+	check := NewOrderFiringCurrentCheck(cfg, cityPath, WithOrderFiringCurrentLastRunFunc(orderFiringNamedLastRun(now, &mu, &asked)))
+	check.readActive = func(string) ([]events.Event, error) { return nil, fmt.Errorf("scanning events: boom") }
 	check.clock = func() time.Time { return now }
 	result := check.Run(&CheckContext{CityPath: cityPath})
 
-	if result.Status != StatusOK || len(result.Details) != 0 {
-		t.Fatalf("status = %v details = %v, want ok with no details", result.Status, result.Details)
+	if result.Status != StatusOK {
+		t.Fatalf("status = %v, want ok; msg = %s; details = %v", result.Status, result.Message, result.Details)
 	}
-	if n := calls.Load(); n != 1 {
-		t.Fatalf("store lookups = %d, want 1", n)
+	if strings.Join(asked, ",") != "cleanup-cooldown" {
+		t.Fatalf("store lookups = %v, want [cleanup-cooldown]", asked)
+	}
+	details := strings.Join(result.Details, "\n")
+	if !strings.Contains(details, "active event log unreadable past its tail") {
+		t.Fatalf("details = %v, want the unreadable active log named", result.Details)
+	}
+	if strings.Contains(details, "newest event archive unreadable") {
+		t.Fatalf("details = %v: the archive was read although the active log was not read whole", result.Details)
+	}
+}
+
+// TestReadActiveOrderFiringsReadsNoArchive: the whole-log read folds the active
+// log's firings to the newest per order and never opens an archive (the one
+// here is not gzip, so opening it would fail the read).
+func TestReadActiveOrderFiringsReadsNoArchive(t *testing.T) {
+	now := time.Date(2026, 11, 3, 23, 0, 0, 0, time.UTC)
+	cityPath, _ := orderFiringTestCity(t)
+	if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityPath, ".gc", "events.jsonl.archive-20261029T235635Z-seq-1-100.gz"), []byte("not gzip"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeOrderFiringTestEvents(t, cityPath,
+		events.Event{Type: events.OrderFired, Subject: "a", Ts: now.Add(-3 * time.Hour)},
+		events.Event{Type: events.OrderFired, Subject: "b", Ts: now.Add(-2 * time.Hour)},
+		events.Event{Type: events.OrderCompleted, Subject: "a", Ts: now.Add(-90 * time.Minute)},
+		events.Event{Type: events.OrderFired, Subject: "a", Ts: now.Add(-time.Hour)},
+	)
+
+	got, err := readActiveOrderFirings(filepath.Join(cityPath, ".gc", "events.jsonl"))
+	if err != nil {
+		t.Fatalf("readActiveOrderFirings: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d events, want 2 (newest firing per order): %+v", len(got), got)
+	}
+	for _, e := range got {
+		if e.Type != events.OrderFired {
+			t.Fatalf("got a %q event, want only order.fired", e.Type)
+		}
+		want := map[string]time.Time{"a": now.Add(-time.Hour), "b": now.Add(-2 * time.Hour)}[e.Subject]
+		if !e.Ts.Equal(want) {
+			t.Fatalf("%s: ts = %s, want %s", e.Subject, e.Ts, want)
+		}
 	}
 }
 
