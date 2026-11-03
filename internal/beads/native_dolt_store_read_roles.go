@@ -162,7 +162,7 @@ func (s *NativeDoltStore) List(query ListQuery) ([]Bead, error) {
 	if s.typePushdownOff.Load() {
 		pushable = nil
 	}
-	plan := nativeListPlan(query, pushable)
+	plan := nativeListPlan(query, pushable, s.listNotClosedStatus)
 	s.noteUnkeyedPlan(query, plan)
 	var (
 		out   []Bead
@@ -760,7 +760,7 @@ func filterReadyByWorkOutcomeFetchBlockers(ctx context.Context, reader issueops.
 //     is ApplyListQuery's, as the wisp-tier filter already was.
 //
 // Hydration is narrowed as well as filtering: the counts are never hydrated.
-func nativeListRequestFromListQuery(query ListQuery, pushableTypes map[string]bool) issueops.ListRequest {
+func nativeListRequestFromListQuery(query ListQuery, pushableTypes map[string]bool, notClosed string) issueops.ListRequest {
 	req := nativeListReadRequest()
 	limit := nativeListLimitPushdown(query)
 	req.Limit = &limit
@@ -787,6 +787,13 @@ func nativeListRequestFromListQuery(query ListQuery, pushableTypes map[string]bo
 	}
 	if nativeListPushableStatus(query.Status) || nativeListPushesRawOpen(query) {
 		req.Status = query.Status
+	} else if query.Status == "" && !query.IncludeClosed && notClosed != "" {
+		// The not-closed default: every status of the scope's vocabulary but
+		// closed, as the request's OR set (nativeListNotClosedStatusFor). It
+		// replaces the status exclusions AllFlag lifted, and names pinned and
+		// hooked so the pinned-flag predicate stays lifted too. Rows outside
+		// the set are exactly the closed ones, which ApplyListQuery drops.
+		req.Status = notClosed
 	}
 	if pushableTypes[query.Type] {
 		req.IssueType = query.Type

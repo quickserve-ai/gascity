@@ -387,6 +387,13 @@ type NativeDoltStore struct {
 	// directly over a storage value.
 	listPushableTypes map[string]bool
 
+	// listNotClosedStatus is the scope's not-closed status set as the
+	// request's comma-separated Status OR set, read once at open from the
+	// scope's status.custom setting (loadListNotClosedStatus). Empty pushes
+	// no not-closed predicate: a store whose setting could not be read, one
+	// built directly over a storage value, or one whose setting did not parse.
+	listNotClosedStatus string
+
 	// typePushdownOff latches when the backend refused a pushed issue type:
 	// the scope was provisioned without gc's type vocabulary. Listings then
 	// filter type Go-side only, for the store's lifetime.
@@ -634,6 +641,7 @@ func newNativeDoltStoreAtWithCredentialCommand(parent context.Context, scopeRoot
 		opt(store)
 	}
 	store.loadListPushableTypes(ctx)
+	store.loadListNotClosedStatus(ctx)
 	return store, nil
 }
 
@@ -650,6 +658,7 @@ func newNativeDoltStoreAtWithoutAmbientEnv(parent context.Context, scopeRoot, cr
 		opt(store)
 	}
 	store.loadListPushableTypes(ctx)
+	store.loadListNotClosedStatus(ctx)
 	return store, nil
 }
 
