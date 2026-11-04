@@ -557,6 +557,9 @@ func TestOrderFiringCurrent_FullTailReadsTheWholeActiveLogNotTheStore(t *testing
 	for i := 0; i < 40000; i++ {
 		evts = append(evts, events.Event{Type: "bead.updated", Subject: fmt.Sprintf("ga-%d", i), Ts: now.Add(-time.Minute)})
 	}
+	// A recent controller start, so the budget times the firing reads rather
+	// than the backward walk for a start (every order here has a firing).
+	evts = append(evts, events.Event{Type: events.ControllerStarted, Ts: now.Add(-30 * time.Second)})
 	writeOrderFiringTestEvents(t, cityPath, evts...)
 
 	var calls atomic.Int32
@@ -597,11 +600,22 @@ func TestOrderFiringCurrent_FullTailThenNewestArchiveThenTheStore(t *testing.T) 
 
 	var mu sync.Mutex
 	var asked []string
-	var archiveReads atomic.Int32
+	var archiveReads, activeReads atomic.Int32
 	check := NewOrderFiringCurrentCheck(cfg, cityPath, WithOrderFiringCurrentLastRunFunc(orderFiringNamedLastRun(now, &mu, &asked)))
 	countOrderFiringArchiveReads(check, &archiveReads)
+	check.readActive = func(path string) ([]events.Event, error) {
+		if archiveReads.Load() != 0 {
+			t.Errorf("the newest archive was read before the whole active log")
+		}
+		activeReads.Add(1)
+		return readActiveOrderFirings(path)
+	}
 	check.clock = func() time.Time { return now }
 	result := check.Run(&CheckContext{CityPath: cityPath})
+
+	if n := activeReads.Load(); n != 1 {
+		t.Fatalf("whole-active-log reads = %d, want 1", n)
+	}
 
 	if result.Status != StatusOK {
 		t.Fatalf("status = %v, want ok; msg = %s; details = %v", result.Status, result.Message, result.Details)
@@ -652,6 +666,51 @@ func TestOrderFiringCurrent_FullTailUnreadableActiveLogFallsBackToTheStore(t *te
 	}
 	if strings.Contains(details, "newest event archive unreadable") {
 		t.Fatalf("details = %v: the archive was read although the active log was not read whole", result.Details)
+	}
+}
+
+// TestOrderFiringCurrent_FullTailKeepsTheTailAcrossARotation: a rotation
+// between the tail read and the whole-log read leaves the reread a young log
+// without the firings the tail saw. Those firings must still count: the order
+// the tail dated asks no store, and only the truly pending one does.
+func TestOrderFiringCurrent_FullTailKeepsTheTailAcrossARotation(t *testing.T) {
+	now := time.Date(2026, 11, 3, 23, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	writeOrderFiringTestOrder(t, cityPath, "noise-0", "cooldown", "1h")
+	writeOrderFiringTestOrder(t, cityPath, "weekly", "cron", "0 14 * * 4")
+	writeOrderFiringTestEvents(t, cityPath, fullTailOrderFiringEvents(now)...)
+
+	var mu sync.Mutex
+	var asked []string
+	check := NewOrderFiringCurrentCheck(cfg, cityPath, WithOrderFiringCurrentLastRunFunc(orderFiringNamedLastRun(now, &mu, &asked)))
+	// The reread lands on the fresh log a rotation left: nothing in it yet.
+	check.readActive = func(string) ([]events.Event, error) { return nil, nil }
+	check.clock = func() time.Time { return now }
+	result := check.Run(&CheckContext{CityPath: cityPath})
+
+	if result.Status != StatusOK {
+		t.Fatalf("status = %v, want ok; msg = %s; details = %v", result.Status, result.Message, result.Details)
+	}
+	if strings.Join(asked, ",") != "weekly" {
+		t.Fatalf("store lookups = %v, want only [weekly]: noise-0 fired in the tail", asked)
+	}
+}
+
+// TestReadActiveOrderFiringsWithoutAnActiveLogReadsNoArchive: with no active
+// log at all, the read is empty; it does not hand back the newest archive's
+// firings as the active log's.
+func TestReadActiveOrderFiringsWithoutAnActiveLogReadsNoArchive(t *testing.T) {
+	now := time.Date(2026, 11, 3, 23, 0, 0, 0, time.UTC)
+	cityPath, _ := orderFiringTestCity(t)
+	writeOrderFiringArchive(t, cityPath, "20261103T120922Z", 1, 100,
+		orderFiringEventLine(50, events.OrderFired, "archived", now.Add(-time.Hour)))
+
+	got, err := readActiveOrderFirings(filepath.Join(cityPath, ".gc", "events.jsonl"))
+	if err != nil {
+		t.Fatalf("readActiveOrderFirings: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("got %+v, want no events: there is no active log", got)
 	}
 }
 

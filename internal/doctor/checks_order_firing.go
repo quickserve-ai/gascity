@@ -237,7 +237,11 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext) *CheckResult {
 		if fired, err := c.readActiveFirings(eventPath); err != nil {
 			result.Details = append(result.Details, fmt.Sprintf("active event log unreadable past its tail (%v); the order-run store answered instead", err))
 		} else {
-			evidence, activeWhole = fired, true
+			// The tail is kept beside the reread: a rotation between the two
+			// reads leaves the reread a young log, and the firings the tail
+			// already saw are then in a file neither read covers.
+			evidence = append(append(make([]events.Event, 0, len(fired)+len(firedEvents)), fired...), firedEvents...)
+			activeWhole = true
 			pending = c.pendingLastRunOrders(allOrders, evidence, suspendedRigs, cronIntervals, now)
 		}
 	}
@@ -667,30 +671,23 @@ func (c *OrderFiringCurrentCheck) readActiveFirings(path string) ([]events.Event
 }
 
 // readActiveOrderFirings returns the newest order.fired event per subject in
-// the active log at path, reading no archive. The walk skips every line that
-// does not name order.fired before decoding it, so the cost is one pass over
-// the file plus a decode per firing; on the 69 MB / 50k-line log of 2026-11-03
-// with 7,773 firings it is well under a second, where a full decode of every
-// line (ga-klv's 36 s) or a store round-trip per order is not.
+// the active log at path, reading no archive (events.ReadActiveTypes). Lines
+// that do not name order.fired are skipped before decoding, so the cost is one
+// pass over the file plus a decode per firing; on the 72 MB / 50k-line log of
+// 2026-11-03 with 7.8k firings it took about 0.3 s, where a full decode of
+// every line (ga-klv's 36 s) or a store round-trip per order does not fit the
+// budget. The firings are held until folded, so memory follows the active
+// log's firing count, which rotation bounds.
 func readActiveOrderFirings(path string) ([]events.Event, error) {
-	newest := make(map[string]events.Event)
-	read := false
-	err := events.WalkFilteredTypesNewestFirst(path, events.Filter{}, []string{events.OrderFired}, func(evts []events.Event, _ time.Time) bool {
-		// The walk hands over the active log first and stops when told to,
-		// before any archive is opened.
-		read = true
-		for _, e := range evts {
-			if cur, ok := newest[e.Subject]; !ok || e.Ts.After(cur.Ts) {
-				newest[e.Subject] = e
-			}
-		}
-		return false
-	})
+	fired, err := events.ReadActiveTypes(path, []string{events.OrderFired})
 	if err != nil {
 		return nil, err
 	}
-	if !read {
-		return nil, nil
+	newest := make(map[string]events.Event)
+	for _, e := range fired {
+		if cur, ok := newest[e.Subject]; !ok || e.Ts.After(cur.Ts) {
+			newest[e.Subject] = e
+		}
 	}
 	out := make([]events.Event, 0, len(newest))
 	for _, e := range newest {
