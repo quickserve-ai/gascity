@@ -429,6 +429,9 @@ type NativeDoltStore struct {
 	// the scope was provisioned without gc's type vocabulary. Listings then
 	// filter type Go-side only, for the store's lifetime.
 	typePushdownOff atomic.Bool
+	// statusPushdownOff latches when the backend refused the pushed
+	// not-closed status set (disableStatusPushdown).
+	statusPushdownOff atomic.Bool
 
 	// logger receives the list pushdown's diagnostics. Nil is slog.Default(),
 	// read at call time.

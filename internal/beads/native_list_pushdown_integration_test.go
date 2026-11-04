@@ -291,10 +291,11 @@ func TestNativeDoltStoreListNotClosedPushdownAgainstRealStorage(t *testing.T) {
 		t.Fatalf("List(all) = %d rows, want the %d seeded", len(all), seeded)
 	}
 	for _, query := range []ListQuery{
-		{AllowScan: true, TierMode: TierBoth},
-		{AllowScan: true, TierMode: TierBoth, Live: true},
-		{AllowScan: true, TierMode: TierIssues},
-		{AllowScan: true, TierMode: TierWisps},
+		// the opted-in shape (the order dispatcher's fold) on every tier
+		{AllowScan: true, TierMode: TierBoth, PushNotClosed: true},
+		{AllowScan: true, TierMode: TierBoth, Live: true, PushNotClosed: true},
+		{AllowScan: true, TierMode: TierIssues, PushNotClosed: true},
+		{AllowScan: true, TierMode: TierWisps, PushNotClosed: true},
 		{Label: "seed", TierMode: TierBoth},
 	} {
 		got, err := store.List(query)

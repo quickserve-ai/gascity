@@ -1403,9 +1403,17 @@ func (idx *orderDispatchTrackingIndex) entriesForStore(store beads.Store, storeK
 	// that used to be invisible to the first gate now suppresses it. Wider is the
 	// safe direction for single-flight: it can only ever suppress a dispatch that
 	// already had work in flight.
+	//
+	// PushNotClosed (ga-tyf38i, the mayor's opt-in ruling 2026-11-04): on a
+	// native store this read sends the not-closed status set as a WHERE, so a
+	// shared hub answers the open corpus instead of every closed row. It may
+	// hide a row whose status is outside the store's vocabulary; the fold only
+	// counts order-run records (orders.IsRunRecord below), which gc writes in
+	// built-in statuses, so such a row was never one it counts.
 	items, err := beads.HandlesFor(store).Live.List(beads.ListQuery{
-		AllowScan: true,
-		TierMode:  beads.TierBoth,
+		AllowScan:     true,
+		TierMode:      beads.TierBoth,
+		PushNotClosed: true,
 	})
 	if err != nil {
 		wrapped := fmt.Errorf("listing order-run beads: %w", err)

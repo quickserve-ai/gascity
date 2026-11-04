@@ -159,7 +159,11 @@ func (s *NativeDoltStore) List(query ListQuery) ([]Bead, error) {
 	if s.typePushdownOff.Load() {
 		pushable = nil
 	}
-	plan := nativeListPlan(query, pushable, s.listNotClosedStatus)
+	notClosed := s.listNotClosedStatus
+	if s.statusPushdownOff.Load() {
+		notClosed = ""
+	}
+	plan := nativeListPlan(query, pushable, notClosed)
 	s.noteUnkeyedPlan(query, plan)
 	var (
 		out   []Bead
@@ -235,6 +239,19 @@ func (s *NativeDoltStore) List(query ListQuery) ([]Bead, error) {
 func (s *NativeDoltStore) listPlanRequest(ctx context.Context, reader issueops.Reader, req issueops.ListRequest, tally *nativeListTally) (issueops.IssuePage, error) {
 	page, err := reader.List(ctx, req)
 	tally.noteRequest(req, len(page.Items))
+	if err != nil && s.listNotClosedStatus != "" && req.Status == s.listNotClosedStatus && nativeListStatusRefused(err) {
+		// The backend refused the not-closed set (a name its vocabulary no
+		// longer holds): answer this listing unpushed, as before the
+		// pushdown, and latch the pushdown off for this store.
+		req.Status = ""
+		retried, retryErr := reader.List(ctx, req)
+		tally.noteRequest(req, len(retried.Items))
+		if retryErr != nil {
+			return issueops.IssuePage{}, errors.Join(err, retryErr)
+		}
+		s.disableStatusPushdown(err)
+		return retried, nil
+	}
 	if err == nil || req.IssueType == "" || !nativeListTypeRefused(err) {
 		return page, err
 	}
@@ -721,14 +738,15 @@ func nativeListRequestFromListQuery(query ListQuery, pushableTypes map[string]bo
 	}
 	if nativeListPushableStatus(query.Status) {
 		req.Status = query.Status
-	} else if query.Status == "" && !query.IncludeClosed && !query.CompleteActive && notClosed != "" {
+	} else if query.PushNotClosed && query.Status == "" && !query.IncludeClosed && !query.CompleteActive && notClosed != "" {
 		// The not-closed default: every status of the scope's vocabulary but
 		// closed, as the request's OR set (nativeListNotClosedStatusFor). It
 		// replaces the status exclusions AllFlag lifted, and names pinned and
 		// hooked so the pinned-flag predicate stays lifted too. Rows outside
 		// the set are exactly the closed ones, which ApplyListQuery drops.
-		// Never on a CompleteActive read: there a status the vocabulary missed
-		// would not just hide rows, the cache would evict them as closed.
+		// Only when the caller opted in (PushNotClosed), and never on a
+		// CompleteActive read: there a status the vocabulary missed would not
+		// just hide rows, the cache would evict them as closed.
 		req.Status = notClosed
 	}
 	if pushableTypes[query.Type] {
