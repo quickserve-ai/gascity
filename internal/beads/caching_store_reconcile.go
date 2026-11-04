@@ -60,7 +60,7 @@ var recordCacheScanLarge = telemetry.RecordCacheScanLarge
 //     design; closed history grows without bound and would multiply the
 //     per-cycle bd payload without changing the diff result.
 func cacheFullScanQuery() ListQuery {
-	return ListQuery{AllowScan: true, SkipLabels: true, IncludeClosed: false, TierMode: TierBoth}
+	return ListQuery{AllowScan: true, SkipLabels: true, IncludeClosed: false, TierMode: TierBoth, CompleteActive: true}
 }
 
 func (c *CachingStore) reconcileLoop(ctx context.Context, stagger time.Duration) {
