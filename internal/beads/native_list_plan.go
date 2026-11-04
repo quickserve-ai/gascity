@@ -475,6 +475,26 @@ func (s *NativeDoltStore) disableTypePushdown(issueType string, err error) {
 		"prefix", s.idPrefix, "issue_type", issueType, "err", err)
 }
 
+// disableStatusPushdown latches the not-closed pushdown off for this store
+// after the backend refused the pushed status set and answered the same
+// request without it, and warns once naming the store and the set: answers
+// stay exact (closed rows are dropped Go-side), the opted-in listing just
+// reads the whole ledger again until the process restarts.
+func (s *NativeDoltStore) disableStatusPushdown(err error) {
+	if !s.statusPushdownOff.CompareAndSwap(false, true) {
+		return
+	}
+	s.listLogger().Warn("native bead store: backend refused the pushed not-closed status set; listing without it for this store until restart (a status.custom name the scope no longer accepts)",
+		"prefix", s.idPrefix, "status_set", s.listNotClosedStatus, "err", err)
+}
+
+// nativeListStatusRefused reports whether err is the backend refusing a
+// pushed status name: the wire's validation problem, or an unknown-status
+// message from the local filter builder.
+func nativeListStatusRefused(err error) bool {
+	return errors.Is(err, issueops.ErrValidation) || strings.Contains(err.Error(), "invalid status")
+}
+
 // noteUnkeyedPlan is the whole-ledger tripwire: a plan request that carries no
 // narrowing predicate pages through every row, and is logged at debug with
 // the query that asked for it. ListRequestStats counts it. The query is
