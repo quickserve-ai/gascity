@@ -82,6 +82,10 @@ func TestNativeListPlanPushesTheNotClosedSetOnlyForTheDefault(t *testing.T) {
 		{"a Live open stays raw", ListQuery{Status: "open", AllowScan: true, Live: true}, set, "open"},
 		{"an exact status stays exact", ListQuery{Status: "in_progress"}, set, "in_progress"},
 		{"no set, no push", ListQuery{AllowScan: true}, "", ""},
+		// The cache evicts what its full scan does not return as closed, so a
+		// status the set missed must never be narrowed out of that scan.
+		{"the cache's full scan is never narrowed", cacheFullScanQuery(), set, ""},
+		{"a CompleteActive read is never narrowed", ListQuery{AllowScan: true, TierMode: TierBoth, Live: true, CompleteActive: true}, set, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			for i, req := range nativeListPlan(tc.query, nativeListDefaultPushableTypes, tc.notClosed) {

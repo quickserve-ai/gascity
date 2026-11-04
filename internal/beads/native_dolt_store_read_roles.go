@@ -787,12 +787,14 @@ func nativeListRequestFromListQuery(query ListQuery, pushableTypes map[string]bo
 	}
 	if nativeListPushableStatus(query.Status) || nativeListPushesRawOpen(query) {
 		req.Status = query.Status
-	} else if query.Status == "" && !query.IncludeClosed && notClosed != "" {
+	} else if query.Status == "" && !query.IncludeClosed && !query.CompleteActive && notClosed != "" {
 		// The not-closed default: every status of the scope's vocabulary but
 		// closed, as the request's OR set (nativeListNotClosedStatusFor). It
 		// replaces the status exclusions AllFlag lifted, and names pinned and
 		// hooked so the pinned-flag predicate stays lifted too. Rows outside
 		// the set are exactly the closed ones, which ApplyListQuery drops.
+		// Never on a CompleteActive read: there a status the vocabulary missed
+		// would not just hide rows, the cache would evict them as closed.
 		req.Status = notClosed
 	}
 	if pushableTypes[query.Type] {

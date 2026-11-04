@@ -131,6 +131,14 @@ type ListQuery struct {
 	// caller does not need labels for change detection. Stores that cannot
 	// omit labels may ignore it.
 	SkipLabels bool
+	// CompleteActive marks a read whose caller takes the answer as the whole
+	// active (non-closed) universe and treats a bead it holds that is absent
+	// from the answer as closed: the cache's full scan (cacheFullScanQuery).
+	// A backing store must not narrow such a read by a status vocabulary it
+	// derived itself (NativeDoltStore's not-closed pushdown): a status missing
+	// from that vocabulary would hide its rows, and the cache would then evict
+	// them as closes. Other stores ignore it.
+	CompleteActive bool
 	// Live bypasses CachingStore and reads from the backing store. Use it only
 	// for lifecycle gates that must observe external mutations immediately.
 	// A Live Status "open" is the backing's own answer, which on a bd-backed
