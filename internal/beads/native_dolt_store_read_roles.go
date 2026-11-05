@@ -245,7 +245,11 @@ func (s *NativeDoltStore) listPlanRequest(ctx context.Context, reader issueops.R
 	page, err := reader.List(ctx, req)
 	tally.noteRequest(req, len(page.Items))
 	firstErr := err
+	// Each latch logs the refusal that dropped ITS predicate: when the type
+	// is refused first and the status second, firstErr names the type, and
+	// the status line must name the status (the mayor's condition 1).
 	var droppedStatus, droppedType string
+	var statusErr, typeErr error
 	for attempt := 0; err != nil && attempt < 2; attempt++ {
 		statusPushed := notClosed != "" && req.Status == notClosed
 		dropStatus := statusPushed && nativeListStatusRefused(err)
@@ -261,10 +265,10 @@ func (s *NativeDoltStore) listPlanRequest(ctx context.Context, reader issueops.R
 			break
 		}
 		if dropStatus {
-			droppedStatus, req.Status = req.Status, ""
+			droppedStatus, req.Status, statusErr = req.Status, "", err
 		}
 		if dropType {
-			droppedType, req.IssueType = req.IssueType, ""
+			droppedType, req.IssueType, typeErr = req.IssueType, "", err
 		}
 		var retried issueops.IssuePage
 		retried, err = reader.List(ctx, req)
@@ -280,10 +284,10 @@ func (s *NativeDoltStore) listPlanRequest(ctx context.Context, reader issueops.R
 		return page, err
 	}
 	if droppedStatus != "" {
-		s.disableStatusPushdown(droppedStatus, firstErr)
+		s.disableStatusPushdown(droppedStatus, statusErr)
 	}
 	if droppedType != "" {
-		s.disableTypePushdown(droppedType, firstErr)
+		s.disableTypePushdown(droppedType, typeErr)
 	}
 	return page, nil
 }
