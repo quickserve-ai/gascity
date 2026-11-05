@@ -342,18 +342,23 @@ func TestTheNotClosedAndTypeFallbacksCompose(t *testing.T) {
 		wantSent                   []string
 		wantIDs                    []string
 		wantStatusOff, wantTypeOff bool
+		// wantStatusLine is what the status latch's one line must carry
+		// ("" when that latch must not fire).
+		wantStatusLine string
 	}{
 		// The status set stays pushed, so the out-of-vocabulary row is the
 		// documented residue: only the in-vocabulary row comes back.
-		{"the type refused by name", "", `invalid issue type "task"`, []string{set + "|task", set + "|"}, []string{"gc-open"}, false, true},
-		{"a refusal that names neither drops both", "", "", []string{set + "|task", "|"}, []string{"gc-drift", "gc-open"}, true, true},
-		{"both refused, one after the other", "open", `invalid issue type "task"`, []string{set + "|task", set + "|", "|"}, []string{"gc-drift", "gc-open"}, true, true},
+		{"the type refused by name", "", `invalid issue type "task"`, []string{set + "|task", set + "|"}, []string{"gc-open"}, false, true, ""},
+		{"a refusal that names neither drops both", "", "", []string{set + "|task", "|"}, []string{"gc-drift", "gc-open"}, true, true, "refused_status=\"\""},
+		{"both refused, one after the other", "open", `invalid issue type "task"`, []string{set + "|task", set + "|", "|"}, []string{"gc-drift", "gc-open"}, true, true, "refused_status=open"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var sent []string
 			reader := typedVocabularyReader(outOfVocabularyRows(), tc.refuseStatus, true, tc.typeMsg, &sent)
 			store := newNativeDoltStoreWithStorage(statusSettingStorage{nativeDoltReaderSpy: reader}, "native-test")
 			store.listPushableTypes = map[string]bool{"task": true}
+			var logs syncBuffer
+			store.logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
 			got, err := store.List(ListQuery{Type: "task", AllowScan: true, TierMode: TierBoth, Live: true, PushNotClosed: true})
 			if err != nil {
 				t.Fatalf("List = %v, want an answer, never an error", err)
@@ -367,6 +372,19 @@ func TestTheNotClosedAndTypeFallbacksCompose(t *testing.T) {
 			if store.statusPushdownOff.Load() != tc.wantStatusOff || store.typePushdownOff.Load() != tc.wantTypeOff {
 				t.Fatalf("latches status=%v type=%v, want status=%v type=%v",
 					store.statusPushdownOff.Load(), store.typePushdownOff.Load(), tc.wantStatusOff, tc.wantTypeOff)
+			}
+			var statusLines []string
+			for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+				if strings.Contains(line, "not-closed status set") {
+					statusLines = append(statusLines, line)
+				}
+			}
+			if tc.wantStatusLine == "" {
+				if len(statusLines) != 0 {
+					t.Fatalf("status latch logged %q, want no status line", statusLines)
+				}
+			} else if len(statusLines) != 1 || !strings.Contains(statusLines[0], tc.wantStatusLine) {
+				t.Fatalf("status latch lines = %q, want one carrying %q", statusLines, tc.wantStatusLine)
 			}
 		})
 	}
