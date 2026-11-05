@@ -340,11 +340,14 @@ func TestTheNotClosedAndTypeFallbacksCompose(t *testing.T) {
 		refuseStatus               string
 		typeMsg                    string
 		wantSent                   []string
+		wantIDs                    []string
 		wantStatusOff, wantTypeOff bool
 	}{
-		{"the type refused by name", "", `invalid issue type "task"`, []string{set + "|task", set + "|"}, false, true},
-		{"a refusal that names neither drops both", "", "", []string{set + "|task", "|"}, true, true},
-		{"both refused, one after the other", "open", `invalid issue type "task"`, []string{set + "|task", set + "|", "|"}, true, true},
+		// The status set stays pushed, so the out-of-vocabulary row is the
+		// documented residue: only the in-vocabulary row comes back.
+		{"the type refused by name", "", `invalid issue type "task"`, []string{set + "|task", set + "|"}, []string{"gc-open"}, false, true},
+		{"a refusal that names neither drops both", "", "", []string{set + "|task", "|"}, []string{"gc-drift", "gc-open"}, true, true},
+		{"both refused, one after the other", "open", `invalid issue type "task"`, []string{set + "|task", set + "|", "|"}, []string{"gc-drift", "gc-open"}, true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var sent []string
@@ -355,8 +358,8 @@ func TestTheNotClosedAndTypeFallbacksCompose(t *testing.T) {
 			if err != nil {
 				t.Fatalf("List = %v, want an answer, never an error", err)
 			}
-			if ids := listedIDs(got); !slices.Equal(ids, []string{"gc-drift", "gc-open"}) {
-				t.Fatalf("listing = %v, want every non-closed task", ids)
+			if ids := listedIDs(got); !slices.Equal(ids, tc.wantIDs) {
+				t.Fatalf("listing = %v, want %v", ids, tc.wantIDs)
 			}
 			if !slices.Equal(sent, tc.wantSent) {
 				t.Fatalf("sent %q, want %q", sent, tc.wantSent)
@@ -402,7 +405,7 @@ func TestARefusedNotClosedSetLogsOneLineNamingTheStatus(t *testing.T) {
 		return base.list(ctx, req)
 	}}
 	var logs syncBuffer
-	store := newNativeDoltStoreWithStorage(statusSettingStorage{nativeDoltReaderSpy: reader, value: "staged_ready,launched"}, "native-test")
+	store := newNativeDoltStoreWithStorageAndPrefix(statusSettingStorage{nativeDoltReaderSpy: reader, value: "staged_ready,launched"}, "native-test", "native-test")
 	store.logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	var wg sync.WaitGroup
 	for i := 0; i < 8; i++ {
