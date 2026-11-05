@@ -162,18 +162,27 @@ func (s *NativeDoltStore) List(query ListQuery) ([]Bead, error) {
 	if s.typePushdownOff.Load() {
 		pushable = nil
 	}
-	notClosed := s.listNotClosedStatus
-	if s.statusPushdownOff.Load() {
-		notClosed = ""
+	// Only an opted-in read pushes the not-closed set, and it reads the
+	// scope's status vocabulary afresh each time (readListNotClosedStatus),
+	// so a status.custom name added after the store opened is pushed too and
+	// its rows stay visible. An unreadable vocabulary pushes nothing.
+	optedIn := query.PushNotClosed && !query.CompleteActive && !s.statusPushdownOff.Load()
+	plan := nativeListPlan(query, pushable, "")
+	if !optedIn {
+		s.noteUnkeyedPlan(query, plan)
 	}
-	plan := nativeListPlan(query, pushable, notClosed)
-	s.noteUnkeyedPlan(query, plan)
 	var (
 		out   []Bead
 		tally nativeListTally
 	)
 	err := s.withReadRetry(func(ctx context.Context, storage beadslib.Storage) error {
 		tally = nativeListTally{}
+		notClosed := ""
+		if optedIn {
+			notClosed = s.readListNotClosedStatus(ctx, storage)
+			plan = nativeListPlan(query, pushable, notClosed)
+			s.noteUnkeyedPlan(query, plan)
+		}
 		reader, err := storage.IssueReader()
 		if err != nil {
 			return err
@@ -184,7 +193,7 @@ func (s *NativeDoltStore) List(query ListQuery) ([]Bead, error) {
 			if req.IssueType != "" && s.typePushdownOff.Load() {
 				req.IssueType = ""
 			}
-			page, err := s.listPlanRequest(ctx, reader, req, &tally)
+			page, err := s.listPlanRequest(ctx, reader, req, notClosed, &tally)
 			if err != nil {
 				return err
 			}
@@ -223,39 +232,60 @@ func (s *NativeDoltStore) List(query ListQuery) ([]Bead, error) {
 	return out, nil
 }
 
-// listPlanRequest sends one plan request. A pushed type the backend refuses is
-// sent again without it; type pushdown latches off only when that retry is
-// answered. A retry that fails too returns both errors joined: errors.Is still
-// finds the refusal, and withReadRetry classifies the retry's own failure, so
-// a connection lost on the retry reconnects. Both sends are counted.
-func (s *NativeDoltStore) listPlanRequest(ctx context.Context, reader issueops.Reader, req issueops.ListRequest, tally *nativeListTally) (issueops.IssuePage, error) {
+// listPlanRequest sends one plan request. A pushed predicate the backend
+// refuses (the not-closed set, notClosed, or a type) is dropped and the request
+// sent again; each dropped predicate latches off for the store only once a
+// retry is answered. The two compose: when the refusal names one predicate
+// only that one is dropped first, a refusal that names neither drops both, and
+// a second refusal on the retry drops what is left. A retry that still fails
+// returns the first error and the last joined: errors.Is still finds the
+// refusal, and withReadRetry classifies the retry's own failure, so a
+// connection lost on the retry reconnects. Every send is counted.
+func (s *NativeDoltStore) listPlanRequest(ctx context.Context, reader issueops.Reader, req issueops.ListRequest, notClosed string, tally *nativeListTally) (issueops.IssuePage, error) {
 	page, err := reader.List(ctx, req)
 	tally.noteRequest(req, len(page.Items))
-	if err != nil && s.listNotClosedStatus != "" && req.Status == s.listNotClosedStatus && nativeListStatusRefused(err) {
-		// The backend refused the not-closed set (a name its vocabulary no
-		// longer holds): answer this listing unpushed, as before the
-		// pushdown, and latch the pushdown off for this store.
-		req.Status = ""
-		retried, retryErr := reader.List(ctx, req)
-		tally.noteRequest(req, len(retried.Items))
-		if retryErr != nil {
-			return issueops.IssuePage{}, errors.Join(err, retryErr)
+	firstErr := err
+	var droppedStatus, droppedType string
+	for attempt := 0; err != nil && attempt < 2; attempt++ {
+		statusPushed := notClosed != "" && req.Status == notClosed
+		dropStatus := statusPushed && nativeListStatusRefused(err)
+		dropType := req.IssueType != "" && nativeListTypeRefused(err)
+		if dropStatus && dropType {
+			names := err.Error()
+			namesStatus, namesType := strings.Contains(names, "invalid status"), strings.Contains(names, "invalid issue type")
+			if namesStatus != namesType {
+				dropStatus, dropType = namesStatus, namesType
+			}
 		}
-		s.disableStatusPushdown(err)
-		return retried, nil
+		if !dropStatus && !dropType {
+			break
+		}
+		if dropStatus {
+			droppedStatus, req.Status = req.Status, ""
+		}
+		if dropType {
+			droppedType, req.IssueType = req.IssueType, ""
+		}
+		var retried issueops.IssuePage
+		retried, err = reader.List(ctx, req)
+		tally.noteRequest(req, len(retried.Items))
+		if err == nil {
+			page = retried
+		}
 	}
-	if err == nil || req.IssueType == "" || !nativeListTypeRefused(err) {
+	if err != nil {
+		if err != firstErr {
+			return issueops.IssuePage{}, errors.Join(firstErr, err)
+		}
 		return page, err
 	}
-	refusedType := req.IssueType
-	req.IssueType = ""
-	retried, retryErr := reader.List(ctx, req)
-	tally.noteRequest(req, len(retried.Items))
-	if retryErr != nil {
-		return issueops.IssuePage{}, errors.Join(err, retryErr)
+	if droppedStatus != "" {
+		s.disableStatusPushdown(droppedStatus, firstErr)
 	}
-	s.disableTypePushdown(refusedType, err)
-	return retried, nil
+	if droppedType != "" {
+		s.disableTypePushdown(droppedType, firstErr)
+	}
+	return page, nil
 }
 
 // sortBeadsNativeListDefaultOrder sorts items into the reader role's default
