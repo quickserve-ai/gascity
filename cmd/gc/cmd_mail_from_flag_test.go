@@ -85,14 +85,26 @@ func TestCmdHandoff_FromNamesTargetSender(t *testing.T) {
 			t.Fatalf("Create %s: %v", alias, err)
 		}
 	}
-	t.Setenv("GC_ALIAS", "sender")
-
 	var stdout, stderr bytes.Buffer
+	// An identity-less caller (a terminal, a script) may name any sender.
 	if code := cmdHandoffRemoteFrom([]string{"context cycle"}, "recipient", "human", false, &stdout, &stderr); code != 0 {
-		t.Fatalf("handoff --target --from human = %d; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+		t.Fatalf("identity-less handoff --target --from human = %d; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
 	if stored := mailSendTestFindMessage(t, cityPath); stored.From != "human" {
 		t.Fatalf("From = %q, want human", stored.From)
+	}
+
+	// A live seat may claim only its own identity, as on a send or reply
+	// (ga-7lmivm.1): claiming the operator or an order is refused.
+	t.Setenv("GC_ALIAS", "sender")
+	for _, from := range []string{"human", "order:city/town-claude-inbox"} {
+		stderr.Reset()
+		if code := cmdHandoffRemoteFrom([]string{"forged " + from}, "recipient", from, false, &stdout, &stderr); code == 0 {
+			t.Fatalf("seat handoff --from %s = 0, want a refusal; stdout=%s", from, stdout.String())
+		}
+		if !strings.Contains(stderr.String(), "does not match this session's own identity") {
+			t.Fatalf("seat handoff --from %s: stderr = %q, want the identity refusal", from, stderr.String())
+		}
 	}
 
 	stderr.Reset()
