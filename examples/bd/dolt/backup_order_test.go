@@ -25,6 +25,7 @@ import (
 //	FAKE_CONFIGURED_DBS      databases that already have a backup destination
 //	FAKE_STATUS_FAIL_DBS     databases whose backup status fails
 //	FAKE_INIT_FAIL_DBS       databases whose backup init fails
+//	FAKE_BACKUP_URL          backup_url in backup status (default: the artifact dir)
 //	FAKE_FAILURE_DETAIL      text appended to the unreachable, status, and init errors
 //	FAKE_SYNC_FAIL_UNTIL     fail each database's first N syncs (default 0)
 //	FAKE_SYNC_STDERR         stderr line a failing sync prints (default: a closed connection)
@@ -88,7 +89,9 @@ case "${1:-} ${2:-}" in
         configured=false
         case " ${FAKE_CONFIGURED_DBS:-} " in *" $db "*) configured=true ;; esac
         [ -f "$state/$db.configured" ] && configured=true
-        printf '{"backup":{},"dolt":{"configured":%%s}}\n' "$configured"
+        url="${FAKE_BACKUP_URL:-file://${GC_BACKUP_ARTIFACT_DIR:-$GC_CITY_PATH/.dolt-backup}/$db}"
+        [ -s "$state/$db.configured" ] && url="$(cat "$state/$db.configured")"
+        printf '{"backup":{},"dolt":{"configured":%%s,"backup_url":"%%s"}}\n' "$configured" "$url"
         ;;
       init)
         case " ${FAKE_INIT_FAIL_DBS:-} " in
