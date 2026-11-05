@@ -1406,10 +1406,13 @@ func (idx *orderDispatchTrackingIndex) entriesForStore(store beads.Store, storeK
 	//
 	// PushNotClosed (ga-tyf38i, the mayor's opt-in ruling 2026-11-04): on a
 	// native store this read sends the not-closed status set as a WHERE, so a
-	// shared hub answers the open corpus instead of every closed row. It may
-	// hide a row whose status is outside the store's vocabulary; the fold only
-	// counts order-run records (orders.IsRunRecord below), which gc writes in
-	// built-in statuses, so such a row was never one it counts.
+	// shared hub answers the open corpus instead of every closed row. The set
+	// is the scope's built-ins plus its CURRENT status.custom, read afresh on
+	// every such listing, so a run root an agent moved into any status the
+	// scope accepts is still seen. What it can hide: a row whose status is in
+	// no current status.custom (a name removed while rows still carry it, or
+	// one kept only in config.yaml); such a run would be missed and its order
+	// could dispatch again. That residue closes with ExcludeStatus (beads #7647).
 	items, err := beads.HandlesFor(store).Live.List(beads.ListQuery{
 		AllowScan:     true,
 		TierMode:      beads.TierBoth,

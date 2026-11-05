@@ -1,11 +1,14 @@
 package beads
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	beadslib "github.com/steveyegge/beads"
@@ -18,10 +21,17 @@ type statusSettingStorage struct {
 	*nativeDoltReaderSpy
 	value string
 	err   error
+	// live, when set, is read on every WorkspaceConfig call instead of
+	// value: an operator changing status.custom while the store is open.
+	live *string
 }
 
 func (s statusSettingStorage) WorkspaceConfig() (issueops.WorkspaceConfig, error) {
-	return statusSettingConfig{infraSettingConfig: infraSettingConfig{}, value: s.value, err: s.err}, nil
+	value := s.value
+	if s.live != nil {
+		value = *s.live
+	}
+	return statusSettingConfig{infraSettingConfig: infraSettingConfig{}, value: value, err: s.err}, nil
 }
 
 type statusSettingConfig struct {
@@ -242,5 +252,176 @@ func TestARefusedNotClosedSetFallsBackAndLatchesOff(t *testing.T) {
 	}
 	if !slices.Equal(sent, []string{""}) {
 		t.Fatalf("after the latch the opted-in listing sent %q, want nothing pushed", sent)
+	}
+}
+
+// The mayor's condition 2(b), the opt-in path: a status the vocabulary read at
+// open does not hold, added to status.custom while the store is open, is in
+// the set the next opted-in listing pushes, so its row (a workflow root an
+// agent moved into it, say) is still seen by the order dispatcher's fold. Red
+// when the opted-in listing pushes the set cached at open.
+func TestAnOptedInListingSeesAStatusAddedAfterOpen(t *testing.T) {
+	var sent []string
+	setting := ""
+	rows := []*beadslib.Issue{
+		{ID: "gc-open", Title: "o", Status: beadslib.StatusOpen, IssueType: "task"},
+		{ID: "gc-review", Title: "r", Status: beadslib.Status("review"), IssueType: "task"},
+		{ID: "gc-done", Title: "c", Status: beadslib.StatusClosed, IssueType: "task"},
+	}
+	store := newNativeDoltStoreWithStorage(statusSettingStorage{nativeDoltReaderSpy: vocabularyReader(rows, "", &sent), live: &setting}, "native-test")
+	store.loadListNotClosedStatus(context.Background())
+	if store.listNotClosedStatus != builtinNotClosed {
+		t.Fatalf("set at open = %q, want the built-ins only", store.listNotClosedStatus)
+	}
+	setting = "review" // the operator adds the status after open
+	got, err := store.List(ListQuery{AllowScan: true, TierMode: TierBoth, Live: true, PushNotClosed: true})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if ids := listedIDs(got); !slices.Equal(ids, []string{"gc-open", "gc-review"}) {
+		t.Fatalf("opted-in listing = %v, want the open row and the row in the status added after open", ids)
+	}
+	if want := builtinNotClosed + ",review"; !slices.Equal(sent, []string{want}) {
+		t.Fatalf("sent %q, want the set read afresh (%q)", sent, want)
+	}
+}
+
+// An opted-in listing whose vocabulary cannot be read pushes nothing: the full
+// read, never a guessed set.
+func TestAnOptedInListingWithAnUnreadableVocabularyReadsUnpushed(t *testing.T) {
+	var sent []string
+	store := newNativeDoltStoreWithStorage(statusSettingStorage{nativeDoltReaderSpy: vocabularyReader(outOfVocabularyRows(), "", &sent), err: errors.New("config read failed")}, "native-test")
+	got, err := store.List(ListQuery{AllowScan: true, TierMode: TierBoth, Live: true, PushNotClosed: true})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if ids := listedIDs(got); !slices.Equal(ids, []string{"gc-drift", "gc-open"}) {
+		t.Fatalf("listing = %v, want every non-closed row", ids)
+	}
+	if !slices.Equal(sent, []string{""}) {
+		t.Fatalf("sent %q, want nothing pushed", sent)
+	}
+}
+
+// typedVocabularyReader is vocabularyReader that also refuses a pushed type:
+// with typeMsg when it is set, else with a bare validation error that names
+// neither predicate.
+func typedVocabularyReader(rows []*beadslib.Issue, refuseStatus string, refuseType bool, typeMsg string, sent *[]string) *nativeDoltReaderSpy {
+	return &nativeDoltReaderSpy{
+		list: func(_ context.Context, req issueops.ListRequest) (issueops.IssuePage, error) {
+			*sent = append(*sent, req.Status+"|"+req.IssueType)
+			if refuseType && req.IssueType != "" {
+				if typeMsg == "" {
+					return issueops.IssuePage{}, fmt.Errorf("listIssues: %w", issueops.ErrValidation)
+				}
+				return issueops.IssuePage{}, fmt.Errorf("listIssues: %w: %s", issueops.ErrValidation, typeMsg)
+			}
+			if refuseStatus != "" && slices.Contains(strings.Split(req.Status, ","), refuseStatus) {
+				return issueops.IssuePage{}, fmt.Errorf("listIssues: %w: invalid status %q", issueops.ErrValidation, refuseStatus)
+			}
+			var page issueops.IssuePage
+			for _, r := range rows {
+				if req.Status == "" || slices.Contains(strings.Split(req.Status, ","), string(r.Status)) {
+					page.Items = append(page.Items, &issueops.IssueWithCounts{Issue: r})
+				}
+			}
+			return page, nil
+		},
+	}
+}
+
+// The two fallbacks compose (both reads' finding on round 1): an opted-in
+// listing that also pushes a type the backend refuses is answered, never an
+// error until restart, and only the predicate the refusal names latches off.
+func TestTheNotClosedAndTypeFallbacksCompose(t *testing.T) {
+	set := builtinNotClosed
+	for _, tc := range []struct {
+		name                       string
+		refuseStatus               string
+		typeMsg                    string
+		wantSent                   []string
+		wantStatusOff, wantTypeOff bool
+	}{
+		{"the type refused by name", "", `invalid issue type "task"`, []string{set + "|task", set + "|"}, false, true},
+		{"a refusal that names neither drops both", "", "", []string{set + "|task", "|"}, true, true},
+		{"both refused, one after the other", "open", `invalid issue type "task"`, []string{set + "|task", set + "|", "|"}, true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var sent []string
+			reader := typedVocabularyReader(outOfVocabularyRows(), tc.refuseStatus, true, tc.typeMsg, &sent)
+			store := newNativeDoltStoreWithStorage(statusSettingStorage{nativeDoltReaderSpy: reader}, "native-test")
+			store.listPushableTypes = map[string]bool{"task": true}
+			got, err := store.List(ListQuery{Type: "task", AllowScan: true, TierMode: TierBoth, Live: true, PushNotClosed: true})
+			if err != nil {
+				t.Fatalf("List = %v, want an answer, never an error", err)
+			}
+			if ids := listedIDs(got); !slices.Equal(ids, []string{"gc-drift", "gc-open"}) {
+				t.Fatalf("listing = %v, want every non-closed task", ids)
+			}
+			if !slices.Equal(sent, tc.wantSent) {
+				t.Fatalf("sent %q, want %q", sent, tc.wantSent)
+			}
+			if store.statusPushdownOff.Load() != tc.wantStatusOff || store.typePushdownOff.Load() != tc.wantTypeOff {
+				t.Fatalf("latches status=%v type=%v, want status=%v type=%v",
+					store.statusPushdownOff.Load(), store.typePushdownOff.Load(), tc.wantStatusOff, tc.wantTypeOff)
+			}
+		})
+	}
+}
+
+// syncBuffer is a bytes.Buffer safe for concurrent log writes.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (w *syncBuffer) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.b.Write(p)
+}
+
+func (w *syncBuffer) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.b.String()
+}
+
+// The mayor's condition 1: the latch logs ONE line naming the store and the
+// refused name, however many opted-in listings race into the refusal.
+func TestARefusedNotClosedSetLogsOneLineNamingTheStatus(t *testing.T) {
+	var (
+		mu   sync.Mutex
+		sent []string
+	)
+	base := vocabularyReader(outOfVocabularyRows(), "launched", &[]string{})
+	reader := &nativeDoltReaderSpy{list: func(ctx context.Context, req issueops.ListRequest) (issueops.IssuePage, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		sent = append(sent, req.Status)
+		return base.list(ctx, req)
+	}}
+	var logs syncBuffer
+	store := newNativeDoltStoreWithStorage(statusSettingStorage{nativeDoltReaderSpy: reader, value: "staged_ready,launched"}, "native-test")
+	store.logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := store.List(ListQuery{AllowScan: true, TierMode: TierBoth, Live: true, PushNotClosed: true}); err != nil {
+				t.Errorf("List: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	lines := strings.Split(strings.TrimSpace(logs.String()), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("latch logged %d lines, want exactly one:\n%s", len(lines), logs.String())
+	}
+	for _, want := range []string{"prefix=native-test", "refused_status=launched"} {
+		if !strings.Contains(lines[0], want) {
+			t.Fatalf("latch line %q does not carry %q", lines[0], want)
+		}
 	}
 }

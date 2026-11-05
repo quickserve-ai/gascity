@@ -254,33 +254,62 @@ func nativeListStatusNameOK(name string) bool {
 	return true
 }
 
-// loadListNotClosedStatus sets the store's not-closed status set from its
-// scope's status.custom setting, read through the workspace-config role as
-// loadListPushableTypes reads types.infra. It runs once, at open: a custom
-// status an operator adds later is not in the set of a store already open, and
-// its rows are hidden from that store's no-Status listings until the process
-// restarts. A setting that cannot be read or parsed leaves the set empty, and
-// the store then pushes no not-closed predicate (the full read it always made).
+// loadListNotClosedStatus records the store's not-closed status set from its
+// scope's status.custom setting at open, read through the workspace-config
+// role as loadListPushableTypes reads types.infra, and warns once if it cannot
+// be read. Opted-in listings do not use this copy: each reads the setting
+// afresh (readListNotClosedStatus), so a custom status added after open is
+// pushed by the next one.
+//
+// WHAT STAYS HIDDEN from an opted-in listing until ExcludeStatus (beads
+// #7647) lets the pushdown say "not closed" directly: a row whose status is in
+// no current status.custom, either a name since removed from the setting
+// while rows still carry it, or one kept only in a server's config.yaml.
 //
 // THE SAME RESIDUE as types.infra: a status.custom kept only in a server's
 // config.yaml is invisible to the workspace-config role, so its statuses are
 // missing from the set; such a status must also be stored as the setting.
 func (s *NativeDoltStore) loadListNotClosedStatus(ctx context.Context) {
-	settings, err := s.storage.WorkspaceConfig()
+	set, err := notClosedStatusFromStorage(ctx, s.storage)
 	if err == nil {
-		var result issueops.SettingResult
-		result, err = settings.GetSetting(ctx, issueops.GetSettingRequest{Key: issueops.SettingKeyStatusCustom})
-		if err == nil {
-			set, ok := nativeListNotClosedStatusFor(result.Value)
-			if ok {
-				s.listNotClosedStatus = set
-				return
-			}
-			err = fmt.Errorf("status.custom %q does not parse as a status list", result.Value)
-		}
+		s.listNotClosedStatus = set
+		return
 	}
 	s.listLogger().Warn("native bead store: cannot read the scope's status.custom setting; listing without the not-closed pushdown for this store",
 		"prefix", s.idPrefix, "err", err)
+}
+
+// readListNotClosedStatus is the not-closed set for one opted-in read, read
+// afresh from storage's status.custom setting so a name added after open is
+// in it. An unreadable or unparsable setting pushes nothing ("") for this
+// read: the full read the listing always made.
+func (s *NativeDoltStore) readListNotClosedStatus(ctx context.Context, storage beadslib.Storage) string {
+	set, err := notClosedStatusFromStorage(ctx, storage)
+	if err != nil {
+		s.listLogger().Debug("native bead store: cannot read status.custom for an opted-in listing; reading it unpushed",
+			"prefix", s.idPrefix, "err", err)
+		return ""
+	}
+	return set
+}
+
+func notClosedStatusFromStorage(ctx context.Context, storage beadslib.Storage) (string, error) {
+	if storage == nil {
+		return "", fmt.Errorf("no storage")
+	}
+	settings, err := storage.WorkspaceConfig()
+	if err != nil {
+		return "", err
+	}
+	result, err := settings.GetSetting(ctx, issueops.GetSettingRequest{Key: issueops.SettingKeyStatusCustom})
+	if err != nil {
+		return "", err
+	}
+	set, ok := nativeListNotClosedStatusFor(result.Value)
+	if !ok {
+		return "", fmt.Errorf("status.custom %q does not parse as a status list", result.Value)
+	}
+	return set, nil
 }
 
 // nativeListTypeRefused reports whether err is the role refusing a pushed
@@ -469,12 +498,30 @@ func (s *NativeDoltStore) disableTypePushdown(issueType string, err error) {
 // request without it, and warns once naming the store and the set: answers
 // stay exact (closed rows are dropped Go-side), the opted-in listing just
 // reads the whole ledger again until the process restarts.
-func (s *NativeDoltStore) disableStatusPushdown(err error) {
+func (s *NativeDoltStore) disableStatusPushdown(set string, err error) {
 	if !s.statusPushdownOff.CompareAndSwap(false, true) {
 		return
 	}
 	s.listLogger().Warn("native bead store: backend refused the pushed not-closed status set; listing without it for this store until restart (a status.custom name the scope no longer accepts)",
-		"prefix", s.idPrefix, "status_set", s.listNotClosedStatus, "err", err)
+		"prefix", s.idPrefix, "refused_status", nativeListRefusedStatusName(err), "status_set", set, "err", err)
+}
+
+// nativeListRefusedStatusName is the status name a refusal quotes
+// (`invalid status "name"`), or "" when it quotes none.
+func nativeListRefusedStatusName(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	i := strings.Index(msg, `invalid status "`)
+	if i < 0 {
+		return ""
+	}
+	rest := msg[i+len(`invalid status "`):]
+	if j := strings.IndexByte(rest, '"'); j >= 0 {
+		return rest[:j]
+	}
+	return ""
 }
 
 // nativeListStatusRefused reports whether err is the backend refusing a

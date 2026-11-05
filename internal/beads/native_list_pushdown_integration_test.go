@@ -312,6 +312,30 @@ func TestNativeDoltStoreListNotClosedPushdownAgainstRealStorage(t *testing.T) {
 			}
 		}
 	}
+	// A status added to status.custom while the store is open (round 2 of
+	// ga-tyf38i): the next opted-in listing reads the vocabulary afresh and
+	// pushes it, so a row moved into it stays visible to the fold, without a
+	// reopen. The pinned FLAG needs no case here: naming pinned in the pushed
+	// set lifts the flag predicate (issueops.ListRequest.Status), as AllFlag
+	// does on the unpushed read.
+	if err := store.storage.SetConfig(ctx, "status.custom", "staged_ready:wip,launched,review"); err != nil {
+		t.Fatalf("add a custom status after open: %v", err)
+	}
+	late, err := store.Create(Bead{Title: "status review", Type: "task", Labels: []string{"seed"}})
+	if err != nil {
+		t.Fatalf("Create(review): %v", err)
+	}
+	review := "review"
+	if err := store.Update(late.ID, UpdateOpts{Status: &review}); err != nil {
+		t.Fatalf("Update(%s, review): %v", late.ID, err)
+	}
+	got, err := store.List(ListQuery{AllowScan: true, TierMode: TierBoth, PushNotClosed: true})
+	if err != nil {
+		t.Fatalf("List after the late status: %v", err)
+	}
+	if !slices.Contains(sortedBeadIDs(got), late.ID) {
+		t.Fatalf("opted-in listing after status.custom gained review lacks %s (status review)", late.ID)
+	}
 	// The only whole-ledger read is the test's own List(all): every no-Status
 	// listing above went out keyed by the not-closed set.
 	if stats := listRequestStatsForTest(t, store); stats.Unkeyed != 1 {

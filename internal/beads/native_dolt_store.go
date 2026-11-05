@@ -418,11 +418,11 @@ type NativeDoltStore struct {
 	// directly over a storage value.
 	listPushableTypes map[string]bool
 
-	// listNotClosedStatus is the scope's not-closed status set as the
-	// request's comma-separated Status OR set, read once at open from the
-	// scope's status.custom setting (loadListNotClosedStatus). Empty pushes
-	// no not-closed predicate: a store whose setting could not be read, one
-	// built directly over a storage value, or one whose setting did not parse.
+	// listNotClosedStatus is the scope's not-closed status set as read at
+	// open (loadListNotClosedStatus), kept for the open-time warning and
+	// tests. An opted-in listing does NOT push it: it reads the vocabulary
+	// afresh each time (readListNotClosedStatus), so a status added to
+	// status.custom later is pushed too.
 	listNotClosedStatus string
 
 	// typePushdownOff latches when the backend refused a pushed issue type:
