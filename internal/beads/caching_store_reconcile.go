@@ -6,7 +6,11 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"os"
 	"sort"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/clock"
@@ -127,13 +131,52 @@ func effectiveCadence(beadCount int, latencyDriverActive bool) time.Duration {
 	return bead
 }
 
+// CacheReconcileLargeIntervalEnv names the opt-in override, in milliseconds,
+// of the reconcile cadence for a store of 5000 or more beads. Unset, empty or
+// out of range keeps cacheReconcileIntervalLarge (120 s), today's behaviour.
+// A full reconcile of a large store on a shared server is the dominant steady
+// read it sees, so an operator may trade cache freshness for server load:
+// non-Live reads of such a store become up to this stale. Read on each
+// cadence decision, so a supervisor restart with the variable unset rolls it
+// back.
+const CacheReconcileLargeIntervalEnv = "GC_BEADS_CACHE_RECONCILE_LARGE_MS"
+
+// cacheReconcileLargeIntervalMax bounds the override: past it a cache is too
+// stale to serve dispatch.
+const cacheReconcileLargeIntervalMax = 15 * time.Minute
+
+var warnReconcileLargeOnce sync.Once
+
+// cacheReconcileLargeInterval is the large-store cadence: the override when
+// set to a whole number of milliseconds within [cacheReconcileIntervalLarge,
+// cacheReconcileLargeIntervalMax], else cacheReconcileIntervalLarge. A value
+// that does not qualify warns once and is ignored, never failing toward a
+// faster cadence than today's.
+func cacheReconcileLargeInterval() time.Duration {
+	raw := strings.TrimSpace(os.Getenv(CacheReconcileLargeIntervalEnv))
+	if raw == "" {
+		return cacheReconcileIntervalLarge
+	}
+	ms, err := strconv.ParseInt(raw, 10, 64)
+	d := time.Duration(ms) * time.Millisecond
+	if err != nil || d < cacheReconcileIntervalLarge || d > cacheReconcileLargeIntervalMax {
+		warnReconcileLargeOnce.Do(func() {
+			log.Printf("beads cache: ignoring %s=%q: want whole milliseconds in [%d, %d]; using %d",
+				CacheReconcileLargeIntervalEnv, raw, cacheReconcileIntervalLarge.Milliseconds(),
+				cacheReconcileLargeIntervalMax.Milliseconds(), cacheReconcileIntervalLarge.Milliseconds())
+		})
+		return cacheReconcileIntervalLarge
+	}
+	return d
+}
+
 // beadCountCadence returns the cadence demanded by the bead-count input
 // alone. Preserved from the original adaptiveIntervalLocked so the
 // classification stays in one place.
 func beadCountCadence(total int) time.Duration {
 	switch {
 	case total >= 5000:
-		return cacheReconcileIntervalLarge
+		return cacheReconcileLargeInterval()
 	case total >= 1000:
 		return cacheReconcileIntervalMedium
 	default:
