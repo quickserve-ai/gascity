@@ -111,11 +111,21 @@ echo "$STATE" | jq -e 'type == "object"' >/dev/null 2>&1 || STATE='{}'
 
 NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 NUDGED=0
+SKIPPED_WISPS=0
+LOOKED_UP=0
 while IFS= read -r blocker; do
     [ -n "$blocker" ] || continue
 
+    # A wisp is never a blocker, so its close has no dependents to find. Skip
+    # it before any store read: wisps are close to half of all closes, and
+    # each lookup costs a query on a store that may be a shared remote.
+    case "$blocker" in
+        *-wisp-*) SKIPPED_WISPS=$((SKIPPED_WISPS + 1)); continue ;;
+    esac
+
     set_rig_args "$blocker"
     [ -z "$RIG_SUSPENDED" ] || continue
+    LOOKED_UP=$((LOOKED_UP + 1))
     DEPS="$(gc bd dep list "$blocker" ${RIG_ARG1:+"$RIG_ARG1" "$RIG_ARG2"} \
             --direction=up --type=blocks --json 2>/dev/null)" || continue
     if [ -z "$DEPS" ] || [ "$DEPS" = "[]" ]; then continue; fi
@@ -159,6 +169,6 @@ TMP="$(mktemp "$PACK_STATE_DIR/.cascade-nudge-on-blocker-close-state.XXXXXX")"
 printf '%s\n' "$STATE" > "$TMP"
 mv -f "$TMP" "$STATE_FILE"
 
-if [ "$NUDGED" -gt 0 ]; then
-    echo "cascade-nudge-on-blocker-close: nudged $NUDGED dependent(s)"
+if [ "$NUDGED" -gt 0 ] || [ "$SKIPPED_WISPS" -gt 0 ]; then
+    echo "cascade-nudge-on-blocker-close: nudged $NUDGED dependent(s); looked up $LOOKED_UP blocker(s); skipped $SKIPPED_WISPS wisp(s) with no lookup"
 fi
