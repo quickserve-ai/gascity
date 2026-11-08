@@ -346,6 +346,13 @@ type ListRequestStats struct {
 	// Rows is the number of rows the backend returned across all requests,
 	// before any client-side filtering.
 	Rows int64
+	// GuardRuns is the number of not-closed guard probes run for opted-in listings.
+	GuardRuns int64
+	// GuardRows is the number of rows those probes found outside the pushed set.
+	GuardRows int64
+	// GuardFallbacks is the number of opted-in listings a probe sent down the
+	// full unpushed read, whether it found rows or failed.
+	GuardFallbacks int64
 }
 
 // listRequestCounter is implemented by a store that counts the backend listing
@@ -373,6 +380,10 @@ type nativeListCounters struct {
 	requests atomic.Int64
 	unkeyed  atomic.Int64
 	rows     atomic.Int64
+
+	guardRuns      atomic.Int64
+	guardRows      atomic.Int64
+	guardFallbacks atomic.Int64
 }
 
 func (c *nativeListCounters) noteList() { c.lists.Add(1) }
@@ -407,6 +418,10 @@ func (c *nativeListCounters) snapshot() ListRequestStats {
 		Requests: c.requests.Load(),
 		Unkeyed:  c.unkeyed.Load(),
 		Rows:     c.rows.Load(),
+
+		GuardRuns:      c.guardRuns.Load(),
+		GuardRows:      c.guardRows.Load(),
+		GuardFallbacks: c.guardFallbacks.Load(),
 	}
 }
 

@@ -433,6 +433,10 @@ type NativeDoltStore struct {
 	// not-closed status set (disableStatusPushdown).
 	statusPushdownOff atomic.Bool
 
+	// listOutsideProbe overrides the not-closed guard probe in tests; nil is
+	// nativeListOutsideRows.
+	listOutsideProbe nativeListOutsideProbe
+
 	// logger receives the list pushdown's diagnostics. Nil is slog.Default(),
 	// read at call time.
 	logger *slog.Logger

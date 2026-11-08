@@ -145,6 +145,7 @@ func TestNativeDoltStoreLoadsItsNotClosedSet(t *testing.T) {
 				},
 			}
 			store := newNativeDoltStoreWithStorage(statusSettingStorage{nativeDoltReaderSpy: spy, value: tc.setting, err: tc.err}, "native-test")
+			store.listOutsideProbe = noOutsideRows
 			store.loadListNotClosedStatus(context.Background())
 			if store.listNotClosedStatus != tc.want {
 				t.Fatalf("listNotClosedStatus = %q, want %q", store.listNotClosedStatus, tc.want)
@@ -227,6 +228,7 @@ func TestARefusedNotClosedSetFallsBackAndLatchesOff(t *testing.T) {
 	var sent []string
 	reader := vocabularyReader(outOfVocabularyRows(), "launched", &sent)
 	store := newNativeDoltStoreWithStorage(statusSettingStorage{nativeDoltReaderSpy: reader, value: "staged_ready,launched"}, "native-test")
+	store.listOutsideProbe = noOutsideRows
 	store.loadListNotClosedStatus(context.Background())
 	set := builtinNotClosed + ",staged_ready,launched"
 	if store.listNotClosedStatus != set {
@@ -269,6 +271,7 @@ func TestAnOptedInListingSeesAStatusAddedAfterOpen(t *testing.T) {
 		{ID: "gc-done", Title: "c", Status: beadslib.StatusClosed, IssueType: "task"},
 	}
 	store := newNativeDoltStoreWithStorage(statusSettingStorage{nativeDoltReaderSpy: vocabularyReader(rows, "", &sent), live: &setting}, "native-test")
+	store.listOutsideProbe = noOutsideRows
 	store.loadListNotClosedStatus(context.Background())
 	if store.listNotClosedStatus != builtinNotClosed {
 		t.Fatalf("set at open = %q, want the built-ins only", store.listNotClosedStatus)
@@ -356,6 +359,7 @@ func TestTheNotClosedAndTypeFallbacksCompose(t *testing.T) {
 			var sent []string
 			reader := typedVocabularyReader(outOfVocabularyRows(), tc.refuseStatus, true, tc.typeMsg, &sent)
 			store := newNativeDoltStoreWithStorage(statusSettingStorage{nativeDoltReaderSpy: reader}, "native-test")
+			store.listOutsideProbe = noOutsideRows
 			store.listPushableTypes = map[string]bool{"task": true}
 			var logs syncBuffer
 			store.logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
@@ -424,6 +428,7 @@ func TestARefusedNotClosedSetLogsOneLineNamingTheStatus(t *testing.T) {
 	}}
 	var logs syncBuffer
 	store := newNativeDoltStoreWithStorageAndPrefix(statusSettingStorage{nativeDoltReaderSpy: reader, value: "staged_ready,launched"}, "native-test", "native-test")
+	store.listOutsideProbe = noOutsideRows
 	store.logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	var wg sync.WaitGroup
 	for i := 0; i < 8; i++ {
