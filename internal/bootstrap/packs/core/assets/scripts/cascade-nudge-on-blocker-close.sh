@@ -5,8 +5,8 @@
 # <blocker>`), the owner of each dependent has no event-driven signal that
 # work can resume: they poll, get nudged by hand, or miss the unblock.
 #
-# This order subscribes to bead.closed events. For each closed bead it
-# resolves the dependents linked by a `blocks` dependency and nudges the
+# This order subscribes to bead.closed events. For each closed bead other than
+# a wisp it resolves the dependents linked by a `blocks` dependency and nudges the
 # assignee of every open or deferred dependent. Idempotent: a given
 # (blocker, dependent) pair is nudged at most once. Dedup state lives in
 # $GC_PACK_STATE_DIR/cascade-nudge-on-blocker-close-state.json, so it is
@@ -181,5 +181,6 @@ echo "cascade-nudge-on-blocker-close: $PASS_LINE"
 {
     printf '%s %s\n' "$NOW" "$PASS_LINE" >> "$PASS_LOG"
     PASS_TMP="$(mktemp "$PACK_STATE_DIR/.cascade-nudge-on-blocker-close-passes.XXXXXX")"
-    tail -n "$PASS_LOG_LINES" "$PASS_LOG" > "$PASS_TMP" && mv -f "$PASS_TMP" "$PASS_LOG"
+    tail -n "$PASS_LOG_LINES" "$PASS_LOG" > "$PASS_TMP" && mv -f "$PASS_TMP" "$PASS_LOG" \
+        || rm -f "$PASS_TMP"
 } 2>/dev/null || true
