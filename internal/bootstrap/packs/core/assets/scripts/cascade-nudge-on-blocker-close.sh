@@ -49,6 +49,10 @@ RETENTION="${GC_CASCADE_NUDGE_RETENTION:-1h}"
 
 PACK_STATE_DIR="${GC_PACK_STATE_DIR:-${GC_CITY_RUNTIME_DIR:-$CITY/.gc/runtime}/packs/core}"
 STATE_FILE="$PACK_STATE_DIR/cascade-nudge-on-blocker-close-state.json"
+# One line per pass that had closes to read. An order's stdout is kept only
+# when it fails, so the counts live here; bounded to PASS_LOG_LINES lines.
+PASS_LOG="$PACK_STATE_DIR/cascade-nudge-on-blocker-close-passes.log"
+PASS_LOG_LINES=2000
 mkdir -p "$PACK_STATE_DIR"
 
 # Convert a simple Go-style duration (Ns/Nm/Nh) to whole seconds.
@@ -116,9 +120,11 @@ LOOKED_UP=0
 while IFS= read -r blocker; do
     [ -n "$blocker" ] || continue
 
-    # A wisp is never a blocker, so its close has no dependents to find. Skip
-    # it before any store read: wisps are close to half of all closes, and
-    # each lookup costs a query on a store that may be a shared remote.
+    # Skip a wisp's close before any store read: wisps are close to half of
+    # all closes, and each lookup costs a query on a store that may be a
+    # shared remote. In practice no blocks edge targets a wisp, but gc can
+    # create one (a bead attached to a root-only vapor formula's wisp root),
+    # and that dependent gets no cascade nudge. An accepted trade (ga-ohwi67).
     case "$blocker" in
         *-wisp-*) SKIPPED_WISPS=$((SKIPPED_WISPS + 1)); continue ;;
     esac
@@ -169,6 +175,11 @@ TMP="$(mktemp "$PACK_STATE_DIR/.cascade-nudge-on-blocker-close-state.XXXXXX")"
 printf '%s\n' "$STATE" > "$TMP"
 mv -f "$TMP" "$STATE_FILE"
 
-if [ "$NUDGED" -gt 0 ] || [ "$SKIPPED_WISPS" -gt 0 ]; then
-    echo "cascade-nudge-on-blocker-close: nudged $NUDGED dependent(s); looked up $LOOKED_UP blocker(s); skipped $SKIPPED_WISPS wisp(s) with no lookup"
-fi
+PASS_LINE="looked_up=$LOOKED_UP skipped_wisps=$SKIPPED_WISPS nudged=$NUDGED"
+echo "cascade-nudge-on-blocker-close: $PASS_LINE"
+# Best-effort: a full disk must not fail the pass after its nudges went out.
+{
+    printf '%s %s\n' "$NOW" "$PASS_LINE" >> "$PASS_LOG"
+    PASS_TMP="$(mktemp "$PACK_STATE_DIR/.cascade-nudge-on-blocker-close-passes.XXXXXX")"
+    tail -n "$PASS_LOG_LINES" "$PASS_LOG" > "$PASS_TMP" && mv -f "$PASS_TMP" "$PASS_LOG"
+} 2>/dev/null || true

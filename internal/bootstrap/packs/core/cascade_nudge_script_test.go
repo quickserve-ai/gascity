@@ -88,10 +88,11 @@ exit 0
 }
 
 // TestCascadeNudgeSkipsWispClosesBeforeTheDepLookup pins the skip that keeps a
-// wisp's close from costing a store read: a wisp is never a blocker
-// (ga-ohwi67: 0 of 78,252 blocks rows name one), so no dep list runs for it,
-// while an ordinary close in the same run still nudges its dependent. The run
-// line reports the skip, so the saving can be read from the order's output.
+// wisp's close from costing a store read: no dep list runs for it, while an
+// ordinary close in the same run, and an id that only resembles a wisp's, are
+// still looked up. The trade is on ga-ohwi67: gc can create a blocks edge onto
+// a wisp root, and that dependent gets no cascade nudge. The pass's counts are
+// written to the state dir, because an order's stdout is kept only on failure.
 func TestCascadeNudgeSkipsWispClosesBeforeTheDepLookup(t *testing.T) {
 	if _, err := exec.LookPath("jq"); err != nil {
 		t.Skip("jq not available; cascade-nudge-on-blocker-close.sh requires it")
@@ -106,11 +107,13 @@ exit 0
 `)
 	events := `{"seq":7,"type":"bead.closed","subject":"qc-wisp-abc","payload":{"bead":{"id":"qc-wisp-abc","status":"closed"}}}
 {"seq":8,"type":"bead.closed","subject":"ga-blk","payload":{"bead":{"id":"ga-blk","status":"closed"}}}
+{"seq":9,"type":"bead.closed","subject":"ga-wispy","payload":{"bead":{"id":"ga-wispy","status":"closed"}}}
 `
 	if err := os.WriteFile(eventsPath, []byte(events), 0o644); err != nil {
 		t.Fatalf("write events: %v", err)
 	}
-	out, err := runCascadeNudge(t, binDir, filepath.Join(dir, "state"))
+	stateDir := filepath.Join(dir, "state")
+	out, err := runCascadeNudge(t, binDir, stateDir)
 	if err != nil {
 		t.Fatalf("cascade-nudge-on-blocker-close.sh failed: %v\n%s", err, out)
 	}
@@ -118,10 +121,14 @@ exit 0
 	if strings.Contains(logged, "qc-wisp-abc") {
 		t.Fatalf("a wisp close must make no store call at all; gc calls:\n%s", logged)
 	}
-	if !strings.Contains(logged, "dep list ga-blk") || got != 1 {
-		t.Fatalf("an ordinary close must still be looked up and nudge once (nudges = %d); gc calls:\n%s", got, logged)
+	if !strings.Contains(logged, "dep list ga-blk") || !strings.Contains(logged, "dep list ga-wispy") || got != 2 {
+		t.Fatalf("each ordinary close must still be looked up and nudge its dependent (nudges = %d, want 2); gc calls:\n%s", got, logged)
 	}
-	if !strings.Contains(out, "skipped 1 wisp") {
-		t.Fatalf("the run line must report the skip; output:\n%s", out)
+	passes, err := os.ReadFile(filepath.Join(stateDir, "cascade-nudge-on-blocker-close-passes.log"))
+	if err != nil {
+		t.Fatalf("read pass log: %v", err)
+	}
+	if want := "looked_up=2 skipped_wisps=1 nudged=2"; !strings.Contains(string(passes), want) {
+		t.Fatalf("the pass log must carry %q; got:\n%s", want, passes)
 	}
 }
