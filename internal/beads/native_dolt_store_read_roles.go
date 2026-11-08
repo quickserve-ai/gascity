@@ -179,7 +179,7 @@ func (s *NativeDoltStore) List(query ListQuery) ([]Bead, error) {
 		tally = nativeListTally{}
 		notClosed := ""
 		if optedIn {
-			notClosed = s.readListNotClosedStatus(ctx, storage)
+			notClosed = s.guardNotClosed(ctx, storage, s.readListNotClosedStatus(ctx, storage))
 			plan = nativeListPlan(query, pushable, notClosed)
 			s.noteUnkeyedPlan(query, plan)
 		}
