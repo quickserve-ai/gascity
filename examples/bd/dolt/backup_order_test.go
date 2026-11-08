@@ -598,6 +598,83 @@ func TestBackupOrderHonorsDatabaseFilter(t *testing.T) {
 	}
 }
 
+// A suspended rig is never touched (a bd call would wake it), but a run that
+// left a selected database un-backed-up must not read as success
+// (ga-wcc3ry: pl went 42 h stale behind three "success" runs).
+func TestBackupOrderDeclaresSelectedSuspendedRigWithoutTouchingIt(t *testing.T) {
+	cityPath := resolvedTempDir(t)
+	binDir := t.TempDir()
+	gc := writeBackupFakeGC(t, binDir)
+	outcomeFile := filepath.Join(t.TempDir(), "outcome.json")
+
+	out := mustRunBackupOrder(t, binDir, cityPath,
+		`FAKE_RIG_LIST_JSON={"rigs":[{"name":"platform","prefix":"pl","hq":false,"suspended":true}]}`,
+		"FAKE_SCOPE_DBS=city=hq rig:platform=pl",
+		"FAKE_CONFIGURED_DBS=hq pl",
+		"GC_BACKUP_DATABASES=hq,pl",
+		"GC_ORDER_OUTCOME_FILE="+outcomeFile,
+	)
+	if !strings.Contains(out, "synced: 1/1") || !strings.Contains(out, "suspended: 1") {
+		t.Fatalf("summary should count the synced city and the suspended rig:\n%s", out)
+	}
+	if strings.Contains(gc.log(t), "--rig platform") {
+		t.Fatalf("a suspended rig must not be reached through bd:\n%s", gc.log(t))
+	}
+	if got := syncAttempts(t, binDir, "pl"); got != 0 {
+		t.Fatalf("suspended rig's database was synced %d times", got)
+	}
+	outcome, ok := readBackupOutcome(t, outcomeFile)
+	if !ok || outcome.Outcome != "partial" || len(outcome.Scopes) != 1 ||
+		outcome.Scopes[0].Scope != "rig:platform" || outcome.Scopes[0].Reason != "rig suspended" {
+		t.Fatalf("outcome = %+v (declared %v), want partial naming rig:platform as suspended", outcome, ok)
+	}
+}
+
+func TestBackupOrderStaysQuietForUnselectedSuspendedRig(t *testing.T) {
+	cityPath := resolvedTempDir(t)
+	binDir := t.TempDir()
+	_ = writeBackupFakeGC(t, binDir)
+	outcomeFile := filepath.Join(t.TempDir(), "outcome.json")
+
+	out := mustRunBackupOrder(t, binDir, cityPath,
+		`FAKE_RIG_LIST_JSON={"rigs":[{"name":"astro","prefix":"as","hq":false,"suspended":true}]}`,
+		"FAKE_SCOPE_DBS=city=hq rig:astro=as",
+		"FAKE_CONFIGURED_DBS=hq as",
+		"GC_BACKUP_DATABASES=hq,pl",
+		"GC_ORDER_OUTCOME_FILE="+outcomeFile,
+	)
+	if !strings.Contains(out, "synced: 1/1") || strings.Contains(out, "suspended:") {
+		t.Fatalf("a suspended rig the filter does not select must not be counted:\n%s", out)
+	}
+	if outcome, ok := readBackupOutcome(t, outcomeFile); ok {
+		t.Fatalf("outcome = %+v, want none declared (success)", outcome)
+	}
+}
+
+func TestBackupOrderDeclaresEverySuspendedRigWithoutFilter(t *testing.T) {
+	cityPath := resolvedTempDir(t)
+	binDir := t.TempDir()
+	gc := writeBackupFakeGC(t, binDir)
+	outcomeFile := filepath.Join(t.TempDir(), "outcome.json")
+
+	out := mustRunBackupOrder(t, binDir, cityPath,
+		`FAKE_RIG_LIST_JSON={"rigs":[{"name":"api","prefix":"apidb","hq":false},{"name":"archive","hq":false,"suspended":true}]}`,
+		"FAKE_SCOPE_DBS=city=prod rig:api=apidb rig:archive=archivedb",
+		"FAKE_CONFIGURED_DBS=prod apidb archivedb",
+		"GC_ORDER_OUTCOME_FILE="+outcomeFile,
+	)
+	if !strings.Contains(out, "synced: 2/2") || !strings.Contains(out, "suspended: 1") {
+		t.Fatalf("unexpected backup summary:\n%s", out)
+	}
+	if strings.Contains(gc.log(t), "--rig archive") {
+		t.Fatalf("a suspended rig must not be reached through bd:\n%s", gc.log(t))
+	}
+	outcome, ok := readBackupOutcome(t, outcomeFile)
+	if !ok || outcome.Outcome != "partial" || len(outcome.Scopes) != 1 || outcome.Scopes[0].Scope != "rig:archive" {
+		t.Fatalf("outcome = %+v (declared %v), want partial naming rig:archive", outcome, ok)
+	}
+}
+
 func TestBackupOrderEscalatesOffsiteFailureWithConfiguredBound(t *testing.T) {
 	cityPath := resolvedTempDir(t)
 	offsiteDir := filepath.Join(t.TempDir(), "offsite")
