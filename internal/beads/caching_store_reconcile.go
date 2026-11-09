@@ -131,7 +131,7 @@ func effectiveCadence(beadCount int, latencyDriverActive bool) time.Duration {
 
 // CacheReconcileLargeIntervalEnv names the opt-in override, in milliseconds,
 // of the reconcile cadence for a store of 5000 or more beads. Unset, empty or
-// out of range keeps cacheReconcileIntervalLarge (120 s), today's behaviour.
+// out of range keeps cacheReconcileIntervalLarge (120 s), today's behavior.
 // A full reconcile of a large store on a shared server is the dominant steady
 // read it sees, so an operator may trade cache freshness for server load:
 // non-Live reads of such a store become up to this stale. Read on each

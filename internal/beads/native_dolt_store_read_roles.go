@@ -308,7 +308,7 @@ func (s *NativeDoltStore) listPlanRequest(ctx context.Context, reader issueops.R
 		}
 	}
 	if err != nil {
-		if err != firstErr {
+		if !errors.Is(err, firstErr) {
 			return issueops.IssuePage{}, errors.Join(firstErr, err)
 		}
 		return page, err
@@ -834,7 +834,7 @@ func nativeListRequestFromListQuery(query ListQuery, pushableTypes map[string]bo
 	req.SkipCounts = true
 	// Labels stay hydrated whatever query.SkipLabels says. The CachingStore's
 	// full scan (cacheFullScanQuery) sets SkipLabels and installs the rows it
-	// gets back wholesale, so a native store that honoured it would empty every
+	// gets back wholesale, so a native store that honored it would empty every
 	// cached bead's labels and every cached label read after the first Prime.
 	return req
 }

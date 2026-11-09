@@ -150,7 +150,7 @@ type ListQuery struct {
 	// moving, between the probe and the read, into a status no status.custom
 	// then names is missed, by that one listing. The probe is one more query
 	// per listing. Today the caller is the order dispatcher's
-	// open-work fold (order-run tracking beads). Never honoured on a
+	// open-work fold (order-run tracking beads). Never honored on a
 	// CompleteActive read. Other stores ignore it.
 	PushNotClosed bool
 	// Live bypasses CachingStore and reads from the backing store. Other Store

@@ -829,14 +829,14 @@ func TestNativeListPlanNeverSkipsLabels(t *testing.T) {
 }
 
 // A CachingStore over a native store keeps its labels: the cache's full scan
-// asks for SkipLabels, and a server that honoured a pushed skip would hand back
+// asks for SkipLabels, and a server that honored a pushed skip would hand back
 // label-less rows the cache installs wholesale, emptying every cached label read.
 func TestCachingStoreOverNativeKeepsLabelsAfterPrime(t *testing.T) {
 	storage := &nativeDoltReaderSpy{
 		list: func(_ context.Context, req issueops.ListRequest) (issueops.IssuePage, error) {
 			issue := &beadslib.Issue{ID: "gc-1", Title: "one", Status: beadslib.StatusOpen, IssueType: "task", Labels: []string{"gc:session"}}
 			if req.SkipLabels {
-				issue.Labels = nil // what a server honouring the skip returns
+				issue.Labels = nil // what a server honoring the skip returns
 			}
 			return issueops.IssuePage{Items: []*issueops.IssueWithCounts{{Issue: issue}}}, nil
 		},

@@ -65,9 +65,9 @@ func (s *gateBlockingStore) setCreatedAt(at time.Time) {
 	}
 }
 
-// List honours the label filter the way a real store does: a non-idempotent
+// List honors the label filter the way a real store does: a non-idempotent
 // order's live gate read asks for its own order-run label and must not be
-// handed a neighbour's tracking bead.
+// handed a neighbor's tracking bead.
 func (s *gateBlockingStore) List(query beads.ListQuery) ([]beads.Bead, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -267,7 +267,7 @@ func TestOrderDispatchOpenWorkSuppressionStreakResetsWhenGateOpens(t *testing.T)
 // TestOrderDispatchOpenWorkSuppressionStreaksAreIndependentPerOrder pins that a
 // streak belongs to one order. Keying the state by anything coarser — or
 // clearing more than the one order that just passed its gate — hands a busy
-// city a healthy order that wipes its wedged neighbour's streak on every tick,
+// city a healthy order that wipes its wedged neighbor's streak on every tick,
 // which is the ga-a6zy9 silence this event exists to end.
 func TestOrderDispatchOpenWorkSuppressionStreaksAreIndependentPerOrder(t *testing.T) {
 	const wedged, healthy = "wedged-neighbor", "healthy-neighbor"
@@ -297,7 +297,7 @@ func TestOrderDispatchOpenWorkSuppressionStreaksAreIndependentPerOrder(t *testin
 		t.Errorf("event subject = %q, want %q", got[0].Subject, wedged)
 	}
 	if p := decodeSuppressedPayload(t, got[0]); p.Consecutive != orderOpenWorkSuppressionAlertAfter {
-		t.Errorf("payload consecutive = %d, want %d (the neighbour's clears must not touch this streak)",
+		t.Errorf("payload consecutive = %d, want %d (the neighbor's clears must not touch this streak)",
 			p.Consecutive, orderOpenWorkSuppressionAlertAfter)
 	}
 }

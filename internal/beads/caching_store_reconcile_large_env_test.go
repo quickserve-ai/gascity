@@ -6,7 +6,7 @@ import (
 )
 
 // The large-store cadence override (ga-6qht7x, ga-tyf38i install): unset keeps
-// today's 120 s; a value in range is honoured; anything else is ignored and
+// today's 120 s; a value in range is honored; anything else is ignored and
 // never yields a faster cadence than today's.
 func TestCacheReconcileLargeIntervalOverride(t *testing.T) {
 	cases := []struct {
@@ -15,7 +15,7 @@ func TestCacheReconcileLargeIntervalOverride(t *testing.T) {
 		want time.Duration
 	}{
 		{"unset keeps 120 s", "", cacheReconcileIntervalLarge},
-		{"300 s honoured", "300000", 300 * time.Second},
+		{"300 s honored", "300000", 300 * time.Second},
 		{"the floor itself", "120000", cacheReconcileIntervalLarge},
 		{"the ceiling itself", "900000", 15 * time.Minute},
 		{"faster than today is ignored", "60000", cacheReconcileIntervalLarge},
