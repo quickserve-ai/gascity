@@ -281,7 +281,14 @@ func nativeListStatusNameOK(name string) bool {
 // missing from the set and any row in one costs that scope the pushdown; such
 // a status must also be stored as the setting.
 func (s *NativeDoltStore) loadListNotClosedStatus(ctx context.Context) {
-	set, err := notClosedStatusFromStorage(ctx, s.storage)
+	storage, release, err := s.acquireStorage()
+	if err != nil {
+		s.listLogger().Warn("native bead store: cannot read the scope's status.custom setting; listing without the not-closed pushdown",
+			"prefix", s.idPrefix, "err", err)
+		return
+	}
+	defer release()
+	set, err := notClosedStatusFromStorage(ctx, storage)
 	if err == nil {
 		s.listNotClosedStatus = set
 		return
