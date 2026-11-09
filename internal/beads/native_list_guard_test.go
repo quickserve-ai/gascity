@@ -216,7 +216,7 @@ func TestAMoleculeRootOutsideTheVocabularyAppearsBecauseOfTheGuard(t *testing.T)
 		if !slices.Equal(sent, []string{""}) {
 			t.Fatalf("sent %q, want nothing pushed", sent)
 		}
-		for _, want := range []string{"level=WARN", "rows sit outside", "prefix=native-test", "count=1", "statuses=" + stray} {
+		for _, want := range []string{"level=WARN", "rows sit outside", "prefix=native-test", "count=1", "statuses=" + stray, "rows=\"" + rootID + "=" + stray} {
 			if !strings.Contains(logs.String(), want) {
 				t.Fatalf("log %q lacks %q", logs.String(), want)
 			}

@@ -1,11 +1,17 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"io"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/events"
+	"github.com/gastownhall/gascity/internal/orders"
 )
 
 type listQueryRecordingStore struct {
@@ -41,4 +47,142 @@ func TestOrderDispatchTrackingIndexListingOptsIntoNotClosedPushdown(t *testing.T
 	if query.Status != "" || query.IncludeClosed || query.CompleteActive || !query.AllowScan || query.TierMode != beads.TierBoth {
 		t.Fatalf("query = %+v, want the no-status, not-closed, both-tier corpus read the pushdown can serve", query)
 	}
+}
+
+// pushedListingHidesStore answers an opted-in listing as if every row had left
+// the pushed status set between the guard probe and the read, the one residue
+// the mayor accepted. Every other read sees the real rows.
+type pushedListingHidesStore struct {
+	beads.Store
+
+	mu        sync.Mutex
+	liveReads int
+}
+
+func (s *pushedListingHidesStore) List(query beads.ListQuery) ([]beads.Bead, error) {
+	if query.PushNotClosed {
+		return nil, nil
+	}
+	if strings.HasPrefix(query.Label, "order-run:") {
+		s.mu.Lock()
+		s.liveReads++
+		s.mu.Unlock()
+	}
+	return s.Store.List(query)
+}
+
+func (s *pushedListingHidesStore) labelReads() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.liveReads
+}
+
+func createMoleculeRun(t *testing.T, store beads.Store, scoped string) {
+	t.Helper()
+	root, err := store.Create(beads.Bead{Title: "run", Type: "molecule", Labels: []string{"order-run:" + scoped}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Create(beads.Bead{Title: "step", ParentID: root.ID}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func gateCandidate(store beads.Store, idempotent bool) *orderDispatchCandidate {
+	return &orderDispatchCandidate{
+		order:         orders.Order{Name: "digest", Idempotent: idempotent},
+		scoped:        "digest",
+		gateStores:    []beads.Store{store},
+		gateStoreKeys: []string{"store"},
+	}
+}
+
+// The mayor's condition (a), ruling 2026-11-09 on ga-tyf38i: an order whose
+// repeat is not a no-op never relies on the pushed listing for "no open work",
+// and an idempotent order keeps the index's answer with no extra hub read.
+func TestOpenWorkGateConfirmsAbsenceLiveOnlyForANonIdempotentOrder(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		idempotent    bool
+		wantShut      bool
+		wantLiveReads int
+	}{
+		{"a non-idempotent order reads live and is held", false, true, 1},
+		{"an idempotent order keeps the index answer", true, false, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &pushedListingHidesStore{Store: beads.NewMemStore()}
+			createMoleculeRun(t, store.Store, "digest")
+			var stderr bytes.Buffer
+			m := &memoryOrderDispatcher{stderr: &stderr, rec: events.Discard}
+			idx := newOrderDispatchTrackingIndex(&stderr)
+			if got := m.openWorkGateShut(context.Background(), gateCandidate(store, tc.idempotent), idx, time.Now()); got != tc.wantShut {
+				t.Fatalf("gate shut = %t, want %t; stderr: %s", got, tc.wantShut, stderr.String())
+			}
+			if got := store.labelReads(); got != tc.wantLiveReads {
+				t.Fatalf("live label reads = %d, want %d", got, tc.wantLiveReads)
+			}
+			if named := strings.Contains(stderr.String(), "digest: order-run index for store store found no open work but the live read did"); named != !tc.idempotent {
+				t.Fatalf("disagreement line present = %t, want %t; stderr: %s", named, !tc.idempotent, stderr.String())
+			}
+		})
+	}
+}
+
+// An index positive cannot be wrong about a hidden row, so it costs no live read.
+func TestOpenWorkGateTrustsAnIndexPositiveWithoutALiveRead(t *testing.T) {
+	store := &recordingLabelReadStore{Store: beads.NewMemStore()}
+	createMoleculeRun(t, store.Store, "digest")
+	m := &memoryOrderDispatcher{stderr: io.Discard, rec: events.Discard}
+	idx := newOrderDispatchTrackingIndex(io.Discard)
+	if !m.openWorkGateShut(context.Background(), gateCandidate(store, false), idx, time.Now()) {
+		t.Fatal("gate open, want it held by the molecule root the index read")
+	}
+	if store.labelReads != 0 {
+		t.Fatalf("live label reads = %d, want 0 on an index positive", store.labelReads)
+	}
+}
+
+// The mayor's term 3: an order-run root reaches the single-flight answer through
+// the fold the opted-in listing feeds, in whatever not-closed status it sits.
+func TestAnOrderRunRootHoldsTheGateThroughTheFold(t *testing.T) {
+	for _, status := range []string{"", "in_progress"} {
+		store := beads.NewMemStore()
+		root, err := store.Create(beads.Bead{Title: "run", Type: "molecule", Labels: []string{"order-run:digest"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.Create(beads.Bead{Title: "step", ParentID: root.ID}); err != nil {
+			t.Fatal(err)
+		}
+		if status != "" {
+			if err := store.Update(root.ID, beads.UpdateOpts{Status: &status}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		idx := newOrderDispatchTrackingIndex(io.Discard)
+		entries, err := idx.entriesForStore(store, "store")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := len(entries["digest"].openRoots); got != 1 {
+			t.Fatalf("status %q: open roots = %d, want 1", status, got)
+		}
+		m := &memoryOrderDispatcher{stderr: io.Discard, rec: events.Discard}
+		if !m.openWorkGateShut(context.Background(), gateCandidate(store, true), idx, time.Now()) {
+			t.Fatalf("status %q: gate open, want the root to hold single-flight", status)
+		}
+	}
+}
+
+type recordingLabelReadStore struct {
+	beads.Store
+	labelReads int
+}
+
+func (s *recordingLabelReadStore) List(query beads.ListQuery) ([]beads.Bead, error) {
+	if strings.HasPrefix(query.Label, "order-run:") {
+		s.labelReads++
+	}
+	return s.Store.List(query)
 }

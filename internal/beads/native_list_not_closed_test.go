@@ -95,7 +95,6 @@ func TestNativeListPlanPushesTheNotClosedSetOnlyWhenOptedIn(t *testing.T) {
 		{"no Status, opted in", in(ListQuery{AllowScan: true, TierMode: TierBoth, Live: true}), set, set},
 		{"opted in, IncludeClosed", in(ListQuery{AllowScan: true, IncludeClosed: true}), set, ""},
 		{"a folded open stays Go-side", in(ListQuery{Status: "open", AllowScan: true}), set, ""},
-		{"a Live open stays raw", in(ListQuery{Status: "open", AllowScan: true, Live: true}), set, "open"},
 		{"an exact status stays exact", in(ListQuery{Status: "in_progress"}), set, "in_progress"},
 		{"no set, no push", in(ListQuery{AllowScan: true}), "", ""},
 		// The cache evicts what its full scan does not return as closed, so a
@@ -221,14 +220,17 @@ func TestAnOrdinaryListingStillReturnsAnOutOfVocabularyRow(t *testing.T) {
 	}
 }
 
-// The mayor's condition 1 and 2(b): a store that refuses the pushed set (a name
-// its vocabulary no longer accepts) answers the opted-in listing unpushed, with
-// the out-of-vocabulary row, latches the pushdown off, and is never an error.
-func TestARefusedNotClosedSetFallsBackAndLatchesOff(t *testing.T) {
+// The mayor's condition 1 and 2(b): a store that refuses the pushed set answers
+// the opted-in listing unpushed, with the out-of-vocabulary row, and is never an
+// error. A refusal that quotes a name does not latch: the set was read for this
+// listing, so the reader's own cache is what lags (Opus round 2, must-fix 1).
+func TestARefusedNamedStatusFallsBackWithoutLatching(t *testing.T) {
 	var sent []string
 	reader := vocabularyReader(outOfVocabularyRows(), "launched", &sent)
 	store := newNativeDoltStoreWithStorage(statusSettingStorage{nativeDoltReaderSpy: reader, value: "staged_ready,launched"}, "native-test")
 	store.listOutsideProbe = noOutsideRows
+	var logs syncBuffer
+	store.logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	store.loadListNotClosedStatus(context.Background())
 	set := builtinNotClosed + ",staged_ready,launched"
 	if store.listNotClosedStatus != set {
@@ -242,18 +244,24 @@ func TestARefusedNotClosedSetFallsBackAndLatchesOff(t *testing.T) {
 	if ids := listedIDs(got); !slices.Equal(ids, []string{"gc-drift", "gc-open"}) {
 		t.Fatalf("fallback listing = %v, want every non-closed row", ids)
 	}
-	if !store.statusPushdownOff.Load() {
-		t.Fatal("a refused set did not latch the pushdown off")
+	if store.statusPushdownOff.Load() {
+		t.Fatal("a refusal quoting a name the fresh set holds latched the pushdown off")
 	}
 	if !slices.Equal(sent, []string{set, ""}) {
 		t.Fatalf("sent %q, want the set then one unpushed retry", sent)
+	}
+	if !strings.Contains(logs.String(), "refused_status=launched") {
+		t.Fatalf("logs = %q, want the line naming the refused status", logs.String())
 	}
 	sent = nil
 	if _, err := store.List(opted); err != nil {
 		t.Fatalf("second List: %v", err)
 	}
-	if !slices.Equal(sent, []string{""}) {
-		t.Fatalf("after the latch the opted-in listing sent %q, want nothing pushed", sent)
+	if !slices.Equal(sent, []string{set, ""}) {
+		t.Fatalf("the next listing sent %q, want it to try the fresh set again", sent)
+	}
+	if stats := store.listCounters.snapshot(); stats.GuardFallbacks != 2 || stats.GuardRuns != 2 {
+		t.Fatalf("stats = %+v, want 2 runs and 2 fallbacks", stats)
 	}
 }
 
@@ -353,7 +361,7 @@ func TestTheNotClosedAndTypeFallbacksCompose(t *testing.T) {
 		// documented residue: only the in-vocabulary row comes back.
 		{"the type refused by name", "", `invalid issue type "task"`, []string{set + "|task", set + "|"}, []string{"gc-open"}, false, true, ""},
 		{"a refusal that names neither drops both", "", "", []string{set + "|task", "|"}, []string{"gc-drift", "gc-open"}, true, true, "refused_status=\"\""},
-		{"both refused, one after the other", "open", `invalid issue type "task"`, []string{set + "|task", set + "|", "|"}, []string{"gc-drift", "gc-open"}, true, true, "refused_status=open"},
+		{"both refused, one after the other", "open", `invalid issue type "task"`, []string{set + "|task", set + "|", "|"}, []string{"gc-drift", "gc-open"}, false, true, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var sent []string
@@ -443,11 +451,31 @@ func TestARefusedNotClosedSetLogsOneLineNamingTheStatus(t *testing.T) {
 	wg.Wait()
 	lines := strings.Split(strings.TrimSpace(logs.String()), "\n")
 	if len(lines) != 1 {
-		t.Fatalf("latch logged %d lines, want exactly one:\n%s", len(lines), logs.String())
+		t.Fatalf("refusal logged %d lines, want exactly one:\n%s", len(lines), logs.String())
 	}
 	for _, want := range []string{"prefix=native-test", "refused_status=launched"} {
 		if !strings.Contains(lines[0], want) {
 			t.Fatalf("latch line %q does not carry %q", lines[0], want)
 		}
+	}
+}
+
+// A latched store's opted-in listing reads unpushed, and that has to be
+// countable: the guard runs no probe there, so without the count the latch
+// reads as a guard with no work.
+func TestALatchedListingCountsAsAFallback(t *testing.T) {
+	var sent []string
+	reader := vocabularyReader(outOfVocabularyRows(), "", &sent)
+	store := newNativeDoltStoreWithStorage(statusSettingStorage{nativeDoltReaderSpy: reader}, "native-test")
+	store.listOutsideProbe = noOutsideRows
+	store.statusPushdownOff.Store(true)
+	if _, err := store.List(ListQuery{AllowScan: true, TierMode: TierBoth, Live: true, PushNotClosed: true}); err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if !slices.Equal(sent, []string{""}) {
+		t.Fatalf("sent %q, want nothing pushed", sent)
+	}
+	if stats := store.listCounters.snapshot(); stats.GuardFallbacks != 1 || stats.GuardRuns != 0 {
+		t.Fatalf("stats = %+v, want 1 fallback and no probe", stats)
 	}
 }

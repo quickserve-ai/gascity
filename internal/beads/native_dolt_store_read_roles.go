@@ -59,10 +59,11 @@ import (
 // is a substitute. AllFlag is stated because it says what it does in the member
 // name rather than in a magic status value.
 //
-// There is no ExcludeStatus member to spell "everything but closed"
-// with, so gc's "open" and its not-closed default cannot be pushed down; gc's
-// three-value projection (mapBdStatus, ListQuery.Matches) is the only
-// definition of them and runs Go-side. The two statuses that map one-to-one
+// There is no ExcludeStatus member to spell "everything but closed" with, so
+// gc's "open" cannot be pushed down, and its not-closed default is pushed only
+// as an allow-list for a caller that opts in (ListQuery.PushNotClosed, behind
+// guardNotClosed); gc's three-value projection (mapBdStatus, ListQuery.Matches)
+// stays the definition and runs Go-side. The two statuses that map one-to-one
 // onto a bd status are pushed beside AllFlag (nativeListRequestFromListQuery),
 // which keeps the pinned-flag default lifted under a named status.
 //
@@ -164,7 +165,8 @@ func (s *NativeDoltStore) List(query ListQuery) ([]Bead, error) {
 	// so a status.custom name added after the store opened is pushed too and
 	// its rows stay visible. An unreadable vocabulary pushes nothing. A listing
 	// the plan could not narrow anyway reads no vocabulary and runs no guard.
-	optedIn := nativeListCanPushNotClosed(query) && !s.statusPushdownOff.Load()
+	latched := s.statusPushdownOff.Load()
+	optedIn := nativeListCanPushNotClosed(query) && !latched
 	plan := nativeListPlan(query, pushable, "")
 	if !optedIn {
 		s.noteUnkeyedPlan(query, plan)
@@ -175,6 +177,11 @@ func (s *NativeDoltStore) List(query ListQuery) ([]Bead, error) {
 	)
 	err := s.withReadRetry(func(ctx context.Context, storage beadslib.Storage) error {
 		tally = nativeListTally{}
+		if latched && nativeListCanPushNotClosed(query) {
+			// The listing opted in and reads unpushed: that is a fallback, and
+			// without this count the latch would read as a guard with no work.
+			tally.guardFallbacks++
+		}
 		notClosed := ""
 		if optedIn {
 			notClosed = s.guardNotClosed(ctx, storage, s.readListNotClosedStatus(ctx, storage, &tally), &tally)
@@ -293,7 +300,20 @@ func (s *NativeDoltStore) listPlanRequest(ctx context.Context, reader issueops.R
 		return page, err
 	}
 	if droppedStatus != "" {
-		s.disableStatusPushdown(droppedStatus, statusErr)
+		tally.guardFallbacks++
+		if refused := nativeListRefusedStatusName(statusErr); refused != "" {
+			// The set was read from status.custom for this very listing, so a
+			// name the reader refuses is the reader's per-handle cache lagging
+			// another process's status.custom write. Latching would freeze the
+			// guard until restart; this listing reads unpushed and the next one
+			// tries again. Only a refusal that quotes no name latches.
+			if s.statusRefusalWarned.CompareAndSwap(false, true) {
+				s.listLogger().Warn("native bead store: reader refused a status the scope's current status.custom names; reading such listings unpushed (counted as guard fallbacks)",
+					"prefix", s.idPrefix, "refused_status", refused, "err", statusErr, "guard_stats", s.listCounters.guardText(*tally))
+			}
+		} else {
+			s.disableStatusPushdown(droppedStatus, statusErr)
+		}
 	}
 	if droppedType != "" {
 		s.disableTypePushdown(droppedType, typeErr)

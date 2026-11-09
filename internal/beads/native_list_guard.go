@@ -125,8 +125,21 @@ func (s *NativeDoltStore) guardNotClosed(ctx context.Context, storage beadslib.S
 	tally.guardFallbacks++
 	s.listLogger().Warn("native bead store: rows sit outside the not-closed status set; reading this listing unpushed",
 		"prefix", s.idPrefix, "count", len(rows), "count_capped", len(rows) >= nativeListGuardRowLimit,
-		"statuses", nativeListOutsideStatuses(rows, 3), "guard_stats", s.listCounters.guardText(*tally))
+		"statuses", nativeListOutsideStatuses(rows, 3), "rows", nativeListOutsideRowNames(rows), "guard_stats", s.listCounters.guardText(*tally))
 	return ""
+}
+
+// nativeListOutsideRowNames renders every row the probe returned as id=status.
+// A pushed read that hid one of these rows could have let an order dispatch
+// twice, so the line has to name the row (the mayor's ruling 2026-11-09): the
+// next probe is what sees it. The probe caps the list at
+// nativeListGuardRowLimit.
+func nativeListOutsideRowNames(rows []nativeListOutsideRow) string {
+	names := make([]string, 0, len(rows))
+	for _, row := range rows {
+		names = append(names, row.ID+"="+row.Status)
+	}
+	return strings.Join(names, ",")
 }
 
 // noteGuardHeartbeat logs one Info line when guardRuns, the store's run count

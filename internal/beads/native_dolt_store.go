@@ -436,6 +436,10 @@ type NativeDoltStore struct {
 	// listOutsideProbe overrides the not-closed guard probe in tests; nil is
 	// nativeListOutsideRows.
 	listOutsideProbe nativeListOutsideProbe
+	// statusRefusalWarned latches after the one warning that the reader refused
+	// a status this scope's current status.custom names. Each such listing still
+	// counts as a guard fallback.
+	statusRefusalWarned atomic.Bool
 	// guardNoSQLWarned latches after the one warning that this store's storage
 	// has no SQL handle for the not-closed guard.
 	guardNoSQLWarned atomic.Bool

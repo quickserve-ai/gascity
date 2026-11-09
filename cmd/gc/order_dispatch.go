@@ -862,7 +862,7 @@ func (m *memoryOrderDispatcher) openWorkGateShut(ctx context.Context, cand *orde
 		return false
 	}
 	hasOpenWork, err := gateOpenWorkBounded(ctx, orderGateTimeout, scoped, func() (bool, error) {
-		return trackingIndex.hasOpenWork(cand.gateStores, cand.gateStoreKeys, scoped, m.wispRootHasOpenWork, m.hasOpenWorkStrict)
+		return trackingIndex.hasOpenWork(cand.gateStores, cand.gateStoreKeys, scoped, m.wispRootHasOpenWork, m.hasOpenWorkStrict, !a.Idempotent)
 	})
 	if err != nil {
 		if m.gateFailClosed(ctx, a, scoped, err) {
@@ -1234,12 +1234,26 @@ func (idx *orderDispatchTrackingIndex) hasOpenTracking(
 // FAILED. There the index knows nothing, and answering "no open work" from a
 // hole is the duplicate-dispatch shape single-flight exists to prevent — so that
 // store, alone, pays the old per-order read and its error still propagates.
+//
+// confirmAbsence is the second case (ga-tyf38i, the mayor's ruling 2026-11-09):
+// the index is built from a pushed not-closed listing, and a run root that moves
+// into an out-of-vocabulary status between the guard probe and that listing is
+// missing from it for one tick. An index POSITIVE can never be wrong that way,
+// so only a "no open work" answer is in doubt, and only an order whose repeat
+// is not a no-op cares. The dispatcher passes !Idempotent: such an order takes
+// the live read before it fires, so it never relies on the pushed listing to
+// keep single-flight. The read happens only when the order is due and the index
+// found nothing, so it costs about one label read per dispatch of a
+// non-idempotent order, not one per order per tick. An idempotent order keeps
+// the index's answer: it already dispatches without any gate when the gate
+// times out (gateFailClosed).
 func (idx *orderDispatchTrackingIndex) hasOpenWork(
 	stores []beads.Store,
 	storeKeys []string,
 	scopedName string,
 	wispHasOpenWork func(beads.Store, beads.Bead) (bool, error),
 	fallback func(beads.Store, string) (bool, error),
+	confirmAbsence bool,
 ) (bool, error) {
 	for i, store := range stores {
 		if store == nil {
@@ -1272,17 +1286,27 @@ func (idx *orderDispatchTrackingIndex) hasOpenWork(
 		if summary.openWorkTracking {
 			return true, nil
 		}
-		if wispHasOpenWork == nil {
+		if wispHasOpenWork != nil {
+			for _, root := range summary.openRoots {
+				open, err := wispHasOpenWork(store, root)
+				if err != nil {
+					return false, err
+				}
+				if open {
+					return true, nil
+				}
+			}
+		}
+		if !confirmAbsence {
 			continue
 		}
-		for _, root := range summary.openRoots {
-			open, err := wispHasOpenWork(store, root)
-			if err != nil {
-				return false, err
-			}
-			if open {
-				return true, nil
-			}
+		open, err := fallback(store, scopedName)
+		if err != nil {
+			return false, err
+		}
+		if open {
+			logDispatchError(idx.stderr, "gc: order dispatch: %s: order-run index for store %s found no open work but the live read did (a run started after the index was read, or a status the pushed listing hid); holding the order", scopedName, indexStoreKey(storeKeys, i))
+			return true, nil
 		}
 	}
 	return false, nil
@@ -1415,6 +1439,10 @@ func (idx *orderDispatchTrackingIndex) entriesForStore(store beads.Store, storeK
 	// could dispatch again. So the store probes for such rows before each
 	// pushed read and reads unpushed when it finds one or cannot tell
 	// (guardNotClosed). The probe goes away with ExcludeStatus (beads #7647).
+	// A row that leaves the set between the probe and the read is missed for
+	// that tick; a non-idempotent order does not rely on this listing for a
+	// "no open work" answer (hasOpenWork's confirmAbsence), and the next probe
+	// names the row.
 	items, err := beads.HandlesFor(store).Live.List(beads.ListQuery{
 		AllowScan:     true,
 		TierMode:      beads.TierBoth,

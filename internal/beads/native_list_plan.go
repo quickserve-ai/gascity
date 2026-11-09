@@ -546,8 +546,9 @@ func (s *NativeDoltStore) disableTypePushdown(issueType string, err error) {
 }
 
 // disableStatusPushdown latches the not-closed pushdown off for this store
-// after the backend refused the pushed status set and answered the same
-// request without it, and warns once naming the store and the set: answers
+// after the backend refused the pushed status set without quoting a name and
+// answered the same request without it, and warns once naming the store and
+// the set: answers
 // stay exact (closed rows are dropped Go-side), the opted-in listing just
 // reads the whole ledger again until the process restarts.
 func (s *NativeDoltStore) disableStatusPushdown(set string, err error) {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -64,14 +65,21 @@ func (s *gateBlockingStore) setCreatedAt(at time.Time) {
 	}
 }
 
-func (s *gateBlockingStore) List(beads.ListQuery) ([]beads.Bead, error) {
+// List honours the label filter the way a real store does: a non-idempotent
+// order's live gate read asks for its own order-run label and must not be
+// handed a neighbour's tracking bead.
+func (s *gateBlockingStore) List(query beads.ListQuery) ([]beads.Bead, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.blocked {
 		return nil, nil
 	}
-	out := make([]beads.Bead, len(s.corpus))
-	copy(out, s.corpus)
+	out := make([]beads.Bead, 0, len(s.corpus))
+	for _, b := range s.corpus {
+		if query.Label == "" || slices.Contains(b.Labels, query.Label) {
+			out = append(out, b)
+		}
+	}
 	return out, nil
 }
 
