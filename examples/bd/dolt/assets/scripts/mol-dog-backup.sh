@@ -320,6 +320,7 @@ database_selected() {
 }
 
 SCOPE_SPECS="city"
+SUSPENDED=0
 if RIG_LIST=$(cd "$CITY_ABS" && run_bounded "$BACKUP_BD_TIMEOUT_SECS" gc rig list --json 2>/dev/null); then
     while IFS= read -r rig_name; do
         [ -n "$rig_name" ] || continue
@@ -329,6 +330,21 @@ rig $rig_name"
     # retired proxy and Dolt, and nothing writes to it while it is suspended,
     # so its backup waits for it to resume.
     done < <(printf '%s\n' "$RIG_LIST" | jq -r '.rigs[]? | select((.hq // false) == false and (.suspended // false) == false) | .name // empty' 2>/dev/null)
+    # A rig left cold is still a store this run did not back up, so the run
+    # declares it rather than reporting success over it (ga-wcc3ry: a selected
+    # database went 42 h without a backup while every run read "success"). Its
+    # database name is read from the rig's prefix, never from bd, which would
+    # wake it. With GC_BACKUP_DATABASES set, only a rig whose prefix it selects
+    # is declared; a cold rig with no prefix cannot be matched and is not.
+    while IFS=$'\t' read -r rig_name rig_prefix; do
+        [ -n "$rig_name" ] || continue
+        if [ -n "$DATABASE_FILTER" ] && ! database_selected "$rig_prefix"; then
+            continue
+        fi
+        SUSPENDED=$((SUSPENDED + 1))
+        echo "backup: rig:$rig_name is suspended; its store${rig_prefix:+ ($rig_prefix)} is not backed up until it resumes" >&2
+        outcome_scope_skipped "rig:$rig_name" "rig suspended"
+    done < <(printf '%s\n' "$RIG_LIST" | jq -r '.rigs[]? | select((.hq // false) == false and (.suspended // false) == true) | [(.name // ""), (.prefix // "")] | @tsv' 2>/dev/null)
 else
     echo "backup: gc rig list failed; backing up the city scope only" >&2
     outcome_scope_skipped "rigs" "rig list unavailable"
@@ -475,5 +491,8 @@ elif [ "$OUTCOME_SCOPES_JSON" != "[]" ] || [ "$FAILED_COUNT" -gt 0 ]; then
 fi
 
 SUMMARY="backup — synced: $SYNCED/$TOTAL, unsupported: $UNSUPPORTED, offsite: $OFFSITE_STATUS"
+if [ "$SUSPENDED" -gt 0 ]; then
+    SUMMARY="$SUMMARY, suspended: $SUSPENDED"
+fi
 dolt_notify_done "$SUMMARY"
 echo "backup: $SUMMARY"
