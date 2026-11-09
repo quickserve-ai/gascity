@@ -3208,6 +3208,52 @@ func TestOpenNativeDoltStoreAtWithoutAmbientEnvWithholdsTheWholeNamespace(t *tes
 	}
 }
 
+// A withheld-env open must not start a server the workspace's own config
+// forbids (ga-y7lmi0): the ambient opt-out is withheld with the rest.
+func TestOpenNativeDoltStoreAtWithoutAmbientEnvHonoursTheWorkspaceAutoStart(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		config string
+		want   string
+	}{
+		{"false turns auto-start off", "dolt.auto-start: false\n", "0"},
+		{"true leaves it", "dolt.auto-start: true\n", ""},
+		{"no key leaves it", "issue-prefix: gc\n", ""},
+		{"no file leaves it", "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("BEADS_DOLT_AUTO_START", "1")
+			oldOpen := nativeDoltOpenBestAvailable
+			t.Cleanup(func() { nativeDoltOpenBestAvailable = oldOpen })
+			scope := t.TempDir()
+			if tc.config != "" {
+				if err := os.MkdirAll(filepath.Join(scope, ".beads"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(scope, ".beads", "config.yaml"), []byte(tc.config), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			seen := "unset"
+			nativeDoltOpenBestAvailable = func(context.Context, string) (beadslib.Storage, error) {
+				seen = os.Getenv("BEADS_DOLT_AUTO_START")
+				return &nativeDoltStorageSpy{
+					getConfig: func(context.Context, string) (string, error) { return "gcg", nil },
+				}, nil
+			}
+			if _, err := OpenNativeDoltStoreAtWithoutAmbientEnv(context.Background(), scope); err != nil {
+				t.Fatalf("open: %v", err)
+			}
+			if seen != tc.want {
+				t.Errorf("BEADS_DOLT_AUTO_START during the open = %q, want %q", seen, tc.want)
+			}
+			if got := os.Getenv("BEADS_DOLT_AUTO_START"); got != "1" {
+				t.Errorf("BEADS_DOLT_AUTO_START after the open = %q, want the ambient value restored", got)
+			}
+		})
+	}
+}
+
 func TestOpenNativeDoltStoreAtWithoutAmbientEnvWithCredentialCommandProjectsOnlyTheSelectedCommand(t *testing.T) {
 	t.Setenv("BEADS_DOLT_CREDENTIAL_COMMAND", "/poison/credential-command")
 	t.Setenv("BEADS_DB", "/poison/db")

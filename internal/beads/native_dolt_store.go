@@ -13,6 +13,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/beads/contract"
+	"github.com/gastownhall/gascity/internal/fsys"
 	beadslib "github.com/steveyegge/beads"
 	"github.com/steveyegge/beads/issueops"
 )
@@ -309,6 +311,19 @@ func withWithheldPrefixesLocked(prefixes ...string) (func(), error) {
 	}, nil
 }
 
+// workspaceAutoStartOpenEnv is the one setting a withheld-env open carries over
+// from the workspace itself. The library reads dolt.auto-start only on bd's CLI
+// path, so with the ambient BEADS_DOLT_AUTO_START withheld, an open of a
+// workspace saying false still starts a dolt sql-server beside it when none is
+// listening (ga-y7lmi0). A config that cannot be read changes nothing.
+func workspaceAutoStartOpenEnv(scopeRoot string) map[string]string {
+	disabled, err := contract.ReadAutoStartDisabled(fsys.OSFS{}, filepath.Join(scopeRoot, ".beads", "config.yaml"))
+	if err != nil || !disabled {
+		return nil
+	}
+	return map[string]string{"BEADS_DOLT_AUTO_START": "0"}
+}
+
 // openNativeStorageWithoutAmbientEnvWithCredentialCommand opens native
 // storage while holding the same process-environment lock used by snapshots
 // and ordinary native opens. The whole BEADS_ namespace is withheld before
@@ -324,7 +339,7 @@ func openNativeStorageWithoutAmbientEnvWithCredentialCommand(ctx context.Context
 	}
 	defer restoreNamespace()
 
-	restoreEnv, err := withNativeDoltOpenEnvAndCredentialCommandLocked(nil, credentialCommand)
+	restoreEnv, err := withNativeDoltOpenEnvAndCredentialCommandLocked(workspaceAutoStartOpenEnv(scopeRoot), credentialCommand)
 	if err != nil {
 		return nil, "", err
 	}
