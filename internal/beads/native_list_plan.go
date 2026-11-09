@@ -274,10 +274,12 @@ func nativeListStatusNameOK(name string) bool {
 // one kept only in a server's config.yaml. A pushed read would hide it, so
 // guardNotClosed probes for such rows before each push and reads that listing
 // unpushed when it finds one or cannot tell, and listVocabularyMoved re-reads
-// the setting after the push so a status registered during it costs that
-// listing the pushdown. What is left: a row that moves, between the probe and
-// the read, into a status no status.custom names (kept only in a config.yaml, or
-// written past validation). That listing misses it; the next probe names it.
+// the setting after the push so a status registered during it and still
+// registered costs that listing the pushdown. What is left: a row that moves,
+// between the probe and the read, into a status no status.custom names (kept
+// only in a config.yaml, written past validation, or added and removed again
+// within the read). That listing misses it; the next probe names it unless the
+// status is by then gone from the row.
 //
 // THE SAME RESIDUE as types.infra: a status.custom kept only in a server's
 // config.yaml is invisible to the workspace-config role, so its statuses are

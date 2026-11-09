@@ -143,10 +143,10 @@ func nativeListOutsideRowNames(rows []nativeListOutsideRow) string {
 }
 
 // listVocabularyMoved reports whether status.custom no longer gives notClosed,
-// the set a just-finished pushed read used, re-reading it afterwards. A row can
-// only enter a registered status once the status exists, so a set unchanged
-// after the read proves no such status appeared during it. An unreadable
-// setting counts as moved: the full read is the answer that needs no proof.
+// the set a just-finished pushed read used, re-reading it afterwards. A status
+// registered during the read and still registered now shows up as a change. One
+// added and removed again within the read does not: it compares the two ends.
+// An unreadable setting counts as moved: the full read needs no proof.
 func (s *NativeDoltStore) listVocabularyMoved(ctx context.Context, storage beadslib.Storage, notClosed string, tally *nativeListTally) bool {
 	now, err := notClosedStatusFromStorage(ctx, storage)
 	if err == nil && now == notClosed {
