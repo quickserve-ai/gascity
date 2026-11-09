@@ -235,10 +235,9 @@ func ReadIssuePrefix(fs fsys.FS, path string) (string, bool, error) {
 	return "", false, nil
 }
 
-// autoStartValueIsFalse reads a dolt.auto-start scalar: any capitalisation of
-// false, with the trailing comment a line scan of a malformed file leaves on it.
+// autoStartValueIsFalse reads a decoded dolt.auto-start scalar: any
+// capitalisation of false.
 func autoStartValueIsFalse(value string) bool {
-	value, _, _ = strings.Cut(value, "#")
 	return strings.EqualFold(strings.TrimSpace(value), "false")
 }
 
@@ -250,6 +249,9 @@ func ReadAutoStartDisabled(fs fsys.FS, path string) (bool, error) {
 			return false, nil
 		}
 		if value, ok := scanConfigLineValue(fs, path, "dolt.auto-start:"); ok {
+			// A raw line still carries its comment; YAML starts one only
+			// after whitespace, so a hash inside a word is not one.
+			value, _, _ = strings.Cut(strings.ReplaceAll(value, "\t", " "), " #")
 			return autoStartValueIsFalse(value), nil
 		}
 		return false, err

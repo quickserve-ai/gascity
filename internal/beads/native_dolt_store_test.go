@@ -3223,6 +3223,8 @@ func TestOpenNativeDoltStoreAtWithoutAmbientEnvHonoursTheWorkspaceAutoStart(t *t
 		{"capitalised False turns it off", "dolt.auto-start: False\n", "0"},
 		{"a trailing comment on a malformed file still turns it off", "dolt.auto-start: false # no server\n\tbad: [\n", "0"},
 		{"an unreadable config is unknown, and unknown starts nothing", "DIRECTORY", "0"},
+		{"a quoted value with a literal hash is not false", "dolt.auto-start: \"false # literal\"\n", ""},
+		{"a hash inside a word is not a comment", "dolt.auto-start: false#suffix\n", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("BEADS_DOLT_AUTO_START", "1")
