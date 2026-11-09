@@ -3220,13 +3220,22 @@ func TestOpenNativeDoltStoreAtWithoutAmbientEnvHonoursTheWorkspaceAutoStart(t *t
 		{"true leaves it", "dolt.auto-start: true\n", ""},
 		{"no key leaves it", "issue-prefix: gc\n", ""},
 		{"no file leaves it", "", ""},
+		{"capitalised False turns it off", "dolt.auto-start: False\n", "0"},
+		{"a trailing comment on a malformed file still turns it off", "dolt.auto-start: false # no server\n\tbad: [\n", "0"},
+		{"an unreadable config is unknown, and unknown starts nothing", "DIRECTORY", "0"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("BEADS_DOLT_AUTO_START", "1")
 			oldOpen := nativeDoltOpenBestAvailable
 			t.Cleanup(func() { nativeDoltOpenBestAvailable = oldOpen })
 			scope := t.TempDir()
-			if tc.config != "" {
+			switch tc.config {
+			case "":
+			case "DIRECTORY":
+				if err := os.MkdirAll(filepath.Join(scope, ".beads", "config.yaml"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			default:
 				if err := os.MkdirAll(filepath.Join(scope, ".beads"), 0o755); err != nil {
 					t.Fatal(err)
 				}

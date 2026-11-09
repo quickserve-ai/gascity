@@ -315,10 +315,12 @@ func withWithheldPrefixesLocked(prefixes ...string) (func(), error) {
 // from the workspace itself. The library reads dolt.auto-start only on bd's CLI
 // path, so with the ambient BEADS_DOLT_AUTO_START withheld, an open of a
 // workspace saying false still starts a dolt sql-server beside it when none is
-// listening (ga-y7lmi0). A config that cannot be read changes nothing.
+// listening (ga-y7lmi0). A config that exists but cannot be read leaves the
+// policy unknown, and unknown does not start a server: the open itself still
+// proceeds, as it did.
 func workspaceAutoStartOpenEnv(scopeRoot string) map[string]string {
 	disabled, err := contract.ReadAutoStartDisabled(fsys.OSFS{}, filepath.Join(scopeRoot, ".beads", "config.yaml"))
-	if err != nil || !disabled {
+	if err == nil && !disabled {
 		return nil
 	}
 	return map[string]string{"BEADS_DOLT_AUTO_START": "0"}
