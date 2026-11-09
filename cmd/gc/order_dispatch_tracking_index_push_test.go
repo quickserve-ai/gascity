@@ -201,3 +201,25 @@ func (s *recordingLabelReadStore) List(query beads.ListQuery) ([]beads.Bead, err
 	}
 	return s.Store.List(query)
 }
+
+// A bd-backed store ignores the pushdown, so its index was never narrowed and a
+// non-idempotent order has nothing to confirm: the live read would only add a
+// forked read per order per tick, and a hold when that read is slow.
+func TestHasOpenWorkSkipsTheLiveReadOnAStoreThatCannotPush(t *testing.T) {
+	store := beads.NewBdStore(t.TempDir(), func(string, string, ...string) ([]byte, error) {
+		return []byte("[]"), nil
+	})
+	idx := newOrderDispatchTrackingIndex(io.Discard)
+	liveReads := 0
+	open, err := idx.hasOpenWork([]beads.Store{store}, []string{"store"}, "digest", nil,
+		func(beads.Store, string) (bool, error) {
+			liveReads++
+			return false, nil
+		}, true)
+	if err != nil {
+		t.Fatalf("hasOpenWork: %v", err)
+	}
+	if open || liveReads != 0 {
+		t.Fatalf("open = %t, live reads = %d; want the index's answer and no live read", open, liveReads)
+	}
+}

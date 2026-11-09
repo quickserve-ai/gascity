@@ -580,3 +580,37 @@ func TestAFailedRecheckSendsTheListingUnpushed(t *testing.T) {
 		})
 	}
 }
+
+type backingOnlyStore struct {
+	Store
+	backing Store
+}
+
+func (s backingOnlyStore) Backing() Store { return s.backing }
+
+// A wrong true here would let a non-idempotent order rely on a narrowed listing,
+// so only a bd store, bare or wrapped, may answer true.
+func TestIgnoresPushNotClosed(t *testing.T) {
+	bd := NewBdStore(t.TempDir(), func(string, string, ...string) ([]byte, error) { return []byte("[]"), nil })
+	mem := NewMemStore()
+	for _, tc := range []struct {
+		name  string
+		store Store
+		want  bool
+	}{
+		{"bd", bd, true},
+		{"bd behind a wrapper", backingOnlyStore{backing: bd}, true},
+		{"bd behind two wrappers", backingOnlyStore{backing: backingOnlyStore{backing: bd}}, true},
+		{"a native store can push", &NativeDoltStore{}, false},
+		{"native behind a wrapper", backingOnlyStore{backing: &NativeDoltStore{}}, false},
+		{"another store", mem, false},
+		{"a wrapper with nothing behind it", backingOnlyStore{}, false},
+		{"nil", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IgnoresPushNotClosed(tc.store); got != tc.want {
+				t.Fatalf("IgnoresPushNotClosed = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}

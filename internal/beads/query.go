@@ -517,3 +517,22 @@ func sortBeadsForQuery(items []Bead, order SortOrder) {
 		})
 	}
 }
+
+// IgnoresPushNotClosed reports whether store certainly answers a
+// ListQuery.PushNotClosed listing without narrowing it, so that listing cannot
+// have hidden a row. It looks through caching and proxy wrappers to the store
+// that reads. Only a *BdStore counts: every other store answers false, because
+// false costs a live read and a wrong true would lose single-flight.
+func IgnoresPushNotClosed(store Store) bool {
+	for store != nil {
+		if _, ok := store.(*BdStore); ok {
+			return true
+		}
+		wrapper, ok := store.(interface{ Backing() Store })
+		if !ok {
+			return false
+		}
+		store = wrapper.Backing()
+	}
+	return false
+}
