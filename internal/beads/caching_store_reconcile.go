@@ -158,8 +158,9 @@ func cacheReconcileLargeInterval() time.Duration {
 		return cacheReconcileIntervalLarge
 	}
 	ms, err := strconv.ParseInt(raw, 10, 64)
-	d := time.Duration(ms) * time.Millisecond
-	if err != nil || d < cacheReconcileIntervalLarge || d > cacheReconcileLargeIntervalMax {
+	// The bounds are compared in milliseconds: a huge value converted to a
+	// Duration first could wrap into range.
+	if err != nil || ms < cacheReconcileIntervalLarge.Milliseconds() || ms > cacheReconcileLargeIntervalMax.Milliseconds() {
 		warnReconcileLargeOnce.Do(func() {
 			log.Printf("beads cache: ignoring %s=%q: want whole milliseconds in [%d, %d]; using %d",
 				CacheReconcileLargeIntervalEnv, raw, cacheReconcileIntervalLarge.Milliseconds(),
@@ -167,7 +168,7 @@ func cacheReconcileLargeInterval() time.Duration {
 		})
 		return cacheReconcileIntervalLarge
 	}
-	return d
+	return time.Duration(ms) * time.Millisecond
 }
 
 // beadCountCadence returns the cadence demanded by the bead-count input

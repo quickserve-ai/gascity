@@ -83,6 +83,13 @@ func nativeListFanOutAssignees(query ListQuery) []string {
 	return out
 }
 
+// nativeListCanPushNotClosed reports whether query's plan can carry the
+// not-closed set: it opted in and leaves the status to the default. It says
+// nothing of whether this store has a set to push.
+func nativeListCanPushNotClosed(query ListQuery) bool {
+	return query.PushNotClosed && query.Status == "" && !query.IncludeClosed && !query.CompleteActive
+}
+
 // nativeListPushableStatus reports whether a gc status maps one-to-one onto a
 // bd status. mapBdStatus folds every other bd status into gc's "open".
 func nativeListPushableStatus(status string) bool {
@@ -270,14 +277,18 @@ func nativeListStatusNameOK(name string) bool {
 // afresh (readListNotClosedStatus), so a custom status added after open is
 // pushed by the next one.
 //
-// WHAT STAYS HIDDEN from an opted-in listing until ExcludeStatus (beads
-// #7647) lets the pushdown say "not closed" directly: a row whose status is in
-// no current status.custom, either a name since removed from the setting
-// while rows still carry it, or one kept only in a server's config.yaml.
+// WHAT THE SET CANNOT NAME until ExcludeStatus (beads #7647) lets the pushdown
+// say "not closed" directly: a row whose status is in no current status.custom,
+// either a name since removed from the setting while rows still carry it, or
+// one kept only in a server's config.yaml. A pushed read would hide it, so
+// guardNotClosed probes for such rows before each push and reads that listing
+// unpushed when it finds one or cannot tell. Only a row that leaves the set
+// between the probe and the read is missed, by that one listing.
 //
 // THE SAME RESIDUE as types.infra: a status.custom kept only in a server's
 // config.yaml is invisible to the workspace-config role, so its statuses are
-// missing from the set; such a status must also be stored as the setting.
+// missing from the set and any row in one costs that scope the pushdown; such
+// a status must also be stored as the setting.
 func (s *NativeDoltStore) loadListNotClosedStatus(ctx context.Context) {
 	set, err := notClosedStatusFromStorage(ctx, s.storage)
 	if err == nil {
@@ -291,12 +302,14 @@ func (s *NativeDoltStore) loadListNotClosedStatus(ctx context.Context) {
 // readListNotClosedStatus is the not-closed set for one opted-in read, read
 // afresh from storage's status.custom setting so a name added after open is
 // in it. An unreadable or unparsable setting pushes nothing ("") for this
-// read: the full read the listing always made.
-func (s *NativeDoltStore) readListNotClosedStatus(ctx context.Context, storage beadslib.Storage) string {
+// read, the full read the listing always made, and counts as a fallback on
+// tally: no probe runs, but the pushdown this listing opted into was lost.
+func (s *NativeDoltStore) readListNotClosedStatus(ctx context.Context, storage beadslib.Storage, tally *nativeListTally) string {
 	set, err := notClosedStatusFromStorage(ctx, storage)
 	if err != nil {
-		s.listLogger().Debug("native bead store: cannot read status.custom for an opted-in listing; reading it unpushed",
-			"prefix", s.idPrefix, "err", err)
+		tally.guardFallbacks++
+		s.listLogger().Warn("native bead store: cannot read status.custom for an opted-in listing; reading it unpushed",
+			"prefix", s.idPrefix, "err", err, "guard_stats", s.listCounters.guardText(*tally))
 		return ""
 	}
 	return set
@@ -357,12 +370,16 @@ type ListRequestStats struct {
 	// Rows is the number of rows the backend returned across all requests,
 	// before any client-side filtering.
 	Rows int64
-	// GuardRuns is the number of not-closed guard probes run for opted-in listings.
+	// GuardRuns is the number of not-closed guard probes run for opted-in
+	// listings, counting a retried List's last attempt only.
 	GuardRuns int64
-	// GuardRows is the number of rows those probes found outside the pushed set.
+	// GuardRows is the number of rows those probes found outside the pushed
+	// set. Each probe reports at most nativeListGuardRowLimit.
 	GuardRows int64
-	// GuardFallbacks is the number of opted-in listings a probe sent down the
-	// full unpushed read, whether it found rows or failed.
+	// GuardFallbacks is the number of opted-in listings sent down the full
+	// unpushed read because status.custom could not be used or a probe found
+	// rows or failed. A status.custom failure runs no probe, so this can pass
+	// GuardRuns.
 	GuardFallbacks int64
 }
 
@@ -407,6 +424,10 @@ type nativeListTally struct {
 	requests int64
 	unkeyed  int64
 	rows     int64
+
+	guardRuns      int64
+	guardRows      int64
+	guardFallbacks int64
 }
 
 func (t *nativeListTally) noteRequest(req issueops.ListRequest, rows int) {
@@ -417,10 +438,19 @@ func (t *nativeListTally) noteRequest(req issueops.ListRequest, rows int) {
 	t.rows += int64(rows)
 }
 
-func (c *nativeListCounters) commit(t nativeListTally) {
+// commit adds a finished attempt's counts. It returns the store's guard run
+// count when t ran the guard, and 0 when it did not. Runs are added last, so a
+// reader that sees this run's count sees its rows and fallback too.
+func (c *nativeListCounters) commit(t nativeListTally) int64 {
 	c.requests.Add(t.requests)
 	c.unkeyed.Add(t.unkeyed)
 	c.rows.Add(t.rows)
+	c.guardRows.Add(t.guardRows)
+	c.guardFallbacks.Add(t.guardFallbacks)
+	if t.guardRuns == 0 {
+		return 0
+	}
+	return c.guardRuns.Add(t.guardRuns)
 }
 
 func (c *nativeListCounters) snapshot() ListRequestStats {

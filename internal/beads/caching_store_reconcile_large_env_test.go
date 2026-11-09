@@ -22,6 +22,9 @@ func TestCacheReconcileLargeIntervalOverride(t *testing.T) {
 		{"past the ceiling is ignored", "900001", cacheReconcileIntervalLarge},
 		{"not a number is ignored", "5m", cacheReconcileIntervalLarge},
 		{"negative is ignored", "-300000", cacheReconcileIntervalLarge},
+		// 2^64 ns is 18446744073709.551616 ms, so this value times 1e6 wraps
+		// to about 299.999 s, inside the bounds.
+		{"a value that wraps into range is ignored", "18446744373709", cacheReconcileIntervalLarge},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
