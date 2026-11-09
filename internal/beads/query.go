@@ -141,12 +141,15 @@ type ListQuery struct {
 	CompleteActive bool
 	// PushNotClosed opts a no-Status, not-IncludeClosed read into
 	// NativeDoltStore's not-closed pushdown: the store sends its derived
-	// not-closed status set as a WHERE instead of reading every row. A status
-	// missing from that vocabulary is then hidden from the answer, where an
-	// unpushed read would return it (folded to open), so only a caller whose
-	// rows gc writes in built-in statuses may set it. Today that is the order
-	// dispatcher's open-work fold (order-run tracking beads). Never honoured
-	// on a CompleteActive read. Other stores ignore it.
+	// not-closed status set as a WHERE instead of reading every row. That set
+	// is an allow-list, so before each pushed read the store probes for rows
+	// outside it, and on finding one or failing to probe it serves that read
+	// unpushed (guardNotClosed): a row in a status missing from the vocabulary
+	// stays in the answer, folded to open. Only a row that leaves the set
+	// between the probe and the read is missed, by that one listing. The probe
+	// is one more query per listing. Today the caller is the order dispatcher's
+	// open-work fold (order-run tracking beads). Never honoured on a
+	// CompleteActive read. Other stores ignore it.
 	PushNotClosed bool
 	// Live bypasses CachingStore and reads from the backing store. Other Store
 	// implementations ignore it. Use it only for lifecycle gates that must

@@ -436,6 +436,9 @@ type NativeDoltStore struct {
 	// listOutsideProbe overrides the not-closed guard probe in tests; nil is
 	// nativeListOutsideRows.
 	listOutsideProbe nativeListOutsideProbe
+	// guardNoSQLWarned latches after the one warning that this store's storage
+	// has no SQL handle for the not-closed guard.
+	guardNoSQLWarned atomic.Bool
 
 	// logger receives the list pushdown's diagnostics. Nil is slog.Default(),
 	// read at call time.

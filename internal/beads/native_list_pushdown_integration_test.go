@@ -5,6 +5,7 @@ package beads
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -248,6 +249,12 @@ func TestNativeDoltStoreListPushdownHonorsTheScopeInfraTypes(t *testing.T) {
 // included, on both tiers.
 func TestNativeDoltStoreListNotClosedPushdownAgainstRealStorage(t *testing.T) {
 	store := openRealNativeDoltStoreForFacade(t, "notclosed-test")
+	// This helper opens an embedded store, which has no SQL handle for the real
+	// probe to use, so left alone every opted-in listing below would read
+	// unpushed and nothing here would test the pushed set. Every row this test
+	// writes is in a status the scope names, so "no rows outside" is the true
+	// answer. The real probe is proved on a server below.
+	store.listOutsideProbe = noOutsideRows
 	ctx := context.Background()
 	if err := store.storage.SetConfig(ctx, "types.custom", strings.Join(RequiredCustomTypes, ",")); err != nil {
 		t.Fatalf("register gc types: %v", err)
@@ -343,5 +350,135 @@ func TestNativeDoltStoreListNotClosedPushdownAgainstRealStorage(t *testing.T) {
 	}
 	if got := ApplyListQuery(all, ListQuery{AllowScan: true, TierMode: TierBoth}); len(got) != seeded-2 {
 		t.Fatalf("the unpushed answer has %d rows, want every seed but the two closed (%d)", len(got), seeded-2)
+	}
+}
+
+// setRawStatus writes a status straight to the table, as a status removed from
+// the vocabulary or written by another tool leaves one: the store's own write
+// path would validate it.
+func setRawStatus(t *testing.T, db *sql.DB, table, id, status string) {
+	t.Helper()
+	result, err := db.Exec("UPDATE "+table+" SET status = ? WHERE id = ?", status, id)
+	if err != nil {
+		t.Fatalf("set %s.%s to %s: %v", table, id, status, err)
+	}
+	if n, err := result.RowsAffected(); err != nil || n != 1 {
+		t.Fatalf("set %s.%s to %s: affected %d rows (%v), want 1", table, id, status, n, err)
+	}
+}
+
+// The not-closed guard's SQL against a real server: it finds a row outside the
+// set in each table, finds none in a clean ledger, and the listing the store
+// then serves carries that row, through the store's own probe and storage.
+func TestNativeListGuardFindsARealRowOutsideTheSet(t *testing.T) {
+	store, db := openServerNativeStoreForTest(t)
+	ctx := context.Background()
+	if err := store.storage.SetConfig(ctx, "types.custom", strings.Join(RequiredCustomTypes, ",")); err != nil {
+		t.Fatalf("register gc types: %v", err)
+	}
+	var logs bytes.Buffer
+	store.logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	create := func(title string, ephemeral bool) string {
+		t.Helper()
+		created, err := store.Create(Bead{Title: title, Type: "task", Ephemeral: ephemeral})
+		if err != nil {
+			t.Fatalf("Create(%s): %v", title, err)
+		}
+		return created.ID
+	}
+	issueID := create("durable", false)
+	wispID := create("wisp", true)
+	for _, ephemeral := range []bool{false, true} {
+		if err := store.Close(create(fmt.Sprintf("closed %v", ephemeral), ephemeral)); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	}
+	probe := func(notClosed string) []nativeListOutsideRow {
+		t.Helper()
+		rows, err := nativeListOutsideRows(ctx, store.storage, notClosed)
+		if err != nil {
+			t.Fatalf("nativeListOutsideRows: %v", err)
+		}
+		return rows
+	}
+	opted := ListQuery{AllowScan: true, TierMode: TierBoth, Live: true, PushNotClosed: true}
+
+	// Control: the open and closed rows of both tables are not outside the set.
+	if rows := probe(builtinNotClosed); len(rows) != 0 {
+		t.Fatalf("clean ledger: probe found %+v, want none", rows)
+	}
+	before := listRequestStatsForTest(t, store)
+	got, err := store.List(opted)
+	if err != nil {
+		t.Fatalf("List on a clean ledger: %v", err)
+	}
+	after := listRequestStatsForTest(t, store)
+	if after.GuardRuns != before.GuardRuns+1 || after.GuardFallbacks != before.GuardFallbacks || after.Unkeyed != before.Unkeyed {
+		t.Fatalf("clean ledger: stats went %+v to %+v, want one guard run, pushed and keyed:\n%s", before, after, logs.String())
+	}
+	if ids := sortedBeadIDs(got); !slices.Contains(ids, issueID) || !slices.Contains(ids, wispID) {
+		t.Fatalf("clean pushed listing = %v, want %s and %s", ids, issueID, wispID)
+	}
+
+	for _, tc := range []struct{ table, id string }{{"issues", issueID}, {"wisps", wispID}} {
+		t.Run(tc.table, func(t *testing.T) {
+			setRawStatus(t, db, tc.table, tc.id, "drifted")
+			defer setRawStatus(t, db, tc.table, tc.id, "open")
+
+			want := []nativeListOutsideRow{{ID: tc.id, Status: "drifted"}}
+			if rows := probe(builtinNotClosed); !slices.Equal(rows, want) {
+				t.Fatalf("probe found %+v, want %+v", rows, want)
+			}
+			if rows := probe(builtinNotClosed + ",drifted"); len(rows) != 0 {
+				t.Fatalf("with drifted in the set the probe found %+v, want none", rows)
+			}
+
+			logs.Reset()
+			before := listRequestStatsForTest(t, store)
+			got, err := store.List(opted)
+			if err != nil {
+				t.Fatalf("List: %v", err)
+			}
+			if !slices.Contains(sortedBeadIDs(got), tc.id) {
+				t.Fatalf("listing %v lacks %s, whose status the set does not name", sortedBeadIDs(got), tc.id)
+			}
+			after := listRequestStatsForTest(t, store)
+			if after.GuardRows != before.GuardRows+1 || after.GuardFallbacks != before.GuardFallbacks+1 || after.Unkeyed != before.Unkeyed+1 {
+				t.Fatalf("stats went %+v to %+v, want one row, one fallback, one unpushed read", before, after)
+			}
+			if !strings.Contains(logs.String(), "statuses=drifted") {
+				t.Fatalf("log %q does not name the status", logs.String())
+			}
+		})
+	}
+}
+
+// LIMIT binds the whole UNION ALL on a real server: 60 strays in each table
+// return 100 rows, where a per-table limit or none would return 120.
+func TestNativeListGuardLimitBindsTheWholeUnion(t *testing.T) {
+	store, db := openServerNativeStoreForTest(t)
+	ctx := context.Background()
+	if err := store.storage.SetConfig(ctx, "types.custom", strings.Join(RequiredCustomTypes, ",")); err != nil {
+		t.Fatalf("register gc types: %v", err)
+	}
+	for _, ephemeral := range []bool{false, true} {
+		for i := range 60 {
+			if _, err := store.Create(Bead{Title: fmt.Sprintf("stray %d", i), Type: "task", Ephemeral: ephemeral}); err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+		}
+	}
+	for _, table := range []string{"issues", "wisps"} {
+		if _, err := db.Exec("UPDATE " + table + " SET status = 'drifted'"); err != nil {
+			t.Fatalf("set %s rows outside the set: %v", table, err)
+		}
+	}
+	rows, err := nativeListOutsideRows(ctx, store.storage, builtinNotClosed)
+	if err != nil {
+		t.Fatalf("nativeListOutsideRows: %v", err)
+	}
+	if len(rows) != 100 {
+		t.Fatalf("probe returned %d rows, want 100", len(rows))
 	}
 }

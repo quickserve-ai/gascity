@@ -3,7 +3,9 @@ package beads
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -12,7 +14,19 @@ import (
 
 // nativeListGuardTimeout bounds the guard probe. A probe that outruns it
 // counts as failed, and the listing reads unpushed.
-const nativeListGuardTimeout = 15 * time.Second
+const nativeListGuardTimeout = 10 * time.Second
+
+// nativeListGuardRowLimit caps the rows one probe returns. The guard only needs
+// to know that a row exists; the statuses it logs need a sample, not the set.
+const nativeListGuardRowLimit = 100
+
+// nativeListGuardHeartbeatEvery is how many guard runs pass between the Info
+// lines that show the guard working (noteGuardHeartbeat).
+const nativeListGuardHeartbeatEvery = 120
+
+// errNativeListNoSQLHandle is a storage the guard can never probe. It does not
+// clear, so its listings read unpushed and the store warns once.
+var errNativeListNoSQLHandle = errors.New("no SQL handle")
 
 // nativeListOutsideRow is one row whose status the pushed not-closed set names
 // nowhere: a pushed read would hide it, because the set is an allow-list.
@@ -26,9 +40,10 @@ type nativeListOutsideRow struct {
 type nativeListOutsideProbe func(ctx context.Context, storage beadslib.Storage, notClosed string) ([]nativeListOutsideRow, error)
 
 // nativeListGuardQuery is the probe's SQL and arguments: rows of either table
-// whose status is neither in notClosed nor closed. It covers every kind of
-// row, which is stricter than the opted-in caller needs: a stray status on a
-// row that caller would not have used still costs it the pushdown.
+// whose status is neither in notClosed nor closed, at most
+// nativeListGuardRowLimit in all across the two. It covers every kind of row,
+// which is stricter than the opted-in caller needs: a stray status on a row
+// that caller would not have used still costs it the pushdown.
 func nativeListGuardQuery(notClosed string) (string, []any) {
 	var names []any
 	for _, name := range strings.Split(notClosed, ",") {
@@ -38,8 +53,9 @@ func nativeListGuardQuery(notClosed string) (string, []any) {
 	}
 	names = append(names, "closed")
 	marks := strings.TrimSuffix(strings.Repeat("?,", len(names)), ",")
-	query := "SELECT id, status FROM issues WHERE status NOT IN (" + marks +
-		") UNION ALL SELECT id, status FROM wisps WHERE status NOT IN (" + marks + ")"
+	query := "(SELECT id, status FROM issues WHERE status NOT IN (" + marks +
+		")) UNION ALL (SELECT id, status FROM wisps WHERE status NOT IN (" + marks +
+		")) LIMIT " + strconv.Itoa(nativeListGuardRowLimit)
 	return query, append(append([]any{}, names...), names...)
 }
 
@@ -48,11 +64,11 @@ func nativeListGuardQuery(notClosed string) (string, []any) {
 func nativeListOutsideRows(ctx context.Context, storage beadslib.Storage, notClosed string) ([]nativeListOutsideRow, error) {
 	accessor, ok := storage.(interface{ UnderlyingDB() *sql.DB })
 	if !ok {
-		return nil, fmt.Errorf("storage %T has no SQL handle", storage)
+		return nil, fmt.Errorf("storage %T: %w", storage, errNativeListNoSQLHandle)
 	}
 	db := accessor.UnderlyingDB()
 	if db == nil {
-		return nil, fmt.Errorf("storage %T has a nil SQL handle", storage)
+		return nil, fmt.Errorf("storage %T returned a nil handle: %w", storage, errNativeListNoSQLHandle)
 	}
 	ctx, cancel := context.WithTimeout(ctx, nativeListGuardTimeout)
 	defer cancel()
@@ -77,8 +93,9 @@ func nativeListOutsideRows(ctx context.Context, storage beadslib.Storage, notClo
 // returns the set to push: notClosed when no row sits outside it, "" otherwise.
 // Any row outside the set, or a probe that fails or times out, sends this one
 // listing down the full unpushed read. Nothing latches, so a status renamed
-// back clears itself on the next listing.
-func (s *NativeDoltStore) guardNotClosed(ctx context.Context, storage beadslib.Storage, notClosed string) string {
+// back clears itself on the next listing. Its counts go on tally, so a retried
+// attempt is not counted twice.
+func (s *NativeDoltStore) guardNotClosed(ctx context.Context, storage beadslib.Storage, notClosed string, tally *nativeListTally) string {
 	if notClosed == "" {
 		return ""
 	}
@@ -86,23 +103,43 @@ func (s *NativeDoltStore) guardNotClosed(ctx context.Context, storage beadslib.S
 	if probe == nil {
 		probe = nativeListOutsideRows
 	}
-	s.listCounters.guardRuns.Add(1)
+	tally.guardRuns++
 	rows, err := probe(ctx, storage, notClosed)
 	if err != nil {
-		s.listCounters.guardFallbacks.Add(1)
+		tally.guardFallbacks++
+		if errors.Is(err, errNativeListNoSQLHandle) {
+			if s.guardNoSQLWarned.CompareAndSwap(false, true) {
+				s.listLogger().Warn("native bead store: this storage has no SQL handle for the not-closed guard; every opted-in listing on this store reads unpushed",
+					"prefix", s.idPrefix, "err", err, "guard_stats", s.listCounters.guardText(*tally))
+			}
+			return ""
+		}
 		s.listLogger().Warn("native bead store: not-closed guard failed; reading this listing unpushed",
-			"prefix", s.idPrefix, "err", err, "guard_stats", s.listCounters.guardText())
+			"prefix", s.idPrefix, "err", err, "guard_stats", s.listCounters.guardText(*tally))
 		return ""
 	}
 	if len(rows) == 0 {
 		return notClosed
 	}
-	s.listCounters.guardRows.Add(int64(len(rows)))
-	s.listCounters.guardFallbacks.Add(1)
+	tally.guardRows += int64(len(rows))
+	tally.guardFallbacks++
 	s.listLogger().Warn("native bead store: rows sit outside the not-closed status set; reading this listing unpushed",
-		"prefix", s.idPrefix, "count", len(rows), "statuses", nativeListOutsideStatuses(rows, 3),
-		"guard_stats", s.listCounters.guardText())
+		"prefix", s.idPrefix, "count", len(rows), "count_capped", len(rows) >= nativeListGuardRowLimit,
+		"statuses", nativeListOutsideStatuses(rows, 3), "guard_stats", s.listCounters.guardText(*tally))
 	return ""
+}
+
+// noteGuardHeartbeat logs one Info line when guardRuns, the store's run count
+// after a List's commit, is a multiple of nativeListGuardHeartbeatEvery. It is
+// the counters' one production reader: without it a healthy guard says nothing.
+// Each committed run yields a distinct count, so racing Lists log it once.
+func (s *NativeDoltStore) noteGuardHeartbeat(guardRuns int64) {
+	if guardRuns == 0 || guardRuns%nativeListGuardHeartbeatEvery != 0 {
+		return
+	}
+	stats := s.listCounters.snapshot()
+	s.listLogger().Info("native bead store: not-closed guard heartbeat",
+		"prefix", s.idPrefix, "guard_runs", guardRuns, "guard_rows", stats.GuardRows, "guard_fallbacks", stats.GuardFallbacks)
 }
 
 // nativeListOutsideStatuses names up to limit distinct statuses, in first-seen order.
@@ -122,6 +159,7 @@ func nativeListOutsideStatuses(rows []nativeListOutsideRow, limit int) string {
 	return strings.Join(names, ",")
 }
 
-func (c *nativeListCounters) guardText() string {
-	return fmt.Sprintf("runs=%d rows=%d fallbacks=%d", c.guardRuns.Load(), c.guardRows.Load(), c.guardFallbacks.Load())
+// guardText renders the committed guard counts plus t, the attempt in progress.
+func (c *nativeListCounters) guardText(t nativeListTally) string {
+	return fmt.Sprintf("runs=%d rows=%d fallbacks=%d", c.guardRuns.Load()+t.guardRuns, c.guardRows.Load()+t.guardRows, c.guardFallbacks.Load()+t.guardFallbacks)
 }

@@ -162,8 +162,9 @@ func (s *NativeDoltStore) List(query ListQuery) ([]Bead, error) {
 	// Only an opted-in read pushes the not-closed set, and it reads the
 	// scope's status vocabulary afresh each time (readListNotClosedStatus),
 	// so a status.custom name added after the store opened is pushed too and
-	// its rows stay visible. An unreadable vocabulary pushes nothing.
-	optedIn := query.PushNotClosed && !query.CompleteActive && !s.statusPushdownOff.Load()
+	// its rows stay visible. An unreadable vocabulary pushes nothing. A listing
+	// the plan could not narrow anyway reads no vocabulary and runs no guard.
+	optedIn := nativeListCanPushNotClosed(query) && !s.statusPushdownOff.Load()
 	plan := nativeListPlan(query, pushable, "")
 	if !optedIn {
 		s.noteUnkeyedPlan(query, plan)
@@ -176,7 +177,7 @@ func (s *NativeDoltStore) List(query ListQuery) ([]Bead, error) {
 		tally = nativeListTally{}
 		notClosed := ""
 		if optedIn {
-			notClosed = s.guardNotClosed(ctx, storage, s.readListNotClosedStatus(ctx, storage))
+			notClosed = s.guardNotClosed(ctx, storage, s.readListNotClosedStatus(ctx, storage, &tally), &tally)
 			plan = nativeListPlan(query, pushable, notClosed)
 			s.noteUnkeyedPlan(query, plan)
 		}
@@ -233,7 +234,7 @@ func (s *NativeDoltStore) List(query ListQuery) ([]Bead, error) {
 		out = ApplyListQuery(beads, query)
 		return nil
 	})
-	s.listCounters.commit(tally)
+	s.noteGuardHeartbeat(s.listCounters.commit(tally))
 	if err != nil {
 		return nil, err
 	}
@@ -772,12 +773,14 @@ func nativeListRequestFromListQuery(query ListQuery, pushableTypes map[string]bo
 	}
 	if nativeListPushableStatus(query.Status) {
 		req.Status = query.Status
-	} else if query.PushNotClosed && query.Status == "" && !query.IncludeClosed && !query.CompleteActive && notClosed != "" {
+	} else if nativeListCanPushNotClosed(query) && notClosed != "" {
 		// The not-closed default: every status of the scope's vocabulary but
 		// closed, as the request's OR set (nativeListNotClosedStatusFor). It
 		// replaces the status exclusions AllFlag lifted, and names pinned and
-		// hooked so the pinned-flag predicate stays lifted too. Rows outside
-		// the set are exactly the closed ones, which ApplyListQuery drops.
+		// hooked so the pinned-flag predicate stays lifted too. A row outside
+		// the set is either closed, which ApplyListQuery drops anyway, or in a
+		// status the scope no longer names; guardNotClosed looks for the second
+		// kind first and passes an empty set here when it finds one.
 		// Only when the caller opted in (PushNotClosed), and never on a
 		// CompleteActive read: there a status the vocabulary missed would not
 		// just hide rows, the cache would evict them as closed.
