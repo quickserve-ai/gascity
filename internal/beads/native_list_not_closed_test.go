@@ -479,3 +479,37 @@ func TestALatchedListingCountsAsAFallback(t *testing.T) {
 		t.Fatalf("stats = %+v, want 1 fallback and no probe", stats)
 	}
 }
+
+// A status registered while the pushed read runs can already hold rows the set
+// did not name, and the next probe will not see them because the set will then
+// name that status. The listing answers from a full read instead (Opus round 3).
+func TestAStatusRegisteredDuringThePushedReadSendsItUnpushed(t *testing.T) {
+	setting := ""
+	var sent []string
+	base := vocabularyReader(outOfVocabularyRows(), "", &sent)
+	reader := &nativeDoltReaderSpy{list: func(ctx context.Context, req issueops.ListRequest) (issueops.IssuePage, error) {
+		page, err := base.list(ctx, req)
+		setting = "staged_ready"
+		return page, err
+	}}
+	store := newNativeDoltStoreWithStorage(statusSettingStorage{nativeDoltReaderSpy: reader, live: &setting}, "native-test")
+	store.listOutsideProbe = noOutsideRows
+	var logs syncBuffer
+	store.logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	got, err := store.List(ListQuery{AllowScan: true, TierMode: TierBoth, Live: true, PushNotClosed: true})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if ids := listedIDs(got); !slices.Equal(ids, []string{"gc-drift", "gc-open"}) {
+		t.Fatalf("listing = %v, want the row in the new status too", ids)
+	}
+	if !slices.Equal(sent, []string{builtinNotClosed, ""}) {
+		t.Fatalf("sent %q, want the set then one unpushed read", sent)
+	}
+	if !strings.Contains(logs.String(), "status.custom changed during a pushed") {
+		t.Fatalf("logs = %q, want the line saying why", logs.String())
+	}
+	if stats := store.listCounters.snapshot(); stats.GuardFallbacks != 1 {
+		t.Fatalf("stats = %+v, want 1 fallback", stats)
+	}
+}

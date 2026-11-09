@@ -70,8 +70,6 @@ func nativeListOutsideRows(ctx context.Context, storage beadslib.Storage, notClo
 	if db == nil {
 		return nil, fmt.Errorf("storage %T returned a nil handle: %w", storage, errNativeListNoSQLHandle)
 	}
-	ctx, cancel := context.WithTimeout(ctx, nativeListGuardTimeout)
-	defer cancel()
 	query, args := nativeListGuardQuery(notClosed)
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -104,7 +102,9 @@ func (s *NativeDoltStore) guardNotClosed(ctx context.Context, storage beadslib.S
 		probe = nativeListOutsideRows
 	}
 	tally.guardRuns++
-	rows, err := probe(ctx, storage, notClosed)
+	probeCtx, cancel := context.WithTimeout(ctx, nativeListGuardTimeout)
+	defer cancel()
+	rows, err := probe(probeCtx, storage, notClosed)
 	if err != nil {
 		tally.guardFallbacks++
 		if errors.Is(err, errNativeListNoSQLHandle) {
@@ -140,6 +140,22 @@ func nativeListOutsideRowNames(rows []nativeListOutsideRow) string {
 		names = append(names, row.ID+"="+row.Status)
 	}
 	return strings.Join(names, ",")
+}
+
+// listVocabularyMoved reports whether status.custom no longer gives notClosed,
+// the set a just-finished pushed read used, re-reading it afterwards. A row can
+// only enter a registered status once the status exists, so a set unchanged
+// after the read proves no such status appeared during it. An unreadable
+// setting counts as moved: the full read is the answer that needs no proof.
+func (s *NativeDoltStore) listVocabularyMoved(ctx context.Context, storage beadslib.Storage, notClosed string, tally *nativeListTally) bool {
+	now, err := notClosedStatusFromStorage(ctx, storage)
+	if err == nil && now == notClosed {
+		return false
+	}
+	tally.guardFallbacks++
+	s.listLogger().Warn("native bead store: status.custom changed during a pushed not-closed listing; reading it again unpushed",
+		"prefix", s.idPrefix, "pushed_set", notClosed, "current_set", now, "err", err, "guard_stats", s.listCounters.guardText(*tally))
+	return true
 }
 
 // noteGuardHeartbeat logs one Info line when guardRuns, the store's run count

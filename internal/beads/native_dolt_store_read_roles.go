@@ -195,7 +195,21 @@ func (s *NativeDoltStore) List(query ListQuery) ([]Bead, error) {
 		var beads []Bead
 		seen := make(map[string]bool)
 		reqs := plan
-		for i := 0; i < len(reqs); i++ {
+		for i := 0; ; i++ {
+			if i >= len(reqs) {
+				if notClosed == "" || !s.listVocabularyMoved(ctx, storage, notClosed, &tally) {
+					break
+				}
+				// A status registered after this listing read the vocabulary
+				// can already hold rows the pushed set did not name. The next
+				// probe cannot see them, because the set will then name it, so
+				// this listing answers from the full read instead.
+				notClosed = ""
+				reqs = nativeListPlan(query, pushable, "")
+				i, beads = -1, beads[:0]
+				clear(seen)
+				continue
+			}
 			req := reqs[i]
 			if req.IssueType != "" && s.typePushdownOff.Load() {
 				req.IssueType = ""
@@ -303,10 +317,12 @@ func (s *NativeDoltStore) listPlanRequest(ctx context.Context, reader issueops.R
 		tally.guardFallbacks++
 		if refused := nativeListRefusedStatusName(statusErr); refused != "" {
 			// The set was read from status.custom for this very listing, so a
-			// name the reader refuses is the reader's per-handle cache lagging
-			// another process's status.custom write. Latching would freeze the
-			// guard until restart; this listing reads unpushed and the next one
-			// tries again. Only a refusal that quotes no name latches.
+			// name the reader refuses is the reader's per-handle cache, which
+			// only a SetConfig on that handle clears, missing another process's
+			// write. It can last until a restart or reconnect. Latching would
+			// stop the guard for that whole time; instead each listing pays the
+			// refusal, reads unpushed and counts as a fallback, and the pushdown
+			// resumes by itself. Only a refusal that quotes no name latches.
 			if s.statusRefusalWarned.CompareAndSwap(false, true) {
 				s.listLogger().Warn("native bead store: reader refused a status the scope's current status.custom names; reading such listings unpushed (counted as guard fallbacks)",
 					"prefix", s.idPrefix, "refused_status", refused, "err", statusErr, "guard_stats", s.listCounters.guardText(*tally))

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"strings"
 	"sync"
@@ -57,6 +58,7 @@ type pushedListingHidesStore struct {
 
 	mu        sync.Mutex
 	liveReads int
+	liveErr   error
 }
 
 func (s *pushedListingHidesStore) List(query beads.ListQuery) ([]beads.Bead, error) {
@@ -67,6 +69,9 @@ func (s *pushedListingHidesStore) List(query beads.ListQuery) ([]beads.Bead, err
 		s.mu.Lock()
 		s.liveReads++
 		s.mu.Unlock()
+		if s.liveErr != nil {
+			return nil, s.liveErr
+		}
 	}
 	return s.Store.List(query)
 }
@@ -126,6 +131,16 @@ func TestOpenWorkGateConfirmsAbsenceLiveOnlyForANonIdempotentOrder(t *testing.T)
 				t.Fatalf("disagreement line present = %t, want %t; stderr: %s", named, !tc.idempotent, stderr.String())
 			}
 		})
+	}
+}
+
+// A live read that fails gives no proof of absence, so the order is held.
+func TestOpenWorkGateHoldsANonIdempotentOrderWhenTheLiveReadFails(t *testing.T) {
+	store := &pushedListingHidesStore{Store: beads.NewMemStore(), liveErr: errors.New("hub unavailable")}
+	m := &memoryOrderDispatcher{stderr: io.Discard, rec: events.Discard}
+	idx := newOrderDispatchTrackingIndex(io.Discard)
+	if !m.openWorkGateShut(context.Background(), gateCandidate(store, false), idx, time.Now()) {
+		t.Fatal("gate open on a failed live read, want the order held")
 	}
 }
 

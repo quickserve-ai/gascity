@@ -145,9 +145,10 @@ type ListQuery struct {
 	// is an allow-list, so before each pushed read the store probes for rows
 	// outside it, and on finding one or failing to probe it serves that read
 	// unpushed (guardNotClosed): a row in a status missing from the vocabulary
-	// stays in the answer, folded to open. Only a row that leaves the set
-	// between the probe and the read is missed, by that one listing. The probe
-	// is one more query per listing. Today the caller is the order dispatcher's
+	// stays in the answer, folded to open. A status registered during the
+	// read sends it down the same full read. Only a row moving, between the
+	// probe and the read, into a status no status.custom names is missed, by
+	// that one listing. The probe is one more query per listing. Today the caller is the order dispatcher's
 	// open-work fold (order-run tracking beads). Never honoured on a
 	// CompleteActive read. Other stores ignore it.
 	PushNotClosed bool

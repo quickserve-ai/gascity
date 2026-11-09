@@ -486,6 +486,31 @@ func TestTheGuardProbeIsBounded(t *testing.T) {
 	}
 }
 
+// The bound is on the context the probe runs under, not only a constant.
+func TestTheGuardProbeRunsUnderTheTimeout(t *testing.T) {
+	var sent []string
+	var logs syncBuffer
+	store := guardStore(t, &sent, &logs)
+	called := false
+	store.listOutsideProbe = func(ctx context.Context, _ beadslib.Storage, _ string) ([]nativeListOutsideRow, error) {
+		called = true
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			t.Fatal("the probe ran with no deadline")
+		}
+		if left := time.Until(deadline); left > nativeListGuardTimeout {
+			t.Fatalf("deadline in %v, want at most %v", left, nativeListGuardTimeout)
+		}
+		return nil, nil
+	}
+	if _, err := store.List(ListQuery{AllowScan: true, TierMode: TierBoth, Live: true, PushNotClosed: true}); err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if !called {
+		t.Fatal("the probe did not run")
+	}
+}
+
 // A count at the limit is "at least": the log says it is capped.
 func TestAGuardCountAtTheLimitIsLoggedAsCapped(t *testing.T) {
 	for _, tc := range []struct {

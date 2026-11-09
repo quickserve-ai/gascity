@@ -8,15 +8,59 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+
+	beadslib "github.com/steveyegge/beads"
 )
 
 // The list pushdown against REAL upstream native storage. The unit property
 // proves the plan against an oracle of the reader role; this proves the role
 // itself agrees: every query answers exactly what ApplyListQuery answers over
 // the whole ledger, with and without the scope's type vocabulary registered.
+
+// openServerNativeStoreForTest opens a native store over a throwaway dolt
+// sql-server, with a raw handle on its database for the legacy-row setup.
+func openServerNativeStoreForTest(tb *testing.T) (*NativeDoltStore, *sql.DB) {
+	tb.Helper()
+	ctx := context.Background()
+	port := startTestDoltServer(tb)
+	beadsDir := filepath.Join(tb.TempDir(), ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		tb.Fatalf("create .beads directory: %v", err)
+	}
+	metadata := fmt.Sprintf(`{"backend":"dolt","database":"beads","dolt_mode":"server","dolt_server_host":"127.0.0.1","dolt_server_port":%d}`, port)
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(metadata), 0o644); err != nil {
+		tb.Fatalf("write metadata.json: %v", err)
+	}
+	storage, err := beadslib.OpenBestAvailable(ctx, beadsDir)
+	if err != nil {
+		tb.Skipf("upstream native beads storage unavailable: %v", err)
+	}
+	tb.Cleanup(func() { _ = storage.Close() })
+	if err := storage.SetConfig(ctx, "issue_prefix", "gc"); err != nil {
+		tb.Fatalf("set issue prefix: %v", err)
+	}
+	accessor, ok := storage.(testRawDBGetter)
+	if !ok {
+		tb.Fatal("server-backed storage exposes no raw DB")
+	}
+	return newNativeDoltStoreWithStorageAndPrefix(storage, "list-revision", "gc"), accessor.DB()
+}
+
+// nativeStorageForTest is the store's current handle, held for the test.
+func nativeStorageForTest(t *testing.T, store *NativeDoltStore) beadslib.Storage {
+	t.Helper()
+	storage, release, err := store.acquireStorage()
+	if err != nil {
+		t.Fatalf("acquire storage: %v", err)
+	}
+	t.Cleanup(release)
+	return storage
+}
 
 func seedPushdownLedger(t *testing.T, store *NativeDoltStore) {
 	t.Helper()
@@ -256,10 +300,10 @@ func TestNativeDoltStoreListNotClosedPushdownAgainstRealStorage(t *testing.T) {
 	// answer. The real probe is proved on a server below.
 	store.listOutsideProbe = noOutsideRows
 	ctx := context.Background()
-	if err := store.storage.SetConfig(ctx, "types.custom", strings.Join(RequiredCustomTypes, ",")); err != nil {
+	if err := nativeStorageForTest(t, store).SetConfig(ctx, "types.custom", strings.Join(RequiredCustomTypes, ",")); err != nil {
 		t.Fatalf("register gc types: %v", err)
 	}
-	if err := store.storage.SetConfig(ctx, "status.custom", "staged_ready:wip,launched"); err != nil {
+	if err := nativeStorageForTest(t, store).SetConfig(ctx, "status.custom", "staged_ready:wip,launched"); err != nil {
 		t.Fatalf("register custom statuses: %v", err)
 	}
 	store.loadListPushableTypes(ctx)
@@ -325,7 +369,7 @@ func TestNativeDoltStoreListNotClosedPushdownAgainstRealStorage(t *testing.T) {
 	// reopen. The pinned FLAG needs no case here: naming pinned in the pushed
 	// set lifts the flag predicate (issueops.ListRequest.Status), as AllFlag
 	// does on the unpushed read.
-	if err := store.storage.SetConfig(ctx, "status.custom", "staged_ready:wip,launched,review"); err != nil {
+	if err := nativeStorageForTest(t, store).SetConfig(ctx, "status.custom", "staged_ready:wip,launched,review"); err != nil {
 		t.Fatalf("add a custom status after open: %v", err)
 	}
 	late, err := store.Create(Bead{Title: "status review", Type: "task", Labels: []string{"seed"}})
@@ -373,7 +417,7 @@ func setRawStatus(t *testing.T, db *sql.DB, table, id, status string) {
 func TestNativeListGuardFindsARealRowOutsideTheSet(t *testing.T) {
 	store, db := openServerNativeStoreForTest(t)
 	ctx := context.Background()
-	if err := store.storage.SetConfig(ctx, "types.custom", strings.Join(RequiredCustomTypes, ",")); err != nil {
+	if err := nativeStorageForTest(t, store).SetConfig(ctx, "types.custom", strings.Join(RequiredCustomTypes, ",")); err != nil {
 		t.Fatalf("register gc types: %v", err)
 	}
 	var logs bytes.Buffer
@@ -396,7 +440,7 @@ func TestNativeListGuardFindsARealRowOutsideTheSet(t *testing.T) {
 	}
 	probe := func(notClosed string) []nativeListOutsideRow {
 		t.Helper()
-		rows, err := nativeListOutsideRows(ctx, store.storage, notClosed)
+		rows, err := nativeListOutsideRows(ctx, nativeStorageForTest(t, store), notClosed)
 		if err != nil {
 			t.Fatalf("nativeListOutsideRows: %v", err)
 		}
@@ -459,7 +503,7 @@ func TestNativeListGuardFindsARealRowOutsideTheSet(t *testing.T) {
 func TestNativeListGuardLimitBindsTheWholeUnion(t *testing.T) {
 	store, db := openServerNativeStoreForTest(t)
 	ctx := context.Background()
-	if err := store.storage.SetConfig(ctx, "types.custom", strings.Join(RequiredCustomTypes, ",")); err != nil {
+	if err := nativeStorageForTest(t, store).SetConfig(ctx, "types.custom", strings.Join(RequiredCustomTypes, ",")); err != nil {
 		t.Fatalf("register gc types: %v", err)
 	}
 	for _, ephemeral := range []bool{false, true} {
@@ -474,7 +518,7 @@ func TestNativeListGuardLimitBindsTheWholeUnion(t *testing.T) {
 			t.Fatalf("set %s rows outside the set: %v", table, err)
 		}
 	}
-	rows, err := nativeListOutsideRows(ctx, store.storage, builtinNotClosed)
+	rows, err := nativeListOutsideRows(ctx, nativeStorageForTest(t, store), builtinNotClosed)
 	if err != nil {
 		t.Fatalf("nativeListOutsideRows: %v", err)
 	}

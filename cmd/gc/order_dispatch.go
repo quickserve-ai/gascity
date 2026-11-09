@@ -1243,10 +1243,12 @@ func (idx *orderDispatchTrackingIndex) hasOpenTracking(
 // is not a no-op cares. The dispatcher passes !Idempotent: such an order takes
 // the live read before it fires, so it never relies on the pushed listing to
 // keep single-flight. The read happens only when the order is due and the index
-// found nothing, so it costs about one label read per dispatch of a
-// non-idempotent order, not one per order per tick. An idempotent order keeps
-// the index's answer: it already dispatches without any gate when the gate
-// times out (gateFailClosed).
+// found nothing. It is the per-order label read this index replaced: unpushed,
+// so it returns the order's closed runs too, and it walks each open root again.
+// It runs under the gate's bound, so on a saturated store a timeout holds the
+// order and arms its backoff, the policy a non-idempotent order has always had
+// on a gate timeout. An idempotent order keeps the index's answer: it already
+// dispatches without any gate when the gate times out (gateFailClosed).
 func (idx *orderDispatchTrackingIndex) hasOpenWork(
 	stores []beads.Store,
 	storeKeys []string,
@@ -1439,10 +1441,12 @@ func (idx *orderDispatchTrackingIndex) entriesForStore(store beads.Store, storeK
 	// could dispatch again. So the store probes for such rows before each
 	// pushed read and reads unpushed when it finds one or cannot tell
 	// (guardNotClosed). The probe goes away with ExcludeStatus (beads #7647).
-	// A row that leaves the set between the probe and the read is missed for
-	// that tick; a non-idempotent order does not rely on this listing for a
-	// "no open work" answer (hasOpenWork's confirmAbsence), and the next probe
-	// names the row.
+	// A row that moves, between the probe and the read, into a status no
+	// status.custom names is missed for that tick; a non-idempotent order does
+	// not rely on this listing for a "no open work" answer (hasOpenWork's
+	// confirmAbsence), and the next probe names the row. A status registered
+	// during the read sends the listing back to a full read
+	// (listVocabularyMoved).
 	items, err := beads.HandlesFor(store).Live.List(beads.ListQuery{
 		AllowScan:     true,
 		TierMode:      beads.TierBoth,
