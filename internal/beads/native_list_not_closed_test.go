@@ -24,6 +24,9 @@ type statusSettingStorage struct {
 	// live, when set, is read on every WorkspaceConfig call instead of
 	// value: an operator changing status.custom while the store is open.
 	live *string
+	// liveErr, when set, is read on every WorkspaceConfig call instead of err:
+	// a setting that was readable and then is not.
+	liveErr *error
 }
 
 func (s statusSettingStorage) WorkspaceConfig() (issueops.WorkspaceConfig, error) {
@@ -31,7 +34,11 @@ func (s statusSettingStorage) WorkspaceConfig() (issueops.WorkspaceConfig, error
 	if s.live != nil {
 		value = *s.live
 	}
-	return statusSettingConfig{infraSettingConfig: infraSettingConfig{}, value: value, err: s.err}, nil
+	err := s.err
+	if s.liveErr != nil {
+		err = *s.liveErr
+	}
+	return statusSettingConfig{infraSettingConfig: infraSettingConfig{}, value: value, err: err}, nil
 }
 
 type statusSettingConfig struct {
@@ -511,5 +518,65 @@ func TestAStatusRegisteredDuringThePushedReadSendsItUnpushed(t *testing.T) {
 	}
 	if stats := store.listCounters.snapshot(); stats.GuardFallbacks != 1 {
 		t.Fatalf("stats = %+v, want 1 fallback", stats)
+	}
+}
+
+// A re-check that cannot read the setting proves nothing about what the pushed
+// read hid, so the listing answers from a full read, and that read's own failure
+// is the listing's failure, never the pushed page (Astra at 26c81a9dd59d).
+func TestAFailedRecheckSendsTheListingUnpushed(t *testing.T) {
+	retryFailed := errors.New("unpushed read failed")
+	for _, tc := range []struct {
+		name     string
+		retryErr error
+	}{
+		{name: "the unpushed read answers"},
+		{name: "the unpushed read fails", retryErr: retryFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var sent []string
+			var settingErr error
+			base := vocabularyReader(outOfVocabularyRows(), "", &sent)
+			calls := 0
+			reader := &nativeDoltReaderSpy{list: func(ctx context.Context, req issueops.ListRequest) (issueops.IssuePage, error) {
+				calls++
+				if calls == 1 {
+					page, err := base.list(ctx, req)
+					settingErr = errors.New("status.custom unreadable")
+					return page, err
+				}
+				if tc.retryErr != nil {
+					return issueops.IssuePage{}, tc.retryErr
+				}
+				return base.list(ctx, req)
+			}}
+			store := newNativeDoltStoreWithStorage(statusSettingStorage{nativeDoltReaderSpy: reader, liveErr: &settingErr}, "native-test")
+			store.listOutsideProbe = noOutsideRows
+			got, err := store.List(ListQuery{AllowScan: true, TierMode: TierBoth, Live: true, PushNotClosed: true})
+			if calls != 2 {
+				t.Fatalf("reads = %d, want the pushed read then one unpushed read", calls)
+			}
+			if tc.retryErr != nil {
+				if !errors.Is(err, tc.retryErr) {
+					t.Fatalf("List err = %v, want the unpushed read's failure", err)
+				}
+				if len(got) != 0 {
+					t.Fatalf("listing = %v, want no rows from the pushed read", listedIDs(got))
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("List: %v", err)
+			}
+			if ids := listedIDs(got); !slices.Equal(ids, []string{"gc-drift", "gc-open"}) {
+				t.Fatalf("listing = %v, want the full read's rows", ids)
+			}
+			if !slices.Equal(sent, []string{builtinNotClosed, ""}) {
+				t.Fatalf("sent %q, want the set then one unpushed read", sent)
+			}
+			if stats := store.listCounters.snapshot(); stats.GuardFallbacks != 1 {
+				t.Fatalf("stats = %+v, want 1 fallback", stats)
+			}
+		})
 	}
 }
