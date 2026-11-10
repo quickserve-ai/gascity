@@ -1252,7 +1252,8 @@ func (idx *orderDispatchTrackingIndex) hasOpenTracking(
 // the live read before it fires, so it never relies on the pushed listing to
 // keep single-flight. The read happens only when the order is due and the index
 // found nothing. It is the per-order label read this index replaced: unpushed,
-// so it returns the order's closed runs too, and it walks each open root again.
+// so the backend reads the order's closed runs too before they are filtered
+// out, and it walks each open root again.
 // It runs under the gate's bound, so on a saturated store a timeout holds the
 // order and arms its backoff, the policy a non-idempotent order has always had
 // on a gate timeout. An idempotent order keeps the index's answer: it already
