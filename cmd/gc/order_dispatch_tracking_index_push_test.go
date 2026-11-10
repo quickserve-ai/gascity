@@ -93,9 +93,10 @@ func (s *pushedListingHidesStore) labelReads() int {
 	return s.liveReads
 }
 
-func createMoleculeRun(t *testing.T, store beads.Store, scoped string) {
+// createMoleculeRun opens a molecule run of the "digest" order.
+func createMoleculeRun(t *testing.T, store beads.Store) {
 	t.Helper()
-	root, err := store.Create(beads.Bead{Title: "run", Type: "molecule", Labels: []string{"order-run:" + scoped}})
+	root, err := store.Create(beads.Bead{Title: "run", Type: "molecule", Labels: []string{"order-run:digest"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +129,7 @@ func TestOpenWorkGateConfirmsAbsenceLiveOnlyForANonIdempotentOrder(t *testing.T)
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			store := &pushedListingHidesStore{Store: beads.NewMemStore()}
-			createMoleculeRun(t, store.Store, "digest")
+			createMoleculeRun(t, store.Store)
 			var stderr bytes.Buffer
 			m := &memoryOrderDispatcher{stderr: &stderr, rec: events.Discard}
 			idx := newOrderDispatchTrackingIndex(&stderr)
@@ -158,7 +159,7 @@ func TestOpenWorkGateHoldsANonIdempotentOrderWhenTheLiveReadFails(t *testing.T) 
 // An index positive cannot be wrong about a hidden row, so it costs no live read.
 func TestOpenWorkGateTrustsAnIndexPositiveWithoutALiveRead(t *testing.T) {
 	store := &recordingLabelReadStore{Store: beads.NewMemStore()}
-	createMoleculeRun(t, store.Store, "digest")
+	createMoleculeRun(t, store.Store)
 	m := &memoryOrderDispatcher{stderr: io.Discard, rec: events.Discard}
 	idx := newOrderDispatchTrackingIndex(io.Discard)
 	if !m.openWorkGateShut(context.Background(), gateCandidate(store, false), idx, time.Now()) {
@@ -232,7 +233,7 @@ func TestOpenWorkGateConfirmsAbsenceOnlyWhereTheListingWasNarrowed(t *testing.T)
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			store := &pushedListingHidesStore{Store: beads.NewMemStore(), report: tc.report}
-			createMoleculeRun(t, store.Store, "digest")
+			createMoleculeRun(t, store.Store)
 			m := &memoryOrderDispatcher{stderr: io.Discard, rec: events.Discard}
 			idx := newOrderDispatchTrackingIndex(io.Discard)
 			if got := m.openWorkGateShut(context.Background(), gateCandidate(store, false), idx, time.Now()); got != tc.wantShut {
@@ -264,7 +265,7 @@ func TestOpenWorkGateUsesTheReportRecordedAtListingTime(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			store := &pushedListingHidesStore{Store: beads.NewMemStore(), report: tc.atListing}
-			createMoleculeRun(t, store.Store, "digest")
+			createMoleculeRun(t, store.Store)
 			idx := newOrderDispatchTrackingIndex(io.Discard)
 			if _, err := idx.entriesForStore(store, "store"); err != nil {
 				t.Fatal(err)

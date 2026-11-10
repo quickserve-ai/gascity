@@ -536,13 +536,13 @@ func sortBeadsForQuery(items []Bead, order SortOrder) {
 type PushNotClosedOutcome uint8
 
 const (
-	// PushNotClosedUnreported: no store said what it did. A reader must treat
+	// PushNotClosedUnreported means no store said what it did. A reader must treat
 	// it as possibly narrowed; the zero value fails toward the extra read.
 	PushNotClosedUnreported PushNotClosedOutcome = iota
-	// PushNotClosedNotNarrowed: the store answered the listing without any
+	// PushNotClosedNotNarrowed means the store answered the listing without any
 	// not-closed status set, so it cannot have hidden a row by status.
 	PushNotClosedNotNarrowed
-	// PushNotClosedNarrowed: the answering read carried the not-closed set.
+	// PushNotClosedNarrowed means the answering read carried the not-closed set.
 	PushNotClosedNarrowed
 )
 
