@@ -234,6 +234,20 @@ func assertTopologyDoctor(t *testing.T, run *helpers.TopologyRun, allowedFailure
 	logTopologyStoreClass(report, label)
 	if when == "after start" {
 		logControllerStoreLines(run, label)
+		// DIAGNOSTIC BRANCH ONLY (ga-tyf38i, the mayor's 07:11:16Z ruling):
+		// print order-firing-current's details whatever its status, then fail on
+		// purpose so CI prints this output and uploads test.log on a run where
+		// M1 itself is green. Never merged.
+		for _, r := range report.Results {
+			if r.Name != "order-firing-current" {
+				continue
+			}
+			diagnosticLine("%s: order-firing-current status=%s message=%q", label, r.Status, r.Message)
+			for _, d := range r.Details {
+				diagnosticLine("%s:     %s", label, d)
+			}
+		}
+		t.Errorf("ga-tyf38i diagnostic: forced failure to publish test.log (M1 doctor status above is the real result)")
 	}
 
 	allowed := make(map[string]bool, len(allowedFailures)+len(run.Topology.DoctorGaps))
