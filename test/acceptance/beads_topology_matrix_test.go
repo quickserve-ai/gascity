@@ -244,6 +244,15 @@ func assertTopologyDoctor(t *testing.T, run *helpers.TopologyRun, allowedFailure
 		t.Logf("%s: %s — %s", r.Status, r.Name, r.Message)
 		switch r.Status {
 		case "error":
+			// The message alone cannot say WHICH orders were stale or why
+			// (ga-tyf38i: two failures that named nothing). The details can.
+			for i, d := range r.Details {
+				if i == 20 {
+					t.Logf("    ... %d more detail line(s)", len(r.Details)-i)
+					break
+				}
+				t.Logf("    %s", d)
+			}
 			if allowed[r.Name] {
 				continue
 			}
