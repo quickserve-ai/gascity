@@ -172,11 +172,13 @@ func (s *NativeDoltStore) List(query ListQuery) ([]Bead, error) {
 		s.noteUnkeyedPlan(query, plan)
 	}
 	var (
-		out   []Bead
-		tally nativeListTally
+		out      []Bead
+		tally    nativeListTally
+		narrowed bool
 	)
 	err := s.withReadRetry(func(ctx context.Context, storage beadslib.Storage) error {
 		tally = nativeListTally{}
+		narrowed = false
 		if latched && nativeListCanPushNotClosed(query) {
 			// The listing opted in and reads unpushed: that is a fallback, and
 			// without this count the latch would read as a guard with no work.
@@ -253,12 +255,19 @@ func (s *NativeDoltStore) List(query ListQuery) ([]Bead, error) {
 			sortBeadsNativeListDefaultOrder(beads)
 		}
 		out = ApplyListQuery(beads, query)
+		// The answer came from requests carrying the not-closed set exactly
+		// when notClosed survived to here: a guard fallback, a latch or a
+		// vocabulary move empties it first. A request whose pushed predicate
+		// the backend refused still counts as narrowed; that over-report
+		// costs the caller one confirming read, never a missed row.
+		narrowed = notClosed != ""
 		return nil
 	})
 	s.noteGuardHeartbeat(s.listCounters.commit(tally))
 	if err != nil {
 		return nil, err
 	}
+	query.reportPush(narrowed)
 	return out, nil
 }
 

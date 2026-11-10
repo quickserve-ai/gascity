@@ -353,6 +353,13 @@ type orderDispatchTrackingIndex struct {
 	mu      sync.Mutex
 	entries map[string]map[string]orderTrackingSummary
 	errs    map[string]error
+	// mayHaveHidden is, per store key, what that store's open-work listing
+	// reported about itself when it ran (beads.ListQuery.PushReport): true
+	// unless the listing said it was not narrowed. It is written with entries,
+	// from the same listing, and hasOpenWork reads it rather than asking the
+	// store again, so a proxy that demotes after the listing cannot change the
+	// answer (ga-tyf38i, the mayor's ruling A).
+	mayHaveHidden map[string]bool
 
 	// stderr carries the ONE line a failed index read emits, once per store per
 	// tick. Without it a store whose index read fails would fall back to the
@@ -1185,9 +1192,10 @@ func (m *memoryOrderDispatcher) drain(ctx context.Context) bool {
 
 func newOrderDispatchTrackingIndex(stderr io.Writer) *orderDispatchTrackingIndex {
 	return &orderDispatchTrackingIndex{
-		entries: make(map[string]map[string]orderTrackingSummary),
-		errs:    make(map[string]error),
-		stderr:  stderr,
+		entries:       make(map[string]map[string]orderTrackingSummary),
+		errs:          make(map[string]error),
+		mayHaveHidden: make(map[string]bool),
+		stderr:        stderr,
 	}
 }
 
@@ -1250,10 +1258,17 @@ func (idx *orderDispatchTrackingIndex) hasOpenTracking(
 // on a gate timeout. An idempotent order keeps the index's answer: it already
 // dispatches without any gate when the gate times out (gateFailClosed).
 //
-// A store that can never push (beads.IgnoresPushNotClosed: a bd store, bare or
-// directly cached, never a proxy) has no such doubt, so it keeps the index's
-// answer. Otherwise a bd-backed city would pay a forked read per non-idempotent
-// order per tick for nothing, and a slow one would hold the order.
+// The read runs exactly where the pushdown ran (the mayor's ruling A,
+// 2026-11-10T02:52:18Z): only for a store whose listing did not report that
+// nothing narrowed it (openWorkListing, from beads.ListQuery.PushReport). A
+// listing nothing narrowed (a bd store, a cache over one, a proxy whose answer
+// came from its bd leaf) cannot have hidden a row by status, so it keeps the
+// index's answer. Without that, every due non-idempotent order on such a store
+// paid a forked read under the 8s gate on each firing, and a timeout held the
+// order and armed its backoff: the default proxied city's 30s orders went stale
+// in acceptance (M1-proxied-local, twice). The fact is the listing's own,
+// recorded when it ran, so a proxy that demotes afterwards cannot skip a read
+// its narrowed listing owes. A store that reports nothing gets the read.
 func (idx *orderDispatchTrackingIndex) hasOpenWork(
 	stores []beads.Store,
 	storeKeys []string,
@@ -1276,7 +1291,7 @@ func (idx *orderDispatchTrackingIndex) hasOpenWork(
 			}
 			continue
 		}
-		entries, err := idx.entriesForStore(store, indexStoreKey(storeKeys, i))
+		entries, mayHaveHidden, err := idx.openWorkListing(store, indexStoreKey(storeKeys, i))
 		if err != nil {
 			// This store's index is a hole. Ask it directly rather than reading
 			// the hole as an absence of work.
@@ -1304,7 +1319,7 @@ func (idx *orderDispatchTrackingIndex) hasOpenWork(
 				}
 			}
 		}
-		if !confirmAbsence || beads.IgnoresPushNotClosed(store) {
+		if !confirmAbsence || !mayHaveHidden {
 			continue
 		}
 		open, err := fallback(store, scopedName)
@@ -1403,14 +1418,25 @@ func (idx *orderDispatchTrackingIndex) historyEntriesForStore(store beads.Store,
 }
 
 func (idx *orderDispatchTrackingIndex) entriesForStore(store beads.Store, storeKey string) (map[string]orderTrackingSummary, error) {
+	entries, _, err := idx.openWorkListing(store, storeKey)
+	return entries, err
+}
+
+// openWorkListing is entriesForStore plus what the listing that built those
+// entries reported about itself: mayHaveHidden is false only when that listing
+// said nothing narrowed it (beads.ListQuery.PushReport). The two are written
+// together and read together under idx.mu, so a sibling gate's later listing
+// can never pair its report with these entries (ga-tyf38i, ruling A).
+func (idx *orderDispatchTrackingIndex) openWorkListing(store beads.Store, storeKey string) (map[string]orderTrackingSummary, bool, error) {
 	idx.mu.Lock()
 	if err, ok := idx.errs[storeKey]; ok {
 		idx.mu.Unlock()
-		return nil, err
+		return nil, true, err
 	}
 	if entries, ok := idx.entries[storeKey]; ok {
+		hidden, known := idx.mayHaveHidden[storeKey]
 		idx.mu.Unlock()
-		return entries, nil
+		return entries, !known || hidden, nil
 	}
 	idx.mu.Unlock()
 	// ONE read per store per tick, for every order at once.
@@ -1452,10 +1478,12 @@ func (idx *orderDispatchTrackingIndex) entriesForStore(store beads.Store, storeK
 	// confirmAbsence), and the next probe names the row. A status registered
 	// during the read sends the listing back to a full read
 	// (listVocabularyMoved).
+	var pushed beads.PushNotClosedOutcome
 	items, err := beads.HandlesFor(store).Live.List(beads.ListQuery{
 		AllowScan:     true,
 		TierMode:      beads.TierBoth,
 		PushNotClosed: true,
+		PushReport:    &pushed,
 	})
 	if err != nil {
 		wrapped := fmt.Errorf("listing order-run beads: %w", err)
@@ -1466,7 +1494,7 @@ func (idx *orderDispatchTrackingIndex) entriesForStore(store beads.Store, storeK
 		if !seen {
 			logDispatchError(idx.stderr, "gc: order dispatch: order-run index for store %s unavailable, falling back to one live gate read per order: %v", storeKey, wrapped)
 		}
-		return nil, wrapped
+		return nil, true, wrapped
 	}
 	entries := make(map[string]orderTrackingSummary)
 	for _, b := range items {
@@ -1496,10 +1524,12 @@ func (idx *orderDispatchTrackingIndex) entriesForStore(store beads.Store, storeK
 	}
 	// A sibling gate goroutine may have populated this key while we listed;
 	// both computed the same result from the same store, so last writer wins.
+	// The listing's own report travels with its entries.
 	idx.mu.Lock()
 	idx.entries[storeKey] = entries
+	idx.mayHaveHidden[storeKey] = pushed.MayHaveHidden()
 	idx.mu.Unlock()
-	return entries, nil
+	return entries, pushed.MayHaveHidden(), nil
 }
 
 func indexStoreKey(storeKeys []string, index int) string {

@@ -153,6 +153,13 @@ type ListQuery struct {
 	// open-work fold (order-run tracking beads). Never honored on a
 	// CompleteActive read. Other stores ignore it.
 	PushNotClosed bool
+	// PushReport, when non-nil on a PushNotClosed listing, receives what the
+	// store that answered did with it (PushNotClosedOutcome): NativeDoltStore
+	// writes narrowed or not, BdStore writes not narrowed, and a wrapper
+	// (CachingStore's live path, ProxiedStore) passes the query through so its
+	// leaf writes it. A store that writes nothing leaves it unreported, which
+	// a reader treats as possibly narrowed.
+	PushReport *PushNotClosedOutcome
 	// Live bypasses CachingStore and reads from the backing store. Other Store
 	// implementations ignore it. Use it only for lifecycle gates that must
 	// observe external mutations immediately.
@@ -518,15 +525,42 @@ func sortBeadsForQuery(items []Bead, order SortOrder) {
 	}
 }
 
-// IgnoresPushNotClosed reports whether store declares that it answers a
-// ListQuery.PushNotClosed listing without narrowing it, so that listing cannot
-// have hidden a row. The answer is the store's own statement about its
-// behavior (the IgnoresPushNotClosed method). A store that does not declare
-// it answers false: false costs a live read, and a wrong true would lose
-// single-flight. A ProxiedStore never declares it: a proxy can demote from a
-// native to a bd read leaf between the listing and this check, so its leaf now
-// says nothing about the listing.
-func IgnoresPushNotClosed(store Store) bool {
-	declares, ok := store.(interface{ IgnoresPushNotClosed() bool })
-	return ok && declares.IgnoresPushNotClosed()
+// PushNotClosedOutcome is what the store that answered a PushNotClosed
+// listing did with it, written by that store into ListQuery.PushReport.
+//
+// It is a fact about one listing, recorded while that listing runs, never a
+// property of a store type: a ProxiedStore can demote from a native to a bd
+// read leaf between a listing and a later check, so only the listing itself
+// can say whether it was narrowed (ga-tyf38i, the mayor's ruling A,
+// 2026-11-10).
+type PushNotClosedOutcome uint8
+
+const (
+	// PushNotClosedUnreported: no store said what it did. A reader must treat
+	// it as possibly narrowed; the zero value fails toward the extra read.
+	PushNotClosedUnreported PushNotClosedOutcome = iota
+	// PushNotClosedNotNarrowed: the store answered the listing without any
+	// not-closed status set, so it cannot have hidden a row by status.
+	PushNotClosedNotNarrowed
+	// PushNotClosedNarrowed: the answering read carried the not-closed set.
+	PushNotClosedNarrowed
+)
+
+// MayHaveHidden reports whether the listing could have hidden a row the
+// not-closed pushdown left out: anything but an explicit not-narrowed report.
+func (o PushNotClosedOutcome) MayHaveHidden() bool {
+	return o != PushNotClosedNotNarrowed
+}
+
+// reportPush records, for a caller that asked (PushReport set), whether this
+// listing was narrowed. A store calls it once, after the listing succeeded.
+func (q ListQuery) reportPush(narrowed bool) {
+	if q.PushReport == nil {
+		return
+	}
+	if narrowed {
+		*q.PushReport = PushNotClosedNarrowed
+		return
+	}
+	*q.PushReport = PushNotClosedNotNarrowed
 }

@@ -3003,14 +3003,22 @@ func (s *BdStore) DeleteBatch(ids []string) error {
 	return nil
 }
 
-// IgnoresPushNotClosed declares that a bd listing is never narrowed by
-// ListQuery.PushNotClosed: it sends bd the same command with or without it. A
-// change that teaches bd the pushdown must stop declaring this, and
-// TestBdStoreIndexAnswerEqualsItsFullRead fails until it does.
-func (s *BdStore) IgnoresPushNotClosed() bool { return true }
-
 // List returns beads matching the query via bd list and bd query.
+//
+// A bd listing is never narrowed by ListQuery.PushNotClosed: it sends bd the
+// same command with or without it, so a successful listing reports itself not
+// narrowed (PushReport). A change that teaches bd the pushdown must report
+// narrowed instead, and TestBdStoreIndexAnswerEqualsItsFullRead fails until it
+// does.
 func (s *BdStore) List(query ListQuery) ([]Bead, error) {
+	found, err := s.list(query)
+	if err == nil {
+		query.reportPush(false)
+	}
+	return found, err
+}
+
+func (s *BdStore) list(query ListQuery) ([]Bead, error) {
 	if !query.HasFilter() && !query.AllowScan {
 		return nil, fmt.Errorf("bd list: %w", ErrQueryRequiresScan)
 	}

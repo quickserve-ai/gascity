@@ -310,9 +310,13 @@ func TestAnOptedInListingSeesAStatusAddedAfterOpen(t *testing.T) {
 func TestAnOptedInListingWithAnUnreadableVocabularyReadsUnpushed(t *testing.T) {
 	var sent []string
 	store := newNativeDoltStoreWithStorage(statusSettingStorage{nativeDoltReaderSpy: vocabularyReader(outOfVocabularyRows(), "", &sent), err: errors.New("config read failed")}, "native-test")
-	got, err := store.List(ListQuery{AllowScan: true, TierMode: TierBoth, Live: true, PushNotClosed: true})
+	var report PushNotClosedOutcome
+	got, err := store.List(ListQuery{AllowScan: true, TierMode: TierBoth, Live: true, PushNotClosed: true, PushReport: &report})
 	if err != nil {
 		t.Fatalf("List: %v", err)
+	}
+	if report != PushNotClosedNotNarrowed {
+		t.Fatalf("report = %d, want not narrowed", report)
 	}
 	if ids := listedIDs(got); !slices.Equal(ids, []string{"gc-drift", "gc-open"}) {
 		t.Fatalf("listing = %v, want every non-closed row", ids)
@@ -504,12 +508,16 @@ func TestAStatusRegisteredDuringThePushedReadSendsItUnpushed(t *testing.T) {
 	store.listOutsideProbe = noOutsideRows
 	var logs syncBuffer
 	store.logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
-	got, err := store.List(ListQuery{AllowScan: true, TierMode: TierBoth, Live: true, PushNotClosed: true})
+	var report PushNotClosedOutcome
+	got, err := store.List(ListQuery{AllowScan: true, TierMode: TierBoth, Live: true, PushNotClosed: true, PushReport: &report})
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
 	if ids := listedIDs(got); !slices.Equal(ids, []string{"gc-drift", "gc-open"}) {
 		t.Fatalf("listing = %v, want the row in the new status too", ids)
+	}
+	if report != PushNotClosedNotNarrowed {
+		t.Fatalf("report = %d, want not narrowed: the answer came from the full read", report)
 	}
 	if !slices.Equal(sent, []string{builtinNotClosed, ""}) {
 		t.Fatalf("sent %q, want the set then one unpushed read", sent)
@@ -582,48 +590,65 @@ func TestAFailedRecheckSendsTheListingUnpushed(t *testing.T) {
 	}
 }
 
-type backingOnlyStore struct {
-	Store
-	backing Store
+// pushReport lists through store's live handle with the pushdown on and
+// returns what the listing reported about itself.
+func pushReport(t *testing.T, store Store) PushNotClosedOutcome {
+	t.Helper()
+	var report PushNotClosedOutcome
+	if _, err := HandlesFor(store).Live.List(ListQuery{AllowScan: true, TierMode: TierBoth, PushNotClosed: true, PushReport: &report}); err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	return report
 }
 
-func (s backingOnlyStore) Backing() Store { return s.backing }
-
-// A wrong true here would let a non-idempotent order rely on a narrowed listing.
-// A proxy answers false even over a bd leaf: it can demote between the listing
-// and the check, so its leaf now says nothing about that listing (Astra at
-// 903dd063089f).
-func TestIgnoresPushNotClosed(t *testing.T) {
-	bd := NewBdStore(t.TempDir(), func(string, string, ...string) ([]byte, error) { return []byte("[]"), nil })
-	mem := NewMemStore()
+// The mayor's ruling A (ga-tyf38i, 2026-11-10T02:52:18Z): the order gate's live
+// confirmation runs exactly where the pushdown ran, and the fact comes from the
+// listing, never from the store's type. One case per store class: a native
+// listing that sent the set says narrowed, whatever wraps it; a bd listing
+// says not narrowed, whatever wraps it, so a demoted proxy is judged by the
+// leaf that answered THIS listing; a store that says nothing may have hidden.
+func TestAPushNotClosedListingReportsWhetherItWasNarrowed(t *testing.T) {
+	newNative := func() *NativeDoltStore {
+		var sent []string
+		setting := ""
+		store := newNativeDoltStoreWithStorage(statusSettingStorage{nativeDoltReaderSpy: vocabularyReader(outOfVocabularyRows(), "", &sent), live: &setting}, "native-test")
+		store.listOutsideProbe = noOutsideRows
+		return store
+	}
+	newBd := func() *BdStore {
+		return NewBdStore(t.TempDir(), func(string, string, ...string) ([]byte, error) { return []byte("[]"), nil })
+	}
 	for _, tc := range []struct {
 		name  string
-		store Store
-		want  bool
+		store func() Store
+		want  PushNotClosedOutcome
 	}{
-		{"bd", bd, true},
-		{"a cache directly over bd", NewCachingStoreForTest(bd, nil), true},
-		{"a demoted proxy, whose read leaf is bd", &ProxiedStore{bd: bd}, false},
-		{"a cache over a demoted proxy", NewCachingStoreForTest(&ProxiedStore{bd: bd}, nil), false},
-		{"a proxy-shaped wrapper over bd", backingOnlyStore{backing: bd}, false},
-		{"a native store can push", &NativeDoltStore{}, false},
-		{"a cache over a native store", NewCachingStoreForTest(&NativeDoltStore{}, nil), false},
-		{"another store", mem, false},
-		{"nil", nil, false},
+		{"native", func() Store { return newNative() }, PushNotClosedNarrowed},
+		{"a cache over native", func() Store { return NewCachingStoreForTest(newNative(), nil) }, PushNotClosedNarrowed},
+		{"a proxy serving native", func() Store { return &ProxiedStore{native: newNative(), bd: newBd()} }, PushNotClosedNarrowed},
+		{"bd", func() Store { return newBd() }, PushNotClosedNotNarrowed},
+		{"a cache over bd", func() Store { return NewCachingStoreForTest(newBd(), nil) }, PushNotClosedNotNarrowed},
+		{"a proxy demoted to bd", func() Store { return &ProxiedStore{bd: newBd()} }, PushNotClosedNotNarrowed},
+		{"a cache over a proxy demoted to bd", func() Store { return NewCachingStoreForTest(&ProxiedStore{bd: newBd()}, nil) }, PushNotClosedNotNarrowed},
+		{"a store that reports nothing", func() Store { return NewMemStore() }, PushNotClosedUnreported},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := IgnoresPushNotClosed(tc.store); got != tc.want {
-				t.Fatalf("IgnoresPushNotClosed = %t, want %t", got, tc.want)
+			got := pushReport(t, tc.store())
+			if got != tc.want {
+				t.Fatalf("report = %d, want %d", got, tc.want)
+			}
+			if wantHidden := tc.want != PushNotClosedNotNarrowed; got.MayHaveHidden() != wantHidden {
+				t.Fatalf("MayHaveHidden = %t, want %t", got.MayHaveHidden(), wantHidden)
 			}
 		})
 	}
 }
 
-// The gate's exemption for a store that ignores the pushdown rests on this: for
-// the dispatcher's own question a bd store sends the same command and returns
-// the same rows with the flag as without it. If bd learns the pushdown, this
-// fails until BdStore stops declaring IgnoresPushNotClosed (the mayor's
-// condition, 2026-11-10T00:09:14Z, ga-tyf38i).
+// A bd listing's "not narrowed" report rests on this: for the dispatcher's own
+// question a bd store sends the same command and returns the same rows with the
+// flag as without it. If bd learns the pushdown, this fails until BdStore
+// reports such a listing narrowed (the mayor's conditions,
+// 2026-11-10T00:09:14Z and ruling A 2026-11-10T02:52:18Z, ga-tyf38i).
 func TestBdStoreIndexAnswerEqualsItsFullRead(t *testing.T) {
 	const rows = `[
 		{"id":"gc-open","title":"t","status":"open","issue_type":"task","labels":["order-run:digest"]},
@@ -644,8 +669,8 @@ func TestBdStoreIndexAnswerEqualsItsFullRead(t *testing.T) {
 				calls = append(calls, name+" "+strings.Join(args, " "))
 				return []byte(rows), nil
 			}))
-			if !IgnoresPushNotClosed(store) {
-				t.Fatalf("%T does not declare it ignores the pushdown", store)
+			if got := pushReport(t, store); got != PushNotClosedNotNarrowed {
+				t.Fatalf("%T reports %d for a pushed listing, want not narrowed", store, got)
 			}
 			live := HandlesFor(store).Live
 			read := func(push bool) ([]Bead, []string) {

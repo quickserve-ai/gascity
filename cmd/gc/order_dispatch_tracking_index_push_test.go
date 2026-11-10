@@ -53,16 +53,27 @@ func TestOrderDispatchTrackingIndexListingOptsIntoNotClosedPushdown(t *testing.T
 // pushedListingHidesStore answers an opted-in listing as if every row had left
 // the pushed status set between the guard probe and the read, the one residue
 // the mayor accepted. Every other read sees the real rows.
+//
+// report is what the listing says about itself, as the answering store class
+// would write it (beads.ListQuery.PushReport): the zero value writes nothing,
+// which the gate must read as possibly narrowed.
 type pushedListingHidesStore struct {
 	beads.Store
 
 	mu        sync.Mutex
 	liveReads int
 	liveErr   error
+	report    beads.PushNotClosedOutcome
 }
 
 func (s *pushedListingHidesStore) List(query beads.ListQuery) ([]beads.Bead, error) {
 	if query.PushNotClosed {
+		s.mu.Lock()
+		report := s.report
+		s.mu.Unlock()
+		if query.PushReport != nil && report != beads.PushNotClosedUnreported {
+			*query.PushReport = report
+		}
 		return nil, nil
 	}
 	if strings.HasPrefix(query.Label, "order-run:") {
@@ -202,10 +213,63 @@ func (s *recordingLabelReadStore) List(query beads.ListQuery) ([]beads.Bead, err
 	return s.Store.List(query)
 }
 
-// A bd-backed store ignores the pushdown, so its index was never narrowed and a
-// non-idempotent order has nothing to confirm: the live read would only add a
-// forked read per order per tick, and a hold when that read is slow.
-func TestHasOpenWorkSkipsTheLiveReadOnAStoreThatCannotPush(t *testing.T) {
+// The mayor's ruling A (ga-tyf38i, 2026-11-10T02:52:18Z): the live confirmation
+// runs exactly where the pushdown ran, judged by what the listing reported when
+// it ran. Each store class's report is pinned in package beads
+// (TestAPushNotClosedListingReportsWhetherItWasNarrowed: native and a proxy
+// serving native say narrowed; bd, a cache over bd and a proxy demoted to bd say
+// not narrowed). Here: the gate on each report, and a real bd store end to end.
+func TestOpenWorkGateConfirmsAbsenceOnlyWhereTheListingWasNarrowed(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		report        beads.PushNotClosedOutcome
+		wantShut      bool
+		wantLiveReads int
+	}{
+		{"a narrowed listing (native) is confirmed live", beads.PushNotClosedNarrowed, true, 1},
+		{"a listing nothing narrowed (bd, a demoted proxy) keeps the index answer", beads.PushNotClosedNotNarrowed, false, 0},
+		{"a listing that reported nothing is confirmed live", beads.PushNotClosedUnreported, true, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &pushedListingHidesStore{Store: beads.NewMemStore(), report: tc.report}
+			createMoleculeRun(t, store.Store, "digest")
+			m := &memoryOrderDispatcher{stderr: io.Discard, rec: events.Discard}
+			idx := newOrderDispatchTrackingIndex(io.Discard)
+			if got := m.openWorkGateShut(context.Background(), gateCandidate(store, false), idx, time.Now()); got != tc.wantShut {
+				t.Fatalf("gate shut = %t, want %t", got, tc.wantShut)
+			}
+			if got := store.labelReads(); got != tc.wantLiveReads {
+				t.Fatalf("live label reads = %d, want %d", got, tc.wantLiveReads)
+			}
+		})
+	}
+}
+
+// The fact is the listing's, carried to the gate: a store that would answer
+// differently now (a proxy demoted to bd after its narrowed listing) does not
+// change what the gate owes that listing.
+func TestOpenWorkGateUsesTheReportRecordedAtListingTime(t *testing.T) {
+	store := &pushedListingHidesStore{Store: beads.NewMemStore(), report: beads.PushNotClosedNarrowed}
+	createMoleculeRun(t, store.Store, "digest")
+	idx := newOrderDispatchTrackingIndex(io.Discard)
+	if _, err := idx.entriesForStore(store, "store"); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	store.report = beads.PushNotClosedNotNarrowed // the demotion, after the listing
+	store.mu.Unlock()
+	m := &memoryOrderDispatcher{stderr: io.Discard, rec: events.Discard}
+	if !m.openWorkGateShut(context.Background(), gateCandidate(store, false), idx, time.Now()) {
+		t.Fatal("gate open, want the narrowed listing confirmed live")
+	}
+	if got := store.labelReads(); got != 1 {
+		t.Fatalf("live label reads = %d, want 1", got)
+	}
+}
+
+// A real bd store reports its listing not narrowed, so a non-idempotent order
+// pays no forked read per firing and cannot be held by a slow one.
+func TestHasOpenWorkSkipsTheLiveReadOnABdStore(t *testing.T) {
 	store := beads.NewBdStore(t.TempDir(), func(string, string, ...string) ([]byte, error) {
 		return []byte("[]"), nil
 	})
