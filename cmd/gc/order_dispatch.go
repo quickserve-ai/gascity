@@ -360,6 +360,8 @@ type orderDispatchTrackingIndex struct {
 	// store again, so a proxy that demotes after the listing cannot change the
 	// answer (ga-tyf38i, the mayor's ruling A).
 	mayHaveHidden map[string]bool
+	// diag is the per-tick timing line (DIAGNOSTIC BRANCH ONLY, ga-tyf38i).
+	diag *tickDiag
 
 	// stderr carries the ONE line a failed index read emits, once per store per
 	// tick. Without it a store whose index read fails would fall back to the
@@ -655,6 +657,10 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 	}()
 	trackingIndex := newOrderDispatchTrackingIndex(m.stderr)
 	budgetSpent := 0
+	// DIAGNOSTIC BRANCH ONLY (ga-tyf38i): one timing line per tick.
+	var diagCandidates, diagFired int
+	diagPhaseStart := time.Now()
+	defer func() { trackingIndex.diag.log(m.stderr, diagCandidates, diagFired) }()
 
 	total := len(m.aa)
 	if total == 0 {
@@ -759,7 +765,13 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 		candidates = append(candidates, cand)
 	}
 
+	trackingIndex.diag.phase("resolve_gate", diagPhaseStart)
+	diagCandidates = len(candidates)
+	diagPhaseStart = time.Now()
 	m.prefetchConditionResults(candidates, now)
+	trackingIndex.diag.phase("prefetch", diagPhaseStart)
+	diagPhaseStart = time.Now()
+	defer func() { trackingIndex.diag.phase("fire", diagPhaseStart) }()
 
 	// Phase 2: the fire loop, in two passes over the same rotation order.
 	//
@@ -788,12 +800,15 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 		}
 	}
 	for _, cand := range unbudgeted {
-		m.fireCandidate(ctx, cand, trackingIndex, &inFlight, cityPath, now)
+		if m.fireCandidate(ctx, cand, trackingIndex, &inFlight, cityPath, now) {
+			diagFired++
+		}
 	}
 	for i, cand := range budgeted {
 		if !m.fireCandidate(ctx, cand, trackingIndex, &inFlight, cityPath, now) {
 			continue
 		}
+		diagFired++
 		if spendDispatchBudget(cand.idx) {
 			m.logUnreachedCandidates(budgeted[i+1:])
 			return
@@ -1196,6 +1211,7 @@ func newOrderDispatchTrackingIndex(stderr io.Writer) *orderDispatchTrackingIndex
 		errs:          make(map[string]error),
 		mayHaveHidden: make(map[string]bool),
 		stderr:        stderr,
+		diag:          newTickDiag(),
 	}
 }
 
@@ -1318,7 +1334,9 @@ func (idx *orderDispatchTrackingIndex) hasOpenWork(
 		}
 		if wispHasOpenWork != nil {
 			for _, root := range summary.openRoots {
+				diagWispStart := time.Now()
 				open, err := wispHasOpenWork(store, root)
+				idx.diag.wispChecked(indexStoreKey(storeKeys, i), store, time.Since(diagWispStart))
 				if err != nil {
 					return false, err
 				}
@@ -1332,7 +1350,9 @@ func (idx *orderDispatchTrackingIndex) hasOpenWork(
 		}
 		// DIAGNOSTIC BRANCH ONLY (ga-tyf38i): name each confirm-absence read.
 		logDispatchError(idx.stderr, "gc: order dispatch: DIAG ga-tyf38i confirm-absence live read: order=%s store=%T key=%s", scopedName, store, indexStoreKey(storeKeys, i))
+		diagConfirmStart := time.Now()
 		open, err := fallback(store, scopedName)
+		idx.diag.confirmed(indexStoreKey(storeKeys, i), store, time.Since(diagConfirmStart))
 		if err != nil {
 			return false, err
 		}
@@ -1403,7 +1423,9 @@ func (idx *orderDispatchTrackingIndex) historyEntriesForStore(store beads.Store,
 		return entries, nil
 	}
 	idx.mu.Unlock()
+	diagHistStart := time.Now()
 	runs, err := orders.NewStore(beads.OrdersStore{Store: store}).RecentRunsAll(orderTrackingHistoryIndexLimit)
+	idx.diag.historyListed(storeKey, store, time.Since(diagHistStart))
 	if err != nil {
 		wrapped := fmt.Errorf("listing order-tracking history: %w", err)
 		idx.mu.Lock()
@@ -1489,12 +1511,14 @@ func (idx *orderDispatchTrackingIndex) openWorkListing(store beads.Store, storeK
 	// during the read sends the listing back to a full read
 	// (listVocabularyMoved).
 	var pushed beads.PushNotClosedOutcome
+	diagListStart := time.Now()
 	items, err := beads.HandlesFor(store).Live.List(beads.ListQuery{
 		AllowScan:     true,
 		TierMode:      beads.TierBoth,
 		PushNotClosed: true,
 		PushReport:    &pushed,
 	})
+	idx.diag.listed(storeKey, store, time.Since(diagListStart), len(items))
 	if err != nil {
 		wrapped := fmt.Errorf("listing order-run beads: %w", err)
 		idx.mu.Lock()
