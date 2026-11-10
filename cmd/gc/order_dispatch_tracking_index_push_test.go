@@ -245,45 +245,79 @@ func TestOpenWorkGateConfirmsAbsenceOnlyWhereTheListingWasNarrowed(t *testing.T)
 	}
 }
 
-// The fact is the listing's, carried to the gate: a store that would answer
-// differently now (a proxy demoted to bd after its narrowed listing) does not
-// change what the gate owes that listing.
+// The fact is the listing's, carried to the gate, in both directions. A store
+// that would answer differently now (a proxy demoted to bd after its narrowed
+// listing, or one promoted after a listing nothing narrowed) does not change
+// what the gate owes that listing. The not-narrowed direction also fails if the
+// index stops keeping the report with the entries it cached: a missing report
+// reads as "confirm" (Astra at adcd898e9037).
 func TestOpenWorkGateUsesTheReportRecordedAtListingTime(t *testing.T) {
-	store := &pushedListingHidesStore{Store: beads.NewMemStore(), report: beads.PushNotClosedNarrowed}
-	createMoleculeRun(t, store.Store, "digest")
-	idx := newOrderDispatchTrackingIndex(io.Discard)
-	if _, err := idx.entriesForStore(store, "store"); err != nil {
-		t.Fatal(err)
-	}
-	store.mu.Lock()
-	store.report = beads.PushNotClosedNotNarrowed // the demotion, after the listing
-	store.mu.Unlock()
-	m := &memoryOrderDispatcher{stderr: io.Discard, rec: events.Discard}
-	if !m.openWorkGateShut(context.Background(), gateCandidate(store, false), idx, time.Now()) {
-		t.Fatal("gate open, want the narrowed listing confirmed live")
-	}
-	if got := store.labelReads(); got != 1 {
-		t.Fatalf("live label reads = %d, want 1", got)
+	for _, tc := range []struct {
+		name          string
+		atListing     beads.PushNotClosedOutcome
+		later         beads.PushNotClosedOutcome
+		wantShut      bool
+		wantLiveReads int
+	}{
+		{"a narrowed listing is confirmed after a demotion", beads.PushNotClosedNarrowed, beads.PushNotClosedNotNarrowed, true, 1},
+		{"a listing nothing narrowed stays unread after a promotion", beads.PushNotClosedNotNarrowed, beads.PushNotClosedNarrowed, false, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &pushedListingHidesStore{Store: beads.NewMemStore(), report: tc.atListing}
+			createMoleculeRun(t, store.Store, "digest")
+			idx := newOrderDispatchTrackingIndex(io.Discard)
+			if _, err := idx.entriesForStore(store, "store"); err != nil {
+				t.Fatal(err)
+			}
+			store.mu.Lock()
+			store.report = tc.later
+			store.mu.Unlock()
+			m := &memoryOrderDispatcher{stderr: io.Discard, rec: events.Discard}
+			if got := m.openWorkGateShut(context.Background(), gateCandidate(store, false), idx, time.Now()); got != tc.wantShut {
+				t.Fatalf("gate shut = %t, want %t", got, tc.wantShut)
+			}
+			if got := store.labelReads(); got != tc.wantLiveReads {
+				t.Fatalf("live label reads = %d, want %d", got, tc.wantLiveReads)
+			}
+		})
 	}
 }
 
 // A real bd store reports its listing not narrowed, so a non-idempotent order
-// pays no forked read per firing and cannot be held by a slow one.
+// pays no forked read per firing and cannot be held by a slow one. The policy
+// wrapper over a cache over bd is the default M1 shape with the native flag
+// off; the store-type capability this replaced was hidden by that wrapper, so
+// there every due non-idempotent order took the read (Astra at adcd898e9037).
 func TestHasOpenWorkSkipsTheLiveReadOnABdStore(t *testing.T) {
-	store := beads.NewBdStore(t.TempDir(), func(string, string, ...string) ([]byte, error) {
-		return []byte("[]"), nil
-	})
-	idx := newOrderDispatchTrackingIndex(io.Discard)
-	liveReads := 0
-	open, err := idx.hasOpenWork([]beads.Store{store}, []string{"store"}, "digest", nil,
-		func(beads.Store, string) (bool, error) {
-			liveReads++
-			return false, nil
-		}, true)
-	if err != nil {
-		t.Fatalf("hasOpenWork: %v", err)
+	newBd := func() *beads.BdStore {
+		return beads.NewBdStore(t.TempDir(), func(string, string, ...string) ([]byte, error) {
+			return []byte("[]"), nil
+		})
 	}
-	if open || liveReads != 0 {
-		t.Fatalf("open = %t, live reads = %d; want the index's answer and no live read", open, liveReads)
+	for _, tc := range []struct {
+		name  string
+		store func() beads.Store
+	}{
+		{"bd", func() beads.Store { return newBd() }},
+		{"the bead policy over bd", func() beads.Store { return &beadPolicyStore{Store: newBd()} }},
+		{"the bead policy over a cache over bd", func() beads.Store {
+			return &beadPolicyStore{Store: beads.NewCachingStoreForTest(newBd(), nil)}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			idx := newOrderDispatchTrackingIndex(io.Discard)
+			liveReads := 0
+			open, err := idx.hasOpenWork([]beads.Store{tc.store()}, []string{"store"}, "digest", nil,
+				func(beads.Store, string) (bool, error) {
+					liveReads++
+					return false, nil
+				}, true)
+			if err != nil {
+				t.Fatalf("hasOpenWork: %v", err)
+			}
+			if open || liveReads != 0 {
+				t.Fatalf("open = %t, live reads = %d; want the index's answer and no live read", open, liveReads)
+			}
+		})
 	}
 }

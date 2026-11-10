@@ -1258,17 +1258,22 @@ func (idx *orderDispatchTrackingIndex) hasOpenTracking(
 // on a gate timeout. An idempotent order keeps the index's answer: it already
 // dispatches without any gate when the gate times out (gateFailClosed).
 //
-// The read runs exactly where the pushdown ran (the mayor's ruling A,
+// The read runs where the pushdown ran (the mayor's ruling A,
 // 2026-11-10T02:52:18Z): only for a store whose listing did not report that
-// nothing narrowed it (openWorkListing, from beads.ListQuery.PushReport). A
-// listing nothing narrowed (a bd store, a cache over one, a proxy whose answer
-// came from its bd leaf) cannot have hidden a row by status, so it keeps the
-// index's answer. Without that, every due non-idempotent order on such a store
-// paid a forked read under the 8s gate on each firing, and a timeout held the
-// order and armed its backoff: the default proxied city's 30s orders went stale
-// in acceptance (M1-proxied-local, twice). The fact is the listing's own,
-// recorded when it ran, so a proxy that demotes afterwards cannot skip a read
-// its narrowed listing owes. A store that reports nothing gets the read.
+// nothing narrowed it (openWorkListing, from beads.ListQuery.PushReport). The
+// native report errs toward narrowed: a request whose pushed status the backend
+// refused is read unpushed but still reported narrowed, so such a listing pays
+// a read it did not strictly need, never the reverse. A listing nothing
+// narrowed (a bd store, behind a cache or the bead policy wrapper, or a proxy
+// whose answer came from its bd leaf) cannot have hidden a row by status, so it
+// keeps the index's answer. Before this, a store-type capability decided, and
+// the bead policy wrapper hid it from the gate, so in the default M1 shape with
+// the native flag off every due non-idempotent order took a forked read under
+// the 8s gate, where a timeout holds the order and arms its backoff. That fits
+// the twice-seen M1 "scheduled orders are stale" acceptance failure; it is not
+// proven to be its cause. The fact is the listing's own, recorded when it ran,
+// so a proxy that demotes afterwards cannot skip a read its narrowed listing
+// owes. A store that reports nothing gets the read.
 func (idx *orderDispatchTrackingIndex) hasOpenWork(
 	stores []beads.Store,
 	storeKeys []string,
