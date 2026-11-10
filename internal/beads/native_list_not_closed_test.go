@@ -602,8 +602,8 @@ func TestIgnoresPushNotClosed(t *testing.T) {
 	}{
 		{"bd", bd, true},
 		{"a cache directly over bd", NewCachingStoreForTest(bd, nil), true},
-		{"a cache over a proxy", NewCachingStoreForTest(&ProxiedStore{}, nil), false},
-		{"a proxy", &ProxiedStore{}, false},
+		{"a demoted proxy, whose read leaf is bd", &ProxiedStore{bd: bd}, false},
+		{"a cache over a demoted proxy", NewCachingStoreForTest(&ProxiedStore{bd: bd}, nil), false},
 		{"a proxy-shaped wrapper over bd", backingOnlyStore{backing: bd}, false},
 		{"a native store can push", &NativeDoltStore{}, false},
 		{"a cache over a native store", NewCachingStoreForTest(&NativeDoltStore{}, nil), false},
@@ -613,6 +613,51 @@ func TestIgnoresPushNotClosed(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := IgnoresPushNotClosed(tc.store); got != tc.want {
 				t.Fatalf("IgnoresPushNotClosed = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
+// The gate's exemption for a store that ignores the pushdown rests on this: for
+// the dispatcher's own question a bd store sends the same command and returns
+// the same rows with the flag as without it. If bd learns the pushdown, this
+// fails until BdStore stops declaring IgnoresPushNotClosed (the mayor's
+// condition, 2026-11-10T00:09:14Z, ga-tyf38i).
+func TestBdStoreIndexAnswerEqualsItsFullRead(t *testing.T) {
+	type call struct{ dir, name, args string }
+	newStore := func(calls *[]call) *BdStore {
+		return NewBdStore(t.TempDir(), func(dir, name string, args ...string) ([]byte, error) {
+			*calls = append(*calls, call{name: name, args: strings.Join(args, " ")})
+			return []byte(`[{"id":"gc-open","title":"t","status":"open"},{"id":"gc-other","title":"t","status":"in_progress"}]`), nil
+		})
+	}
+	for _, tc := range []struct {
+		name string
+		wrap func(*BdStore) Store
+	}{
+		{"bare", func(s *BdStore) Store { return s }},
+		{"directly cached", func(s *BdStore) Store { return NewCachingStoreForTest(s, nil) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			read := func(push bool) ([]Bead, []call) {
+				var calls []call
+				store := tc.wrap(newStore(&calls))
+				if !IgnoresPushNotClosed(store) {
+					t.Fatalf("%T does not declare it ignores the pushdown", store)
+				}
+				got, err := HandlesFor(store).Live.List(ListQuery{AllowScan: true, TierMode: TierBoth, PushNotClosed: push})
+				if err != nil {
+					t.Fatalf("List(push=%t): %v", push, err)
+				}
+				return got, calls
+			}
+			pushed, pushedCalls := read(true)
+			full, fullCalls := read(false)
+			if len(pushedCalls) == 0 || !slices.Equal(pushedCalls, fullCalls) {
+				t.Fatalf("bd commands differ:\n pushed: %v\n full:   %v", pushedCalls, fullCalls)
+			}
+			if ids := listedIDs(pushed); len(ids) == 0 || !slices.Equal(ids, listedIDs(full)) {
+				t.Fatalf("rows differ: pushed %v, full %v", ids, listedIDs(full))
 			}
 		})
 	}

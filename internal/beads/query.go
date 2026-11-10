@@ -518,18 +518,15 @@ func sortBeadsForQuery(items []Bead, order SortOrder) {
 	}
 }
 
-// IgnoresPushNotClosed reports whether store certainly answers a
+// IgnoresPushNotClosed reports whether store declares that it answers a
 // ListQuery.PushNotClosed listing without narrowing it, so that listing cannot
-// have hidden a row: a *BdStore, or a *CachingStore directly over one, whose
-// backing is fixed at construction. It does not look through a ProxiedStore: a
-// proxy can demote from a native to a bd read leaf between the listing and this
-// check, so a bd leaf now says nothing about the listing. Every other store
-// answers false, because false costs a live read and a wrong true would lose
-// single-flight.
+// have hidden a row. The answer is the store's own statement about its
+// behaviour (the IgnoresPushNotClosed method). A store that does not declare
+// it answers false: false costs a live read, and a wrong true would lose
+// single-flight. A ProxiedStore never declares it: a proxy can demote from a
+// native to a bd read leaf between the listing and this check, so its leaf now
+// says nothing about the listing.
 func IgnoresPushNotClosed(store Store) bool {
-	if cached, ok := store.(*CachingStore); ok {
-		store = cached.Backing()
-	}
-	_, ok := store.(*BdStore)
-	return ok
+	declares, ok := store.(interface{ IgnoresPushNotClosed() bool })
+	return ok && declares.IgnoresPushNotClosed()
 }

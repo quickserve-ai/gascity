@@ -2177,6 +2177,10 @@ func (c *CachingStore) IsLive() bool {
 // Backing returns the underlying store.
 func (c *CachingStore) Backing() Store { return c.backing }
 
+// IgnoresPushNotClosed answers for the store a live listing goes to, whose
+// identity is fixed at construction.
+func (c *CachingStore) IgnoresPushNotClosed() bool { return IgnoresPushNotClosed(c.backing) }
+
 func (c *CachingStore) markFreshLocked(now time.Time) {
 	c.lastFreshAt = now
 	c.stats.LastFreshAt = now
