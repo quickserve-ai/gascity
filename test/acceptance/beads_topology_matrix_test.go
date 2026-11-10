@@ -87,6 +87,8 @@ func TestBeadsInitTopologyMatrix(t *testing.T) {
 		})
 
 		t.Run("start-default-pack", func(t *testing.T) {
+			// DIAGNOSTIC BRANCH ONLY (ga-tyf38i): trace every bd call gc makes.
+			run.Env.With(diagBDTraceEnv, filepath.Join(run.Root, "bd-trace.jsonl"))
 			diagStep(topo.Name, "start-default-pack: gc start begins")
 			run.Start(t)
 			diagStep(topo.Name, "start-default-pack: gc start returned")
@@ -257,6 +259,7 @@ func assertTopologyDoctor(t *testing.T, run *helpers.TopologyRun, allowedFailure
 				diagnosticLine("%s:     %s", label, d)
 			}
 		}
+		diagReportTicks(label, run.Env.Get("GC_HOME"), filepath.Join(run.Root, "bd-trace.jsonl"))
 		t.Errorf("ga-tyf38i diagnostic: forced failure to publish test.log (M1 doctor status above is the real result)")
 	}
 

@@ -353,6 +353,8 @@ type orderDispatchTrackingIndex struct {
 	mu      sync.Mutex
 	entries map[string]map[string]orderTrackingSummary
 	errs    map[string]error
+	// diag is the per-tick timing line (DIAGNOSTIC BRANCH ONLY, ga-tyf38i).
+	diag *tickDiag
 
 	// stderr carries the ONE line a failed index read emits, once per store per
 	// tick. Without it a store whose index read fails would fall back to the
@@ -648,6 +650,10 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 	}()
 	trackingIndex := newOrderDispatchTrackingIndex(m.stderr)
 	budgetSpent := 0
+	// DIAGNOSTIC BRANCH ONLY (ga-tyf38i): one timing line per tick.
+	var diagCandidates, diagFired int
+	diagPhaseStart := time.Now()
+	defer func() { trackingIndex.diag.log(m.stderr, diagCandidates, diagFired) }()
 
 	total := len(m.aa)
 	if total == 0 {
@@ -752,7 +758,13 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 		candidates = append(candidates, cand)
 	}
 
+	trackingIndex.diag.phase("resolve_gate", diagPhaseStart)
+	diagCandidates = len(candidates)
+	diagPhaseStart = time.Now()
 	m.prefetchConditionResults(candidates, now)
+	trackingIndex.diag.phase("prefetch", diagPhaseStart)
+	diagPhaseStart = time.Now()
+	defer func() { trackingIndex.diag.phase("fire", diagPhaseStart) }()
 
 	// Phase 2: the fire loop, in two passes over the same rotation order.
 	//
@@ -781,12 +793,15 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 		}
 	}
 	for _, cand := range unbudgeted {
-		m.fireCandidate(ctx, cand, trackingIndex, &inFlight, cityPath, now)
+		if m.fireCandidate(ctx, cand, trackingIndex, &inFlight, cityPath, now) {
+			diagFired++
+		}
 	}
 	for i, cand := range budgeted {
 		if !m.fireCandidate(ctx, cand, trackingIndex, &inFlight, cityPath, now) {
 			continue
 		}
+		diagFired++
 		if spendDispatchBudget(cand.idx) {
 			m.logUnreachedCandidates(budgeted[i+1:])
 			return
@@ -1188,6 +1203,7 @@ func newOrderDispatchTrackingIndex(stderr io.Writer) *orderDispatchTrackingIndex
 		entries: make(map[string]map[string]orderTrackingSummary),
 		errs:    make(map[string]error),
 		stderr:  stderr,
+		diag:    newTickDiag(),
 	}
 }
 
@@ -1276,7 +1292,9 @@ func (idx *orderDispatchTrackingIndex) hasOpenWork(
 			continue
 		}
 		for _, root := range summary.openRoots {
+			diagWispStart := time.Now()
 			open, err := wispHasOpenWork(store, root)
+			idx.diag.wispChecked(indexStoreKey(storeKeys, i), store, time.Since(diagWispStart))
 			if err != nil {
 				return false, err
 			}
@@ -1347,7 +1365,9 @@ func (idx *orderDispatchTrackingIndex) historyEntriesForStore(store beads.Store,
 		return entries, nil
 	}
 	idx.mu.Unlock()
+	diagHistStart := time.Now()
 	runs, err := orders.NewStore(beads.OrdersStore{Store: store}).RecentRunsAll(orderTrackingHistoryIndexLimit)
+	idx.diag.historyListed(storeKey, store, time.Since(diagHistStart))
 	if err != nil {
 		wrapped := fmt.Errorf("listing order-tracking history: %w", err)
 		idx.mu.Lock()
@@ -1403,10 +1423,12 @@ func (idx *orderDispatchTrackingIndex) entriesForStore(store beads.Store, storeK
 	// that used to be invisible to the first gate now suppresses it. Wider is the
 	// safe direction for single-flight: it can only ever suppress a dispatch that
 	// already had work in flight.
+	diagListStart := time.Now()
 	items, err := beads.HandlesFor(store).Live.List(beads.ListQuery{
 		AllowScan: true,
 		TierMode:  beads.TierBoth,
 	})
+	idx.diag.listed(storeKey, store, time.Since(diagListStart), len(items))
 	if err != nil {
 		wrapped := fmt.Errorf("listing order-run beads: %w", err)
 		idx.mu.Lock()
