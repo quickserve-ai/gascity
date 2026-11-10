@@ -10,12 +10,106 @@ package acceptance_test
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
+
+	helpers "github.com/gastownhall/gascity/test/acceptance/helpers"
 )
+
+// diagCPUProfileEnv and diagCPUProfileSecsEnv match cmd/gc's diagnostic
+// profile switches (order_dispatch_tickdiag.go).
+const (
+	diagCPUProfileEnv     = "GC_DIAG_CPUPROFILE"
+	diagCPUProfileSecsEnv = "GC_DIAG_CPUPROFILE_SECS"
+)
+
+// diagMachineBench is the machine-speed reading the mayor ruled (B step 1,
+// widened): a fixed CPU-only workload with no gc, bd or Dolt, timed. 64 SHA-256
+// passes over 8 MiB, single goroutine, best of 3.
+func diagMachineBench(label string) {
+	buf := make([]byte, 8<<20)
+	for i := range buf {
+		buf[i] = byte(i)
+	}
+	best := time.Duration(0)
+	for round := 0; round < 3; round++ {
+		start := time.Now()
+		var sum [32]byte
+		for i := 0; i < 64; i++ {
+			sum = sha256.Sum256(append(buf[:len(buf)-32], sum[:]...))
+		}
+		if d := time.Since(start); best == 0 || d < best {
+			best = d
+		}
+	}
+	diagnosticLine("%s: machine bench: sha256 64x8MiB best of 3 = %d ms", label, best.Milliseconds())
+}
+
+// diagGCStartup times 20 runs of one trivial gc command (gc version) with the
+// test's environment: the start-up cost of the binary under test.
+func diagGCStartup(label string, env *helpers.Env) {
+	gcPath, err := helpers.ResolveGCPath(env)
+	if err != nil {
+		diagnosticLine("%s: gc startup: %v", label, err)
+		return
+	}
+	var times []time.Duration
+	for i := 0; i < 20; i++ {
+		start := time.Now()
+		cmd := exec.Command(gcPath, "version")
+		cmd.Env = env.List()
+		_ = cmd.Run()
+		times = append(times, time.Since(start))
+	}
+	sort.Slice(times, func(i, j int) bool { return times[i] < times[j] })
+	total := time.Duration(0)
+	for _, d := range times {
+		total += d
+	}
+	diagnosticLine("%s: gc startup: 20x gc version: median %d ms, min %d ms, max %d ms, total %d ms",
+		label, times[10].Milliseconds(), times[0].Milliseconds(), times[19].Milliseconds(), total.Milliseconds())
+}
+
+// diagPrintProfile waits for the controller's CPU profile to be complete (its
+// window closed and the file stopped growing), then prints it base64-encoded
+// between markers, in 3000-character lines, so it can be decoded from the CI
+// log and read with go tool pprof.
+func diagPrintProfile(label, path string, wait time.Duration) {
+	deadline := time.Now().Add(wait)
+	var last int64 = -1
+	for time.Now().Before(deadline) {
+		st, err := os.Stat(path)
+		if err == nil && st.Size() > 0 && st.Size() == last {
+			break
+		}
+		if err == nil {
+			last = st.Size()
+		}
+		time.Sleep(5 * time.Second)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		diagnosticLine("%s: cpuprofile: %v", label, err)
+		return
+	}
+	enc := base64.StdEncoding.EncodeToString(data)
+	diagnosticLine("%s: cpuprofile-begin bytes=%d", label, len(data))
+	for i := 0; i < len(enc); i += 3000 {
+		j := i + 3000
+		if j > len(enc) {
+			j = len(enc)
+		}
+		diagnosticLine("%s: cpuprofile-chunk %s", label, enc[i:j])
+	}
+	diagnosticLine("%s: cpuprofile-end", label)
+}
 
 // diagBDTraceEnv is internal/beads.TraceBDCall's JSONL sink variable.
 const diagBDTraceEnv = "GC_BD_TRACE_JSON"

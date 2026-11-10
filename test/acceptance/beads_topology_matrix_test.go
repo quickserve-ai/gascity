@@ -89,6 +89,9 @@ func TestBeadsInitTopologyMatrix(t *testing.T) {
 		t.Run("start-default-pack", func(t *testing.T) {
 			// DIAGNOSTIC BRANCH ONLY (ga-tyf38i): trace every bd call gc makes.
 			run.Env.With(diagBDTraceEnv, filepath.Join(run.Root, "bd-trace.jsonl"))
+			run.Env.With(diagCPUProfileEnv, filepath.Join(run.Root, "cpu.pprof")).With(diagCPUProfileSecsEnv, "50")
+			diagMachineBench(topo.Name)
+			diagGCStartup(topo.Name, run.Env)
 			diagStep(topo.Name, "start-default-pack: gc start begins")
 			run.Start(t)
 			diagStep(topo.Name, "start-default-pack: gc start returned")
@@ -260,6 +263,7 @@ func assertTopologyDoctor(t *testing.T, run *helpers.TopologyRun, allowedFailure
 			}
 		}
 		diagReportTicks(label, run.Env.Get("GC_HOME"), filepath.Join(run.Root, "bd-trace.jsonl"))
+		diagPrintProfile(label, filepath.Join(run.Root, "cpu.pprof"), 70*time.Second)
 		t.Errorf("ga-tyf38i diagnostic: forced failure to publish test.log (M1 doctor status above is the real result)")
 	}
 
@@ -627,8 +631,8 @@ func logControllerStoreLines(run *helpers.TopologyRun, label string) {
 				if !strings.Contains(line, m) {
 					continue
 				}
-				if printed == 60 {
-					diagnosticLine("%s: controller store lines: stopped at 60", label)
+				if printed == 300 {
+					diagnosticLine("%s: controller store lines: stopped at 300", label)
 					return
 				}
 				diagnosticLine("%s: controller store line [%s]: %s", label, filepath.Base(f), line)
