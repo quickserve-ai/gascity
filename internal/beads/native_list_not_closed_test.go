@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -624,13 +625,12 @@ func TestIgnoresPushNotClosed(t *testing.T) {
 // fails until BdStore stops declaring IgnoresPushNotClosed (the mayor's
 // condition, 2026-11-10T00:09:14Z, ga-tyf38i).
 func TestBdStoreIndexAnswerEqualsItsFullRead(t *testing.T) {
-	type call struct{ dir, name, args string }
-	newStore := func(calls *[]call) *BdStore {
-		return NewBdStore(t.TempDir(), func(dir, name string, args ...string) ([]byte, error) {
-			*calls = append(*calls, call{name: name, args: strings.Join(args, " ")})
-			return []byte(`[{"id":"gc-open","title":"t","status":"open"},{"id":"gc-other","title":"t","status":"in_progress"}]`), nil
-		})
-	}
+	const rows = `[
+		{"id":"gc-open","title":"t","status":"open","issue_type":"task","labels":["order-run:digest"]},
+		{"id":"gc-track","title":"t","status":"in_progress","issue_type":"task","labels":["order-tracking","order-run:digest"]},
+		{"id":"gc-mol","title":"t","status":"open","issue_type":"molecule","labels":["order-run:sweep"]},
+		{"id":"gc-stray","title":"t","status":"staged_ready","issue_type":"task","labels":["order-run:stray"]}
+	]`
 	for _, tc := range []struct {
 		name string
 		wrap func(*BdStore) Store
@@ -639,25 +639,40 @@ func TestBdStoreIndexAnswerEqualsItsFullRead(t *testing.T) {
 		{"directly cached", func(s *BdStore) Store { return NewCachingStoreForTest(s, nil) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			read := func(push bool) ([]Bead, []call) {
-				var calls []call
-				store := tc.wrap(newStore(&calls))
-				if !IgnoresPushNotClosed(store) {
-					t.Fatalf("%T does not declare it ignores the pushdown", store)
-				}
-				got, err := HandlesFor(store).Live.List(ListQuery{AllowScan: true, TierMode: TierBoth, PushNotClosed: push})
+			var calls []string
+			store := tc.wrap(NewBdStore(t.TempDir(), func(_, name string, args ...string) ([]byte, error) {
+				calls = append(calls, name+" "+strings.Join(args, " "))
+				return []byte(rows), nil
+			}))
+			if !IgnoresPushNotClosed(store) {
+				t.Fatalf("%T does not declare it ignores the pushdown", store)
+			}
+			live := HandlesFor(store).Live
+			read := func(push bool) ([]Bead, []string) {
+				calls = nil
+				got, err := live.List(ListQuery{AllowScan: true, TierMode: TierBoth, PushNotClosed: push})
 				if err != nil {
 					t.Fatalf("List(push=%t): %v", push, err)
 				}
-				return got, calls
+				return got, slices.Clone(calls)
 			}
 			pushed, pushedCalls := read(true)
 			full, fullCalls := read(false)
 			if len(pushedCalls) == 0 || !slices.Equal(pushedCalls, fullCalls) {
 				t.Fatalf("bd commands differ:\n pushed: %v\n full:   %v", pushedCalls, fullCalls)
 			}
-			if ids := listedIDs(pushed); len(ids) == 0 || !slices.Equal(ids, listedIDs(full)) {
-				t.Fatalf("rows differ: pushed %v, full %v", ids, listedIDs(full))
+			if !reflect.DeepEqual(pushed, full) {
+				t.Fatalf("rows differ:\n pushed: %+v\n full:   %+v", pushed, full)
+			}
+			want := map[string]string{"gc-open": "order-run:digest", "gc-track": "order-run:digest", "gc-mol": "order-run:sweep", "gc-stray": "order-run:stray"}
+			seen := map[string]bool{}
+			for _, b := range pushed {
+				if label, ok := want[b.ID]; ok && slices.Contains(b.Labels, label) {
+					seen[b.ID] = true
+				}
+			}
+			if len(seen) != len(want) {
+				t.Fatalf("rows with their order-run labels = %v, want all of %v; rows: %+v", seen, want, pushed)
 			}
 		})
 	}
