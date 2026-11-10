@@ -355,7 +355,7 @@ type orderDispatchTrackingIndex struct {
 	errs    map[string]error
 	// mayHaveHidden is, per store key, what that store's open-work listing
 	// reported about itself when it ran (beads.ListQuery.PushReport): true
-	// unless the listing said it was not narrowed. It is written with entries,
+	// only when the listing said the not-closed set narrowed it. It is written with entries,
 	// from the same listing, and hasOpenWork reads it rather than asking the
 	// store again, so a proxy that demotes after the listing cannot change the
 	// answer (ga-tyf38i, the mayor's ruling A).
@@ -1259,22 +1259,24 @@ func (idx *orderDispatchTrackingIndex) hasOpenTracking(
 // on a gate timeout. An idempotent order keeps the index's answer: it already
 // dispatches without any gate when the gate times out (gateFailClosed).
 //
-// The read runs where the pushdown ran (the mayor's ruling A,
-// 2026-11-10T02:52:18Z): only for a store whose listing did not report that
-// nothing narrowed it (openWorkListing, from beads.ListQuery.PushReport). The
-// native report errs toward narrowed: a request whose pushed status the backend
-// refused is read unpushed but still reported narrowed, so such a listing pays
-// a read it did not strictly need, never the reverse. A listing nothing
-// narrowed (a bd store, behind a cache or the bead policy wrapper, or a proxy
-// whose answer came from its bd leaf) cannot have hidden a row by status, so it
-// keeps the index's answer. Before this, a store-type capability decided, and
-// the bead policy wrapper hid it from the gate, so in the default M1 shape with
-// the native flag off every due non-idempotent order took a forked read under
-// the 8s gate, where a timeout holds the order and arms its backoff. That fits
-// the twice-seen M1 "scheduled orders are stale" acceptance failure; it is not
-// proven to be its cause. The fact is the listing's own, recorded when it ran,
-// so a proxy that demotes afterwards cannot skip a read its narrowed listing
-// owes. A store that reports nothing gets the read.
+// The read runs only where the pushdown narrowed the listing (the mayor's
+// ruling A, 2026-11-10T02:52:18Z, as restated 2026-11-10T08:52:17Z): only for
+// a store whose listing REPORTED that the not-closed set narrowed it
+// (openWorkListing, from beads.ListQuery.PushReport). The native report errs
+// toward narrowed: a request whose pushed status the backend refused is read
+// unpushed but still reported narrowed, so such a listing pays a read it did
+// not strictly need, never the reverse. Every other listing keeps the index's
+// answer: one reported not narrowed (bd, behind a cache or the bead policy
+// wrapper, or a proxy whose answer came from its bd leaf), and one that
+// reported nothing, because only a store that can push writes a report and a
+// store that cannot push never narrowed (exec, file, mem, sqlite, doltlite, the
+// storebinding front doors). Before that restatement an unreported listing
+// counted as narrowed, so on every such store each due non-idempotent order
+// took the forked read under the 8s gate on every tick: with it removed (bisect
+// arm D, 0 failures in 20) the M1 "scheduled orders are stale" and suspension
+// quiescence acceptance failures stopped. The fact is the listing's own,
+// recorded when it ran, so a proxy that demotes afterwards cannot skip a read
+// its narrowed listing owes.
 func (idx *orderDispatchTrackingIndex) hasOpenWork(
 	stores []beads.Store,
 	storeKeys []string,
@@ -1429,20 +1431,20 @@ func (idx *orderDispatchTrackingIndex) entriesForStore(store beads.Store, storeK
 }
 
 // openWorkListing is entriesForStore plus what the listing that built those
-// entries reported about itself: mayHaveHidden is false only when that listing
-// said nothing narrowed it (beads.ListQuery.PushReport). The two are written
+// entries reported about itself: mayHaveHidden is true only when that listing
+// said the not-closed set narrowed it (beads.ListQuery.PushReport). The two are written
 // together and read together under idx.mu, so a sibling gate's later listing
 // can never pair its report with these entries (ga-tyf38i, ruling A).
 func (idx *orderDispatchTrackingIndex) openWorkListing(store beads.Store, storeKey string) (map[string]orderTrackingSummary, bool, error) {
 	idx.mu.Lock()
 	if err, ok := idx.errs[storeKey]; ok {
 		idx.mu.Unlock()
-		return nil, true, err
+		return nil, false, err
 	}
 	if entries, ok := idx.entries[storeKey]; ok {
-		hidden, known := idx.mayHaveHidden[storeKey]
+		hidden := idx.mayHaveHidden[storeKey]
 		idx.mu.Unlock()
-		return entries, !known || hidden, nil
+		return entries, hidden, nil
 	}
 	idx.mu.Unlock()
 	// ONE read per store per tick, for every order at once.
@@ -1500,7 +1502,7 @@ func (idx *orderDispatchTrackingIndex) openWorkListing(store beads.Store, storeK
 		if !seen {
 			logDispatchError(idx.stderr, "gc: order dispatch: order-run index for store %s unavailable, falling back to one live gate read per order: %v", storeKey, wrapped)
 		}
-		return nil, true, wrapped
+		return nil, false, wrapped
 	}
 	entries := make(map[string]orderTrackingSummary)
 	for _, b := range items {

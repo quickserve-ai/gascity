@@ -5,13 +5,17 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	beadsexec "github.com/gastownhall/gascity/internal/beads/exec"
 	"github.com/gastownhall/gascity/internal/events"
+	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/orders"
 )
 
@@ -56,7 +60,7 @@ func TestOrderDispatchTrackingIndexListingOptsIntoNotClosedPushdown(t *testing.T
 //
 // report is what the listing says about itself, as the answering store class
 // would write it (beads.ListQuery.PushReport): the zero value writes nothing,
-// which the gate must read as possibly narrowed.
+// as a store that cannot push does, which the gate reads as not narrowed.
 type pushedListingHidesStore struct {
 	beads.Store
 
@@ -128,7 +132,7 @@ func TestOpenWorkGateConfirmsAbsenceLiveOnlyForANonIdempotentOrder(t *testing.T)
 		{"an idempotent order keeps the index answer", true, false, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			store := &pushedListingHidesStore{Store: beads.NewMemStore()}
+			store := &pushedListingHidesStore{Store: beads.NewMemStore(), report: beads.PushNotClosedNarrowed}
 			createMoleculeRun(t, store.Store)
 			var stderr bytes.Buffer
 			m := &memoryOrderDispatcher{stderr: &stderr, rec: events.Discard}
@@ -148,7 +152,7 @@ func TestOpenWorkGateConfirmsAbsenceLiveOnlyForANonIdempotentOrder(t *testing.T)
 
 // A live read that fails gives no proof of absence, so the order is held.
 func TestOpenWorkGateHoldsANonIdempotentOrderWhenTheLiveReadFails(t *testing.T) {
-	store := &pushedListingHidesStore{Store: beads.NewMemStore(), liveErr: errors.New("hub unavailable")}
+	store := &pushedListingHidesStore{Store: beads.NewMemStore(), liveErr: errors.New("hub unavailable"), report: beads.PushNotClosedNarrowed}
 	m := &memoryOrderDispatcher{stderr: io.Discard, rec: events.Discard}
 	idx := newOrderDispatchTrackingIndex(io.Discard)
 	if !m.openWorkGateShut(context.Background(), gateCandidate(store, false), idx, time.Now()) {
@@ -229,7 +233,7 @@ func TestOpenWorkGateConfirmsAbsenceOnlyWhereTheListingWasNarrowed(t *testing.T)
 	}{
 		{"a narrowed listing (native) is confirmed live", beads.PushNotClosedNarrowed, true, 1},
 		{"a listing nothing narrowed (bd, a demoted proxy) keeps the index answer", beads.PushNotClosedNotNarrowed, false, 0},
-		{"a listing that reported nothing is confirmed live", beads.PushNotClosedUnreported, true, 1},
+		{"a listing that reported nothing (a store that cannot push) keeps the index answer", beads.PushNotClosedUnreported, false, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			store := &pushedListingHidesStore{Store: beads.NewMemStore(), report: tc.report}
@@ -249,9 +253,9 @@ func TestOpenWorkGateConfirmsAbsenceOnlyWhereTheListingWasNarrowed(t *testing.T)
 // The fact is the listing's, carried to the gate, in both directions. A store
 // that would answer differently now (a proxy demoted to bd after its narrowed
 // listing, or one promoted after a listing nothing narrowed) does not change
-// what the gate owes that listing. The not-narrowed direction also fails if the
+// what the gate owes that listing. The narrowed direction also fails if the
 // index stops keeping the report with the entries it cached: a missing report
-// reads as "confirm" (Astra at adcd898e9037).
+// reads as not narrowed, so the read that narrowed listing owes would be lost.
 func TestOpenWorkGateUsesTheReportRecordedAtListingTime(t *testing.T) {
 	for _, tc := range []struct {
 		name          string
@@ -284,40 +288,88 @@ func TestOpenWorkGateUsesTheReportRecordedAtListingTime(t *testing.T) {
 	}
 }
 
-// A real bd store reports its listing not narrowed, so a non-idempotent order
-// pays no forked read per firing and cannot be held by a slow one. The policy
-// wrapper over a cache over bd is the default M1 shape with the native flag
-// off; the store-type capability this replaced was hidden by that wrapper, so
-// there every due non-idempotent order took the read (Astra at adcd898e9037).
-func TestHasOpenWorkSkipsTheLiveReadOnABdStore(t *testing.T) {
+// The mayor's ruling 2026-11-10T08:52:17Z (ga-tyf38i): the confirmation read
+// runs only where a leaf REPORTED that the pushdown narrowed its listing. One
+// case per leaf class the gate can hold, each asserting whether a confirm read
+// happens for a due non-idempotent order the index found no open work for.
+// The stores are real where cmd/gc can build them; the native and proxied
+// leaves are a double that writes what package beads pins those classes to
+// write (TestAPushNotClosedListingReportsWhetherItWasNarrowed: native and a
+// proxy serving native say narrowed; native whose set could not be read says
+// not narrowed). The storebinding front doors are not gate stores; they pass
+// a listing to their inner store, pinned in their own packages.
+//
+// Before this ruling every store but bd and native reported nothing, the gate
+// read that as narrowed, and every due non-idempotent order on such a store
+// took the forked read each tick (bisect arm D: removing it ended the M1 and
+// suspension quiescence acceptance failures, 0 of 20).
+func TestHasOpenWorkConfirmsAbsenceOnlyOnALeafThatReportedNarrowed(t *testing.T) {
 	newBd := func() *beads.BdStore {
 		return beads.NewBdStore(t.TempDir(), func(string, string, ...string) ([]byte, error) {
 			return []byte("[]"), nil
 		})
 	}
+	newExec := func() beads.Store {
+		path := filepath.Join(t.TempDir(), "beads-provider")
+		if err := os.WriteFile(path, []byte("#!/bin/sh\necho '[]'\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return beadsexec.NewStore(path)
+	}
+	newFile := func() beads.Store {
+		store, err := beads.OpenFileStore(fsys.OSFS{}, filepath.Join(t.TempDir(), "beads.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return store
+	}
+	newSQLite := func() beads.Store {
+		store, err := beads.OpenSQLiteStore(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return store
+	}
+	reporting := func(report beads.PushNotClosedOutcome) func() beads.Store {
+		return func() beads.Store { return &pushedListingHidesStore{Store: beads.NewMemStore(), report: report} }
+	}
 	for _, tc := range []struct {
-		name  string
-		store func() beads.Store
+		name       string
+		store      func() beads.Store
+		wantReads  int
+		reportedAs string
 	}{
-		{"bd", func() beads.Store { return newBd() }},
-		{"the bead policy over bd", func() beads.Store { return &beadPolicyStore{Store: newBd()} }},
+		{"native, narrowed (double)", reporting(beads.PushNotClosedNarrowed), 1, "narrowed"},
+		{"a proxy serving native (double)", reporting(beads.PushNotClosedNarrowed), 1, "narrowed"},
+		{"native, set unreadable (double)", reporting(beads.PushNotClosedNotNarrowed), 0, "not narrowed"},
+		{"a proxy demoted to bd (double)", reporting(beads.PushNotClosedNotNarrowed), 0, "not narrowed"},
+		{"bd", func() beads.Store { return newBd() }, 0, "not narrowed"},
+		{"the bead policy over bd", func() beads.Store { return &beadPolicyStore{Store: newBd()} }, 0, "not narrowed"},
 		{"the bead policy over a cache over bd", func() beads.Store {
 			return &beadPolicyStore{Store: beads.NewCachingStoreForTest(newBd(), nil)}
-		}},
+		}, 0, "not narrowed"},
+		{"exec (a provider script)", newExec, 0, "nothing"},
+		{"the bead policy over a cache over exec", func() beads.Store {
+			return &beadPolicyStore{Store: beads.NewCachingStoreForTest(newExec(), nil)}
+		}, 0, "nothing"},
+		{"file", newFile, 0, "nothing"},
+		{"mem", func() beads.Store { return beads.NewMemStore() }, 0, "nothing"},
+		{"sqlite", newSQLite, 0, "nothing"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			idx := newOrderDispatchTrackingIndex(io.Discard)
-			liveReads := 0
+			confirmReads := 0
 			open, err := idx.hasOpenWork([]beads.Store{tc.store()}, []string{"store"}, "digest", nil,
 				func(beads.Store, string) (bool, error) {
-					liveReads++
+					confirmReads++
 					return false, nil
 				}, true)
 			if err != nil {
 				t.Fatalf("hasOpenWork: %v", err)
 			}
-			if open || liveReads != 0 {
-				t.Fatalf("open = %t, live reads = %d; want the index's answer and no live read", open, liveReads)
+			if open || confirmReads != tc.wantReads {
+				t.Fatalf("a leaf that reported %s: open = %t, confirm reads = %d; want false, %d",
+					tc.reportedAs, open, confirmReads, tc.wantReads)
 			}
 		})
 	}

@@ -152,6 +152,7 @@ go_test(
         "dep_metadata_test.go",
         "doltlite_count_test.go",
         "doltlite_namespace_census_test.go",
+        "doltlite_push_report_test.go",
         "doltlite_read_store_graph_ready_test.go",
         "doltlite_read_store_test.go",
         "doltlite_seek_test.go",
