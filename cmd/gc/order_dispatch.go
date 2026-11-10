@@ -1328,6 +1328,8 @@ func (idx *orderDispatchTrackingIndex) hasOpenWork(
 		if !confirmAbsence || !mayHaveHidden {
 			continue
 		}
+		// DIAGNOSTIC BRANCH ONLY (ga-tyf38i): name each confirm-absence read.
+		logDispatchError(idx.stderr, "gc: order dispatch: DIAG ga-tyf38i confirm-absence live read: order=%s store=%T key=%s", scopedName, store, indexStoreKey(storeKeys, i))
 		open, err := fallback(store, scopedName)
 		if err != nil {
 			return false, err
@@ -1535,6 +1537,8 @@ func (idx *orderDispatchTrackingIndex) openWorkListing(store beads.Store, storeK
 	idx.entries[storeKey] = entries
 	idx.mayHaveHidden[storeKey] = pushed.MayHaveHidden()
 	idx.mu.Unlock()
+	// DIAGNOSTIC BRANCH ONLY (ga-tyf38i): what each listing reported.
+	logDispatchError(idx.stderr, "gc: order dispatch: DIAG ga-tyf38i open-work listing: store=%T key=%s report=%d mayHaveHidden=%t rows=%d", store, storeKey, pushed, pushed.MayHaveHidden(), len(items))
 	return entries, pushed.MayHaveHidden(), nil
 }
 

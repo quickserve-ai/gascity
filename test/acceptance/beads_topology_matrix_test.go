@@ -624,8 +624,8 @@ func logControllerStoreLines(run *helpers.TopologyRun, label string) {
 				if !strings.Contains(line, m) {
 					continue
 				}
-				if printed == 60 {
-					diagnosticLine("%s: controller store lines: stopped at 60", label)
+				if printed == 300 {
+					diagnosticLine("%s: controller store lines: stopped at 300", label)
 					return
 				}
 				diagnosticLine("%s: controller store line [%s]: %s", label, filepath.Base(f), line)
