@@ -353,6 +353,15 @@ type orderDispatchTrackingIndex struct {
 	mu      sync.Mutex
 	entries map[string]map[string]orderTrackingSummary
 	errs    map[string]error
+	// mayHaveHidden is, per store key, what that store's open-work listing
+	// reported about itself when it ran (beads.ListQuery.PushReport): true
+	// only when the listing said the not-closed set narrowed it. It is written with entries,
+	// from the same listing, and hasOpenWork reads it rather than asking the
+	// store again, so a proxy that demotes after the listing cannot change the
+	// answer (ga-tyf38i, the mayor's ruling A).
+	mayHaveHidden map[string]bool
+	// diag is the per-tick timing line (DIAGNOSTIC BRANCH ONLY, ga-tyf38i).
+	diag *tickDiag
 
 	// stderr carries the ONE line a failed index read emits, once per store per
 	// tick. Without it a store whose index read fails would fall back to the
@@ -648,6 +657,10 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 	}()
 	trackingIndex := newOrderDispatchTrackingIndex(m.stderr)
 	budgetSpent := 0
+	// DIAGNOSTIC BRANCH ONLY (ga-tyf38i): one timing line per tick.
+	var diagCandidates, diagFired int
+	diagPhaseStart := time.Now()
+	defer func() { trackingIndex.diag.log(m.stderr, diagCandidates, diagFired) }()
 
 	total := len(m.aa)
 	if total == 0 {
@@ -752,7 +765,13 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 		candidates = append(candidates, cand)
 	}
 
+	trackingIndex.diag.phase("resolve_gate", diagPhaseStart)
+	diagCandidates = len(candidates)
+	diagPhaseStart = time.Now()
 	m.prefetchConditionResults(candidates, now)
+	trackingIndex.diag.phase("prefetch", diagPhaseStart)
+	diagPhaseStart = time.Now()
+	defer func() { trackingIndex.diag.phase("fire", diagPhaseStart) }()
 
 	// Phase 2: the fire loop, in two passes over the same rotation order.
 	//
@@ -781,12 +800,15 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 		}
 	}
 	for _, cand := range unbudgeted {
-		m.fireCandidate(ctx, cand, trackingIndex, &inFlight, cityPath, now)
+		if m.fireCandidate(ctx, cand, trackingIndex, &inFlight, cityPath, now) {
+			diagFired++
+		}
 	}
 	for i, cand := range budgeted {
 		if !m.fireCandidate(ctx, cand, trackingIndex, &inFlight, cityPath, now) {
 			continue
 		}
+		diagFired++
 		if spendDispatchBudget(cand.idx) {
 			m.logUnreachedCandidates(budgeted[i+1:])
 			return
@@ -862,7 +884,7 @@ func (m *memoryOrderDispatcher) openWorkGateShut(ctx context.Context, cand *orde
 		return false
 	}
 	hasOpenWork, err := gateOpenWorkBounded(ctx, orderGateTimeout, scoped, func() (bool, error) {
-		return trackingIndex.hasOpenWork(cand.gateStores, cand.gateStoreKeys, scoped, m.wispRootHasOpenWork, m.hasOpenWorkStrict)
+		return trackingIndex.hasOpenWork(cand.gateStores, cand.gateStoreKeys, scoped, m.wispRootHasOpenWork, m.hasOpenWorkStrict, !a.Idempotent)
 	})
 	if err != nil {
 		if m.gateFailClosed(ctx, a, scoped, err) {
@@ -1185,9 +1207,11 @@ func (m *memoryOrderDispatcher) drain(ctx context.Context) bool {
 
 func newOrderDispatchTrackingIndex(stderr io.Writer) *orderDispatchTrackingIndex {
 	return &orderDispatchTrackingIndex{
-		entries: make(map[string]map[string]orderTrackingSummary),
-		errs:    make(map[string]error),
-		stderr:  stderr,
+		entries:       make(map[string]map[string]orderTrackingSummary),
+		errs:          make(map[string]error),
+		mayHaveHidden: make(map[string]bool),
+		stderr:        stderr,
+		diag:          newTickDiag(),
 	}
 }
 
@@ -1234,12 +1258,48 @@ func (idx *orderDispatchTrackingIndex) hasOpenTracking(
 // FAILED. There the index knows nothing, and answering "no open work" from a
 // hole is the duplicate-dispatch shape single-flight exists to prevent — so that
 // store, alone, pays the old per-order read and its error still propagates.
+//
+// confirmAbsence is the second case (ga-tyf38i, the mayor's ruling 2026-11-09):
+// the index is built from a pushed not-closed listing, and a run root that moves
+// into an out-of-vocabulary status between the guard probe and that listing is
+// missing from it for one tick. An index POSITIVE can never be wrong that way,
+// so only a "no open work" answer is in doubt, and only an order whose repeat
+// is not a no-op cares. The dispatcher passes !Idempotent: such an order takes
+// the live read before it fires, so it never relies on the pushed listing to
+// keep single-flight. The read happens only when the order is due and the index
+// found nothing. It is the per-order label read this index replaced: unpushed,
+// so the backend reads the order's closed runs too before they are filtered
+// out, and it walks each open root again.
+// It runs under the gate's bound, so on a saturated store a timeout holds the
+// order and arms its backoff, the policy a non-idempotent order has always had
+// on a gate timeout. An idempotent order keeps the index's answer: it already
+// dispatches without any gate when the gate times out (gateFailClosed).
+//
+// The read runs only where the pushdown narrowed the listing (the mayor's
+// ruling A, 2026-11-10T02:52:18Z, as restated 2026-11-10T08:52:17Z): only for
+// a store whose listing REPORTED that the not-closed set narrowed it
+// (openWorkListing, from beads.ListQuery.PushReport). The native report errs
+// toward narrowed: a request whose pushed status the backend refused is read
+// unpushed but still reported narrowed, so such a listing pays a read it did
+// not strictly need, never the reverse. Every other listing keeps the index's
+// answer: one reported not narrowed (bd, behind a cache or the bead policy
+// wrapper, or a proxy whose answer came from its bd leaf), and one that
+// reported nothing, because only a store that can push writes a report and a
+// store that cannot push never narrowed (exec, file, mem, sqlite, doltlite, the
+// storebinding front doors). Before that restatement an unreported listing
+// counted as narrowed, so on every such store each due non-idempotent order
+// took the forked read under the 8s gate on every tick: with it removed (bisect
+// arm D, 0 failures in 20) the M1 "scheduled orders are stale" and suspension
+// quiescence acceptance failures stopped. The fact is the listing's own,
+// recorded when it ran, so a proxy that demotes afterwards cannot skip a read
+// its narrowed listing owes.
 func (idx *orderDispatchTrackingIndex) hasOpenWork(
 	stores []beads.Store,
 	storeKeys []string,
 	scopedName string,
 	wispHasOpenWork func(beads.Store, beads.Bead) (bool, error),
 	fallback func(beads.Store, string) (bool, error),
+	confirmAbsence bool,
 ) (bool, error) {
 	for i, store := range stores {
 		if store == nil {
@@ -1255,7 +1315,7 @@ func (idx *orderDispatchTrackingIndex) hasOpenWork(
 			}
 			continue
 		}
-		entries, err := idx.entriesForStore(store, indexStoreKey(storeKeys, i))
+		entries, mayHaveHidden, err := idx.openWorkListing(store, indexStoreKey(storeKeys, i))
 		if err != nil {
 			// This store's index is a hole. Ask it directly rather than reading
 			// the hole as an absence of work.
@@ -1272,17 +1332,33 @@ func (idx *orderDispatchTrackingIndex) hasOpenWork(
 		if summary.openWorkTracking {
 			return true, nil
 		}
-		if wispHasOpenWork == nil {
+		if wispHasOpenWork != nil {
+			for _, root := range summary.openRoots {
+				diagWispStart := time.Now()
+				open, err := wispHasOpenWork(store, root)
+				idx.diag.wispChecked(indexStoreKey(storeKeys, i), store, time.Since(diagWispStart))
+				if err != nil {
+					return false, err
+				}
+				if open {
+					return true, nil
+				}
+			}
+		}
+		if !confirmAbsence || !mayHaveHidden {
 			continue
 		}
-		for _, root := range summary.openRoots {
-			open, err := wispHasOpenWork(store, root)
-			if err != nil {
-				return false, err
-			}
-			if open {
-				return true, nil
-			}
+		// DIAGNOSTIC BRANCH ONLY (ga-tyf38i): name each confirm-absence read.
+		logDispatchError(idx.stderr, "gc: order dispatch: DIAG ga-tyf38i confirm-absence live read: order=%s store=%T key=%s", scopedName, store, indexStoreKey(storeKeys, i))
+		diagConfirmStart := time.Now()
+		open, err := fallback(store, scopedName)
+		idx.diag.confirmed(indexStoreKey(storeKeys, i), store, time.Since(diagConfirmStart))
+		if err != nil {
+			return false, err
+		}
+		if open {
+			logDispatchError(idx.stderr, "gc: order dispatch: %s: order-run index for store %s found no open work but the live read did (a run started after the index was read, or a status the pushed listing hid); holding the order", scopedName, indexStoreKey(storeKeys, i))
+			return true, nil
 		}
 	}
 	return false, nil
@@ -1347,7 +1423,9 @@ func (idx *orderDispatchTrackingIndex) historyEntriesForStore(store beads.Store,
 		return entries, nil
 	}
 	idx.mu.Unlock()
+	diagHistStart := time.Now()
 	runs, err := orders.NewStore(beads.OrdersStore{Store: store}).RecentRunsAll(orderTrackingHistoryIndexLimit)
+	idx.diag.historyListed(storeKey, store, time.Since(diagHistStart))
 	if err != nil {
 		wrapped := fmt.Errorf("listing order-tracking history: %w", err)
 		idx.mu.Lock()
@@ -1372,14 +1450,25 @@ func (idx *orderDispatchTrackingIndex) historyEntriesForStore(store beads.Store,
 }
 
 func (idx *orderDispatchTrackingIndex) entriesForStore(store beads.Store, storeKey string) (map[string]orderTrackingSummary, error) {
+	entries, _, err := idx.openWorkListing(store, storeKey)
+	return entries, err
+}
+
+// openWorkListing is entriesForStore plus what the listing that built those
+// entries reported about itself: mayHaveHidden is true only when that listing
+// said the not-closed set narrowed it (beads.ListQuery.PushReport). The two are written
+// together and read together under idx.mu, so a sibling gate's later listing
+// can never pair its report with these entries (ga-tyf38i, ruling A).
+func (idx *orderDispatchTrackingIndex) openWorkListing(store beads.Store, storeKey string) (map[string]orderTrackingSummary, bool, error) {
 	idx.mu.Lock()
 	if err, ok := idx.errs[storeKey]; ok {
 		idx.mu.Unlock()
-		return nil, err
+		return nil, false, err
 	}
 	if entries, ok := idx.entries[storeKey]; ok {
+		hidden := idx.mayHaveHidden[storeKey]
 		idx.mu.Unlock()
-		return entries, nil
+		return entries, hidden, nil
 	}
 	idx.mu.Unlock()
 	// ONE read per store per tick, for every order at once.
@@ -1403,10 +1492,33 @@ func (idx *orderDispatchTrackingIndex) entriesForStore(store beads.Store, storeK
 	// that used to be invisible to the first gate now suppresses it. Wider is the
 	// safe direction for single-flight: it can only ever suppress a dispatch that
 	// already had work in flight.
+	//
+	// PushNotClosed (ga-tyf38i, the mayor's opt-in ruling 2026-11-04): on a
+	// native store this read sends the not-closed status set as a WHERE, so a
+	// shared hub answers the open corpus instead of every closed row. The set
+	// is the scope's built-ins plus its CURRENT status.custom, read afresh on
+	// every such listing, so a run root an agent moved into any status the
+	// scope accepts is still seen. What it could hide is a row whose status is
+	// in no current status.custom (a name removed while rows still carry it, or
+	// one kept only in config.yaml); such a run would be missed and its order
+	// could dispatch again. So the store probes for such rows before each
+	// pushed read and reads unpushed when it finds one or cannot tell
+	// (guardNotClosed). The probe goes away with ExcludeStatus (beads #7647).
+	// A row that moves, between the probe and the read, into a status no
+	// status.custom names is missed for that tick; a non-idempotent order does
+	// not rely on this listing for a "no open work" answer (hasOpenWork's
+	// confirmAbsence), and the next probe names the row. A status registered
+	// during the read sends the listing back to a full read
+	// (listVocabularyMoved).
+	var pushed beads.PushNotClosedOutcome
+	diagListStart := time.Now()
 	items, err := beads.HandlesFor(store).Live.List(beads.ListQuery{
-		AllowScan: true,
-		TierMode:  beads.TierBoth,
+		AllowScan:     true,
+		TierMode:      beads.TierBoth,
+		PushNotClosed: true,
+		PushReport:    &pushed,
 	})
+	idx.diag.listed(storeKey, store, time.Since(diagListStart), len(items))
 	if err != nil {
 		wrapped := fmt.Errorf("listing order-run beads: %w", err)
 		idx.mu.Lock()
@@ -1416,7 +1528,7 @@ func (idx *orderDispatchTrackingIndex) entriesForStore(store beads.Store, storeK
 		if !seen {
 			logDispatchError(idx.stderr, "gc: order dispatch: order-run index for store %s unavailable, falling back to one live gate read per order: %v", storeKey, wrapped)
 		}
-		return nil, wrapped
+		return nil, false, wrapped
 	}
 	entries := make(map[string]orderTrackingSummary)
 	for _, b := range items {
@@ -1446,10 +1558,14 @@ func (idx *orderDispatchTrackingIndex) entriesForStore(store beads.Store, storeK
 	}
 	// A sibling gate goroutine may have populated this key while we listed;
 	// both computed the same result from the same store, so last writer wins.
+	// The listing's own report travels with its entries.
 	idx.mu.Lock()
 	idx.entries[storeKey] = entries
+	idx.mayHaveHidden[storeKey] = pushed.MayHaveHidden()
 	idx.mu.Unlock()
-	return entries, nil
+	// DIAGNOSTIC BRANCH ONLY (ga-tyf38i): what each listing reported.
+	logDispatchError(idx.stderr, "gc: order dispatch: DIAG ga-tyf38i open-work listing: store=%T key=%s report=%d mayHaveHidden=%t rows=%d", store, storeKey, pushed, pushed.MayHaveHidden(), len(items))
+	return entries, pushed.MayHaveHidden(), nil
 }
 
 func indexStoreKey(storeKeys []string, index int) string {

@@ -19,6 +19,9 @@ package acceptance_test
 
 import (
 	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -84,7 +87,14 @@ func TestBeadsInitTopologyMatrix(t *testing.T) {
 		})
 
 		t.Run("start-default-pack", func(t *testing.T) {
+			// DIAGNOSTIC BRANCH ONLY (ga-tyf38i): trace every bd call gc makes.
+			run.Env.With(diagBDTraceEnv, filepath.Join(run.Root, "bd-trace.jsonl"))
+			run.Env.With(diagCPUProfileEnv, filepath.Join(run.Root, "cpu.pprof")).With(diagCPUProfileSecsEnv, "50")
+			diagMachineBench(topo.Name)
+			diagGCStartup(topo.Name, run.Env)
+			diagStep(topo.Name, "start-default-pack: gc start begins")
 			run.Start(t)
+			diagStep(topo.Name, "start-default-pack: gc start returned")
 
 			if topo.Deferred {
 				helpers.AssertScopeShape(t, cityRoot, rigDir, topo.Rig, topo.Name+" rig after the deferred start")
@@ -97,14 +107,17 @@ func TestBeadsInitTopologyMatrix(t *testing.T) {
 			// does not own it has to be a typed no-op, and on one it does own
 			// it has to do the real thing.
 			assertDoltCleanupOutcome(t, run)
+			diagStep(topo.Name, "start-default-pack: dolt cleanup outcome done")
 
 			// Whatever the shape, gc must publish managed-Dolt runtime state
 			// only for a scope whose Dolt process it actually started.
 			helpers.AssertScopeShape(t, cityRoot, cityRoot, topo.City, topo.Name+" city under supervisor")
 
+			diagStep(topo.Name, "start-default-pack: scope shape done")
 			if out, err := run.GC("status"); err != nil {
 				t.Fatalf("gc status: %v\n%s", err, out)
 			}
+			diagStep(topo.Name, "start-default-pack: gc status done")
 		})
 
 		t.Run("doctor-after-start", func(t *testing.T) {
@@ -218,7 +231,12 @@ const topologyDoctorCheckTimeout = "180s"
 func assertTopologyDoctor(t *testing.T, run *helpers.TopologyRun, allowedFailures []string, when string) {
 	t.Helper()
 	label := run.Topology.Name + " " + when
+	diagStep(label, "gc doctor begins")
 	out, err := run.City.GC("doctor", "--json", "--check-timeout", topologyDoctorCheckTimeout)
+	diagStep(label, "gc doctor returned")
+	if when == "after start" {
+		diagControllerStarts(run, label)
+	}
 	var report doctorReport
 	lastJSONLine(t, out, &report)
 
@@ -228,6 +246,26 @@ func assertTopologyDoctor(t *testing.T, run *helpers.TopologyRun, allowedFailure
 	// the message — the message is the operator's line and is free to change,
 	// these are the contract automation reads.
 	assertTopologyBeadsStore(t, report, run.Topology.CityStore, label)
+	logTopologyStoreClass(report, label)
+	if when == "after start" {
+		logControllerStoreLines(run, label)
+		// DIAGNOSTIC BRANCH ONLY (ga-tyf38i, the mayor's 07:11:16Z ruling):
+		// print order-firing-current's details whatever its status, then fail on
+		// purpose so CI prints this output and uploads test.log on a run where
+		// M1 itself is green. Never merged.
+		for _, r := range report.Results {
+			if r.Name != "order-firing-current" {
+				continue
+			}
+			diagnosticLine("%s: order-firing-current status=%s message=%q", label, r.Status, r.Message)
+			for _, d := range r.Details {
+				diagnosticLine("%s:     %s", label, d)
+			}
+		}
+		diagReportTicks(label, run.Env.Get("GC_HOME"), filepath.Join(run.Root, "bd-trace.jsonl"))
+		diagPrintProfile(label, filepath.Join(run.Root, "cpu.pprof"), 70*time.Second)
+		t.Errorf("ga-tyf38i diagnostic: forced failure to publish test.log (M1 doctor status above is the real result)")
+	}
 
 	allowed := make(map[string]bool, len(allowedFailures)+len(run.Topology.DoctorGaps))
 	for _, name := range allowedFailures {
@@ -244,6 +282,15 @@ func assertTopologyDoctor(t *testing.T, run *helpers.TopologyRun, allowedFailure
 		t.Logf("%s: %s — %s", r.Status, r.Name, r.Message)
 		switch r.Status {
 		case "error":
+			// The message alone cannot say WHICH orders were stale or why
+			// (ga-tyf38i: two failures that named nothing). The details can.
+			for i, d := range r.Details {
+				if i == 20 {
+					t.Logf("    ... %d more detail line(s)", len(r.Details)-i)
+					break
+				}
+				t.Logf("    %s", d)
+			}
 			if allowed[r.Name] {
 				continue
 			}
@@ -517,4 +564,116 @@ func assertStopRetiresTheScope(t *testing.T, run *helpers.TopologyRun, rigDir st
 		t.Errorf("%s: gc stop retired the external Dolt server it does not own (%s)",
 			run.Topology.Name, run.Upstream.Addr())
 	}
+}
+
+// diagnosticLine writes one ga-tyf38i diagnostic line to the test binary's
+// stdout. Unlike t.Logf it survives a passing, non-verbose run: Bazel keeps the
+// binary's stdout in test.log whatever the result, so a green run also says
+// which store it opened.
+func diagnosticLine(format string, args ...any) {
+	_, _ = fmt.Fprintf(os.Stdout, "ga-tyf38i diag: "+format+"\n", args...)
+}
+
+// logTopologyStoreClass names the store class this doctor run opened
+// (ga-tyf38i): the beads-store payload's store, preflight gate and reason. It
+// is the doctor process's open, not the controller's; logControllerStoreLines
+// prints the controller's own lines.
+func logTopologyStoreClass(report doctorReport, label string) {
+	for _, r := range report.Results {
+		if r.Name != "beads-store" || len(r.Payload) == 0 {
+			continue
+		}
+		var payload beadsStorePayloadDoc
+		if err := json.Unmarshal(r.Payload, &payload); err != nil {
+			diagnosticLine("%s: store class: unreadable beads-store payload: %v", label, err)
+			return
+		}
+		diagnosticLine("%s: store class (doctor's open): store=%q preflight_gate=%q preflight_reason=%q proxied_account=%t",
+			label, payload.Store, payload.PreflightGate, payload.PreflightReason, payload.Proxied != nil)
+		return
+	}
+	diagnosticLine("%s: store class: no beads-store payload in this doctor report", label)
+}
+
+// controllerStoreLineMarkers are the substrings of a controller log line that
+// say which store the controller opened or how its order gate read it
+// (ga-tyf38i): the native lane's decline, the order dispatcher's index and
+// live-read lines, and the store class names.
+var controllerStoreLineMarkers = []string{
+	"native_store", "order dispatch", "order-run index", "NativeDoltStore", "BdStore", "ProxiedStore",
+}
+
+// logControllerStoreLines prints, after every post-start doctor run, each
+// controller log line that names its store or its order gate's reads, from the
+// supervisor log and the city's own logs, up to 60 lines, and says so when
+// there are none. It reads files in Go, never through a shell.
+func logControllerStoreLines(run *helpers.TopologyRun, label string) {
+	var files []string
+	if home := run.Env.Get("GC_HOME"); home != "" {
+		files = append(files, filepath.Join(home, "supervisor.log"))
+	}
+	for _, pat := range []string{
+		filepath.Join(run.City.Dir, ".gc", "*.log"),
+		filepath.Join(run.City.Dir, ".gc", "runtime", "*.log"),
+	} {
+		matches, _ := filepath.Glob(pat)
+		files = append(files, matches...)
+	}
+	printed := 0
+	for _, f := range files {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			diagnosticLine("%s: controller store lines: %s: %v", label, f, err)
+			continue
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			for _, m := range controllerStoreLineMarkers {
+				if !strings.Contains(line, m) {
+					continue
+				}
+				if printed == 300 {
+					diagnosticLine("%s: controller store lines: stopped at 300", label)
+					return
+				}
+				diagnosticLine("%s: controller store line [%s]: %s", label, filepath.Base(f), line)
+				printed++
+				break
+			}
+		}
+	}
+	if printed == 0 {
+		diagnosticLine("%s: controller store lines: none in %d log file(s): %s", label, len(files), strings.Join(files, ", "))
+	}
+}
+
+// diagStep prints a wall-clock mark (DIAGNOSTIC BRANCH ONLY, ga-tyf38i), so
+// the gap between the controller's start and doctor's read can be split into
+// the steps that make it up.
+func diagStep(label, what string) {
+	diagnosticLine("%s: t=%s %s", label, time.Now().UTC().Format("15:04:05.000"), what)
+}
+
+// diagControllerStarts prints every controller.started event's timestamp in
+// the city's active event log (DIAGNOSTIC BRANCH ONLY, ga-tyf38i): the start
+// order-firing-current dates a never-fired order from.
+func diagControllerStarts(run *helpers.TopologyRun, label string) {
+	path := filepath.Join(run.City.Dir, ".gc", "runtime", "events.jsonl")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		diagnosticLine("%s: controller.started: %v", label, err)
+		return
+	}
+	n := 0
+	for _, line := range strings.Split(string(data), "\n") {
+		var ev struct {
+			Type string `json:"type"`
+			Ts   string `json:"ts"`
+		}
+		if json.Unmarshal([]byte(line), &ev) != nil || ev.Type != "controller.started" {
+			continue
+		}
+		diagnosticLine("%s: controller.started ts=%s", label, ev.Ts)
+		n++
+	}
+	diagnosticLine("%s: controller.started events: %d", label, n)
 }

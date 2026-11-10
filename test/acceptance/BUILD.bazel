@@ -194,12 +194,18 @@ go_test(
         "status_test.go",
         "supervisor_registry_test.go",
         "testenv_import_test.go",
+        "tickdiag_report_test.go",
         "wait_test.go",
         "worktree_lifecycle_test.go",
         "worktree_test.go",
     ],
     # The SOLO_TESTS run in targets of their own (below), never here.
-    args = ["-test.skip=^(%s)$$" % "|".join(SOLO_TESTS.values())],
+    # DIAGNOSTIC BRANCH ONLY (ga-tyf38i): -test.v so test.xml carries each
+    # test's duration.
+    args = [
+        "-test.v",
+        "-test.skip=^(%s)$$" % "|".join(SOLO_TESTS.values()),
+    ],
     data = [
         "//cmd/gc",
         "//examples/bd",
