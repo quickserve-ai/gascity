@@ -340,6 +340,12 @@ func TestHasOpenWorkConfirmsAbsenceOnlyOnALeafThatReportedNarrowed(t *testing.T)
 		reportedAs string
 	}{
 		{"native, narrowed (double)", reporting(beads.PushNotClosedNarrowed), 1, "narrowed"},
+		{"the bead policy over native, narrowed (double)", func() beads.Store {
+			return &beadPolicyStore{Store: reporting(beads.PushNotClosedNarrowed)()}
+		}, 1, "narrowed"},
+		{"the bead policy over a cache over native, narrowed (double)", func() beads.Store {
+			return &beadPolicyStore{Store: beads.NewCachingStoreForTest(reporting(beads.PushNotClosedNarrowed)(), nil)}
+		}, 1, "narrowed"},
 		{"a proxy serving native (double)", reporting(beads.PushNotClosedNarrowed), 1, "narrowed"},
 		{"native, set unreadable (double)", reporting(beads.PushNotClosedNotNarrowed), 0, "not narrowed"},
 		{"a proxy demoted to bd (double)", reporting(beads.PushNotClosedNotNarrowed), 0, "not narrowed"},

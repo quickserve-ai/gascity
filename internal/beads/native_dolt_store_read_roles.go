@@ -328,10 +328,16 @@ func (s *NativeDoltStore) listPlanRequest(ctx context.Context, reader issueops.R
 			// The set was read from status.custom for this very listing, so a
 			// name the reader refuses is the reader's per-handle cache, which
 			// only a SetConfig on that handle clears, missing another process's
-			// write. It can last until a restart or reconnect. Latching would
-			// stop the guard for that whole time; instead each listing pays the
-			// refusal, reads unpushed and counts as a fallback, and the pushdown
-			// resumes by itself. Only a refusal that quotes no name latches.
+			// write. It lasts until this store replaces the handle (a reconnect
+			// after a transient failure, a re-pin on a proxy generation change)
+			// or the process restarts; it does not clear by itself. Latching
+			// would freeze the guard's counters and keep the pushdown off past
+			// those replacements; instead each listing pays the refusal, reads
+			// unpushed and counts as a fallback, and the pushdown resumes once
+			// the handle is replaced. A named refusal can only name a status this
+			// listing sent, and every status it sent is in the set just read, so
+			// only a refusal that names no status latches (the mayor's scope of
+			// the 11/04 refusal-latch rule, 2026-11-10T09:51:33Z, ga-tyf38i).
 			if s.statusRefusalWarned.CompareAndSwap(false, true) {
 				s.listLogger().Warn("native bead store: reader refused a status the scope's current status.custom names; reading such listings unpushed (counted as guard fallbacks)",
 					"prefix", s.idPrefix, "refused_status", refused, "err", statusErr, "guard_stats", s.listCounters.guardText(*tally))
