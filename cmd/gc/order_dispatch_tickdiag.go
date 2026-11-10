@@ -10,11 +10,16 @@ package main
 import (
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
+	"runtime/pprof"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
@@ -25,6 +30,9 @@ type tickDiag struct {
 	start  time.Time
 	phases []string
 	stores map[string]*tickStoreDiag
+	self0  syscall.Rusage
+	kids0  syscall.Rusage
+	ruOK   bool
 }
 
 type tickStoreDiag struct {
@@ -41,7 +49,97 @@ type tickStoreDiag struct {
 }
 
 func newTickDiag() *tickDiag {
-	return &tickDiag{start: time.Now(), stores: make(map[string]*tickStoreDiag)}
+	diagStartProfile()
+	d := &tickDiag{start: time.Now(), stores: make(map[string]*tickStoreDiag)}
+	d.ruOK = syscall.Getrusage(syscall.RUSAGE_SELF, &d.self0) == nil &&
+		syscall.Getrusage(syscall.RUSAGE_CHILDREN, &d.kids0) == nil
+	return d
+}
+
+// diagCPUProfileEnv names the file the controller writes one CPU profile to,
+// covering diagCPUProfileWindow from its first dispatch tick.
+const diagCPUProfileEnv = "GC_DIAG_CPUPROFILE"
+
+// diagCPUProfileSecsEnv sets the profile window in seconds (default 120).
+const diagCPUProfileSecsEnv = "GC_DIAG_CPUPROFILE_SECS"
+
+func diagCPUProfileWindow() time.Duration {
+	if v, err := strconv.Atoi(os.Getenv(diagCPUProfileSecsEnv)); err == nil && v > 0 {
+		return time.Duration(v) * time.Second
+	}
+	return 120 * time.Second
+}
+
+var diagProfileOnce sync.Once
+
+func diagStartProfile() {
+	diagProfileOnce.Do(func() {
+		path := os.Getenv(diagCPUProfileEnv)
+		if path == "" {
+			return
+		}
+		f, err := os.Create(path)
+		if err != nil {
+			return
+		}
+		if err := pprof.StartCPUProfile(f); err != nil {
+			_ = f.Close()
+			return
+		}
+		time.AfterFunc(diagCPUProfileWindow(), func() {
+			pprof.StopCPUProfile()
+			_ = f.Close()
+		})
+	})
+}
+
+func diagTV(tv syscall.Timeval) time.Duration {
+	return time.Duration(tv.Sec)*time.Second + time.Duration(tv.Usec)*time.Microsecond
+}
+
+func diagRusageMS(ru syscall.Rusage) (int64, int64) {
+	return diagTV(ru.Utime).Milliseconds(), diagTV(ru.Stime).Milliseconds()
+}
+
+// diagLoad1 is the 1-minute load average, or -1 where /proc/loadavg is absent.
+func diagLoad1() float64 {
+	b, err := os.ReadFile("/proc/loadavg")
+	if err != nil {
+		return -1
+	}
+	f := strings.Fields(string(b))
+	if len(f) == 0 {
+		return -1
+	}
+	v, err := strconv.ParseFloat(f[0], 64)
+	if err != nil {
+		return -1
+	}
+	return v
+}
+
+// diagProcess is the per-tick process reading: this process's and its reaped
+// children's CPU (user+sys) during the tick and since start, the load
+// average, goroutines and GC.
+func (d *tickDiag) diagProcess() string {
+	out := fmt.Sprintf("load1=%.2f goroutines=%d", diagLoad1(), runtime.NumGoroutine())
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	out += fmt.Sprintf(" gc_num=%d gc_pause_total_ms=%d", ms.NumGC, time.Duration(ms.PauseTotalNs).Milliseconds())
+	if !d.ruOK {
+		return out
+	}
+	var self, kids syscall.Rusage
+	if syscall.Getrusage(syscall.RUSAGE_SELF, &self) != nil || syscall.Getrusage(syscall.RUSAGE_CHILDREN, &kids) != nil {
+		return out
+	}
+	su, ss := diagRusageMS(self)
+	su0, ss0 := diagRusageMS(d.self0)
+	ku, ks := diagRusageMS(kids)
+	ku0, ks0 := diagRusageMS(d.kids0)
+	out += fmt.Sprintf(" self_cpu_ms=%d self_cpu_total_ms=%d kids_cpu_ms=%d kids_cpu_total_ms=%d",
+		(su+ss)-(su0+ss0), su+ss, (ku+ks)-(ku0+ks0), ku+ks)
+	return out
 }
 
 func (d *tickDiag) storeLocked(key string, st beads.Store) *tickStoreDiag {
@@ -130,8 +228,9 @@ func (d *tickDiag) log(stderr io.Writer, candidates, fired int) {
 	phases := strings.Join(d.phases, " ")
 	total := time.Since(d.start).Milliseconds()
 	d.mu.Unlock()
-	logDispatchError(stderr, "gc: order dispatch: DIAG ga-tyf38i tick total_ms=%d %s candidates=%d fired=%d stores=%d %s",
-		total, phases, candidates, fired, len(parts), strings.Join(parts, " "))
+	proc := d.diagProcess()
+	logDispatchError(stderr, "gc: order dispatch: DIAG ga-tyf38i tick total_ms=%d %s candidates=%d fired=%d %s stores=%d %s",
+		total, phases, candidates, fired, proc, len(parts), strings.Join(parts, " "))
 }
 
 func diagShortKey(k string) string {
