@@ -2189,6 +2189,7 @@ go_test(
         "//internal/beads",
         "//internal/beads/beadstest",
         "//internal/beads/contract",
+        "//internal/beads/exec",
         "//internal/beads/proxyendpoint",
         "//internal/beads/proxyendpoint/proxyendpointtest",
         "//internal/beads/splittest",

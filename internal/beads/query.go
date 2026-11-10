@@ -157,8 +157,11 @@ type ListQuery struct {
 	// store that answered did with it (PushNotClosedOutcome): NativeDoltStore
 	// writes narrowed or not, BdStore writes not narrowed, and a wrapper
 	// (CachingStore's live path, ProxiedStore) passes the query through so its
-	// leaf writes it. A store that writes nothing leaves it unreported, which
-	// a reader treats as possibly narrowed.
+	// leaf writes it. A store that writes nothing leaves it unreported: such a
+	// store cannot push the set, so it never narrowed the listing, and a
+	// reader treats it as not narrowed (the mayor's ruling,
+	// 2026-11-10T08:52:17Z, ga-tyf38i). Only a store that can push must write
+	// narrowed when it did.
 	PushReport *PushNotClosedOutcome
 	// Live bypasses CachingStore and reads from the backing store. Other Store
 	// implementations ignore it. Use it only for lifecycle gates that must
@@ -536,8 +539,9 @@ func sortBeadsForQuery(items []Bead, order SortOrder) {
 type PushNotClosedOutcome uint8
 
 const (
-	// PushNotClosedUnreported means no store said what it did. A reader must treat
-	// it as possibly narrowed; the zero value fails toward the extra read.
+	// PushNotClosedUnreported means no store said what it did. Only a store
+	// that can push the not-closed set writes a report, so a store that writes
+	// none never narrowed the listing: a reader treats it as not narrowed.
 	PushNotClosedUnreported PushNotClosedOutcome = iota
 	// PushNotClosedNotNarrowed means the store answered the listing without any
 	// not-closed status set, so it cannot have hidden a row by status.
@@ -547,9 +551,13 @@ const (
 )
 
 // MayHaveHidden reports whether the listing could have hidden a row the
-// not-closed pushdown left out: anything but an explicit not-narrowed report.
+// not-closed pushdown left out: only when the answering store reported that
+// the set narrowed it. A store that cannot push reports nothing and never
+// narrowed (the mayor's ruling, 2026-11-10T08:52:17Z, ga-tyf38i: before it,
+// an unreported listing counted as narrowed, and every due non-idempotent
+// order on such a store took a forked live read each tick).
 func (o PushNotClosedOutcome) MayHaveHidden() bool {
-	return o != PushNotClosedNotNarrowed
+	return o == PushNotClosedNarrowed
 }
 
 // reportPush records, for a caller that asked (PushReport set), whether this

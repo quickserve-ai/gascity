@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/gastownhall/gascity/internal/fsys"
 	beadslib "github.com/steveyegge/beads"
 	"github.com/steveyegge/beads/issueops"
 )
@@ -606,7 +608,9 @@ func pushReport(t *testing.T, store Store) PushNotClosedOutcome {
 // listing, never from the store's type. One case per store class: a native
 // listing that sent the set says narrowed, whatever wraps it; a bd listing
 // says not narrowed, whatever wraps it, so a demoted proxy is judged by the
-// leaf that answered THIS listing; a store that says nothing may have hidden.
+// leaf that answered THIS listing; a store that cannot push says nothing and
+// never narrowed (the restatement 2026-11-10T08:52:17Z), so only a narrowed
+// report may have hidden a row.
 func TestAPushNotClosedListingReportsWhetherItWasNarrowed(t *testing.T) {
 	newNative := func() *NativeDoltStore {
 		var sent []string
@@ -630,14 +634,33 @@ func TestAPushNotClosedListingReportsWhetherItWasNarrowed(t *testing.T) {
 		{"a cache over bd", func() Store { return NewCachingStoreForTest(newBd(), nil) }, PushNotClosedNotNarrowed},
 		{"a proxy demoted to bd", func() Store { return &ProxiedStore{bd: newBd()} }, PushNotClosedNotNarrowed},
 		{"a cache over a proxy demoted to bd", func() Store { return NewCachingStoreForTest(&ProxiedStore{bd: newBd()}, nil) }, PushNotClosedNotNarrowed},
-		{"a store that reports nothing", func() Store { return NewMemStore() }, PushNotClosedUnreported},
+		{"native whose set could not be read", func() Store {
+			var sent []string
+			return newNativeDoltStoreWithStorage(statusSettingStorage{nativeDoltReaderSpy: vocabularyReader(outOfVocabularyRows(), "", &sent), err: errors.New("config read failed")}, "native-test")
+		}, PushNotClosedNotNarrowed},
+		{"mem reports nothing", func() Store { return NewMemStore() }, PushNotClosedUnreported},
+		{"a cache over mem reports nothing", func() Store { return NewCachingStoreForTest(NewMemStore(), nil) }, PushNotClosedUnreported},
+		{"file reports nothing", func() Store {
+			store, err := OpenFileStore(fsys.OSFS{}, filepath.Join(t.TempDir(), "beads.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			return store
+		}, PushNotClosedUnreported},
+		{"sqlite reports nothing", func() Store {
+			store, err := OpenSQLiteStore(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			return store
+		}, PushNotClosedUnreported},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := pushReport(t, tc.store())
 			if got != tc.want {
 				t.Fatalf("report = %d, want %d", got, tc.want)
 			}
-			if wantHidden := tc.want != PushNotClosedNotNarrowed; got.MayHaveHidden() != wantHidden {
+			if wantHidden := tc.want == PushNotClosedNarrowed; got.MayHaveHidden() != wantHidden {
 				t.Fatalf("MayHaveHidden = %t, want %t", got.MayHaveHidden(), wantHidden)
 			}
 		})
