@@ -196,6 +196,10 @@ type quiescenceCity struct {
 	rigDir  string
 	rigName string
 	shim    *scopeRecordingBD
+	// DIAGNOSTIC BRANCH ONLY (ga-tyf38i).
+	env        *helpers.Env
+	bdTrace    string
+	cpuProfile string
 }
 
 // newQuiescenceCity starts the city each suspension row measures. Each row
@@ -211,6 +215,13 @@ func newQuiescenceCity(t *testing.T) *quiescenceCity {
 	env, wrappedBD := proxiedEnvWithBD(t, bdPath, doltPath)
 	shim := newScopeRecordingBD(t, wrappedBD)
 	env = forwardBackstopSpeedup(t, env.With("BD_BIN", shim.path))
+	// DIAGNOSTIC BRANCH ONLY (ga-tyf38i): trace every bd call gc makes.
+	bdTrace := filepath.Join(helpers.TempDir(t), "bd-trace.jsonl")
+	env = env.With(diagBDTraceEnv, bdTrace)
+	cpuProfile := filepath.Join(helpers.TempDir(t), "cpu.pprof")
+	env = env.With(diagCPUProfileEnv, cpuProfile).With(diagCPUProfileSecsEnv, "120")
+	diagMachineBench("quiescence")
+	diagGCStartup("quiescence", env)
 	// The orders the rows run, and the controller's, call bare `gc` through
 	// PATH: unless that gc is the binary under test, they never start or run
 	// another gc, and a row measures nothing or the wrong binary.
@@ -240,11 +251,19 @@ func newQuiescenceCity(t *testing.T) *quiescenceCity {
 			t.Fatalf("gc bd --rig %s list: %v\n%s", rigName, err, out)
 		}
 	}
-	return &quiescenceCity{city: city, rigDir: rigDir, rigName: rigName, shim: shim}
+	return &quiescenceCity{city: city, rigDir: rigDir, rigName: rigName, shim: shim, env: env, bdTrace: bdTrace, cpuProfile: cpuProfile}
 }
 
 func TestProxiedSuspensionIsQuiescenceSuspendedRig(t *testing.T) {
 	q := newQuiescenceCity(t)
+	// DIAGNOSTIC BRANCH ONLY (ga-tyf38i): print the controller's tick lines and
+	// the bd trace, then fail on purpose so CI prints this test's output and
+	// uploads test.log. The real result is whatever failed before this line.
+	defer func() {
+		diagReportTicks("qRig", q.env.Get("GC_HOME"), q.bdTrace)
+		diagPrintProfile("qRig", q.cpuProfile, 150*time.Second)
+		t.Errorf("ga-tyf38i diagnostic: forced failure to publish test.log")
+	}()
 	city, rigDir, rigName, shim := q.city, q.rigDir, q.rigName, q.shim
 
 	if out, err := city.GC("rig", "suspend", rigName); err != nil {

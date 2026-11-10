@@ -46,6 +46,22 @@ func TestBeadsProxiedIgnoresUserLevelSharedServer(t *testing.T) {
 		With("XDG_CONFIG_HOME", xdgConfig).
 		With("BEADS_SHARED_SERVER_DIR", sharedDir).
 		With("BD_DOLT_SHARED_SERVER", "")
+	// DIAGNOSTIC BRANCH ONLY (ga-tyf38i): trace every bd call gc makes and
+	// profile the controller for its first 30 s, then print the tick lines,
+	// the bd census and the profile, and fail on purpose so CI uploads
+	// test.log. The real result is whatever failed before the forced line.
+	bdTrace := filepath.Join(helpers.TempDir(t), "bd-trace.jsonl")
+	cpuProfile := filepath.Join(helpers.TempDir(t), "cpu.pprof")
+	env = env.With(diagBDTraceEnv, bdTrace).
+		With(diagCPUProfileEnv, cpuProfile).
+		With(diagCPUProfileSecsEnv, "30")
+	diagMachineBench("sharedSrv")
+	diagGCStartup("sharedSrv", env)
+	defer func() {
+		diagReportTicks("sharedSrv", env.Get("GC_HOME"), bdTrace)
+		diagPrintProfile("sharedSrv", cpuProfile, 60*time.Second)
+		t.Errorf("ga-tyf38i diagnostic: forced failure to publish test.log")
+	}()
 
 	city := helpers.NewCity(t, env)
 	cityRoot := city.Dir
