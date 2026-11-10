@@ -588,8 +588,10 @@ type backingOnlyStore struct {
 
 func (s backingOnlyStore) Backing() Store { return s.backing }
 
-// A wrong true here would let a non-idempotent order rely on a narrowed listing,
-// so only a bd store, bare or wrapped, may answer true.
+// A wrong true here would let a non-idempotent order rely on a narrowed listing.
+// A proxy answers false even over a bd leaf: it can demote between the listing
+// and the check, so its leaf now says nothing about that listing (Astra at
+// 903dd063089f).
 func TestIgnoresPushNotClosed(t *testing.T) {
 	bd := NewBdStore(t.TempDir(), func(string, string, ...string) ([]byte, error) { return []byte("[]"), nil })
 	mem := NewMemStore()
@@ -599,12 +601,13 @@ func TestIgnoresPushNotClosed(t *testing.T) {
 		want  bool
 	}{
 		{"bd", bd, true},
-		{"bd behind a wrapper", backingOnlyStore{backing: bd}, true},
-		{"bd behind two wrappers", backingOnlyStore{backing: backingOnlyStore{backing: bd}}, true},
+		{"a cache directly over bd", NewCachingStoreForTest(bd, nil), true},
+		{"a cache over a proxy", NewCachingStoreForTest(&ProxiedStore{}, nil), false},
+		{"a proxy", &ProxiedStore{}, false},
+		{"a proxy-shaped wrapper over bd", backingOnlyStore{backing: bd}, false},
 		{"a native store can push", &NativeDoltStore{}, false},
-		{"native behind a wrapper", backingOnlyStore{backing: &NativeDoltStore{}}, false},
+		{"a cache over a native store", NewCachingStoreForTest(&NativeDoltStore{}, nil), false},
 		{"another store", mem, false},
-		{"a wrapper with nothing behind it", backingOnlyStore{}, false},
 		{"nil", nil, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

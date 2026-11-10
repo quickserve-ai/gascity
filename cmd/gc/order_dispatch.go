@@ -1250,10 +1250,10 @@ func (idx *orderDispatchTrackingIndex) hasOpenTracking(
 // on a gate timeout. An idempotent order keeps the index's answer: it already
 // dispatches without any gate when the gate times out (gateFailClosed).
 //
-// A store that cannot push (beads.IgnoresPushNotClosed) has no such doubt, since
-// its listing was never narrowed, so it keeps the index's answer. Otherwise a
-// default bd-backed city would pay a forked read per non-idempotent order per
-// tick for nothing, and a slow one would hold the order (Astra at 11075803fb57).
+// A store that can never push (beads.IgnoresPushNotClosed: a bd store, bare or
+// directly cached, never a proxy) has no such doubt, so it keeps the index's
+// answer. Otherwise a bd-backed city would pay a forked read per non-idempotent
+// order per tick for nothing, and a slow one would hold the order.
 func (idx *orderDispatchTrackingIndex) hasOpenWork(
 	stores []beads.Store,
 	storeKeys []string,
