@@ -19,6 +19,8 @@ package acceptance_test
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -228,6 +230,7 @@ func assertTopologyDoctor(t *testing.T, run *helpers.TopologyRun, allowedFailure
 	// the message — the message is the operator's line and is free to change,
 	// these are the contract automation reads.
 	assertTopologyBeadsStore(t, report, run.Topology.CityStore, label)
+	logTopologyStoreClass(t, report, label)
 
 	allowed := make(map[string]bool, len(allowedFailures)+len(run.Topology.DoctorGaps))
 	for _, name := range allowedFailures {
@@ -282,6 +285,7 @@ func assertTopologyDoctor(t *testing.T, run *helpers.TopologyRun, allowedFailure
 	if err != nil {
 		t.Logf("gc doctor exit: %v", err)
 	}
+	logControllerStoreLines(t, run)
 	t.Fatalf("gc doctor on %s reported %d unexpected failure(s) and %d bead-topology warning(s), want none",
 		label, failures, topologyWarnings)
 }
@@ -525,5 +529,79 @@ func assertStopRetiresTheScope(t *testing.T, run *helpers.TopologyRun, rigDir st
 	if live := helpers.DoltProcessesUnder(t, run.Upstream.DataDir); len(live) == 0 {
 		t.Errorf("%s: gc stop retired the external Dolt server it does not own (%s)",
 			run.Topology.Name, run.Upstream.Addr())
+	}
+}
+
+// logTopologyStoreClass names the store class this doctor run opened
+// (ga-tyf38i): the beads-store payload's store, preflight gate and reason. It
+// is the doctor process's open, not the controller's, so a failure also prints
+// the controller's own lines (logControllerStoreLines).
+func logTopologyStoreClass(t *testing.T, report doctorReport, label string) {
+	t.Helper()
+	for _, r := range report.Results {
+		if r.Name != "beads-store" || len(r.Payload) == 0 {
+			continue
+		}
+		var payload beadsStorePayloadDoc
+		if err := json.Unmarshal(r.Payload, &payload); err != nil {
+			t.Logf("%s: store class: unreadable beads-store payload: %v", label, err)
+			return
+		}
+		t.Logf("%s: store class (doctor's open): store=%q preflight_gate=%q preflight_reason=%q proxied_account=%t",
+			label, payload.Store, payload.PreflightGate, payload.PreflightReason, payload.Proxied != nil)
+		return
+	}
+	t.Logf("%s: store class: no beads-store payload in this doctor report", label)
+}
+
+// controllerStoreLineMarkers are the substrings of a controller log line that
+// say which store the controller opened or how its order gate read it
+// (ga-tyf38i): the native lane's decline, the order dispatcher's index and
+// live-read lines, and the store class names.
+var controllerStoreLineMarkers = []string{
+	"native_store", "order dispatch", "order-run index", "NativeDoltStore", "BdStore", "ProxiedStore",
+}
+
+// logControllerStoreLines prints, after a failed doctor check, every
+// controller log line that names its store or its order gate's reads, from the
+// supervisor log and the city's own logs, up to 60 lines. It reads files in Go,
+// never through a shell.
+func logControllerStoreLines(t *testing.T, run *helpers.TopologyRun) {
+	t.Helper()
+	var files []string
+	if home := run.Env.Get("GC_HOME"); home != "" {
+		files = append(files, filepath.Join(home, "supervisor.log"))
+	}
+	for _, pat := range []string{
+		filepath.Join(run.City.Dir, ".gc", "*.log"),
+		filepath.Join(run.City.Dir, ".gc", "runtime", "*.log"),
+	} {
+		matches, _ := filepath.Glob(pat)
+		files = append(files, matches...)
+	}
+	printed := 0
+	for _, f := range files {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			t.Logf("controller store lines: %s: %v", f, err)
+			continue
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			for _, m := range controllerStoreLineMarkers {
+				if !strings.Contains(line, m) {
+					continue
+				}
+				if printed == 60 {
+					t.Logf("controller store lines: stopped at 60")
+					return
+				}
+				t.Logf("controller store line [%s]: %s", filepath.Base(f), line)
+				printed++
+				break
+			}
+		}
+	}
+	if printed == 0 {
+		t.Logf("controller store lines: none in %d log file(s)", len(files))
 	}
 }
