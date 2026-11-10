@@ -521,7 +521,7 @@ func sortBeadsForQuery(items []Bead, order SortOrder) {
 // IgnoresPushNotClosed reports whether store declares that it answers a
 // ListQuery.PushNotClosed listing without narrowing it, so that listing cannot
 // have hidden a row. The answer is the store's own statement about its
-// behaviour (the IgnoresPushNotClosed method). A store that does not declare
+// behavior (the IgnoresPushNotClosed method). A store that does not declare
 // it answers false: false costs a live read, and a wrong true would lose
 // single-flight. A ProxiedStore never declares it: a proxy can demote from a
 // native to a bd read leaf between the listing and this check, so its leaf now
