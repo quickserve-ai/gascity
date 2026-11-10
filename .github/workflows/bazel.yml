@@ -82,6 +82,21 @@ on:
         description: "Re-execute every lane's tests (--config=fresh: no cached test results), as the nightly run does"
         type: boolean
         default: false
+      # DIAGNOSTIC ONLY (ga-tyf38i repeat, never merged): when diag-targets is
+      # set, the run starts one lane that tests just these targets, unsharded,
+      # with the filter and bazel's per-target run counts.
+      diag-targets:
+        description: "diag: space-separated bazel targets; when set, only this lane runs"
+        type: string
+        default: ""
+      diag-filter:
+        description: "diag: --test_filter value"
+        type: string
+        default: ""
+      diag-runs-per-test:
+        description: "diag: --runs_per_test value, e.g. //cmd/gc:gc_test@100,//internal/doctor:doctor_test@300"
+        type: string
+        default: ""
   workflow_call:
     inputs:
       rbe:
@@ -262,6 +277,9 @@ jobs:
           EVENT: ${{ github.event_name }}
           MODE: ${{ steps.decide.outputs.mode }}
           FRESH: ${{ inputs.fresh-test-results }}
+          DIAG_TARGETS: ${{ inputs.diag-targets }}
+          DIAG_FILTER: ${{ inputs.diag-filter }}
+          DIAG_RUNS: ${{ inputs.diag-runs-per-test }}
         run: |
           set -euo pipefail
           case "$MODE" in remote|fork-ro|fork-rw|cache|local) ;; *) echo "::error::mode '$MODE'"; exit 1 ;; esac
@@ -314,6 +332,14 @@ jobs:
           # gate it in a merge queue instead of moving it back onto push
           # (follow-up, not built here).
           case "$EVENT" in workflow_dispatch|schedule) lanes+=",$integration" ;; esac
+          if [ "$EVENT" = workflow_dispatch ] && [ -n "${DIAG_TARGETS:-}" ]; then
+            diag="test --config=ci --keep_going --test_sharding_strategy=disabled $DIAG_TARGETS"
+            [ -z "${DIAG_FILTER:-}" ] || diag+=" --test_filter=$DIAG_FILTER"
+            [ -z "${DIAG_RUNS:-}" ] || diag+=" --runs_per_test=$DIAG_RUNS"
+            diag+="$fresh"
+            lanes=$(jq -nc --arg cmd "$diag" '{lane:"unit",cmd:$cmd}')
+            echo "diag lane: $diag" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
           echo "lanes=[$lanes]" >> "$GITHUB_OUTPUT"
 
       - name: Resolve the base branch commit (fresh-merge)
