@@ -235,7 +235,9 @@ func cmdHandoffRemoteFrom(args []string, target, from string, force bool, stdout
 	var sender string
 	var ok bool
 	if from = strings.TrimSpace(from); from != "" {
-		sender, ok = resolveExplicitMailSender(mailCityRosterFor(cfg, cityPath), cityPath, cfg, sessStore, from, nil, stderr, "gc handoff", false)
+		// authorize: a live seat may claim only its own identity, as on a
+		// send or reply; an identity-less caller may claim any (ga-7lmivm.1).
+		sender, ok = resolveExplicitMailSender(mailCityRosterFor(cfg, cityPath), cityPath, cfg, sessStore, from, nil, stderr, "gc handoff", true)
 	} else {
 		sender, ok = resolveDefaultMailSenderForCommand(cityPath, cfg, sessStore, stderr, "gc handoff")
 	}
