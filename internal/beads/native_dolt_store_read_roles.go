@@ -334,10 +334,14 @@ func (s *NativeDoltStore) listPlanRequest(ctx context.Context, reader issueops.R
 			// would freeze the guard's counters and keep the pushdown off past
 			// those replacements; instead each listing pays the refusal, reads
 			// unpushed and counts as a fallback, and the pushdown resumes once
-			// the handle is replaced. A named refusal can only name a status this
-			// listing sent, and every status it sent is in the set just read, so
-			// only a refusal that names no status latches (the mayor's scope of
-			// the 11/04 refusal-latch rule, 2026-11-10T09:51:33Z, ga-tyf38i).
+			// the handle is replaced. The scope (the mayor's scope of the 11/04
+			// refusal-latch rule, 2026-11-10T09:51:33Z, ga-tyf38i): a refusal
+			// naming a status PRESENT in the set just read does not latch; a
+			// refusal naming no status, or one ABSENT from that set, latches. The
+			// ABSENT case cannot arise here: the reader can only refuse a status
+			// this listing sent, and every status it sent is in the set just
+			// read. So this branch treats any named refusal as PRESENT, and only
+			// a refusal naming no status reaches the latch below.
 			if s.statusRefusalWarned.CompareAndSwap(false, true) {
 				s.listLogger().Warn("native bead store: reader refused a status the scope's current status.custom names; reading such listings unpushed (counted as guard fallbacks)",
 					"prefix", s.idPrefix, "refused_status", refused, "err", statusErr, "guard_stats", s.listCounters.guardText(*tally))
