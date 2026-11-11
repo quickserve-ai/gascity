@@ -59,10 +59,11 @@ import (
 // is a substitute. AllFlag is stated because it says what it does in the member
 // name rather than in a magic status value.
 //
-// There is no ExcludeStatus member to spell "everything but closed"
-// with, so gc's "open" and its not-closed default cannot be pushed down; gc's
-// three-value projection (mapBdStatus, ListQuery.Matches) is the only
-// definition of them and runs Go-side. The two statuses that map one-to-one
+// There is no ExcludeStatus member to spell "everything but closed" with, so
+// gc's "open" cannot be pushed down, and its not-closed default is pushed only
+// as an allow-list for a caller that opts in (ListQuery.PushNotClosed, behind
+// guardNotClosed); gc's three-value projection (mapBdStatus, ListQuery.Matches)
+// stays the definition and runs Go-side. The two statuses that map one-to-one
 // onto a bd status are pushed beside AllFlag (nativeListRequestFromListQuery),
 // which keeps the pinned-flag default lifted under a named status.
 //
@@ -159,14 +160,36 @@ func (s *NativeDoltStore) List(query ListQuery) ([]Bead, error) {
 	if s.typePushdownOff.Load() {
 		pushable = nil
 	}
-	plan := nativeListPlan(query, pushable)
-	s.noteUnkeyedPlan(query, plan)
+	// Only an opted-in read pushes the not-closed set, and it reads the
+	// scope's status vocabulary afresh each time (readListNotClosedStatus),
+	// so a status.custom name added after the store opened is pushed too and
+	// its rows stay visible. An unreadable vocabulary pushes nothing. A listing
+	// the plan could not narrow anyway reads no vocabulary and runs no guard.
+	latched := s.statusPushdownOff.Load()
+	optedIn := nativeListCanPushNotClosed(query) && !latched
+	plan := nativeListPlan(query, pushable, "")
+	if !optedIn {
+		s.noteUnkeyedPlan(query, plan)
+	}
 	var (
-		out   []Bead
-		tally nativeListTally
+		out      []Bead
+		tally    nativeListTally
+		narrowed bool
 	)
 	err := s.withReadRetry(func(ctx context.Context, storage beadslib.Storage) error {
 		tally = nativeListTally{}
+		narrowed = false
+		if latched && nativeListCanPushNotClosed(query) {
+			// The listing opted in and reads unpushed: that is a fallback, and
+			// without this count the latch would read as a guard with no work.
+			tally.guardFallbacks++
+		}
+		notClosed := ""
+		if optedIn {
+			notClosed = s.guardNotClosed(ctx, storage, s.readListNotClosedStatus(ctx, storage, &tally), &tally)
+			plan = nativeListPlan(query, pushable, notClosed)
+			s.noteUnkeyedPlan(query, plan)
+		}
 		reader, err := storage.IssueReader()
 		if err != nil {
 			return err
@@ -174,12 +197,26 @@ func (s *NativeDoltStore) List(query ListQuery) ([]Bead, error) {
 		var beads []Bead
 		seen := make(map[string]bool)
 		reqs := plan
-		for i := 0; i < len(reqs); i++ {
+		for i := 0; ; i++ {
+			if i >= len(reqs) {
+				if notClosed == "" || !s.listVocabularyMoved(ctx, storage, notClosed, &tally) {
+					break
+				}
+				// A status registered after this listing read the vocabulary
+				// can already hold rows the pushed set did not name. The next
+				// probe cannot see them, because the set will then name it, so
+				// this listing answers from the full read instead.
+				notClosed = ""
+				reqs = nativeListPlan(query, pushable, "")
+				i, beads = -1, beads[:0]
+				clear(seen)
+				continue
+			}
 			req := reqs[i]
 			if req.IssueType != "" && s.typePushdownOff.Load() {
 				req.IssueType = ""
 			}
-			page, err := s.listPlanRequest(ctx, reader, req, &tally)
+			page, err := s.listPlanRequest(ctx, reader, req, notClosed, &tally)
 			if err != nil && req.IDFilter != "" && nativeListIDsRefused(err) {
 				// The backend refuses IDFilter (before any round trip): read the
 				// unfiltered set once and let ApplyListQuery apply the ids.
@@ -218,35 +255,105 @@ func (s *NativeDoltStore) List(query ListQuery) ([]Bead, error) {
 			sortBeadsNativeListDefaultOrder(beads)
 		}
 		out = ApplyListQuery(beads, query)
+		// The answer came from requests carrying the not-closed set exactly
+		// when notClosed survived to here: a guard fallback, a latch or a
+		// vocabulary move empties it first. A request whose pushed predicate
+		// the backend refused still counts as narrowed; that over-report
+		// costs the caller one confirming read, never a missed row.
+		narrowed = notClosed != ""
 		return nil
 	})
-	s.listCounters.commit(tally)
+	s.noteGuardHeartbeat(s.listCounters.commit(tally))
 	if err != nil {
 		return nil, err
 	}
+	query.reportPush(narrowed)
 	return out, nil
 }
 
-// listPlanRequest sends one plan request. A pushed type the backend refuses is
-// sent again without it; type pushdown latches off only when that retry is
-// answered. A retry that fails too returns both errors joined: errors.Is still
-// finds the refusal, and withReadRetry classifies the retry's own failure, so
-// a connection lost on the retry reconnects. Both sends are counted.
-func (s *NativeDoltStore) listPlanRequest(ctx context.Context, reader issueops.Reader, req issueops.ListRequest, tally *nativeListTally) (issueops.IssuePage, error) {
+// listPlanRequest sends one plan request. A pushed predicate the backend
+// refuses (the not-closed set, notClosed, or a type) is dropped and the request
+// sent again; each dropped predicate latches off for the store only once a
+// retry is answered. The two compose: when the refusal names one predicate
+// only that one is dropped first, a refusal that names neither drops both, and
+// a second refusal on the retry drops what is left. A retry that still fails
+// returns the first error and the last joined: errors.Is still finds the
+// refusal, and withReadRetry classifies the retry's own failure, so a
+// connection lost on the retry reconnects. Every send is counted.
+func (s *NativeDoltStore) listPlanRequest(ctx context.Context, reader issueops.Reader, req issueops.ListRequest, notClosed string, tally *nativeListTally) (issueops.IssuePage, error) {
 	page, err := reader.List(ctx, req)
 	tally.noteRequest(req, len(page.Items))
-	if err == nil || req.IssueType == "" || !nativeListTypeRefused(err) {
+	firstErr := err
+	// Each latch logs the refusal that dropped ITS predicate: when the type
+	// is refused first and the status second, firstErr names the type, and
+	// the status line must name the status (the mayor's condition 1).
+	var droppedStatus, droppedType string
+	var statusErr, typeErr error
+	for attempt := 0; err != nil && attempt < 2; attempt++ {
+		statusPushed := notClosed != "" && req.Status == notClosed
+		dropStatus := statusPushed && nativeListStatusRefused(err)
+		dropType := req.IssueType != "" && nativeListTypeRefused(err)
+		if dropStatus && dropType {
+			names := err.Error()
+			namesStatus, namesType := strings.Contains(names, "invalid status"), strings.Contains(names, "invalid issue type")
+			if namesStatus != namesType {
+				dropStatus, dropType = namesStatus, namesType
+			}
+		}
+		if !dropStatus && !dropType {
+			break
+		}
+		if dropStatus {
+			droppedStatus, req.Status, statusErr = req.Status, "", err
+		}
+		if dropType {
+			droppedType, req.IssueType, typeErr = req.IssueType, "", err
+		}
+		var retried issueops.IssuePage
+		retried, err = reader.List(ctx, req)
+		tally.noteRequest(req, len(retried.Items))
+		if err == nil {
+			page = retried
+		}
+	}
+	if err != nil {
+		if !errors.Is(err, firstErr) {
+			return issueops.IssuePage{}, errors.Join(firstErr, err)
+		}
 		return page, err
 	}
-	refusedType := req.IssueType
-	req.IssueType = ""
-	retried, retryErr := reader.List(ctx, req)
-	tally.noteRequest(req, len(retried.Items))
-	if retryErr != nil {
-		return issueops.IssuePage{}, errors.Join(err, retryErr)
+	if droppedStatus != "" {
+		tally.guardFallbacks++
+		if refused := nativeListRefusedStatusName(statusErr); refused != "" {
+			// The set was read from status.custom for this very listing, so a
+			// name the reader refuses is the reader's per-handle cache, which
+			// only a SetConfig on that handle clears, missing another process's
+			// write. It lasts until this store replaces the handle (a reconnect
+			// after a transient failure, a re-pin on a proxy generation change)
+			// or the process restarts; it does not clear by itself. Latching
+			// would freeze the guard's counters and keep the pushdown off past
+			// those replacements; instead each listing pays the refusal, reads
+			// unpushed and counts as a fallback, and the pushdown resumes once
+			// the handle is replaced. The scope (the mayor's scope of the 11/04
+			// refusal-latch rule, 2026-11-10T09:51:33Z, ga-tyf38i): a refusal
+			// naming a status PRESENT in the set just read does not latch; a
+			// refusal naming no status, or one ABSENT from that set, latches. The
+			// ABSENT case cannot arise here: the reader can only refuse a status
+			// this listing sent, and every status it sent is in the set just
+			// read. So this branch treats any named refusal as PRESENT, and only
+			// a refusal naming no status reaches the latch below.
+			if s.statusRefusalWarned.CompareAndSwap(false, true) {
+				s.listLogger().Warn("native bead store: reader refused a status the scope's current status.custom names; reading such listings unpushed (counted as guard fallbacks)",
+					"prefix", s.idPrefix, "refused_status", refused, "err", statusErr, "guard_stats", s.listCounters.guardText(*tally))
+			}
+		} else {
+			s.disableStatusPushdown(droppedStatus, statusErr)
+		}
 	}
-	s.disableTypePushdown(refusedType, err)
-	return retried, nil
+	if droppedType != "" {
+		s.disableTypePushdown(droppedType, typeErr)
+	}
+	return page, nil
 }
 
 // sortBeadsNativeListDefaultOrder sorts items into the reader role's default
@@ -692,7 +799,9 @@ func filterReadyByWorkOutcomeFetchBlockers(ctx context.Context, reader issueops.
 //   - TIER, because the plane knobs only ADMIT. There is no member that
 //     excludes the ephemeral rows a TierIssues read must drop, so that filter
 //     is ApplyListQuery's, as the wisp-tier filter already was.
-func nativeListRequestFromListQuery(query ListQuery, pushableTypes map[string]bool) issueops.ListRequest {
+//
+// Hydration is narrowed as well as filtering: the counts are never hydrated.
+func nativeListRequestFromListQuery(query ListQuery, pushableTypes map[string]bool, notClosed string) issueops.ListRequest {
 	req := nativeListReadRequest()
 	limit := nativeListLimitPushdown(query)
 	req.Limit = &limit
@@ -719,10 +828,33 @@ func nativeListRequestFromListQuery(query ListQuery, pushableTypes map[string]bo
 	}
 	if nativeListPushableStatus(query.Status) {
 		req.Status = query.Status
+	} else if nativeListCanPushNotClosed(query) && notClosed != "" {
+		// The not-closed default: every status of the scope's vocabulary but
+		// closed, as the request's OR set (nativeListNotClosedStatusFor). It
+		// replaces the status exclusions AllFlag lifted, and names pinned and
+		// hooked so the pinned-flag predicate stays lifted too. A row outside
+		// the set is either closed, which ApplyListQuery drops anyway, or in a
+		// status the scope no longer names; guardNotClosed looks for the second
+		// kind first and passes an empty set here when it finds one.
+		// Only when the caller opted in (PushNotClosed), and never on a
+		// CompleteActive read: there a status the vocabulary missed would not
+		// just hide rows, the cache would evict them as closed.
+		req.Status = notClosed
 	}
 	if pushableTypes[query.Type] {
 		req.IssueType = query.Type
 	}
+	// HYDRATION. Bead carries no dependency, dependent or comment count, and
+	// beadFromNativeIssueRow reads none, so the three cardinality aggregates are
+	// paid for and discarded on every listing. Each is its own aggregate join,
+	// and the reverse-blocker one joins on an expression the server cannot
+	// index. SkipCounts chooses what is hydrated, never which rows match, so the
+	// page is otherwise unchanged.
+	req.SkipCounts = true
+	// Labels stay hydrated whatever query.SkipLabels says. The CachingStore's
+	// full scan (cacheFullScanQuery) sets SkipLabels and installs the rows it
+	// gets back wholesale, so a native store that honored it would empty every
+	// cached bead's labels and every cached label read after the first Prime.
 	return req
 }
 
