@@ -131,6 +131,37 @@ func TestComputePoolDesiredStatesSkipsDependencyBlockedRoutedWork(t *testing.T) 
 	}
 }
 
+// A parked assigned bead is not executable wake demand, but an existing
+// claimant still owns it and must not be drained solely because of the hold.
+func TestPoolWakeDemandSkipsHeldAssignedWork(t *testing.T) {
+	for _, label := range beadmeta.DispatchHoldLabels {
+		t.Run(label, func(t *testing.T) {
+			store := beads.NewMemStore()
+			step, err := store.Create(beads.Bead{
+				Title: "held assigned work", Type: "task", Status: "open",
+				Assignee: poolWakeTemplate, Labels: []string{label},
+				Metadata: map[string]string{beadmeta.RoutedToMetadataKey: poolWakeTemplate},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			states := poolDesiredForStore(t, store)
+			if got := PoolDesiredCounts(states)[poolWakeTemplate]; got != 0 {
+				t.Errorf("held work generated %d pool seats, want 0", got)
+			}
+			if got := wakeKnownIdentityWorkBeads(states); len(got) != 0 {
+				t.Errorf("held work generated wake requests %v, want none", got)
+			}
+			// A session already holding the work is the existence case, not
+			// another worker requesting a new piece of executable work.
+			live := livePoolSessionBead("sess-live", poolWakeTemplate)
+			if got := PoolDesiredCounts(poolDesiredForStore(t, store, live))[poolWakeTemplate]; got != 1 {
+				t.Errorf("live claimant for held step %s has desired count %d, want 1", step.ID, got)
+			}
+		})
+	}
+}
+
 // livePoolSessionBead is an awake pool session bead whose runtime name is the
 // identity a work bead's Assignee carries.
 func livePoolSessionBead(id, sessionName string) beads.Bead {
