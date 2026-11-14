@@ -728,16 +728,21 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 				return trackingIndex.hasOpenTracking(storesForGate, storeKeysForGate, scoped)
 			})
 			if err != nil {
-				if m.gateFailClosed(ctx, a, scoped, err) {
-					if isGateContentionTimeout(err) {
-						// Anchor to actual wall clock after the gate consumed its time
-						// budget (the per-order bound OR the underlying store query
-						// timing out, vp-gprv); using the tick-start 'now' would set a
-						// deadline that has already passed. Backing off on the store-query
-						// timeout too keeps a non-idempotent order from re-hammering a
-						// contended Dolt every tick (#3688 #3770).
-						m.setGateBackoff(scoped, time.Now().Add(orderGateBackoffDuration))
-					}
+				blocked := m.gateFailClosed(ctx, a, scoped, err)
+				if isGateContentionTimeout(err) {
+					// Anchor to actual wall clock after the gate consumed its time
+					// budget (the per-order bound OR the underlying store query
+					// timing out, vp-gprv); using the tick-start 'now' would set a
+					// deadline that has already passed. Backing off on the store-query
+					// timeout too keeps a non-idempotent order from re-hammering a
+					// contended Dolt every tick (#3688 #3770). An idempotent order
+					// that fails open here backs off as well (ga-s1zc94): it still
+					// dispatches on this tick, but without the backoff it paid the
+					// full gate bound on every later tick while the store stayed
+					// contended, adding its own read to the contention.
+					m.setGateBackoff(scoped, time.Now().Add(orderGateBackoffDuration))
+				}
+				if blocked {
 					continue
 				}
 			}
@@ -859,8 +864,8 @@ func (m *memoryOrderDispatcher) logUnreachedCandidates(unreached []*orderDispatc
 // holding this order back because its previous dispatch's work is still moving.
 //
 // The gate read is bounded by our per-order timeout so a slow store cannot
-// starve the orders behind it, and a timeout that fails closed also arms the
-// per-order backoff. NoWorkGate orders skip the gate entirely (see the matching
+// starve the orders behind it, and a timeout arms the per-order backoff
+// whether it fails closed or, for an idempotent order, open. NoWorkGate orders skip the gate entirely (see the matching
 // open-tracking skip in dispatch's phase 1).
 func (m *memoryOrderDispatcher) openWorkGateShut(ctx context.Context, cand *orderDispatchCandidate, trackingIndex *orderDispatchTrackingIndex, now time.Time) bool {
 	a := cand.order
@@ -872,12 +877,14 @@ func (m *memoryOrderDispatcher) openWorkGateShut(ctx context.Context, cand *orde
 		return trackingIndex.hasOpenWork(cand.gateStores, cand.gateStoreKeys, scoped, m.wispRootHasOpenWork, m.hasOpenWorkStrict, !a.Idempotent)
 	})
 	if err != nil {
-		if m.gateFailClosed(ctx, a, scoped, err) {
-			if isGateContentionTimeout(err) {
-				// Anchor to actual wall clock after the gate consumed orderGateTimeout;
-				// using the tick-start 'now' would set a deadline that has already passed.
-				m.setGateBackoff(scoped, time.Now().Add(orderGateBackoffDuration))
-			}
+		blocked := m.gateFailClosed(ctx, a, scoped, err)
+		if isGateContentionTimeout(err) {
+			// Anchor to actual wall clock after the gate consumed orderGateTimeout;
+			// using the tick-start 'now' would set a deadline that has already passed.
+			// Armed for a fail-open idempotent order too (ga-s1zc94), as in phase 1.
+			m.setGateBackoff(scoped, time.Now().Add(orderGateBackoffDuration))
+		}
+		if blocked {
 			return true
 		}
 	}
@@ -2744,12 +2751,22 @@ func storeHasOpenDescendants(store beads.Store, rootID string, skip func(beads.B
 // on some steps while sibling ParentID-only steps are un-stamped), it falls
 // back to the authoritative tree walk before reporting the root idle, so
 // single-flight is never weakened for un-stamped or partial-stamp data.
+//
+// The membership read asks the store for not-closed members only, and opts
+// into the native store's not-closed pushdown (ListQuery.PushNotClosed,
+// ga-s1zc94): on a shared hub a long-lived root's closed members otherwise
+// travel on every gate check only to be dropped here. The answer is the same
+// set, because the store's not-closed filter drops exactly status "closed",
+// the one status the loop below drops. A pushed read that misses a member
+// (a status no status.custom names, see PushNotClosed) can only make the fast
+// path find fewer open members, and finding none sends the root to the
+// authoritative walk below, so the pushdown never weakens single-flight.
 func storeOpenDescendantIDs(store beads.Store, rootID string, skip func(beads.Bead) bool) ([]string, error) {
 	reader := beads.HandlesFor(store).Live
 	members, err := reader.List(beads.ListQuery{
 		Metadata:      map[string]string{beadmeta.RootBeadIDMetadataKey: rootID},
-		IncludeClosed: true,
 		TierMode:      beads.TierBoth,
+		PushNotClosed: true,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("listing wisp members of %s: %w", rootID, err)
