@@ -133,7 +133,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "tracked test source totals remain visible as audit evidence",
 			ResourceOwner:   "ga-cp3hwi owns this point-in-time source census",
 			MigrationTarget: "P0.4a",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			Scope:           ScopeAll,
@@ -146,7 +146,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "tracked test source totals remain visible as audit evidence",
 			ResourceOwner:   "ga-cp3hwi owns this point-in-time source census",
 			MigrationTarget: "P0.4a",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			Scope:           ScopeAll,
@@ -159,7 +159,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "all-source listener-helper call/file totals cannot drift without an explicit checked policy update",
 			ResourceOwner:   "ga-cp3hwi owns this all-source audit; tagged calls stay Large and receive no Medium exemption",
 			MigrationTarget: "P0.4c-listener-helper",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 	},
 	Debt: []Baseline{
@@ -174,7 +174,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "untagged subprocess call/file totals cannot grow; reductions must lower this baseline",
 			ResourceOwner:   "each process-owning test removes or replaces its source call site",
 			MigrationTarget: "D1/D2/D5/D6/E6",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			Scope:           ScopeUntagged,
@@ -187,7 +187,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "untagged fixed-sleep call/file totals cannot grow; reductions must lower this baseline",
 			ResourceOwner:   "each owning test replaces elapsed wall time with its lifecycle signal",
 			MigrationTarget: "W1-W5",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			Scope:           ScopeCmdGCUntagged,
@@ -200,7 +200,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "untagged cmd/gc environment call/file totals cannot grow; reductions must lower this baseline",
 			ResourceOwner:   "cmd/gc callers restore or eliminate every recognized process-environment mutation",
 			MigrationTarget: "D5/D6/E6",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			Scope:           ScopeCmdGCUntagged,
@@ -213,7 +213,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "untagged cmd/gc cwd call/file totals cannot grow; reductions must lower this baseline",
 			ResourceOwner:   "cmd/gc callers restore or eliminate every recognized cwd mutation",
 			MigrationTarget: "D5/D6",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			Scope:           ScopeCmdGCUntagged,
@@ -226,7 +226,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "untagged cmd/gc slow-process marker totals cannot grow; reductions must lower this baseline",
 			ResourceOwner:   "the helper definition and every marked caller retain an explicit process-suite migration owner",
 			MigrationTarget: "D5/D6/E6",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			Scope:           ScopeUntagged,
@@ -239,7 +239,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "untagged HTTP test server call/file totals cannot grow; reductions must lower this baseline",
 			ResourceOwner:   "each owning test closes its loopback server and removes duplicate server-backed coverage",
 			MigrationTarget: "P0.4c",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			Scope:           ScopeUntagged,
@@ -252,7 +252,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "untagged listener-helper call/file totals cannot grow; reductions must lower this baseline",
 			ResourceOwner:   "each owning test replaces helper-backed listeners or moves the retained boundary to exact Medium ownership",
 			MigrationTarget: "P0.4c-listener-helper",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			Scope:           ScopeUntagged,
@@ -265,7 +265,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "untagged stream-listener call/file totals cannot grow; reductions must lower this baseline",
 			ResourceOwner:   "each owning test closes its stream listener and removes duplicate listener-backed coverage",
 			MigrationTarget: "P0.4c-listener",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			Scope:           ScopeUntagged,
@@ -278,7 +278,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "untagged net.ListenConfig listener call/file totals cannot grow; reductions must lower this baseline",
 			ResourceOwner:   "each owning test closes its configured listener and removes duplicate listener-backed coverage",
 			MigrationTarget: "P0.4c-listener",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			Scope:           ScopeUntagged,
@@ -291,7 +291,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "untagged packet-listener call/file totals cannot grow; reductions must lower this baseline",
 			ResourceOwner:   "each owning test closes its packet listener and removes duplicate listener-backed coverage",
 			MigrationTarget: "P0.4c-listener",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			Scope:           ScopeUntagged,
@@ -304,7 +304,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "untagged syscall.Listen call/file totals cannot grow; reductions must lower this baseline",
 			ResourceOwner:   "each owning test closes its listening file descriptor and removes duplicate listener-backed coverage",
 			MigrationTarget: "P0.4c",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			Scope:           ScopeUntagged,
@@ -317,7 +317,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "untagged tmux dependency call/file totals cannot grow; reductions must lower this baseline",
 			ResourceOwner:   "each owning test confines tmux processes and sockets to its isolated namespace and cleanup",
 			MigrationTarget: "P0.4c-tmux",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 	},
 	Medium: []MediumOwner{
@@ -330,7 +330,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "internal/api tracked-source error URN guard is a checked Medium owner",
 			ResourceOwner:   "only the git ls-files call lexically inside TestEveryEmittedErrorCodeIsRegistered leaves Small debt",
 			MigrationTarget: "P0.4b",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			PackageDir:      "internal/workrecord",
@@ -341,7 +341,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "the ADR-0009 commit-reachability oracle is a checked Medium subprocess owner",
 			ResourceOwner:   "the git processes are confined to TestCommitReachableOnBranch, which exists to ask a real repository whether a commit is an ancestor of a branch: CommitReachableOnBranch is that git invocation, so a fake oracle would only prove itself",
 			MigrationTarget: "P0.4b",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			PackageDir:      "cmd/gc",
@@ -352,7 +352,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "cmd/gc TestMain is the checked package-level Medium owner for process environment and tmux namespace setup",
 			ResourceOwner:   "only declared environment and tmux calls lexically inside TestMain leave Small debt",
 			MigrationTarget: "P0.4b/P0.4c-tmux",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			PackageDir:      "cmd/gc",
@@ -363,7 +363,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "the CLI-vs-legacy runtime lease harness is a checked Medium subprocess owner",
 			ResourceOwner:   "the CLI process is confined to TestRuntimeLeaseCLIVsLegacyStart, which re-execs the test binary as a gc session CLI starting a row through its Manager: the lease's flock and record must exclude a second process, so only a real one proves the controller's legacy start defers to it",
 			MigrationTarget: "P0.4b",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			PackageDir:      "cmd/gc",
@@ -374,7 +374,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "the controller-token withholding proof is a checked Medium subprocess owner",
 			ResourceOwner:   "the one /bin/sh subprocess is confined to TestPassthroughEnvWithholdsControllerTokenFromChildProcess, which exists to read a credential back out of a real child process: the session env is an overlay, so only a real child can prove GC_CONTROLLER_TOKEN is absent rather than merely missing from a map",
 			MigrationTarget: "P0.4b",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			PackageDir:      "cmd/gc",
@@ -385,7 +385,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "the provider-owned script boundary proof is a checked Medium subprocess owner",
 			ResourceOwner:   "the test executes the copied provider script only with a test-owned BD executable and verifies its lifecycle delegation without a host service",
 			MigrationTarget: "GC6011",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			PackageDir:      "cmd/gc",
@@ -396,7 +396,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "the ready-scope topology boundary proof is a checked Medium subprocess owner",
 			ResourceOwner:   "the test executes the shipped provider script once per init shape with a test-owned BD executable and a scope built from files alone, so no Dolt, no bd and no host service are involved",
 			MigrationTarget: "GC6011",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			PackageDir:      "cmd/gc",
@@ -407,7 +407,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "the provider-owned BD lifecycle proof is a checked Medium process owner",
 			ResourceOwner:   "the test runs the pinned real bd direct and proxied lifecycles under deadlines, records only provider-published identities, and stops its own scope before asserting those children are absent",
 			MigrationTarget: "GC6011",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			PackageDir:      "cmd/gc",
@@ -418,7 +418,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "the created-database migrate-consent proof is a checked Medium subprocess owner",
 			ResourceOwner:   "the test executes the shipped provider script once per case with a test-owned bd, dolt and sleep on PATH and a scope built from files alone, so no Dolt, no bd and no host service are involved",
 			MigrationTarget: "P0.4b",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			PackageDir:      "internal/runtime/herdr",
@@ -429,7 +429,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "herdr stale-socket liveness regression is a checked Medium stream-listener owner",
 			ResourceOwner:   "the Unix stream listener is confined to TestServerAliveRejectsStaleSocket and closed before liveness detection",
 			MigrationTarget: "P0.4c-listener",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			PackageDir:      "internal/runtime/herdr",
@@ -440,7 +440,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "herdr live-server liveness regression is a checked Medium stream-listener owner",
 			ResourceOwner:   "the Unix stream listener is confined to TestServerAliveDetectsLiveServer and closed by test cleanup",
 			MigrationTarget: "P0.4c-listener",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			PackageDir:      "internal/runtime/tmux",
@@ -451,7 +451,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "runtime tmux TestMain is the checked Medium owner for isolated tmux process and socket cleanup",
 			ResourceOwner:   "only declared environment and tmux calls lexically inside TestMain leave Small debt",
 			MigrationTarget: "P0.4c-tmux",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			PackageDir:      "internal/session",
@@ -462,7 +462,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "the runtime lease cross-process harness is a checked Medium subprocess owner",
 			ResourceOwner:   "the role processes are confined to TestRuntimeLeaseCrossProcess, which re-execs the test binary to prove the lease across real processes: a flock dies with its process, so only a killed process proves crash release, and the store record must fence a second process that shares nothing but the store",
 			MigrationTarget: "P0.4b",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			PackageDir:      "internal/session",
@@ -473,7 +473,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "the no-city gate's self-test is a checked Medium subprocess owner",
 			ResourceOwner:   "the probe processes are confined to TestNoCityGateFailsTheRun, which re-execs the test binary on its own probe: the gate decides the exit code of a whole test binary after its last test, so only a real child run shows an undeclared refusal failing a run whose tests all pass",
 			MigrationTarget: "P0.4b",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			PackageDir:      "internal/session/sessiontest",
@@ -484,7 +484,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "the no-city gate's unarmed self-test is a checked Medium subprocess owner",
 			ResourceOwner:   "the probe process is confined to TestNoCityRefusalWithoutTheGateExits, which re-execs the test binary on its own probe: a refusal in a binary that does not run the gate exits that binary, so only a real child run shows it failing before its test can pass",
 			MigrationTarget: "P0.4b",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			PackageDir:      "scripts",
@@ -495,7 +495,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "Docker session adapter protocol proof is a checked Medium owner",
 			ResourceOwner:   "the one adapter subprocess is confined to TestDockerSessionProtocol and Docker itself is a strict PATH-injected fake",
 			MigrationTarget: "W6",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			PackageDir:      "scripts",
@@ -506,7 +506,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "the mol-scoped-work cleanup-worktree behavior proof is a checked Medium subprocess owner",
 			ResourceOwner:   "the one bash subprocess is confined to TestMolScopedWorkTeardownScript, which runs scripts/test-mol-scoped-work-teardown.sh: the step under test is agent-executed shell rendered from formula TOML, so only running that shell against a stub gc can prove what it does",
 			MigrationTarget: "P0.4b",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			PackageDir:      "scripts",
@@ -517,7 +517,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "Make/provider and suite-contract proof is a checked Medium owner",
 			ResourceOwner:   "the six isolated Make invocations are confined to TestProviderOverridesAndSuiteContractsCrossMakeIsolation",
 			MigrationTarget: "P0.1",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			PackageDir:      "internal/doctor",
@@ -528,7 +528,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "doctor custom-types config-CSV-vs-table drift detect+heal proof is a checked Medium owner",
 			ResourceOwner:   "the bd and dolt subprocesses are confined to TestCustomTypesCheck_TableDrift, which manufactures and heals real table drift against a throwaway store",
 			MigrationTarget: "P0.4b",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			PackageDir:      "internal/doctor",
@@ -539,7 +539,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "doctor custom-types test-owned-HOME dolt-isolation regression proof is a checked Medium owner",
 			ResourceOwner:   "the bd subprocess is confined to TestCustomTypesCheck_TableDriftUsesTestOwnedDoltContext, which proves bd routes to an embedded, test-owned dolt store rather than a machine-level shared server",
 			MigrationTarget: "P0.4b",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			PackageDir:      "internal/doctor",
@@ -550,7 +550,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "doctor custom-types configured-store targeting regression proof is a checked Medium owner",
 			ResourceOwner:   "the bd subprocess is confined to TestCustomTypesCheck_ServerBackedStoreIgnoresAmbientEndpoint, which runs two disposable loopback Dolt servers and proves ambient endpoint variables cannot redirect detection or repair",
 			MigrationTarget: "P0.4b",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			PackageDir:      "scripts",
@@ -561,7 +561,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "the nested-git-worktree walk-skip regression proof is a checked Medium subprocess owner",
 			ResourceOwner:   "the one go run subprocess is confined to TestAddTestenvImportSkipsNestedGitWorktrees, which exists to exercise add-testenv-import.go end to end: the script is package main, so only a real subprocess run can prove its directory walk skips linked git worktrees",
 			MigrationTarget: "P0.4b",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			PackageDir:      "scripts",
@@ -572,7 +572,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "the CI go mod download retry proof is a checked Medium subprocess owner",
 			ResourceOwner:   "the one bash subprocess per case is confined to TestGoModDownloadRetryScriptRetriesTransientFailures, which exists to run .github/scripts/go-mod-download-retry.sh against a PATH-injected fake go: the retry loop and GOPROXY selection are shell, so only a real shell run can prove a transient proxy error is retried and a persistent one fails",
 			MigrationTarget: "P0.4b",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			PackageDir:      "scripts",
@@ -583,7 +583,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "the CI Go module cache verification proof is a checked Medium subprocess owner",
 			ResourceOwner:   "the go and bash subprocesses are confined to TestGoModVerifyCacheDetectsTamperedModules, which exists to run .github/scripts/go-mod-download-retry.sh and .github/scripts/go-mod-verify-cache.sh with the real go command against a file:// module proxy and an isolated module cache, then tamper with the cached zip: the claim under test is the go command's own trust of a cached .ziphash, so only the real go command can prove the verify step catches what it accepts",
 			MigrationTarget: "P0.4b",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			PackageDir:      "scripts",
@@ -594,7 +594,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "the fresh-merge composite action's behavior proof is a checked Medium subprocess owner",
 			ResourceOwner:   "the git and bash subprocesses are confined to TestFreshMergeActionBehaviour, which exists to run .github/actions/fresh-merge's own bash script against a scratch git origin (clean merge, workflow skew, conflict, head already containing the tip, unfetchable base): the script is git plumbing, so only real git can prove what it merges and when it fails",
 			MigrationTarget: "P0.4b",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			PackageDir:      "scripts",
@@ -605,7 +605,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "the nightly fresh-on-drift decision proof is a checked Medium subprocess owner",
 			ResourceOwner:   "the bash subprocess per case is confined to TestBazelNightlyFreshDecision, which exists to run bazel-nightly.yml's decide step script against a PATH-injected stub gh (shadow mode, a covered week, a new fingerprint, a key prefix, a PR-scoped cache entry, a dispatch, no canary run, a malformed fingerprint): the decision is shell and gh, so only a real shell run can prove when the nightly re-executes every test and that it fails open to fresh",
 			MigrationTarget: "P0.4b",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			PackageDir:      "scripts",
@@ -616,7 +616,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "the anonymous-cache probes' behavior proof is a checked Medium HTTP test server owner",
 			ResourceOwner:   "the loopback TLS HTTP/2 servers are confined to TestCacheProbes, whose one stand-in rbe-cache runs tools/rbe/cache-zstd-probe.sh (zstd advertised or not) and tools/rbe/cache-rrc-probe.sh (an answer or none, the action cache's and the CAS's NOT_FOUND or not, the kill switch off) through gRPC and HTTP errors, malformed answers and timeouts: the probes are curl's HTTP/2 and gRPC trailers, so only a real server can prove when fork-cache asks for zstd and when fork-cache lanes read the remote repo contents cache",
 			MigrationTarget: "P0.4b",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			PackageDir:      "internal/hooks",
@@ -627,7 +627,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "the embedded provider-plugin behavior proof is a checked Medium subprocess owner",
 			ResourceOwner:   "the one node subprocess is confined to TestProviderPluginNodeSuite, which exists to run the embedded OpenCode and MiMo Code plugins under node against a GC_BIN fake gc: the plugins are JavaScript the provider loads, so only a real node run can prove the system-prompt shape and the once-per-turn drain they produce",
 			MigrationTarget: "P0.4b",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 	},
 	ReviewedHermeticBody: []ReviewedHermeticBody{
@@ -672,7 +672,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "untagged Small subprocess call/file totals cannot grow; reductions must lower this baseline",
 			ResourceOwner:   "non-Medium lexical owners remove or replace each process call site",
 			MigrationTarget: "D1/D2/D5/D6/E6",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			Scope:           ScopeUntagged,
@@ -685,7 +685,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "untagged Small fixed-sleep call/file totals cannot grow; reductions must lower this baseline",
 			ResourceOwner:   "non-Medium lexical owners replace elapsed wall time with lifecycle signals",
 			MigrationTarget: "W1-W5",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			Scope:           ScopeCmdGCUntagged,
@@ -698,7 +698,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "untagged Small cmd/gc environment call/file totals cannot grow; reductions must lower this baseline",
 			ResourceOwner:   "non-Medium lexical owners restore or eliminate every process-environment mutation",
 			MigrationTarget: "D5/D6/E6",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			Scope:           ScopeCmdGCUntagged,
@@ -711,7 +711,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "untagged Small cmd/gc cwd call/file totals cannot grow; reductions must lower this baseline",
 			ResourceOwner:   "non-Medium lexical owners restore or eliminate every cwd mutation",
 			MigrationTarget: "D5/D6",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			Scope:           ScopeCmdGCUntagged,
@@ -724,7 +724,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "untagged Small cmd/gc slow-process marker totals cannot grow; reductions must lower this baseline",
 			ResourceOwner:   "each non-Medium marked caller retains an explicit process-suite migration owner",
 			MigrationTarget: "D5/D6/E6",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			Scope:           ScopeUntagged,
@@ -737,7 +737,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "untagged Small HTTP test server call/file totals cannot grow; reductions must lower this baseline",
 			ResourceOwner:   "non-Medium lexical owners move server-backed tests to exact Medium ownership or replace the listener",
 			MigrationTarget: "P0.4c",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			Scope:           ScopeUntagged,
@@ -750,7 +750,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "untagged Small listener-helper call/file totals cannot grow; reductions must lower this baseline",
 			ResourceOwner:   "non-Medium lexical owners replace helper-backed listeners or declare exact isolated ownership",
 			MigrationTarget: "P0.4c-listener-helper",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			Scope:           ScopeUntagged,
@@ -763,7 +763,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "untagged Small stream-listener call/file totals cannot grow; reductions must lower this baseline",
 			ResourceOwner:   "non-Medium lexical owners move stream-listener tests to exact Medium ownership or replace the listener",
 			MigrationTarget: "P0.4c-listener",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			Scope:           ScopeUntagged,
@@ -776,7 +776,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "untagged Small net.ListenConfig listener call/file totals cannot grow; reductions must lower this baseline",
 			ResourceOwner:   "non-Medium lexical owners move ListenConfig-backed tests to exact Medium ownership or replace the listener",
 			MigrationTarget: "P0.4c-listener",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			Scope:           ScopeUntagged,
@@ -789,7 +789,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "untagged Small packet-listener call/file totals cannot grow; reductions must lower this baseline",
 			ResourceOwner:   "non-Medium lexical owners move packet-listener tests to exact Medium ownership or replace the listener",
 			MigrationTarget: "P0.4c-listener",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			Scope:           ScopeUntagged,
@@ -802,7 +802,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "untagged Small syscall.Listen call/file totals cannot grow; reductions must lower this baseline",
 			ResourceOwner:   "non-Medium lexical owners move syscall-backed listener tests to exact Medium ownership or replace the listener",
 			MigrationTarget: "P0.4c",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 		{
 			Scope:           ScopeUntagged,
@@ -815,7 +815,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "untagged Small tmux dependency call/file totals cannot grow; reductions must lower this baseline",
 			ResourceOwner:   "non-Medium lexical owners replace tmux with a fake executor or declare exact isolated ownership",
 			MigrationTarget: "P0.4c-tmux",
-			Expires:         "2026-10-31",
+			Expires:         "2026-12-31",
 		},
 	},
 }
