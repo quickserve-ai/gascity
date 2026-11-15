@@ -169,15 +169,14 @@ func TestMailSendNotifyPassesTheConfiguredSeatToTheWake(t *testing.T) {
 	}
 }
 
-// Each case is a shape the listing answered; the fast path answers the same
-// (or, for a wisp duplicate the old listing could miss, refuses), skips the
-// listing where it answers (fast), and writes nothing.
+// Each case is a shape the listing answered; the fast path answers the same,
+// skips the listing where it answers (fast), and writes nothing.
 func TestResolveMailRecipientIdentity_KeepsTheListingsAnswers(t *testing.T) {
 	inProgress, empty := "in_progress", ""
 	wisp := func(b *beads.Bead) { b.Ephemeral = true; b.Metadata["alias"] = "backup" }
 	for _, tc := range []struct {
 		name, seat string
-		setup      func(t *testing.T, base beads.Store) []string // returns ids the error must name
+		setup      func(t *testing.T, base beads.Store) []string // returns what the error must name
 		want       string
 		wantErr    error
 		fast       bool
@@ -186,11 +185,13 @@ func TestResolveMailRecipientIdentity_KeepsTheListingsAnswers(t *testing.T) {
 			setup: func(t *testing.T, base beads.Store) []string {
 				a := seatBead(t, base, "mayor", nil)
 				b := seatBead(t, base, "mayor", func(b *beads.Bead) { delete(b.Metadata, "alias"); b.Metadata["session_name"] = "mayor-2" })
-				return []string{a.ID, b.ID}
+				return []string{a.ID, b.ID, "/mayor"} // the bare address is offered rooted
 			}},
-		{name: "a duplicate in the wisp tier refuses on an unwrapped store", seat: "mayor", wantErr: session.ErrAmbiguous,
+		{name: "a wisp duplicate is read as the listing reads it (unwrapped store: not seen)", seat: "mayor", want: "mayor", fast: true,
 			setup: func(t *testing.T, base beads.Store) []string {
-				return []string{seatBead(t, base, "mayor", nil).ID, seatBead(t, base, "mayor", wisp).ID}
+				seatBead(t, base, "mayor", nil)
+				seatBead(t, base, "mayor", wisp)
+				return nil
 			}},
 		{name: "an in_progress bead does not make the seat ambiguous", seat: "mayor", want: "mayor", fast: true,
 			setup: func(t *testing.T, base beads.Store) []string {
@@ -248,47 +249,20 @@ func TestResolveMailRecipientIdentity_KeepsTheListingsAnswers(t *testing.T) {
 	}
 }
 
-// scriptedIdentityReads answers the fast path's two identity reads from a
-// script, so a bead can appear between them.
-type scriptedIdentityReads struct {
-	beads.Store
-	reads [][]beads.Bead
-}
-
-func (s *scriptedIdentityReads) List(query beads.ListQuery) ([]beads.Bead, error) {
-	if len(query.Metadata) == 0 || len(s.reads) == 0 {
-		return s.Store.List(query)
-	}
-	next := s.reads[0]
-	s.reads = s.reads[1:]
-	return next, nil
-}
-
-// Same-address duplicates deliver, as the listing did, and are reported on
-// stderr with their ids (the mayor's ruling), whichever read saw them; a bead
-// appearing between the reads neither panics nor answers alone (round 3).
-func TestResolveMailRecipientIdentity_SameAddressDuplicatesAndBeadsBetweenReads(t *testing.T) {
-	base, _ := newCountedSessionStore(t)
+// Two open beads for one seat that share a mailbox deliver, as the listing
+// did, and are reported on stderr with both ids (the mayor's ruling).
+func TestResolveMailRecipientIdentity_SameAddressDuplicatesDeliverWithAWarning(t *testing.T) {
+	base, store := newCountedSessionStore(t)
 	one, two := seatBead(t, base, "mayor", nil), seatBead(t, base, "mayor", nil)
 	var warned bytes.Buffer
 	saved := mailRecipientWarnings
 	mailRecipientWarnings = &warned
 	t.Cleanup(func() { mailRecipientWarnings = saved })
 
-	late := &scriptedIdentityReads{Store: base, reads: [][]beads.Bead{nil, {one}}}
-	if address, ok, err := resolveConfiguredMailRecipientByLookup(t.TempDir(), oneSeatCity("mayor"), late, "mayor"); ok || err != nil {
-		t.Fatalf("first read empty, second not: got %q, %v, %v; want a decline", address, ok, err)
+	if address, err := resolveRecipient(t, oneSeatCity("mayor"), store, "mayor"); err != nil || address != "mayor" {
+		t.Fatalf("resolve(mayor) = %q, %v; want mayor", address, err)
 	}
-	dup := &scriptedIdentityReads{Store: base, reads: [][]beads.Bead{{one}, {one, two}}}
-	if address, ok, err := resolveConfiguredMailRecipientByLookup(t.TempDir(), oneSeatCity("mayor"), dup, "mayor"); !ok || err != nil || address != "mayor" {
-		t.Fatalf("second read duplicate: got %q, %v, %v; want mayor", address, ok, err)
-	}
-	if !strings.Contains(warned.String(), two.ID) {
-		t.Fatalf("warning = %q, want the second read's bead %s", warned.String(), two.ID)
-	}
-	warned.Reset()
-	if address, err := resolveRecipient(t, oneSeatCity("mayor"), base, "mayor"); err != nil || address != "mayor" ||
-		!strings.Contains(warned.String(), one.ID) || !strings.Contains(warned.String(), two.ID) {
-		t.Fatalf("both reads see both: got %q, %v, warning %q; want mayor and both ids", address, err, warned.String())
+	if !strings.Contains(warned.String(), one.ID) || !strings.Contains(warned.String(), two.ID) || store.sessionListCalls != 0 {
+		t.Fatalf("warning = %q, listing calls %d; want both ids and no listing", warned.String(), store.sessionListCalls)
 	}
 }
