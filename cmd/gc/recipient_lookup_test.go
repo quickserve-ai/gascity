@@ -38,8 +38,10 @@ func (s *sessionListingCounter) refuse() error {
 	return errors.New("recipient resolution must not write")
 }
 
-func (s *sessionListingCounter) Update(string, beads.UpdateOpts) error            { return s.refuse() }
-func (s *sessionListingCounter) SetMetadata(string, string, string) error         { return s.refuse() }
+func (s *sessionListingCounter) Update(string, beads.UpdateOpts) error { return s.refuse() }
+
+func (s *sessionListingCounter) SetMetadata(string, string, string) error { return s.refuse() }
+
 func (s *sessionListingCounter) SetMetadataBatch(string, map[string]string) error { return s.refuse() }
 
 // oneSeatCity is a city with one configured named seat of that name.
@@ -181,19 +183,24 @@ func TestResolveMailRecipientIdentity_KeepsTheListingsAnswers(t *testing.T) {
 		wantErr    error
 		fast       bool
 	}{
-		{name: "duplicates with different addresses refuse (ruling, case B)", seat: "mayor", wantErr: session.ErrAmbiguous,
+		{
+			name: "duplicates with different addresses refuse (ruling, case B)", seat: "mayor", wantErr: session.ErrAmbiguous,
 			setup: func(t *testing.T, base beads.Store) []string {
 				a := seatBead(t, base, "mayor", nil)
 				b := seatBead(t, base, "mayor", func(b *beads.Bead) { delete(b.Metadata, "alias"); b.Metadata["session_name"] = "mayor-2" })
 				return []string{a.ID, b.ID, "/mayor"} // the bare address is offered rooted
-			}},
-		{name: "a wisp duplicate is read as the listing reads it (unwrapped store: not seen)", seat: "mayor", want: "mayor", fast: true,
+			},
+		},
+		{
+			name: "a wisp duplicate is read as the listing reads it (unwrapped store: not seen)", seat: "mayor", want: "mayor", fast: true,
 			setup: func(t *testing.T, base beads.Store) []string {
 				seatBead(t, base, "mayor", nil)
 				seatBead(t, base, "mayor", wisp)
 				return nil
-			}},
-		{name: "an in_progress bead does not make the seat ambiguous", seat: "mayor", want: "mayor", fast: true,
+			},
+		},
+		{
+			name: "an in_progress bead does not make the seat ambiguous", seat: "mayor", want: "mayor", fast: true,
 			setup: func(t *testing.T, base beads.Store) []string {
 				seatBead(t, base, "mayor", nil)
 				busy := seatBead(t, base, "mayor", func(b *beads.Bead) { b.Metadata["alias"] = "backup" })
@@ -201,20 +208,26 @@ func TestResolveMailRecipientIdentity_KeepsTheListingsAnswers(t *testing.T) {
 					t.Fatalf("Update: %v", err)
 				}
 				return nil
-			}},
-		{name: "an alias-only bead is left to the existing path", seat: "controller", wantErr: session.ErrSessionNotFound,
+			},
+		},
+		{
+			name: "an alias-only bead is left to the existing path", seat: "controller", wantErr: session.ErrSessionNotFound,
 			setup: func(t *testing.T, base beads.Store) []string {
 				seatBead(t, base, "controller", func(b *beads.Bead) {
 					b.Metadata = map[string]string{"alias": "controller", "template": "controller"}
 				})
 				return nil
-			}},
-		{name: "a lone wisp the default read misses does not answer", seat: "controller", wantErr: session.ErrSessionNotFound,
+			},
+		},
+		{
+			name: "a lone wisp the default read misses does not answer", seat: "controller", wantErr: session.ErrSessionNotFound,
 			setup: func(t *testing.T, base beads.Store) []string {
 				seatBead(t, base, "controller", func(b *beads.Bead) { b.Ephemeral = true })
 				return nil
-			}},
-		{name: "an empty-type bead resolves without a repair", seat: "mayor", want: "mayor", fast: true,
+			},
+		},
+		{
+			name: "an empty-type bead resolves without a repair", seat: "mayor", want: "mayor", fast: true,
 			setup: func(t *testing.T, base beads.Store) []string {
 				b := seatBead(t, base, "mayor", nil)
 				if err := base.Update(b.ID, beads.UpdateOpts{Type: &empty}); err != nil {
@@ -224,7 +237,8 @@ func TestResolveMailRecipientIdentity_KeepsTheListingsAnswers(t *testing.T) {
 					t.Fatalf("precondition: type = %q, %v; want empty", got.Type, err)
 				}
 				return nil
-			}},
+			},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			base, store := newCountedSessionStore(t)
