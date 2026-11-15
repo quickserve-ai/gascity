@@ -1543,6 +1543,7 @@ go_test(
         "mail_inject_newest_window_test.go",
         "mail_remote_test.go",
         "mail_session_inbox_test.go",
+        "mail_wake_e2e_test.go",
         "main_scope_symlink_test.go",
         "main_test.go",
         "maintenance_startup_test.go",
