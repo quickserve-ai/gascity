@@ -1696,6 +1696,7 @@ go_test(
         "providers_test.go",
         "publish_pointer_gate_test.go",
         "quality_gate_fallback_test.go",
+        "recipient_lookup_test.go",
         "reconcile_admit_test.go",
         "reconcile_arms_baseline_test.go",
         "reconcile_arms_close_test.go",
