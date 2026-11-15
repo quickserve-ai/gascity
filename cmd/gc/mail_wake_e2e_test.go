@@ -11,13 +11,13 @@ import (
 	"github.com/gastownhall/gascity/internal/session"
 )
 
-// ga-y0hv2w.1: gc mail send --notify, end to end for a configured named seat.
+// ga-y0hv2w.1: from a fast-path-resolved recipient to a managed wake request.
 // The recipient resolves through the configured-seat fast path (no session
-// listing); the wake then resolves that recipient string through the real
-// wake resolver and is delivered through the real worker to a fake runtime.
-// The seat is asleep under a managed reconciler, so the wake must be queued
-// for that session and the controller poked for it.
-func TestMailSendNotifyWakesAFastPathResolvedSeatEndToEnd(t *testing.T) {
+// listing); that string resolves through the real wake resolver; the real
+// worker then records a durable wake request on the seat's session, queues
+// one mail wake fenced to that session, and pokes the controller for it. The
+// controller, the runtime start and the mail write are not exercised.
+func TestMailSendNotifyQueuesAManagedWakeForAFastPathResolvedSeat(t *testing.T) {
 	t.Setenv("GC_BEADS", "file")
 	t.Setenv("GC_SESSION", "fake")
 	dir := t.TempDir()
@@ -27,7 +27,7 @@ func TestMailSendNotifyWakesAFastPathResolvedSeatEndToEnd(t *testing.T) {
 	mgr := newSessionManagerWithConfig(dir, store, fake, cfg)
 
 	info, err := mgr.CreateSession(context.Background(), session.CreateOptions{
-		Alias: "mayor", Template: "mayor", Title: "Mayor", Command: "claude", WorkDir: dir, Provider: "claude",
+		Alias: "mayor", ExplicitName: "mayor", Template: "mayor", Title: "Mayor", Command: "claude", WorkDir: dir, Provider: "claude",
 		Hints: runtime.Config{WorkDir: dir},
 		ExtraMeta: map[string]string{
 			"session_origin":            "named",
@@ -43,6 +43,11 @@ func TestMailSendNotifyWakesAFastPathResolvedSeatEndToEnd(t *testing.T) {
 		t.Fatalf("Suspend: %v", err)
 	}
 	sleepUnheld(t, store, info.ID)
+	asleep, err := store.Get(info.ID)
+	if err != nil || asleep.Metadata["wake_request"] != "" {
+		t.Fatalf("precondition: wake_request = %q, %v; want none before the wake", asleep.Metadata["wake_request"], err)
+	}
+	epoch := asleep.Metadata["continuation_epoch"]
 
 	// 1. The send resolves the recipient on the fast path.
 	counted := &sessionListingCounter{Store: cliSessionStore(store.Store, cfg, dir)}
@@ -62,11 +67,14 @@ func TestMailSendNotifyWakesAFastPathResolvedSeatEndToEnd(t *testing.T) {
 		t.Fatalf("wake target session = %q, want the seat's session %q", target.sessionID, info.ID)
 	}
 
-	// 3. The wake is delivered through the real worker.
+	// 3. The real worker records and queues the wake.
 	prevManaged, prevPoke := nudgeCityUsesManagedReconciler, nudgePokeController
 	var pokeKeys []reconcilekey.Key
 	nudgeCityUsesManagedReconciler = func(cityPath string) bool { return cityPath == dir }
-	nudgePokeController = func(_ string, key reconcilekey.Key) error {
+	nudgePokeController = func(cityPath string, key reconcilekey.Key) error {
+		if cityPath != dir {
+			t.Fatalf("poke city = %q, want %q", cityPath, dir)
+		}
 		pokeKeys = append(pokeKeys, key)
 		return nil
 	}
@@ -78,11 +86,19 @@ func TestMailSendNotifyWakesAFastPathResolvedSeatEndToEnd(t *testing.T) {
 	if len(pokeKeys) != 1 || pokeKeys[0] != reconcilekey.Session(info.ID) {
 		t.Fatalf("controller pokes = %v, want one for session %s", pokeKeys, info.ID)
 	}
-	pending, _, _, err := listQueuedNudgesForTarget(dir, target, time.Now())
+	woken, err := store.Get(info.ID)
+	if err != nil || woken.Metadata["wake_request"] != string(session.WakeCauseExplicit) || woken.Metadata["wake_requested_at"] == "" {
+		t.Fatalf("wake_request = %q at %q (%v); want an explicit, stamped wake request on the seat's session",
+			woken.Metadata["wake_request"], woken.Metadata["wake_requested_at"], err)
+	}
+	pending, inFlight, dead, err := listQueuedNudgesForTarget(dir, target, time.Now())
 	if err != nil {
 		t.Fatalf("listQueuedNudgesForTarget: %v", err)
 	}
-	if len(pending) != 1 || pending[0].Source != "mail" || !strings.Contains(pending[0].Message, "You have mail from human") {
-		t.Fatalf("queued wakes = %+v, want one mail wake", pending)
+	if len(pending) != 1 || len(inFlight) != 0 || len(dead) != 0 {
+		t.Fatalf("pending/inFlight/dead = %d/%d/%d, want 1/0/0", len(pending), len(inFlight), len(dead))
+	}
+	if q := pending[0]; q.Source != "mail" || q.SessionID != info.ID || q.ContinuationEpoch != epoch || !strings.Contains(q.Message, "You have mail from human") {
+		t.Fatalf("queued wake = %+v; want a mail wake fenced to session %s, epoch %q", q, info.ID, epoch)
 	}
 }
