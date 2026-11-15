@@ -2755,12 +2755,15 @@ func storeHasOpenDescendants(store beads.Store, rootID string, skip func(beads.B
 // The membership read asks the store for not-closed members only, and opts
 // into the native store's not-closed pushdown (ListQuery.PushNotClosed,
 // ga-s1zc94): on a shared hub a long-lived root's closed members otherwise
-// travel on every gate check only to be dropped here. The answer is the same
-// set, because the store's not-closed filter drops exactly status "closed",
-// the one status the loop below drops. A pushed read that misses a member
-// (a status no status.custom names, see PushNotClosed) can only make the fast
-// path find fewer open members, and finding none sends the root to the
-// authoritative walk below, so the pushdown never weakens single-flight.
+// travel on every gate check only to be dropped here. The store's not-closed
+// filter drops exactly status "closed", the one status the loop below drops,
+// so the answer is normally the same set. It can be smaller: a pushed read
+// misses a member that moves, between the store's probe and its read, into a
+// status no status.custom names (see PushNotClosed). That only removes ids.
+// Every caller decides on whether the list is empty (the workflow delete
+// guard also names the ids in its refusal, which may then list fewer), and
+// an empty list sends the root to the authoritative walk below, so the
+// pushdown never weakens single-flight or the delete guard.
 func storeOpenDescendantIDs(store beads.Store, rootID string, skip func(beads.Bead) bool) ([]string, error) {
 	reader := beads.HandlesFor(store).Live
 	members, err := reader.List(beads.ListQuery{
