@@ -87,7 +87,8 @@ func TestMailSendNotifyQueuesAManagedWakeForAFastPathResolvedSeat(t *testing.T) 
 		t.Fatalf("controller pokes = %v, want one for session %s", pokeKeys, info.ID)
 	}
 	woken, err := store.Get(info.ID)
-	if err != nil || woken.Metadata["wake_request"] != string(session.WakeCauseExplicit) || woken.Metadata["wake_requested_at"] == "" {
+	_, stampErr := time.Parse(time.RFC3339, woken.Metadata["wake_requested_at"])
+	if err != nil || woken.Metadata["wake_request"] != string(session.WakeCauseExplicit) || stampErr != nil {
 		t.Fatalf("wake_request = %q at %q (%v); want an explicit, stamped wake request on the seat's session",
 			woken.Metadata["wake_request"], woken.Metadata["wake_requested_at"], err)
 	}
