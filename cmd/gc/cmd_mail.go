@@ -1562,6 +1562,11 @@ func resolveMailRecipientIdentityCached(cityPath string, cfg *config.City, sessS
 			return "", err
 		}
 	}
+	if address, ok, err := resolveConfiguredMailRecipientByLookup(cityPath, cfg, sessStore, identifier); err != nil {
+		return "", err
+	} else if ok {
+		return address, nil
+	}
 	if target, matched, targetErr := resolveLiveConfiguredNamedMailTargetCached(sessStore, identifier, cache); targetErr != nil {
 		return "", targetErr
 	} else if matched {
@@ -1588,6 +1593,106 @@ func resolveMailRecipientIdentityCached(cityPath string, cfg *config.City, sessS
 		return "", mail.RefuseUnknownCity(err, identifier, roster, cfg.LocalAddressPrefixes())
 	}
 	return resolved, nil
+}
+
+// resolveConfiguredMailRecipientByLookup resolves a bare recipient that names
+// one configured named session to that session's mailbox, reading only the
+// open session beads that carry the seat's identity instead of listing every
+// open session bead (ga-y0hv2w). That listing costs two whole-table reads,
+// and under host load it held alarm sends past their limits before anything
+// was stored.
+//
+// It answers only where the listing below would give the same answer, and
+// otherwise reports false so the caller resolves exactly as before:
+//   - a qualified or rooted recipient (one containing "/") never reached the
+//     listing, so it is left alone;
+//   - the recipient must name a configured named session whose identity's
+//     leaf is the recipient, because the listing matches by that leaf;
+//   - no other configured named session, in any rig, may share the leaf: the
+//     listing matches leaves across rigs and refuses such a name as
+//     ambiguous, and that refusal is kept;
+//   - only beads the listing would have matched by identity answer, read
+//     with the listing's status and with every tier. A seat with no such
+//     bead, or a read error, falls through to the existing path;
+//   - several open beads for the identity with different mailbox addresses
+//     refuse, as the listing did, and the refusal names the beads.
+func resolveConfiguredMailRecipientByLookup(cityPath string, cfg *config.City, sessStore beads.Store, identifier string) (string, bool, error) {
+	identifier = normalizeNamedSessionTarget(identifier)
+	if cfg == nil || sessStore == nil || identifier == "" || identifier == "human" || strings.Contains(identifier, "/") {
+		return "", false, nil
+	}
+	spec, ok, err := findNamedSessionSpecForTarget(cfg, loadedCityName(cfg, cityPath), identifier)
+	if err != nil || !ok {
+		return "", false, nil
+	}
+	identity := normalizeNamedSessionTarget(spec.Identity)
+	if targetBasename(identity) != identifier {
+		return "", false, nil
+	}
+	for i := range cfg.NamedSessions {
+		other := normalizeNamedSessionTarget(cfg.NamedSessions[i].QualifiedName())
+		if other != identity && targetBasename(other) == identifier {
+			return "", false, nil
+		}
+	}
+	// Open session beads carrying this identity, read without the whole-table
+	// listing and without any repair or write: once with the store's default
+	// read, the one the listing used, which alone may supply the answer, and
+	// once across every tier, so a duplicate in either is seen. Both reads
+	// are judged together, so a bead appearing between them is never missed.
+	query := beads.ListQuery{Metadata: map[string]string{namedSessionIdentityMetadata: identity}, Status: "open"}
+	selected, err := sessStore.List(query)
+	if err != nil {
+		return "", false, nil
+	}
+	everyTier := query
+	everyTier.TierMode = beads.TierBoth
+	all, err := sessStore.List(everyTier)
+	if err != nil {
+		return "", false, nil
+	}
+	addresses, ids := openSessionMailboxes(append(append([]beads.Bead{}, selected...), all...))
+	if len(addresses) > 1 {
+		// Delivering to one of them may store the mail where the live seat
+		// does not read, so the listing's refusal is kept, naming the beads.
+		return "", false, fmt.Errorf("%w: %q has %d open session beads with different mailbox addresses (%s); address one of: %s",
+			session.ErrAmbiguous, identifier, len(ids), strings.Join(ids, ", "), strings.Join(addresses, ", "))
+	}
+	answer, _ := openSessionMailboxes(selected)
+	if len(answer) != 1 {
+		return "", false, nil
+	}
+	if len(ids) > 1 {
+		fmt.Fprintf(mailRecipientWarnings, "gc mail send: warning: configured seat %q has %d open session beads (%s); all answer to mailbox %s\n", //nolint:errcheck // best-effort warning
+			identifier, len(ids), strings.Join(ids, ", "), answer[0])
+	}
+	return answer[0], true, nil
+}
+
+// mailRecipientWarnings receives the recipient resolver's warnings; tests
+// replace it.
+var mailRecipientWarnings io.Writer = os.Stderr
+
+// openSessionMailboxes returns the distinct mailbox addresses of the open
+// session beads among bs, in order, and the distinct ids of those beads.
+func openSessionMailboxes(bs []beads.Bead) (addresses, ids []string) {
+	seen, seenID := map[string]bool{}, map[string]bool{}
+	for _, b := range bs {
+		if !session.IsSessionBeadOrRepairable(b) || b.Status != "open" || seenID[b.ID] {
+			continue
+		}
+		seenID[b.ID] = true
+		address := session.MailboxAddress(b)
+		if address == "" {
+			continue
+		}
+		if !seen[address] {
+			seen[address] = true
+			addresses = append(addresses, address)
+		}
+		ids = append(ids, b.ID)
+	}
+	return addresses, ids
 }
 
 func configuredMailboxAddress(identifier string) (string, bool) {
