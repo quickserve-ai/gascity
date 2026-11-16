@@ -272,12 +272,19 @@ func (c *OrderOutcomeHealthyCheck) Run(ctx *CheckContext) *CheckResult {
 
 	worst := StatusOK
 	failing := 0
-	var firstFailingHint string
+	// undetermined counts the orders the look-back could not settle (budget
+	// spent or the read failed). They warn, but they are not "failing
+	// repeatedly": nobody has observed a streak at threshold, so the summary
+	// names them under their own label (ga-fxuyqh (b)).
+	var undetermined []string
+	var firstFailingHint, firstUndeterminedHint string
 
 	for _, order := range scheduled {
 		streak, lastMessage, sawOutcome, skipped := consecutiveOrderFailures(outcomes, order.ScopedName(), starts, c.grace)
 		status, detail := classifyOrderOutcome(order, streak, c.threshold, lastMessage, sawOutcome, skipped)
+		isUndetermined := false
 		if status == StatusOK && unresolved[order.ScopedName()] {
+			isUndetermined = true
 			why := "were not read within the time budget"
 			if lookErr != nil {
 				why = fmt.Sprintf("could not be read (%v)", lookErr)
@@ -297,6 +304,13 @@ func (c *OrderOutcomeHealthyCheck) Run(ctx *CheckContext) *CheckResult {
 		}
 		worst = worseStatus(worst, status)
 		result.Details = append(result.Details, detail)
+		if isUndetermined {
+			undetermined = append(undetermined, orderDisplayName(order))
+			if firstUndeterminedHint == "" {
+				firstUndeterminedHint = orderHistoryHintTarget(order)
+			}
+			continue
+		}
 		if status != StatusOK {
 			failing++
 			if firstFailingHint == "" {
@@ -311,13 +325,33 @@ func (c *OrderOutcomeHealthyCheck) Run(ctx *CheckContext) *CheckResult {
 	}
 
 	result.Status = worst
-	if worst == StatusOK {
-		result.Message = "all scheduled orders succeeding"
-	} else {
-		result.Message = fmt.Sprintf("%d order(s) failing repeatedly", failing)
-		result.FixHint = fmt.Sprintf(orderOutcomeInspectHintFmt, firstFailingHint)
+	result.Message = orderOutcomeSummary(failing, undetermined)
+	if hint := firstFailingHint; hint != "" {
+		result.FixHint = fmt.Sprintf(orderOutcomeInspectHintFmt, hint)
+	} else if firstUndeterminedHint != "" {
+		result.FixHint = fmt.Sprintf(orderOutcomeInspectHintFmt, firstUndeterminedHint)
 	}
 	return result
+}
+
+// orderOutcomeSummary is the check's one-line message. "Failing repeatedly"
+// counts only orders whose observed streak reached the threshold (or whose
+// classification is otherwise non-OK); orders the look-back could not settle
+// are counted and named separately as undetermined, because no streak was
+// observed for them.
+func orderOutcomeSummary(failing int, undetermined []string) string {
+	switch {
+	case failing == 0 && len(undetermined) == 0:
+		return "all scheduled orders succeeding"
+	case len(undetermined) == 0:
+		return fmt.Sprintf("%d order(s) failing repeatedly", failing)
+	case failing == 0:
+		return fmt.Sprintf("%d order(s) undetermined, older runs not read: %s",
+			len(undetermined), strings.Join(undetermined, ", "))
+	default:
+		return fmt.Sprintf("%d order(s) failing repeatedly; %d undetermined, older runs not read: %s",
+			failing, len(undetermined), strings.Join(undetermined, ", "))
+	}
 }
 
 // orderSucceededIn reports whether outcomes hold a success for subject.
