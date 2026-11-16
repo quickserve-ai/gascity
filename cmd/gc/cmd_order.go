@@ -1038,8 +1038,11 @@ func doOrderRunExecTracked(a orders.Order, cityPath string, cfg *config.City, fr
 // dispatcher records (order_dispatch.go dispatchExec), so gc doctor, which
 // reads only the event log, sees the run that gc order history shows
 // (ga-fxuyqh (a)). Each call follows an attempt to store the outcome on the
-// tracking bead; when that store itself failed, order.failed says so (as the
-// dispatcher's does). The actor is the caller, not "controller".
+// tracking bead. When the outcome stamp after a run fails, order.failed
+// carries that error. When the cursor label fails and the failed-outcome
+// stamp then fails too, the event names only the cursor error and the stamp
+// error goes to stderr, as in the dispatcher. The actor is the caller, not
+// "controller".
 // A nil provider (event log unavailable) records nothing; the caller has
 // already been told.
 func recordManualOrderOutcome(ep events.Provider, scoped, typ, message string) {

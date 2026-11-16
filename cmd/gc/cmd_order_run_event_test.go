@@ -115,16 +115,23 @@ func TestOrderRunExecTrackedOutcomeLabelFailureCarriesSeq(t *testing.T) {
 	mem := beads.NewMemStore()
 	ep := events.NewFake()
 	ep.Record(events.Event{Type: events.BeadClosed, Actor: "test"})
-	a := orders.Order{Name: "evt", Trigger: "event", On: events.BeadClosed, Exec: "true"}
+	// The command must SUCCEED, so the only failure is the rejected "exec"
+	// outcome label: a plain exec failure would also yield code 1 and a seq=
+	// event, and must not satisfy this test.
+	a := orders.Order{Name: "evt", Trigger: "event", On: events.BeadClosed, Exec: "echo outcome-label-run-ok"}
 
 	var stdout, stderr bytes.Buffer
 	code := doOrderRunExecTracked(a, cityDir, nil, orders.NewStore(beads.OrdersStore{Store: execLabelUpdateFailStore{Store: mem}}), ep, nil, &stdout, &stderr)
 	if code != 1 {
 		t.Fatalf("doOrderRunExecTracked = %d, want 1", code)
 	}
+	if !strings.Contains(stdout.String(), "outcome-label-run-ok") || !strings.Contains(stdout.String(), "executed (exec)") {
+		t.Fatalf("stdout = %q, want the command to have run and succeeded", stdout.String())
+	}
 	got := outcomeEventsFor(t, ep, a.ScopedName())
-	if len(got) != 1 || got[0].Type != events.OrderFailed || !strings.HasPrefix(got[0].Message, "seq=1: ") {
-		t.Fatalf("outcome events = %+v, want exactly one %s starting seq=1: ", got, events.OrderFailed)
+	if len(got) != 1 || got[0].Type != events.OrderFailed || !strings.HasPrefix(got[0].Message, "seq=1: ") ||
+		!strings.Contains(got[0].Message, "label failed") || !strings.Contains(got[0].Message, "exec label failed") {
+		t.Fatalf("outcome events = %+v, want exactly one %s starting seq=1: naming the injected outcome-label failure", got, events.OrderFailed)
 	}
 }
 
