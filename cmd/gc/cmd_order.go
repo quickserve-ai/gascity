@@ -705,8 +705,11 @@ func cmdOrderRun(name, rig string, jsonOutput bool, vars map[string]string, stdo
 		if store.Store == nil {
 			return storeCode
 		}
-		// Only event-triggered orders need the event cursor; cooldown/cron
-		// orders just need the run recorded.
+		// Event-triggered orders need the event log for their cursor, so a
+		// failure to open it stops the run. Cooldown/cron orders open it only to
+		// record the run's outcome event (ga-fxuyqh (a)); for them the log is
+		// best-effort: the run still happens and is still recorded on its
+		// tracking bead, and the caller is told the event was not recorded.
 		var ep events.Provider
 		if a.Trigger == "event" {
 			var epCode int
@@ -714,6 +717,13 @@ func cmdOrderRun(name, rig string, jsonOutput bool, vars map[string]string, stdo
 			if ep == nil {
 				return epCode
 			}
+		} else {
+			ep, _ = openCityEventsProvider(stderr, "gc order run")
+			if ep == nil {
+				fmt.Fprintf(stderr, "gc order run: %s: event log unavailable; this run's outcome event will not be recorded (gc doctor will not see it)\n", a.ScopedName()) //nolint:errcheck // best-effort stderr
+			}
+		}
+		if ep != nil {
 			defer ep.Close() //nolint:errcheck // best-effort
 		}
 		return doOrderRunExecTracked(a, cityPath, cfg, orderTrackingFrontDoor(cityPath, cfg, store), ep, vars, stdout, stderr)
@@ -979,6 +989,8 @@ func doOrderRunExecTracked(a orders.Order, cityPath string, cfg *config.City, fr
 	if cursor != nil {
 		if err := front.SetCursor(run.ID, scoped, *cursor); err != nil {
 			fmt.Fprintf(stderr, "gc order run: labeling exec event cursor for %s: %v\n", scoped, err) //nolint:errcheck // best-effort stderr
+			recordManualOrderOutcome(ep, scoped, events.OrderFailed,
+				fmt.Sprintf("manual gc order run: exec tracking bead %s event cursor label failed for seq=%d: %v", run.ID, uint64(*cursor), err))
 			return 1
 		}
 	}
@@ -993,6 +1005,8 @@ func doOrderRunExecTracked(a orders.Order, cityPath string, cfg *config.City, fr
 	}
 	if err := front.SetOutcome(run.ID, outcome); err != nil {
 		fmt.Fprintf(stderr, "gc order run: labeling exec tracking bead for %s: %v\n", scoped, err) //nolint:errcheck // best-effort stderr
+		recordManualOrderOutcome(ep, scoped, events.OrderFailed,
+			fmt.Sprintf("manual gc order run: exec tracking bead %s label failed: %v", run.ID, err))
 		return 1
 	}
 	if result.code != 0 {
@@ -1001,8 +1015,29 @@ func doOrderRunExecTracked(a orders.Order, cityPath string, cfg *config.City, fr
 		if err := front.SetError(run.ID, excerpt); err != nil {
 			fmt.Fprintf(stderr, "gc order run: stamping error excerpt for %s: %v\n", scoped, err) //nolint:errcheck // best-effort stderr
 		}
+		if cursor != nil {
+			excerpt = fmt.Sprintf("seq=%d: %s", uint64(*cursor), excerpt)
+		}
+		recordManualOrderOutcome(ep, scoped, events.OrderFailed, excerpt)
+		return result.code
 	}
+	recordManualOrderOutcome(ep, scoped, events.OrderCompleted, "")
 	return result.code
+}
+
+// recordManualOrderOutcome records a manual exec run's outcome on the event
+// log, the same order.completed / order.failed event the controller's
+// dispatcher records (order_dispatch.go dispatchExec), so gc doctor, which
+// reads only the event log, sees the run that gc order history shows
+// (ga-fxuyqh (a)). It is written after the outcome the run observed has been
+// stored on the tracking bead. The actor is the caller, not "controller".
+// A nil provider (event log unavailable) records nothing; the caller has
+// already been told.
+func recordManualOrderOutcome(ep events.Provider, scoped, typ, message string) {
+	if ep == nil {
+		return
+	}
+	ep.Record(events.Event{Type: typ, Actor: eventActor(), Subject: scoped, Message: message})
 }
 
 // doOrderRunExec runs an exec order directly via shell.
