@@ -119,6 +119,7 @@ go_test(
         "checks_order_firing_open_work_test.go",
         "checks_order_firing_test.go",
         "checks_order_outcome_test.go",
+        "checks_order_outcome_undetermined_test.go",
         "checks_pack_credentials_test.go",
         "checks_provider_parity_test.go",
         "checks_provider_readiness_test.go",
