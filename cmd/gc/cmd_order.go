@@ -989,6 +989,11 @@ func doOrderRunExecTracked(a orders.Order, cityPath string, cfg *config.City, fr
 	if cursor != nil {
 		if err := front.SetCursor(run.ID, scoped, *cursor); err != nil {
 			fmt.Fprintf(stderr, "gc order run: labeling exec event cursor for %s: %v\n", scoped, err) //nolint:errcheck // best-effort stderr
+			// Stamp the failed outcome before recording it, as the dispatcher
+			// does, so gc order history and the event log agree.
+			if updateErr := front.SetOutcome(run.ID, orders.RunOutcomeExecFailed); updateErr != nil {
+				fmt.Fprintf(stderr, "gc order run: labeling exec tracking bead for %s: %v\n", scoped, updateErr) //nolint:errcheck // best-effort stderr
+			}
 			recordManualOrderOutcome(ep, scoped, events.OrderFailed,
 				fmt.Sprintf("manual gc order run: exec tracking bead %s event cursor label failed for seq=%d: %v", run.ID, uint64(*cursor), err))
 			return 1
@@ -1005,8 +1010,11 @@ func doOrderRunExecTracked(a orders.Order, cityPath string, cfg *config.City, fr
 	}
 	if err := front.SetOutcome(run.ID, outcome); err != nil {
 		fmt.Fprintf(stderr, "gc order run: labeling exec tracking bead for %s: %v\n", scoped, err) //nolint:errcheck // best-effort stderr
-		recordManualOrderOutcome(ep, scoped, events.OrderFailed,
-			fmt.Sprintf("manual gc order run: exec tracking bead %s label failed: %v", run.ID, err))
+		msg := fmt.Sprintf("manual gc order run: exec tracking bead %s label failed: %v", run.ID, err)
+		if cursor != nil {
+			msg = fmt.Sprintf("seq=%d: %s", uint64(*cursor), msg)
+		}
+		recordManualOrderOutcome(ep, scoped, events.OrderFailed, msg)
 		return 1
 	}
 	if result.code != 0 {
@@ -1029,8 +1037,9 @@ func doOrderRunExecTracked(a orders.Order, cityPath string, cfg *config.City, fr
 // log, the same order.completed / order.failed event the controller's
 // dispatcher records (order_dispatch.go dispatchExec), so gc doctor, which
 // reads only the event log, sees the run that gc order history shows
-// (ga-fxuyqh (a)). It is written after the outcome the run observed has been
-// stored on the tracking bead. The actor is the caller, not "controller".
+// (ga-fxuyqh (a)). Each call follows an attempt to store the outcome on the
+// tracking bead; when that store itself failed, order.failed says so (as the
+// dispatcher's does). The actor is the caller, not "controller".
 // A nil provider (event log unavailable) records nothing; the caller has
 // already been told.
 func recordManualOrderOutcome(ep events.Provider, scoped, typ, message string) {

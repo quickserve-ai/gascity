@@ -55,19 +55,76 @@ func TestOrderRunExecTrackedRecordsOrderFailedEvent(t *testing.T) {
 	cityDir := t.TempDir()
 	store := beads.NewMemStore()
 	ep := events.NewFake()
-	a := orders.Order{Name: "tick", Trigger: "cooldown", Interval: "1m", Exec: "exit 3"}
+	// The marker proves the command itself ran and failed: a run that never
+	// reached the shell (env build failure, missing sh) prints no marker.
+	a := orders.Order{Name: "tick", Trigger: "cooldown", Interval: "1m", Exec: "echo manual-run-marker; exit 3"}
 
 	var stdout, stderr bytes.Buffer
 	code := doOrderRunExecTracked(a, cityDir, nil, orders.NewStore(beads.OrdersStore{Store: store}), ep, nil, &stdout, &stderr)
-	if code == 0 {
-		t.Fatalf("doOrderRunExecTracked = 0, want failure; stdout=%q", stdout.String())
+	if code != 1 {
+		t.Fatalf("doOrderRunExecTracked = %d, want 1; stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "manual-run-marker") || !strings.Contains(stderr.String(), "exec failed") {
+		t.Fatalf("stderr = %q, want the command's own output after an exec failure", stderr.String())
+	}
+	all := trackingBeads(t, store, "order-run:tick")
+	if len(all) != 1 || !slicesContain(all[0].Labels, "exec-failed") {
+		t.Fatalf("tracking beads = %+v, want one labelled exec-failed", all)
 	}
 	got := outcomeEventsFor(t, ep, a.ScopedName())
 	if len(got) != 1 || got[0].Type != events.OrderFailed {
 		t.Fatalf("outcome events = %+v, want exactly one %s", got, events.OrderFailed)
 	}
-	if !strings.Contains(got[0].Message, "manual gc order run") {
-		t.Fatalf("order.failed message = %q, want it to say the run was manual", got[0].Message)
+	if !strings.Contains(got[0].Message, "exit code 1 (manual gc order run") {
+		t.Fatalf("order.failed message = %q, want the excerpt stamped on the bead", got[0].Message)
+	}
+}
+
+// Cross-family read on #355 (1): a cursor-label failure stamps the failed
+// outcome on the bead BEFORE recording order.failed, as the dispatcher does,
+// so history and the event log agree.
+func TestOrderRunExecTrackedCursorLabelFailureStampsFailedThenRecords(t *testing.T) {
+	cityDir := t.TempDir()
+	mem := beads.NewMemStore()
+	ep := events.NewFake()
+	ep.Record(events.Event{Type: events.BeadClosed, Actor: "test"})
+	a := orders.Order{Name: "evt", Trigger: "event", On: events.BeadClosed, Exec: "echo should-not-run"}
+
+	var stdout, stderr bytes.Buffer
+	code := doOrderRunExecTracked(a, cityDir, nil, orders.NewStore(beads.OrdersStore{Store: eventCursorUpdateFailStore{Store: mem}}), ep, nil, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("doOrderRunExecTracked = %d, want 1", code)
+	}
+	if strings.Contains(stdout.String(), "should-not-run") {
+		t.Fatalf("the command ran after its cursor label failed: %q", stdout.String())
+	}
+	all := trackingBeads(t, mem, "exec-failed")
+	if len(all) != 1 {
+		t.Fatalf("beads labelled exec-failed = %d, want 1 (outcome stamped before the event)", len(all))
+	}
+	got := outcomeEventsFor(t, ep, a.ScopedName())
+	if len(got) != 1 || got[0].Type != events.OrderFailed || !strings.Contains(got[0].Message, "seq=") {
+		t.Fatalf("outcome events = %+v, want exactly one %s carrying seq=", got, events.OrderFailed)
+	}
+}
+
+// Cross-family read on #355 (2): an outcome-label failure on an
+// event-triggered run carries the triggering seq, as the dispatcher's does.
+func TestOrderRunExecTrackedOutcomeLabelFailureCarriesSeq(t *testing.T) {
+	cityDir := t.TempDir()
+	mem := beads.NewMemStore()
+	ep := events.NewFake()
+	ep.Record(events.Event{Type: events.BeadClosed, Actor: "test"})
+	a := orders.Order{Name: "evt", Trigger: "event", On: events.BeadClosed, Exec: "true"}
+
+	var stdout, stderr bytes.Buffer
+	code := doOrderRunExecTracked(a, cityDir, nil, orders.NewStore(beads.OrdersStore{Store: execLabelUpdateFailStore{Store: mem}}), ep, nil, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("doOrderRunExecTracked = %d, want 1", code)
+	}
+	got := outcomeEventsFor(t, ep, a.ScopedName())
+	if len(got) != 1 || got[0].Type != events.OrderFailed || !strings.HasPrefix(got[0].Message, "seq=1: ") {
+		t.Fatalf("outcome events = %+v, want exactly one %s starting seq=1: ", got, events.OrderFailed)
 	}
 }
 
