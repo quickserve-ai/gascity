@@ -1202,6 +1202,7 @@ go_test(
         "cmd_nudge_runtime_test.go",
         "cmd_nudge_test.go",
         "cmd_order_history_bounds_test.go",
+        "cmd_order_run_event_test.go",
         "cmd_order_test.go",
         "cmd_pack_commands_test.go",
         "cmd_pack_registry_json_test.go",
