@@ -274,8 +274,10 @@ func (c *OrderOutcomeHealthyCheck) Run(ctx *CheckContext) *CheckResult {
 	failing := 0
 	// undetermined counts the orders the look-back could not settle (budget
 	// spent or the read failed). They warn, but they are not "failing
-	// repeatedly": nobody has observed a streak at threshold, so the summary
-	// names them under their own label (ga-fxuyqh (b)).
+	// repeatedly": no streak at threshold is CONFIRMED for them (the outcomes
+	// read may add up to a provisional one that an unread controller start
+	// could still grace), so the summary names them under their own label
+	// (ga-fxuyqh (b)).
 	var undetermined []string
 	var firstFailingHint, firstUndeterminedHint string
 
@@ -345,10 +347,10 @@ func (c *OrderOutcomeHealthyCheck) Run(ctx *CheckContext) *CheckResult {
 }
 
 // orderOutcomeSummary is the check's one-line message. "Failing repeatedly"
-// counts only orders whose observed streak reached the threshold (or whose
-// classification is otherwise non-OK); orders the look-back could not settle
-// are counted and named separately as undetermined, because no streak was
-// observed for them.
+// counts only orders the look-back settled whose streak reached the threshold
+// (or whose classification is otherwise non-OK); orders it could not settle are
+// counted and named separately as undetermined, because no threshold streak is
+// confirmed for them.
 func orderOutcomeSummary(failing int, undetermined []string) string {
 	switch {
 	case failing == 0 && len(undetermined) == 0:
