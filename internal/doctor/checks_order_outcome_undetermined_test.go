@@ -3,6 +3,7 @@ package doctor
 import (
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -66,5 +67,36 @@ func TestOrderOutcomeHealthy_FailingAndUndeterminedCountedSeparately(t *testing.
 	want := "1 order(s) failing repeatedly; 1 undetermined, older runs not read: daily"
 	if result.Status != StatusWarning || result.Message != want {
 		t.Fatalf("got %v %q, want Warning %q; details %v", result.Status, result.Message, want, result.Details)
+	}
+}
+
+// Cross-family read on #354: the look-back can leave an order unresolved while
+// the outcomes it did read add up to a provisional streak at threshold, because
+// an older controller start it never reached could still grace the oldest
+// failure. Threshold 3, grace 10m: daily failed at now-7d and now; the walk
+// reads one more failure at T+2m and stops (budget) before the start at T.
+// That streak is not confirmed, so the order is undetermined, not failing.
+func TestOrderOutcomeHealthy_ProvisionalStreakFromACutWalkIsUndetermined(t *testing.T) {
+	now := time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	writeOrderFiringTestOrderInDir(t, filepath.Join(cityPath, "orders"), "daily", "cron", "0 0 * * *")
+	writeOutcomeLog(t, cityPath,
+		events.Event{Seq: 3, Type: events.OrderFailed, Ts: now.Add(-7 * 24 * time.Hour), Subject: "daily", Message: "boom"},
+		events.Event{Seq: 4, Type: events.OrderFailed, Ts: now, Subject: "daily", Message: "boom"},
+	)
+	boundary := now.Add(-12*24*time.Hour + 2*time.Minute)
+	check := outcomeCheckAt(cityPath, cfg, now)
+	check.walkBack = func(_ string, _ events.Filter, _ []string, fn func([]events.Event, time.Time) bool) error {
+		// One source read, then the budget stops the walk.
+		fn([]events.Event{{Seq: 2, Type: events.OrderFailed, Ts: boundary, Subject: "daily", Message: "spurious"}}, boundary)
+		return nil
+	}
+	result := check.Run(&CheckContext{CityPath: cityPath})
+	want := "1 order(s) undetermined, older runs not read: daily"
+	if result.Status != StatusWarning || result.Message != want {
+		t.Fatalf("got %v %q, want Warning %q; details %v", result.Status, result.Message, want, result.Details)
+	}
+	if !strings.Contains(strings.Join(result.Details, "\n"), "not confirmed: older runs were not read within the time budget") {
+		t.Fatalf("detail must say the streak is unconfirmed: %v", result.Details)
 	}
 }

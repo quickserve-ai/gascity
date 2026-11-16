@@ -282,9 +282,19 @@ func (c *OrderOutcomeHealthyCheck) Run(ctx *CheckContext) *CheckResult {
 	for _, order := range scheduled {
 		streak, lastMessage, sawOutcome, skipped := consecutiveOrderFailures(outcomes, order.ScopedName(), starts, c.grace)
 		status, detail := classifyOrderOutcome(order, streak, c.threshold, lastMessage, sawOutcome, skipped)
-		isUndetermined := false
-		if status == StatusOK && unresolved[order.ScopedName()] {
-			isUndetermined = true
+		// The look-back's settlement predicate, not the provisional streak,
+		// decides whether a verdict was computed: an order it left unresolved is
+		// undetermined even when the outcomes read so far classify it as failing,
+		// because an unread controller start could still grace one of them.
+		isUndetermined := unresolved[order.ScopedName()]
+		if isUndetermined && status != StatusOK {
+			why := "were not read within the time budget"
+			if lookErr != nil {
+				why = fmt.Sprintf("could not be read (%v)", lookErr)
+			}
+			detail = fmt.Sprintf("%s; not confirmed: older runs %s", detail, why)
+		}
+		if status == StatusOK && isUndetermined {
 			why := "were not read within the time budget"
 			if lookErr != nil {
 				why = fmt.Sprintf("could not be read (%v)", lookErr)
@@ -342,7 +352,7 @@ func (c *OrderOutcomeHealthyCheck) Run(ctx *CheckContext) *CheckResult {
 func orderOutcomeSummary(failing int, undetermined []string) string {
 	switch {
 	case failing == 0 && len(undetermined) == 0:
-		return "all scheduled orders succeeding"
+		return "no scheduled order failing repeatedly"
 	case len(undetermined) == 0:
 		return fmt.Sprintf("%d order(s) failing repeatedly", failing)
 	case failing == 0:
