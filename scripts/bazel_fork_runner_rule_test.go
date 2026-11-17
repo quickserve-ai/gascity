@@ -15,7 +15,7 @@ const bazelUpstreamRepository = "github.repository == 'gastownhall/gascity'"
 // upstream adds or moves trips it at the next rebase: the quickserve-ai fork
 // has no Blacksmith runners, and a job that asks for one sits queued there
 // forever. A job on a Blacksmith label either takes the repository-aware
-// runs-on (upstream's label upstream, ubuntu-latest anywhere else) or runs
+// runs-on (upstream's label upstream, ubuntu-24.04 anywhere else) or runs
 // upstream only by a repository term in its if (or a mode-remote term, which
 // the fork never reaches).
 func TestBazelWorkflowForkRunnerRule(t *testing.T) {
@@ -28,7 +28,7 @@ func TestBazelWorkflowForkRunnerRule(t *testing.T) {
 			continue
 		}
 		repositoryAware := strings.HasPrefix(job.RunsOn, "${{ "+bazelUpstreamRepository+" && ") &&
-			strings.HasSuffix(job.RunsOn, " || 'ubuntu-latest' }}")
+			strings.HasSuffix(job.RunsOn, " || 'ubuntu-24.04' }}")
 		// A job whose if already requires mode remote is upstream only as
 		// it stands: the fork never reaches mode remote (re-sync #7,
 		// upstream's rrc-seed and rrc-verify keep their own conditions).

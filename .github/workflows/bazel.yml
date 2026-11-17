@@ -130,7 +130,10 @@ permissions:
 #     `github.repository == 'gastownhall/gascity' && <upstream's label> ||
 #     'ubuntu-latest'`, the expression the carry gives the runner-policy jobs
 #     of ci.yml, codeql.yml, container-scan.yml, govulncheck.yml,
-#     mac-regression.yml and review-formulas.yml;
+#     mac-regression.yml and review-formulas.yml. This file's own jobs and
+#     the policy's Linux fallbacks (scripts/runner_policy.py) pin
+#     'ubuntu-24.04' instead: on ubuntu-26.04 the hermetic ld.lld cannot load
+#     libxml2.so.2;
 #   - a job that needs the remote-execution secret or a Blacksmith host runs
 #     upstream only, by `github.repository == 'gastownhall/gascity'` in its
 #     `if:` (#198's guard), and so does a step that needs a Blacksmith host
@@ -148,7 +151,7 @@ permissions:
 jobs:
   rbe:
     name: execution mode
-    runs-on: ${{ github.repository == 'gastownhall/gascity' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    runs-on: ${{ github.repository == 'gastownhall/gascity' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 5
     permissions:
       contents: read
@@ -378,7 +381,7 @@ jobs:
     # on 2 vCPU, 23-34 s on 4 and 15-19 s on 8. Unit and acceptance are the
     # critical lanes (ga-vnycm2.12).
     # Fork carry: GitHub-hosted on the fork (the rule above jobs:).
-    runs-on: ${{ github.repository == 'gastownhall/gascity' && ((matrix.lane == 'unit' || matrix.lane == 'acceptance') && 'blacksmith-8vcpu-ubuntu-2404' || 'blacksmith-4vcpu-ubuntu-2404') || 'ubuntu-latest' }}
+    runs-on: ${{ github.repository == 'gastownhall/gascity' && ((matrix.lane == 'unit' || matrix.lane == 'acceptance') && 'blacksmith-8vcpu-ubuntu-2404' || 'blacksmith-4vcpu-ubuntu-2404') || 'ubuntu-24.04' }}
     timeout-minutes: 90
     permissions:
       contents: read
@@ -965,7 +968,7 @@ jobs:
     name: bazel / test cache report
     needs: [rbe, lane]
     if: always() && needs.rbe.result == 'success' && needs.rbe.outputs.lanes != '[]'
-    runs-on: ${{ github.repository == 'gastownhall/gascity' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    runs-on: ${{ github.repository == 'gastownhall/gascity' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 10
     permissions:
       contents: read
@@ -1155,7 +1158,7 @@ jobs:
   sync-check:
     name: BUILD files in sync
     needs: rbe
-    runs-on: ${{ github.repository == 'gastownhall/gascity' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    runs-on: ${{ github.repository == 'gastownhall/gascity' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 15
     permissions:
       contents: read
@@ -1233,7 +1236,7 @@ jobs:
     # Fork carry: secret-free, so it runs on the fork, GitHub-hosted; its
     # host measurement needs a Blacksmith host and is upstream only (the rule
     # above jobs:).
-    runs-on: ${{ github.repository == 'gastownhall/gascity' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    runs-on: ${{ github.repository == 'gastownhall/gascity' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 25
     permissions:
       contents: read
@@ -1371,7 +1374,7 @@ jobs:
     name: bazel test (side-by-side)
     needs: [rbe, lane, sync-check, worker-host]
     if: always()
-    runs-on: ${{ github.repository == 'gastownhall/gascity' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    runs-on: ${{ github.repository == 'gastownhall/gascity' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 5
     steps:
       - name: Evaluate
