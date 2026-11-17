@@ -508,7 +508,7 @@ func TestBazelMultiLaneWorkflowShape(t *testing.T) {
 	// or may (a fork lane's fallback to the read-only cache).
 	// Fork carry (pl-axh9): upstream's choice inside the repository-aware
 	// form, GitHub-hosted on the fork (TestBazelWorkflowForkRunnerRule).
-	if want := "${{ github.repository == 'gastownhall/gascity' && ((matrix.lane == 'unit' || matrix.lane == 'acceptance') && 'blacksmith-8vcpu-ubuntu-2404' || 'blacksmith-4vcpu-ubuntu-2404') || 'ubuntu-latest' }}"; lane.RunsOn != want {
+	if want := "${{ github.repository == 'gastownhall/gascity' && ((matrix.lane == 'unit' || matrix.lane == 'acceptance') && 'blacksmith-8vcpu-ubuntu-2404' || 'blacksmith-4vcpu-ubuntu-2404') || 'ubuntu-24.04' }}"; lane.RunsOn != want {
 		t.Errorf("lane runs-on = %q, want %q", lane.RunsOn, want)
 	}
 

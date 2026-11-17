@@ -26,10 +26,10 @@ BLACKSMITH_RUNNERS = {
 }
 
 GITHUB_RUNNERS = {
-    "runner_2vcpu": "ubuntu-latest",
-    "runner_8vcpu": "ubuntu-latest",
-    "runner_16vcpu": "ubuntu-latest",
-    "runner_32vcpu": "ubuntu-latest",
+    "runner_2vcpu": "ubuntu-24.04",
+    "runner_8vcpu": "ubuntu-24.04",
+    "runner_16vcpu": "ubuntu-24.04",
+    "runner_32vcpu": "ubuntu-24.04",
     "runner_macos": "macos-15",
     "runner_windows": "windows-latest",
 }

@@ -321,7 +321,12 @@ const (
 	// so upstream releases no longer fail a PR's required gate; nightly.yml's
 	// bundled-pack-pins keeps the latest-release check. Reviewed delta: that
 	// one step command; no new job, trigger, permission or needs edge.
-	expectedCIExecutionHash     = "176b514f1fa622ce43b240dba18b147cc8ed59befac7934c05642e8cfe5e0dfb"
+	// Carry (freeze d, 2026-11-17): the fork's fallback in the runner-policy
+	// job's runs-on is ubuntu-24.04, not ubuntu-latest: ubuntu-latest became
+	// ubuntu-26.04, where Bazel's hermetic ld.lld cannot load libxml2.so.2.
+	// Reviewed delta: that one runs-on fallback value; no new job, step,
+	// trigger or permission.
+	expectedCIExecutionHash     = "84c49419b1af54d5111880e06c98f1146e2b27996c54b49f7d369e2b214fc9df"
 	expectedNightlyTriggersHash = "0a4400a09ac567e90adf8be1232eef1f14e36efd8dba3e143aa6e36f5b7a36f5"
 	// Nightly: reviewed delta Beads v1.3.0-rc.2 -> v1.3.0, then (round3 review,
 	// completeness) one new job, beads-proxied-perf: ubuntu-latest,
