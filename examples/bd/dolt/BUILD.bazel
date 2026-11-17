@@ -101,6 +101,7 @@ go_test(
     srcs = [
         "agent_workdir_test.go",
         "backup_order_test.go",
+        "backup_registration_test.go",
         "cleanup_test.go",
         "compact_backup_remotes_test.go",
         "compact_flatten_window_real_dolt_test.go",

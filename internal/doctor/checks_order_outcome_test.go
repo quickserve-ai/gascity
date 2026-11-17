@@ -996,7 +996,7 @@ func TestOrderOutcomeHealthy_OrderWithNoOutcomeEverStaysNoCompletedRuns(t *testi
 	check := outcomeCheckAt(cityPath, cfg, now)
 	walks, sources := countLookBacks(check)
 	result := check.Run(&CheckContext{CityPath: cityPath})
-	if result.Status != StatusOK || result.Message != "all scheduled orders succeeding" ||
+	if result.Status != StatusOK || result.Message != "no scheduled order failing repeatedly" ||
 		!strings.Contains(strings.Join(result.Details, "\n"), "monthly: no completed runs in the lookback window") {
 		t.Fatalf("an order that never ran is reported as having no runs: %v %q %v", result.Status, result.Message, result.Details)
 	}

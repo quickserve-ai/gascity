@@ -5,8 +5,8 @@
 # <blocker>`), the owner of each dependent has no event-driven signal that
 # work can resume: they poll, get nudged by hand, or miss the unblock.
 #
-# This order subscribes to bead.closed events. For each closed bead it
-# resolves the dependents linked by a `blocks` dependency and nudges the
+# This order subscribes to bead.closed events. For each closed bead other than
+# a wisp it resolves the dependents linked by a `blocks` dependency and nudges the
 # assignee of every open or deferred dependent. Idempotent: a given
 # (blocker, dependent) pair is nudged at most once. Dedup state lives in
 # $GC_PACK_STATE_DIR/cascade-nudge-on-blocker-close-state.json, so it is
@@ -49,6 +49,10 @@ RETENTION="${GC_CASCADE_NUDGE_RETENTION:-1h}"
 
 PACK_STATE_DIR="${GC_PACK_STATE_DIR:-${GC_CITY_RUNTIME_DIR:-$CITY/.gc/runtime}/packs/core}"
 STATE_FILE="$PACK_STATE_DIR/cascade-nudge-on-blocker-close-state.json"
+# One line per pass that had closes to read. An order's stdout is kept only
+# when it fails, so the counts live here; bounded to PASS_LOG_LINES lines.
+PASS_LOG="$PACK_STATE_DIR/cascade-nudge-on-blocker-close-passes.log"
+PASS_LOG_LINES=2000
 mkdir -p "$PACK_STATE_DIR"
 
 # Convert a simple Go-style duration (Ns/Nm/Nh) to whole seconds.
@@ -111,11 +115,23 @@ echo "$STATE" | jq -e 'type == "object"' >/dev/null 2>&1 || STATE='{}'
 
 NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 NUDGED=0
+SKIPPED_WISPS=0
+LOOKED_UP=0
 while IFS= read -r blocker; do
     [ -n "$blocker" ] || continue
 
+    # Skip a wisp's close before any store read: wisps are close to half of
+    # all closes, and each lookup costs a query on a store that may be a
+    # shared remote. In practice no blocks edge targets a wisp, but gc can
+    # create one (a bead attached to a root-only vapor formula's wisp root),
+    # and that dependent gets no cascade nudge. An accepted trade (ga-ohwi67).
+    case "$blocker" in
+        *-wisp-*) SKIPPED_WISPS=$((SKIPPED_WISPS + 1)); continue ;;
+    esac
+
     set_rig_args "$blocker"
     [ -z "$RIG_SUSPENDED" ] || continue
+    LOOKED_UP=$((LOOKED_UP + 1))
     DEPS="$(gc bd dep list "$blocker" ${RIG_ARG1:+"$RIG_ARG1" "$RIG_ARG2"} \
             --direction=up --type=blocks --json 2>/dev/null)" || continue
     if [ -z "$DEPS" ] || [ "$DEPS" = "[]" ]; then continue; fi
@@ -159,6 +175,12 @@ TMP="$(mktemp "$PACK_STATE_DIR/.cascade-nudge-on-blocker-close-state.XXXXXX")"
 printf '%s\n' "$STATE" > "$TMP"
 mv -f "$TMP" "$STATE_FILE"
 
-if [ "$NUDGED" -gt 0 ]; then
-    echo "cascade-nudge-on-blocker-close: nudged $NUDGED dependent(s)"
-fi
+PASS_LINE="looked_up=$LOOKED_UP skipped_wisps=$SKIPPED_WISPS nudged=$NUDGED"
+echo "cascade-nudge-on-blocker-close: $PASS_LINE"
+# Best-effort: a full disk must not fail the pass after its nudges went out.
+{
+    printf '%s %s\n' "$NOW" "$PASS_LINE" >> "$PASS_LOG"
+    PASS_TMP="$(mktemp "$PACK_STATE_DIR/.cascade-nudge-on-blocker-close-passes.XXXXXX")"
+    tail -n "$PASS_LOG_LINES" "$PASS_LOG" > "$PASS_TMP" && mv -f "$PASS_TMP" "$PASS_LOG" \
+        || rm -f "$PASS_TMP"
+} 2>/dev/null || true

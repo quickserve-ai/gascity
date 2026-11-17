@@ -128,6 +128,10 @@ const (
 	// however quiet its pane.
 	executionHoldExecuting     = "executing"
 	executionHoldSnapshotError = "snapshot_error"
+	// executionHoldHeartbeat names a seat that called `gc runtime heartbeat`:
+	// its held_until is still in the future, so a silent pane is a declared
+	// long operation rather than a stalled claim.
+	executionHoldHeartbeat = "heartbeat"
 )
 
 // executionStalledLatchRetryAfter bounds how long a latch silences
@@ -268,7 +272,8 @@ func (p poolExecutionBackstop) governs(s beads.Bead) bool {
 
 // resolve reports an outstanding stall only when all of it holds: the session
 // holds exactly ONE in-progress claim under a current identity, and the runtime
-// says the session has been quiet for at least the grace window (quietHold).
+// says the session has been quiet for at least the grace window (quietHold)
+// with no heartbeat hold in force (held_until).
 //
 // Exactly one, because the pacing state names a single bead: a session juggling
 // several claims is demonstrably doing something, and picking one of them to
@@ -285,6 +290,15 @@ func (p poolExecutionBackstop) resolve(s beads.Bead, _ map[string]beads.Bead, se
 		// s is resolve's copy, but it shares the engine's Metadata map, so
 		// the breadcrumb written here is visible to the rest of the tick.
 		p.observeHold(p.store, &s, executionHoldMultiClaim, p.stdout)
+		return backstopTarget{}, backstopResolutionHold
+	}
+	// A seat that called `gc runtime heartbeat` declared a long silent
+	// operation, the same declaration that defers the reconciler's idle and
+	// max-age timers. Like every hold here it skips the tick and leaves the
+	// pacing state alone, so a hold that lapses with the seat still quiet
+	// resumes the escalation instead of restarting the grace window.
+	if sessionpkg.DecodeDisposition(s.Metadata).HeartbeatHeld(p.now) {
+		p.observeHold(p.store, &s, executionHoldHeartbeat, p.stdout)
 		return backstopTarget{}, backstopResolutionHold
 	}
 	if hold := p.quietHold(s, sessName); hold != "" {

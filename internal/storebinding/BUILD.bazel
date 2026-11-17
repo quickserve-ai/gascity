@@ -55,6 +55,7 @@ go_test(
     name = "storebinding_test",
     srcs = [
         "beads_adapter_graph_capability_test.go",
+        "beads_adapter_push_report_test.go",
         "beads_adapter_test.go",
         "beads_nudge_queue_keyed_test.go",
         "beads_nudge_queue_maintain_test.go",
