@@ -128,9 +128,12 @@ permissions:
 #   - a job that needs no org secret and no Blacksmith-only runner runs on the
 #     fork on GitHub-hosted runners: its runs-on is
 #     `github.repository == 'gastownhall/gascity' && <upstream's label> ||
-#     'ubuntu-24.04'`, the expression the carry gives the runner-policy jobs
+#     'ubuntu-latest'`, the expression the carry gives the runner-policy jobs
 #     of ci.yml, codeql.yml, container-scan.yml, govulncheck.yml,
-#     mac-regression.yml and review-formulas.yml;
+#     mac-regression.yml and review-formulas.yml. This file's own jobs and
+#     the policy's Linux fallbacks (scripts/runner_policy.py) pin
+#     'ubuntu-24.04' instead: on ubuntu-26.04 the hermetic ld.lld cannot load
+#     libxml2.so.2;
 #   - a job that needs the remote-execution secret or a Blacksmith host runs
 #     upstream only, by `github.repository == 'gastownhall/gascity'` in its
 #     `if:` (#198's guard), and so does a step that needs a Blacksmith host
