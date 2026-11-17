@@ -635,3 +635,123 @@ func TestOrderDispatchNoWorkGateSkipsTrackingGateDirectly(t *testing.T) {
 		t.Errorf("NoWorkGate order must issue ZERO gate queries; got %d", got)
 	}
 }
+
+// TestOrderDispatchIdempotentGateTimeoutArmsBackoff is the ga-s1zc94 regression:
+// an idempotent order whose open-work gate times out fails OPEN and dispatches
+// (vp-gprv), and it must ALSO arm the gate-timeout backoff, exactly as a
+// fail-closed order does. Before the fix the fail-open path skipped the backoff,
+// so on a contended store the order paid the full gate bound on every tick,
+// due or not, and its gate read added to the contention it was timing out on.
+func TestOrderDispatchIdempotentGateTimeoutArmsBackoff(t *testing.T) {
+	prev := orderGateTimeout
+	orderGateTimeout = 20 * time.Millisecond
+	defer func() { orderGateTimeout = prev }()
+
+	store := &openWorkGateCallCountStore{Store: beads.NewMemStore(), delay: 300 * time.Millisecond}
+	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+
+	aa := []orders.Order{
+		{Name: "unrouted-feeder", Trigger: "cooldown", Interval: "1m", Exec: "true", Idempotent: true},
+	}
+	ad := buildOrderDispatcherFromListExec(aa, store, nil, successfulExec, nil)
+	if ad == nil {
+		t.Fatal("expected non-nil dispatcher")
+	}
+	cityPath := t.TempDir() // stable across ticks so the store-key cache hits
+
+	// Tick 1: the gate times out and the idempotent order still dispatches.
+	ad.dispatch(context.Background(), cityPath, now)
+	ad.drain(context.Background())
+	if got := trackingBeads(t, store.Store, "order-run:unrouted-feeder"); len(got) == 0 {
+		t.Fatal("tick 1: idempotent order must still fail OPEN and dispatch on a gate timeout (vp-gprv)")
+	}
+	afterTick1 := store.gateCallCount()
+	if afterTick1 == 0 {
+		t.Fatal("tick 1 did not reach the open-work gate (the fixture is testing nothing)")
+	}
+	if mem, ok := ad.(*memoryOrderDispatcher); !ok {
+		t.Fatalf("dispatcher is %T, want *memoryOrderDispatcher", ad)
+	} else if !mem.gateBackoffActive("unrouted-feeder", now.Add(orderGateTimeout)) {
+		t.Error("tick 1: an idempotent gate timeout must arm the gate backoff (ga-s1zc94)")
+	}
+
+	// Tick 2, inside the backoff window: the gate must not be read again.
+	ad.dispatch(context.Background(), cityPath, now.Add(orderGateTimeout))
+	ad.drain(context.Background())
+	if extra := store.gateCallCount() - afterTick1; extra > 0 {
+		t.Errorf("tick 2 (within backoff window): idempotent order re-entered the gate %d time(s); the fail-open path must back off too (ga-s1zc94)", extra)
+	}
+}
+
+// listQueryRecorder records every ListQuery a store answers.
+type listQueryRecorder struct {
+	beads.Store
+	mu      sync.Mutex
+	queries []beads.ListQuery
+}
+
+func (s *listQueryRecorder) List(q beads.ListQuery) ([]beads.Bead, error) {
+	s.mu.Lock()
+	s.queries = append(s.queries, q)
+	s.mu.Unlock()
+	return s.Store.List(q)
+}
+
+// TestStoreOpenDescendantIDsAsksStoreForNotClosedMembers pins the ga-s1zc94
+// caller half: the membership read asks the store for not-closed members and
+// opts into the native not-closed pushdown, instead of reading every closed
+// member over the wire and dropping it here. The answer is unchanged: the open
+// member is returned and the closed one is not.
+func TestStoreOpenDescendantIDsAsksStoreForNotClosedMembers(t *testing.T) {
+	mem := beads.NewMemStore()
+	root, err := mem.Create(beads.Bead{Title: "mol-root", Type: "molecule"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	openMember, err := mem.Create(beads.Bead{
+		Title:    "open step",
+		Metadata: map[string]string{"gc.root_bead_id": root.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	closedMember, err := mem.Create(beads.Bead{
+		Title:    "closed step",
+		Metadata: map[string]string{"gc.root_bead_id": root.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mem.Close(closedMember.ID); err != nil {
+		t.Fatal(err)
+	}
+	store := &listQueryRecorder{Store: mem}
+
+	ids, err := storeOpenDescendantIDs(store, root.ID, nil)
+	if err != nil {
+		t.Fatalf("storeOpenDescendantIDs: %v", err)
+	}
+	if len(ids) != 1 || ids[0] != openMember.ID {
+		t.Fatalf("open descendants = %v, want [%s] (the closed member must stay excluded)", ids, openMember.ID)
+	}
+
+	var membership []beads.ListQuery
+	for _, q := range store.queries {
+		if q.Metadata["gc.root_bead_id"] == root.ID {
+			membership = append(membership, q)
+		}
+	}
+	if len(membership) != 1 {
+		t.Fatalf("membership reads = %d, want 1", len(membership))
+	}
+	q := membership[0]
+	if q.IncludeClosed {
+		t.Error("membership read must not ask for closed members (ga-s1zc94)")
+	}
+	if !q.PushNotClosed {
+		t.Error("membership read must opt into the not-closed pushdown (ga-s1zc94)")
+	}
+	if q.Status != "" {
+		t.Errorf("membership read Status = %q, want empty (a Status disables the pushdown)", q.Status)
+	}
+}

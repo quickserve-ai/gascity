@@ -36,9 +36,12 @@ func spyEventReader(calls *[]eventReadCall) orderFiringEventReadFunc {
 // and turns this check permanently red for a reason unrelated to order firing.
 //
 // The check needs only the newest firing per order, so every read it issues up
-// front must carry a positive limit. There is no sanctioned unbounded read:
-// the controller-start fallback reads only the newest archive, through the
-// readArchive seam, so every read through the readEvents seam is bounded.
+// front must carry a positive limit. Every read through the readEvents seam is
+// bounded: the controller-start fallback reads only the newest archive,
+// through the readArchive seam, and the one whole-log read, of order firings
+// after a FULL tail, goes through the readActive seam and decodes only
+// order.fired lines of the active log, never an archive (pl-tfwh; see
+// TestOrderFiring*FullTail* and TestReadActiveOrderFirings*).
 func TestOrderFiringCurrent_EventReadsAreBounded(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
 	cityPath, cfg := orderFiringTestCity(t)

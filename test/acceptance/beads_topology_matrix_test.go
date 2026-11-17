@@ -19,6 +19,9 @@ package acceptance_test
 
 import (
 	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -228,6 +231,10 @@ func assertTopologyDoctor(t *testing.T, run *helpers.TopologyRun, allowedFailure
 	// the message — the message is the operator's line and is free to change,
 	// these are the contract automation reads.
 	assertTopologyBeadsStore(t, report, run.Topology.CityStore, label)
+	logTopologyStoreClass(report, label)
+	if when == "after start" {
+		logControllerStoreLines(run, label)
+	}
 
 	allowed := make(map[string]bool, len(allowedFailures)+len(run.Topology.DoctorGaps))
 	for _, name := range allowedFailures {
@@ -244,6 +251,15 @@ func assertTopologyDoctor(t *testing.T, run *helpers.TopologyRun, allowedFailure
 		t.Logf("%s: %s — %s", r.Status, r.Name, r.Message)
 		switch r.Status {
 		case "error":
+			// The message alone cannot say WHICH orders were stale or why
+			// (ga-tyf38i: two failures that named nothing). The details can.
+			for i, d := range r.Details {
+				if i == 20 {
+					t.Logf("    ... %d more detail line(s)", len(r.Details)-i)
+					break
+				}
+				t.Logf("    %s", d)
+			}
 			if allowed[r.Name] {
 				continue
 			}
@@ -516,5 +532,85 @@ func assertStopRetiresTheScope(t *testing.T, run *helpers.TopologyRun, rigDir st
 	if live := helpers.DoltProcessesUnder(t, run.Upstream.DataDir); len(live) == 0 {
 		t.Errorf("%s: gc stop retired the external Dolt server it does not own (%s)",
 			run.Topology.Name, run.Upstream.Addr())
+	}
+}
+
+// diagnosticLine writes one ga-tyf38i diagnostic line to the test binary's
+// stdout. Unlike t.Logf it survives a passing, non-verbose run: Bazel keeps the
+// binary's stdout in test.log whatever the result, so a green run also says
+// which store it opened.
+func diagnosticLine(format string, args ...any) {
+	_, _ = fmt.Fprintf(os.Stdout, "ga-tyf38i diag: "+format+"\n", args...)
+}
+
+// logTopologyStoreClass names the store class this doctor run opened
+// (ga-tyf38i): the beads-store payload's store, preflight gate and reason. It
+// is the doctor process's open, not the controller's; logControllerStoreLines
+// prints the controller's own lines.
+func logTopologyStoreClass(report doctorReport, label string) {
+	for _, r := range report.Results {
+		if r.Name != "beads-store" || len(r.Payload) == 0 {
+			continue
+		}
+		var payload beadsStorePayloadDoc
+		if err := json.Unmarshal(r.Payload, &payload); err != nil {
+			diagnosticLine("%s: store class: unreadable beads-store payload: %v", label, err)
+			return
+		}
+		diagnosticLine("%s: store class (doctor's open): store=%q preflight_gate=%q preflight_reason=%q proxied_account=%t",
+			label, payload.Store, payload.PreflightGate, payload.PreflightReason, payload.Proxied != nil)
+		return
+	}
+	diagnosticLine("%s: store class: no beads-store payload in this doctor report", label)
+}
+
+// controllerStoreLineMarkers are the substrings of a controller log line that
+// say which store the controller opened or how its order gate read it
+// (ga-tyf38i): the native lane's decline, the order dispatcher's index and
+// live-read lines, and the store class names.
+var controllerStoreLineMarkers = []string{
+	"native_store", "order dispatch", "order-run index", "NativeDoltStore", "BdStore", "ProxiedStore",
+}
+
+// logControllerStoreLines prints, after every post-start doctor run, each
+// controller log line that names its store or its order gate's reads, from the
+// supervisor log and the city's own logs, up to 60 lines, and says so when
+// there are none. It reads files in Go, never through a shell.
+func logControllerStoreLines(run *helpers.TopologyRun, label string) {
+	var files []string
+	if home := run.Env.Get("GC_HOME"); home != "" {
+		files = append(files, filepath.Join(home, "supervisor.log"))
+	}
+	for _, pat := range []string{
+		filepath.Join(run.City.Dir, ".gc", "*.log"),
+		filepath.Join(run.City.Dir, ".gc", "runtime", "*.log"),
+	} {
+		matches, _ := filepath.Glob(pat)
+		files = append(files, matches...)
+	}
+	printed := 0
+	for _, f := range files {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			diagnosticLine("%s: controller store lines: %s: %v", label, f, err)
+			continue
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			for _, m := range controllerStoreLineMarkers {
+				if !strings.Contains(line, m) {
+					continue
+				}
+				if printed == 60 {
+					diagnosticLine("%s: controller store lines: stopped at 60", label)
+					return
+				}
+				diagnosticLine("%s: controller store line [%s]: %s", label, filepath.Base(f), line)
+				printed++
+				break
+			}
+		}
+	}
+	if printed == 0 {
+		diagnosticLine("%s: controller store lines: none in %d log file(s): %s", label, len(files), strings.Join(files, ", "))
 	}
 }

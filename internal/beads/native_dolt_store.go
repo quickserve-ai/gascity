@@ -13,6 +13,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/beads/contract"
+	"github.com/gastownhall/gascity/internal/fsys"
 	beadslib "github.com/steveyegge/beads"
 	"github.com/steveyegge/beads/issueops"
 )
@@ -309,6 +311,21 @@ func withWithheldPrefixesLocked(prefixes ...string) (func(), error) {
 	}, nil
 }
 
+// workspaceAutoStartOpenEnv is the one setting a withheld-env open carries over
+// from the workspace itself. The library reads dolt.auto-start only on bd's CLI
+// path, so with the ambient BEADS_DOLT_AUTO_START withheld, an open of a
+// workspace saying false still starts a dolt sql-server beside it when none is
+// listening (ga-y7lmi0). A config that exists but cannot be read leaves the
+// policy unknown, and unknown does not start a server: the open itself still
+// proceeds, as it did.
+func workspaceAutoStartOpenEnv(scopeRoot string) map[string]string {
+	disabled, err := contract.ReadAutoStartDisabled(fsys.OSFS{}, filepath.Join(scopeRoot, ".beads", "config.yaml"))
+	if err == nil && !disabled {
+		return nil
+	}
+	return map[string]string{"BEADS_DOLT_AUTO_START": "0"}
+}
+
 // openNativeStorageWithoutAmbientEnvWithCredentialCommand opens native
 // storage while holding the same process-environment lock used by snapshots
 // and ordinary native opens. The whole BEADS_ namespace is withheld before
@@ -324,7 +341,7 @@ func openNativeStorageWithoutAmbientEnvWithCredentialCommand(ctx context.Context
 	}
 	defer restoreNamespace()
 
-	restoreEnv, err := withNativeDoltOpenEnvAndCredentialCommandLocked(nil, credentialCommand)
+	restoreEnv, err := withNativeDoltOpenEnvAndCredentialCommandLocked(workspaceAutoStartOpenEnv(scopeRoot), credentialCommand)
 	if err != nil {
 		return nil, "", err
 	}
@@ -418,10 +435,31 @@ type NativeDoltStore struct {
 	// directly over a storage value.
 	listPushableTypes map[string]bool
 
+	// listNotClosedStatus is the scope's not-closed status set as read at
+	// open (loadListNotClosedStatus), kept for the open-time warning and
+	// tests. An opted-in listing does NOT push it: it reads the vocabulary
+	// afresh each time (readListNotClosedStatus), so a status added to
+	// status.custom later is pushed too.
+	listNotClosedStatus string
+
 	// typePushdownOff latches when the backend refused a pushed issue type:
 	// the scope was provisioned without gc's type vocabulary. Listings then
 	// filter type Go-side only, for the store's lifetime.
 	typePushdownOff atomic.Bool
+	// statusPushdownOff latches when the backend refused the pushed
+	// not-closed status set (disableStatusPushdown).
+	statusPushdownOff atomic.Bool
+
+	// listOutsideProbe overrides the not-closed guard probe in tests; nil is
+	// nativeListOutsideRows.
+	listOutsideProbe nativeListOutsideProbe
+	// statusRefusalWarned latches after the one warning that the reader refused
+	// a status this scope's current status.custom names. Each such listing still
+	// counts as a guard fallback.
+	statusRefusalWarned atomic.Bool
+	// guardNoSQLWarned latches after the one warning that this store's storage
+	// has no SQL handle for the not-closed guard.
+	guardNoSQLWarned atomic.Bool
 
 	// logger receives the list pushdown's diagnostics. Nil is slog.Default(),
 	// read at call time.
@@ -680,6 +718,7 @@ func newNativeDoltStoreAtWithCredentialCommand(parent context.Context, scopeRoot
 		opt(store)
 	}
 	store.loadListPushableTypes(ctx)
+	store.loadListNotClosedStatus(ctx)
 	return store, nil
 }
 
@@ -696,6 +735,7 @@ func newNativeDoltStoreAtWithoutAmbientEnv(parent context.Context, scopeRoot, cr
 		opt(store)
 	}
 	store.loadListPushableTypes(ctx)
+	store.loadListNotClosedStatus(ctx)
 	return store, nil
 }
 

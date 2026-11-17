@@ -136,6 +136,29 @@ func scanActiveMatches(f *os.File, filter Filter, needles [][]byte, matches func
 	return result, nil
 }
 
+// ReadActiveTypes returns the events in the active log at path whose Type is
+// one of types, in seq order, reading no archive whatever the active log holds:
+// a missing log is an empty result, not a fall-through to the newest archive as
+// WalkFilteredTypesNewestFirst's first callback would be. Lines that cannot
+// match are skipped before decoding, so the cost is one pass over the file plus
+// a decode per match (pl-tfwh).
+func ReadActiveTypes(path string, types []string) ([]Event, error) {
+	if len(types) == 0 {
+		return nil, fmt.Errorf("ReadActiveTypes: no types given")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("reading events: %w", err)
+	}
+	defer f.Close() //nolint:errcheck // read-only file
+	return scanActiveMatches(f, Filter{}, typeNeedles(Filter{}, types), func(e Event) bool {
+		return slices.Contains(types, e.Type)
+	})
+}
+
 // ReadNewestArchiveTypes returns the events in the newest retained archive
 // beside the log at path whose Type is one of types, in seq order. The active
 // log and every older archive are left unread, so the cost is one archive

@@ -55,6 +55,9 @@ func TestCacheFullScanQueryShape(t *testing.T) {
 	if q.IncludeClosed {
 		t.Error("IncludeClosed = true, want false (scan is O(active beads) by design)")
 	}
+	if !q.CompleteActive {
+		t.Error("CompleteActive = false, want true (absence from the scan is read as a close, so no backing may narrow it)")
+	}
 	if q.Status != "" {
 		t.Errorf("Status = %q, want empty (status filters would shrink the authoritative set)", q.Status)
 	}

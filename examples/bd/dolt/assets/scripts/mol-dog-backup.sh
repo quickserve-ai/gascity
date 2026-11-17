@@ -16,7 +16,10 @@ PACK_DIR="${GC_PACK_DIR:-$(CDPATH= cd -- "$(dirname "${BASH_SOURCE[0]}")/../.." 
 # shellcheck disable=SC1091
 . "$PACK_DIR/assets/scripts/_bounded.sh"
 # _backup_stamp.sh carries write_local_backup_sync_stamp (ga-g3p5rm): the
-# local-backup freshness stamp mol-dog-doctor.sh dates.
+# local-backup freshness stamp mol-dog-doctor.sh dates. It writes under
+# PACK_STATE_DIR, which runtime.sh sets and nothing exports, and does nothing at
+# all without it, so this script must set it the way runtime.sh does.
+PACK_STATE_DIR="${GC_PACK_STATE_DIR:-${GC_CITY_RUNTIME_DIR:-$GC_CITY_PATH/.gc/runtime}/packs/dolt}"
 . "$PACK_DIR/assets/scripts/_backup_stamp.sh"
 # shellcheck disable=SC1091
 . "$PACK_DIR/assets/scripts/_notify.sh"
@@ -24,6 +27,10 @@ PACK_DIR="${GC_PACK_DIR:-$(CDPATH= cd -- "$(dirname "${BASH_SOURCE[0]}")/../.." 
 CITY_ABS="$(cd "$GC_CITY_PATH" 2>/dev/null && pwd -P || printf '%s\n' "$GC_CITY_PATH")"
 OFFSITE_PATH="${GC_BACKUP_OFFSITE_PATH:-}"
 BACKUP_ARTIFACT_DIR="${GC_BACKUP_ARTIFACT_DIR:-$CITY_ABS/.dolt-backup}"
+# Dolt stores a backup URL without a trailing slash; match its spelling.
+while [ "${BACKUP_ARTIFACT_DIR%/}" != "$BACKUP_ARTIFACT_DIR" ] && [ "$BACKUP_ARTIFACT_DIR" != "/" ]; do
+    BACKUP_ARTIFACT_DIR="${BACKUP_ARTIFACT_DIR%/}"
+done
 BACKUP_LOCK_FILE="${GC_DOLT_BACKUP_LOCK_FILE:-$CITY_ABS/.gc/runtime/packs/dolt/backup-sync.lock}"
 BACKUP_LOCK_WAIT_SECONDS="${GC_DOLT_BACKUP_LOCK_WAIT_SECONDS:-5}"
 # Wall-clock bound for one `bd backup sync` attempt, and how many attempts a
@@ -222,6 +229,7 @@ ensure_backup_destination() {
     fi
     if [ "$(printf '%s' "$status" | jq -r '.dolt.configured // false' 2>/dev/null)" = "true" ]; then
         rm -f "$err_file"
+        printf '%s' "$status" | jq -r '.dolt.backup_url // empty' 2>/dev/null || true
         return 0
     fi
     url="file://$BACKUP_ARTIFACT_DIR/$db"
@@ -237,6 +245,7 @@ ensure_backup_destination() {
     fi
     rm -f "$err_file"
     echo "backup: $SCOPE_LABEL: auto-configured missing backup destination -> $url" >&2
+    printf '%s' "$url"
 }
 
 sync_scope() {
@@ -311,6 +320,7 @@ database_selected() {
 }
 
 SCOPE_SPECS="city"
+SUSPENDED=0
 if RIG_LIST=$(cd "$CITY_ABS" && run_bounded "$BACKUP_BD_TIMEOUT_SECS" gc rig list --json 2>/dev/null); then
     while IFS= read -r rig_name; do
         [ -n "$rig_name" ] || continue
@@ -320,6 +330,21 @@ rig $rig_name"
     # retired proxy and Dolt, and nothing writes to it while it is suspended,
     # so its backup waits for it to resume.
     done < <(printf '%s\n' "$RIG_LIST" | jq -r '.rigs[]? | select((.hq // false) == false and (.suspended // false) == false) | .name // empty' 2>/dev/null)
+    # A rig left cold is still a store this run did not back up, so the run
+    # declares it rather than reporting success over it (ga-wcc3ry: a selected
+    # database went 42 h without a backup while every run read "success"). Its
+    # database name is read from the rig's prefix, never from bd, which would
+    # wake it. With GC_BACKUP_DATABASES set, only a rig whose prefix it selects
+    # is declared; a cold rig with no prefix cannot be matched and is not.
+    while IFS=$'\t' read -r rig_name rig_prefix; do
+        [ -n "$rig_name" ] || continue
+        if [ -n "$DATABASE_FILTER" ] && ! database_selected "$rig_prefix"; then
+            continue
+        fi
+        SUSPENDED=$((SUSPENDED + 1))
+        echo "backup: rig:$rig_name is suspended; its store${rig_prefix:+ ($rig_prefix)} is not backed up until it resumes" >&2
+        outcome_scope_skipped "rig:$rig_name" "rig suspended"
+    done < <(printf '%s\n' "$RIG_LIST" | jq -r '.rigs[]? | select((.hq // false) == false and (.suspended // false) == true) | [(.name // ""), (.prefix // "")] | @tsv' 2>/dev/null)
 else
     echo "backup: gc rig list failed; backing up the city scope only" >&2
     outcome_scope_skipped "rigs" "rig list unavailable"
@@ -389,8 +414,14 @@ $db
         SYNCED=$((SYNCED + 1))
         # Stamp ONLY on exit 0 (ga-g3p5rm). The doctor dog dates each database's
         # local backup from this stamp and never from an artifact mtime, because
-        # a killed sync writes chunk files on the failure path too.
-        write_local_backup_sync_stamp "$db" "$BACKUP_ARTIFACT_DIR"
+        # a killed sync writes chunk files on the failure path too. The stamp
+        # names the destination bd reported, which a registration made elsewhere
+        # can make different from the artifact dir: readers bind on it, so it
+        # must say where the sync went. No local destination, no stamp.
+        case "$dest_detail" in
+            file://*/"$db") write_local_backup_sync_stamp "$db" "$(printf '%s' "${dest_detail#file://}" | sed 's|/[^/]*$||')" ;;
+            *) echo "backup: $SCOPE_LABEL: synced, but bd reports no local destination; no stamp written" >&2 ;;
+        esac
     else
         append_failed_db "$db(sync failed)"
         append_failed_detail "$db" "$sync_failure_detail"
@@ -460,5 +491,8 @@ elif [ "$OUTCOME_SCOPES_JSON" != "[]" ] || [ "$FAILED_COUNT" -gt 0 ]; then
 fi
 
 SUMMARY="backup — synced: $SYNCED/$TOTAL, unsupported: $UNSUPPORTED, offsite: $OFFSITE_STATUS"
+if [ "$SUSPENDED" -gt 0 ]; then
+    SUMMARY="$SUMMARY, suspended: $SUSPENDED"
+fi
 dolt_notify_done "$SUMMARY"
 echo "backup: $SUMMARY"
