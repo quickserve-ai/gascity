@@ -163,9 +163,15 @@ type ListQuery struct {
 	// 2026-11-10T08:52:17Z, ga-tyf38i). Only a store that can push must write
 	// narrowed when it did.
 	PushReport *PushNotClosedOutcome
-	// Live bypasses CachingStore and reads from the backing store. Other Store
-	// implementations ignore it. Use it only for lifecycle gates that must
-	// observe external mutations immediately.
+	// Live bypasses CachingStore and reads from the backing store. Use it only
+	// for lifecycle gates that must observe external mutations immediately.
+	// A Live Status "open" is the backing's own answer, which on a bd-backed
+	// store is bd's raw "open": a bead bd records as blocked, deferred or
+	// another parked status reads as "open" but is not in it. NativeDoltStore
+	// reads the flag to push that raw status (nativeListPushesRawOpen); other
+	// backing stores ignore it. A non-Live "open" through CachingStore is gc's
+	// folded answer only while the cache serves it: the cache's fallback
+	// re-issues the read Live, so a cold or dirty cache returns the raw answer.
 	Live bool
 	Sort SortOrder
 	// AllowBackingCreatedLimit lets a backing store satisfy a bounded

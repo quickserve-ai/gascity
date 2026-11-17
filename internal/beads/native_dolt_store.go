@@ -3634,6 +3634,7 @@ func beadFromNativeIssue(issue *beadslib.Issue) (Bead, error) {
 		DeferUntil:           cloneTimePtr(issue.DeferUntil),
 		CloseReason:          bdCloseReason(status, issue.CloseReason),
 		IndefinitelyDeferred: indefinitelyDeferred,
+		SourceStatus:         string(issue.Status),
 		Revision:             issue.RowVersion,
 	}
 	for _, dep := range issue.Dependencies {
