@@ -37,7 +37,7 @@ jobs:
   # run yet, an expired artifact, an API error) means fresh.
   decide:
     name: fresh on host drift
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       actions: read
@@ -127,7 +127,7 @@ jobs:
     name: remember the fresh run
     needs: [decide, bazel]
     if: needs.decide.outputs.key != '' && needs.decide.outputs.fresh == 'true' && needs.bazel.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read

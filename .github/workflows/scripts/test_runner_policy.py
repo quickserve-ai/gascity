@@ -82,7 +82,7 @@ class RunnerPolicyTests(unittest.TestCase):
 
         self.assertFalse(use_blacksmith)
         self.assertIn("GitHub-hosted", reason)
-        self.assertEqual(runners["runner_32vcpu"], "ubuntu-latest")
+        self.assertEqual(runners["runner_32vcpu"], "ubuntu-24.04")
         self.assertEqual(runners["runner_macos"], "macos-15")
 
     def test_upstream_repository_keeps_blacksmith(self) -> None:
