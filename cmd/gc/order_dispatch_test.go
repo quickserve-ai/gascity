@@ -1681,11 +1681,17 @@ func TestOrderDispatchCooldownNotDueSkipsStrictOpenWorkScan(t *testing.T) {
 	store := &strictOpenWorkListCountingStore{Store: beads.NewMemStore()}
 	now := time.Date(2026, 6, 3, 4, 40, 0, 0, time.UTC)
 
-	if _, err := store.Create(beads.Bead{
+	// A closed tracking bead is what makes the order not due: a plain bead
+	// carrying the label is no run of the order (orders.IsRunRecord).
+	recent, err := store.Create(beads.Bead{
 		Title:     "recent run",
-		Labels:    []string{"order-run:test-order"},
+		Labels:    []string{"order-run:test-order", "order-tracking"},
 		CreatedAt: now.Add(-5 * time.Minute),
-	}); err != nil {
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(recent.ID); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1705,6 +1711,9 @@ func TestOrderDispatchCooldownNotDueSkipsStrictOpenWorkScan(t *testing.T) {
 
 	if store.strictOpenWorkLists != 0 {
 		t.Fatalf("strict open-work scans = %d, want 0 for not-due order", store.strictOpenWorkLists)
+	}
+	if all := trackingBeads(t, store.Store, "order-run:test-order"); len(all) != 1 {
+		t.Fatalf("run records = %d, want only the seeded one: the order must not have been due", len(all))
 	}
 }
 

@@ -115,6 +115,13 @@ Entries older than the retention window are pruned on each run.
 | `GC_CASCADE_NUDGE_LOOKBACK` | `5m` | Event lookback window |
 | `GC_CASCADE_NUDGE_RETENTION` | `1h` | Dedup-entry retention (Ns/Nm/Nh) |
 
+**Wisp closes are skipped.** A closed id matching `*-wisp-*` gets no dependency
+lookup. A dependent wired to a wisp root (`gc formula cook` with attach) gets no
+cascade nudge when the wisp closes. Each pass writes
+`looked_up=N skipped_wisps=N nudged=N` to
+`$GC_PACK_STATE_DIR/cascade-nudge-on-blocker-close-passes.log` (last 2,000
+lines), since an order's stdout is kept only on failure.
+
 ## Dependencies
 
 Both nudge scripts use only `gc`, `bd`, and `jq` — already required by the

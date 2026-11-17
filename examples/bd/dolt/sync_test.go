@@ -28,6 +28,9 @@ func syncFilteredEnv() []string {
 		"PATH", "GC_DOLT_HOST", "GC_DOLT_PORT", "GC_DOLT_USER",
 		"GC_DOLT_PASSWORD", "GC_DOLT_DATA_DIR", "GC_CITY_PATH", "GC_PACK_DIR",
 		"GC_DOLT_SYNC_PUSH_TIMEOUT_SECS", "GC_DOLT_SYNC_FETCH_TIMEOUT_SECS",
+		// The env park overrides the city's park file, so an ambient value would
+		// decide the file-source tests instead of the file (ga-p2xtt4).
+		"GC_DOLT_MIRROR_PARKED",
 	)
 }
 

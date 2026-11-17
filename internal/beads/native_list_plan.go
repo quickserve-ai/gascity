@@ -39,13 +39,14 @@ import (
 // without a server: each request costs one backend listing, and a request that
 // NativeListRequestKeyed reports as unkeyed reads the whole ledger.
 func NativeListPlan(query ListQuery) []issueops.ListRequest {
-	return nativeListPlan(query, nativeListDefaultPushableTypes)
+	return nativeListPlan(query, nativeListDefaultPushableTypes, "")
 }
 
-// nativeListPlan is NativeListPlan over a store's own pushable type set. A nil
-// set pushes no type at all.
-func nativeListPlan(query ListQuery, pushableTypes map[string]bool) []issueops.ListRequest {
-	base := nativeListRequestFromListQuery(query, pushableTypes)
+// nativeListPlan is NativeListPlan over a store's own pushable type set and
+// not-closed status set. A nil type set pushes no type at all; an empty status
+// set pushes no not-closed predicate.
+func nativeListPlan(query ListQuery, pushableTypes map[string]bool, notClosed string) []issueops.ListRequest {
+	base := nativeListRequestFromListQuery(query, pushableTypes, notClosed)
 	assignees := nativeListFanOutAssignees(query)
 	if len(assignees) == 0 {
 		return nativeListIDChunks(base, query.IDs)
@@ -106,6 +107,13 @@ func nativeListFanOutAssignees(query ListQuery) []string {
 		out = append(out, assignee)
 	}
 	return out
+}
+
+// nativeListCanPushNotClosed reports whether query's plan can carry the
+// not-closed set: it opted in and leaves the status to the default. It says
+// nothing of whether this store has a set to push.
+func nativeListCanPushNotClosed(query ListQuery) bool {
+	return query.PushNotClosed && query.Status == "" && !query.IncludeClosed && !query.CompleteActive
 }
 
 // nativeListPushableStatus reports whether a gc status maps one-to-one onto a
@@ -199,6 +207,136 @@ func (s *NativeDoltStore) loadListPushableTypes(ctx context.Context) {
 	s.listPushableTypes = pushable
 }
 
+// nativeListBuiltinNotClosedStatuses is bd's built-in status vocabulary less
+// closed. mapBdStatus folds every bd status but closed and in_progress into
+// gc's "open", so gc's not-closed default is exactly every bd status but
+// closed. pinned and hooked are listed for a second reason: naming either in
+// the request's Status lifts the pinned-flag predicate, as AllFlag lifts the
+// status exclusions (see issueops.ListRequest.Status).
+var nativeListBuiltinNotClosedStatuses = []string{"open", "in_progress", "blocked", "deferred", "pinned", "hooked"}
+
+// nativeListNotClosedStatusFor returns the not-closed OR set for a scope whose
+// status.custom setting is customSetting, and false when the setting does not
+// parse. The setting is bd's comma-separated list, each entry a name with an
+// optional ":category" (the category never makes a status closed to gc:
+// mapBdStatus reads the name). A custom status that a listing left out would be
+// hidden from every no-Status read of the scope, so anything this cannot read
+// as a plain name pushes nothing rather than guessing.
+func nativeListNotClosedStatusFor(customSetting string) (string, bool) {
+	statuses := append([]string(nil), nativeListBuiltinNotClosedStatuses...)
+	seen := make(map[string]bool, len(statuses))
+	for _, status := range statuses {
+		seen[status] = true
+	}
+	for _, entry := range strings.Split(customSetting, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		name, _, _ := strings.Cut(entry, ":")
+		name = strings.TrimSpace(name)
+		if name == "closed" || !nativeListStatusNameOK(name) {
+			return "", false
+		}
+		if !seen[name] {
+			seen[name] = true
+			statuses = append(statuses, name)
+		}
+	}
+	return strings.Join(statuses, ","), true
+}
+
+// nativeListStatusNameOK reports whether name is a plain status name: letters,
+// digits, underscore and hyphen. It is the request's OR-set separator and the
+// SQL it reaches that make anything else unsafe to pass on.
+func nativeListStatusNameOK(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, r := range name {
+		if r != '_' && r != '-' && (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') {
+			return false
+		}
+	}
+	return true
+}
+
+// loadListNotClosedStatus records the store's not-closed status set from its
+// scope's status.custom setting at open, read through the workspace-config
+// role as loadListPushableTypes reads types.infra, and warns once if it cannot
+// be read. Opted-in listings do not use this copy: each reads the setting
+// afresh (readListNotClosedStatus), so a custom status added after open is
+// pushed by the next one.
+//
+// WHAT THE SET CANNOT NAME until ExcludeStatus (beads #7647) lets the pushdown
+// say "not closed" directly: a row whose status is in no current status.custom,
+// either a name since removed from the setting while rows still carry it, or
+// one kept only in a server's config.yaml. A pushed read would hide it, so
+// guardNotClosed probes for such rows before each push and reads that listing
+// unpushed when it finds one or cannot tell, and listVocabularyMoved re-reads
+// the setting after the push so a status registered during it and still
+// registered costs that listing the pushdown. What is left: a row that moves,
+// between the probe and the read, into a status no status.custom names (kept
+// only in a config.yaml, written past validation, or added and removed again
+// within the read). That listing misses it; the next probe names it unless the
+// status is by then gone from the row.
+//
+// THE SAME RESIDUE as types.infra: a status.custom kept only in a server's
+// config.yaml is invisible to the workspace-config role, so its statuses are
+// missing from the set and any row in one costs that scope the pushdown; such
+// a status must also be stored as the setting.
+func (s *NativeDoltStore) loadListNotClosedStatus(ctx context.Context) {
+	storage, release, err := s.acquireStorage()
+	if err != nil {
+		s.listLogger().Warn("native bead store: cannot read the scope's status.custom setting; listing without the not-closed pushdown",
+			"prefix", s.idPrefix, "err", err)
+		return
+	}
+	defer release()
+	set, err := notClosedStatusFromStorage(ctx, storage)
+	if err == nil {
+		s.listNotClosedStatus = set
+		return
+	}
+	s.listLogger().Warn("native bead store: cannot read the scope's status.custom setting; listing without the not-closed pushdown for this store",
+		"prefix", s.idPrefix, "err", err)
+}
+
+// readListNotClosedStatus is the not-closed set for one opted-in read, read
+// afresh from storage's status.custom setting so a name added after open is
+// in it. An unreadable or unparsable setting pushes nothing ("") for this
+// read, the full read the listing always made, and counts as a fallback on
+// tally: no probe runs, but the pushdown this listing opted into was lost.
+func (s *NativeDoltStore) readListNotClosedStatus(ctx context.Context, storage beadslib.Storage, tally *nativeListTally) string {
+	set, err := notClosedStatusFromStorage(ctx, storage)
+	if err != nil {
+		tally.guardFallbacks++
+		s.listLogger().Warn("native bead store: cannot read status.custom for an opted-in listing; reading it unpushed",
+			"prefix", s.idPrefix, "err", err, "guard_stats", s.listCounters.guardText(*tally))
+		return ""
+	}
+	return set
+}
+
+func notClosedStatusFromStorage(ctx context.Context, storage beadslib.Storage) (string, error) {
+	if storage == nil {
+		return "", fmt.Errorf("no storage")
+	}
+	settings, err := storage.WorkspaceConfig()
+	if err != nil {
+		return "", err
+	}
+	result, err := settings.GetSetting(ctx, issueops.GetSettingRequest{Key: issueops.SettingKeyStatusCustom})
+	if err != nil {
+		return "", err
+	}
+	set, ok := nativeListNotClosedStatusFor(result.Value)
+	if !ok {
+		return "", fmt.Errorf("status.custom %q does not parse as a status list", result.Value)
+	}
+	return set, nil
+}
+
 // nativeListTypeRefused reports whether err is the role refusing a pushed
 // type: the wire's validation problem, or the local filter builder's
 // unknown-type error, which carries no sentinel.
@@ -233,6 +371,17 @@ type ListRequestStats struct {
 	// Rows is the number of rows the backend returned across all requests,
 	// before any client-side filtering.
 	Rows int64
+	// GuardRuns is the number of not-closed guard probes run for opted-in
+	// listings, counting a retried List's last attempt only.
+	GuardRuns int64
+	// GuardRows is the number of rows those probes found outside the pushed
+	// set. Each probe reports at most nativeListGuardRowLimit.
+	GuardRows int64
+	// GuardFallbacks is the number of opted-in listings sent down the full
+	// unpushed read because status.custom could not be used or a probe found
+	// rows or failed. A status.custom failure runs no probe, so this can pass
+	// GuardRuns.
+	GuardFallbacks int64
 }
 
 // listRequestCounter is implemented by a store that counts the backend listing
@@ -260,6 +409,10 @@ type nativeListCounters struct {
 	requests atomic.Int64
 	unkeyed  atomic.Int64
 	rows     atomic.Int64
+
+	guardRuns      atomic.Int64
+	guardRows      atomic.Int64
+	guardFallbacks atomic.Int64
 }
 
 func (c *nativeListCounters) noteList() { c.lists.Add(1) }
@@ -272,6 +425,10 @@ type nativeListTally struct {
 	requests int64
 	unkeyed  int64
 	rows     int64
+
+	guardRuns      int64
+	guardRows      int64
+	guardFallbacks int64
 }
 
 func (t *nativeListTally) noteRequest(req issueops.ListRequest, rows int) {
@@ -282,10 +439,19 @@ func (t *nativeListTally) noteRequest(req issueops.ListRequest, rows int) {
 	t.rows += int64(rows)
 }
 
-func (c *nativeListCounters) commit(t nativeListTally) {
+// commit adds a finished attempt's counts. It returns the store's guard run
+// count when t ran the guard, and 0 when it did not. Runs are added last, so a
+// reader that sees this run's count sees its rows and fallback too.
+func (c *nativeListCounters) commit(t nativeListTally) int64 {
 	c.requests.Add(t.requests)
 	c.unkeyed.Add(t.unkeyed)
 	c.rows.Add(t.rows)
+	c.guardRows.Add(t.guardRows)
+	c.guardFallbacks.Add(t.guardFallbacks)
+	if t.guardRuns == 0 {
+		return 0
+	}
+	return c.guardRuns.Add(t.guardRuns)
 }
 
 func (c *nativeListCounters) snapshot() ListRequestStats {
@@ -294,6 +460,10 @@ func (c *nativeListCounters) snapshot() ListRequestStats {
 		Requests: c.requests.Load(),
 		Unkeyed:  c.unkeyed.Load(),
 		Rows:     c.rows.Load(),
+
+		GuardRuns:      c.guardRuns.Load(),
+		GuardRows:      c.guardRows.Load(),
+		GuardFallbacks: c.guardFallbacks.Load(),
 	}
 }
 
@@ -378,6 +548,45 @@ func (s *NativeDoltStore) disableTypePushdown(issueType string, err error) {
 	}
 	s.listLogger().Warn("native bead store: backend refused a pushed issue type; listing without type pushdown for this store (register gc's custom types in this scope: gc doctor --fix)",
 		"prefix", s.idPrefix, "issue_type", issueType, "err", err)
+}
+
+// disableStatusPushdown latches the not-closed pushdown off for this store
+// after the backend refused the pushed status set without quoting a name and
+// answered the same request without it, and warns once naming the store and
+// the set: answers
+// stay exact (closed rows are dropped Go-side), the opted-in listing just
+// reads the whole ledger again until the process restarts.
+func (s *NativeDoltStore) disableStatusPushdown(set string, err error) {
+	if !s.statusPushdownOff.CompareAndSwap(false, true) {
+		return
+	}
+	s.listLogger().Warn("native bead store: backend refused the pushed not-closed status set; listing without it for this store until restart (a status.custom name the scope no longer accepts)",
+		"prefix", s.idPrefix, "refused_status", nativeListRefusedStatusName(err), "status_set", set, "err", err)
+}
+
+// nativeListRefusedStatusName is the status name a refusal quotes
+// (`invalid status "name"`), or "" when it quotes none.
+func nativeListRefusedStatusName(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	i := strings.Index(msg, `invalid status "`)
+	if i < 0 {
+		return ""
+	}
+	rest := msg[i+len(`invalid status "`):]
+	if j := strings.IndexByte(rest, '"'); j >= 0 {
+		return rest[:j]
+	}
+	return ""
+}
+
+// nativeListStatusRefused reports whether err is the backend refusing a
+// pushed status name: the wire's validation problem, or an unknown-status
+// message from the local filter builder.
+func nativeListStatusRefused(err error) bool {
+	return errors.Is(err, issueops.ErrValidation) || strings.Contains(err.Error(), "invalid status")
 }
 
 // noteUnkeyedPlan is the whole-ledger tripwire: a plan request that carries no

@@ -127,6 +127,10 @@
 #                       notify-once-per-reason-forever (the marker never
 #                       re-mails on its own once a given reason has been
 #                       reported, even if left unresolved indefinitely).
+#   GC_DOLT_REMOTE_USER_<DB>_<REMOTE>    (optional) — username this database
+#                                         presents to that remote for its
+#                                         fetch and push; see
+#                                         remote_identity_sql_args in runtime.sh.
 #   GC_DOLT_COMPACT_REMOTE               (optional) — remote to fetch/push.
 #                                         Defaults to origin when present;
 #                                         ambiguous multi-remote stores fail.
@@ -1066,7 +1070,8 @@ backup_remotes() {
 fetch_remote() {
   db="$1"
   remote="$2"
-  dolt_query "$db" "CALL DOLT_FETCH('$remote')"
+  remote_ident=$(remote_identity_sql_args "$db" "$remote") || return 1
+  dolt_query "$db" "CALL DOLT_FETCH(${remote_ident}'$remote')"
 }
 
 # skip_fetch_for_db reports whether CALL DOLT_FETCH must be bypassed for the
@@ -1115,12 +1120,13 @@ push_remote_refspec() {
   else
     refspec_arg="$local_branch:$remote_branch"
   fi
+  remote_ident=$(remote_identity_sql_args "$db" "$remote") || return 1
   export DOLT_CLI_PASSWORD="${GC_DOLT_PASSWORD:-}"
   run_bounded "$push_timeout" \
     dolt --host "$host" --port "$GC_DOLT_PORT" \
     --user "$GC_DOLT_USER" --no-tls \
     --use-db "$db" \
-    sql -r tabular -q "CALL DOLT_PUSH('--force', '--set-upstream', '$remote', '$refspec_arg')"
+    sql -r tabular -q "CALL DOLT_PUSH(${remote_ident}'--force', '--set-upstream', '$remote', '$refspec_arg')"
 }
 
 # preflight_counts — write "<table> <count> <value-hash>" lines for the user

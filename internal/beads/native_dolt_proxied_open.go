@@ -127,6 +127,7 @@ func OpenNativeDoltStoreAtProxied(parent context.Context, scopeRoot string, env 
 		opt(store)
 	}
 	store.loadListPushableTypes(ctx)
+	store.loadListNotClosedStatus(ctx)
 	return store, nil
 }
 

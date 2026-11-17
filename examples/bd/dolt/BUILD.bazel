@@ -101,6 +101,7 @@ go_test(
     srcs = [
         "agent_workdir_test.go",
         "backup_order_test.go",
+        "backup_registration_test.go",
         "cleanup_test.go",
         "compact_backup_remotes_test.go",
         "compact_flatten_window_real_dolt_test.go",
@@ -115,6 +116,7 @@ go_test(
         "dog_prompt_test.go",
         "health_order_test.go",
         "health_test.go",
+        "local_backup_health_test.go",
         "logs_test.go",
         "main_test.go",
         "port_resolve_test.go",
@@ -122,6 +124,7 @@ go_test(
         "pull_remote_selection_test.go",
         "pull_test.go",
         "recover_host_test.go",
+        "remote_identity_test.go",
         "restart_test.go",
         "runtime_bounded_test.go",
         "sql_test.go",

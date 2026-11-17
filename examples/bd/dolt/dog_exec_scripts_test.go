@@ -753,7 +753,7 @@ case "$query" in
     esac
     exit 0
     ;;
-  *"DOLT_FETCH('origin')"*)
+  *"DOLT_FETCH('origin')"*|*"DOLT_FETCH('--user', 'cherub', 'origin')"*)
     if [ "$mode" = "remote_fetch_failure" ]; then
       printf 'fetch unavailable\n' >&2
       exit 52
@@ -1439,7 +1439,7 @@ case "$query" in
     rm -rf -- "${GC_DOLT_DATA_DIR:-}/$db/.dolt/noms/oldgen"
     exit 0
     ;;
-  *"DOLT_PUSH('--force', '--set-upstream', 'origin', 'main')"*)
+  *"DOLT_PUSH('--force', '--set-upstream', 'origin', 'main')"*|*"DOLT_PUSH('--user', 'cherub', '--force', '--set-upstream', 'origin', 'main')"*)
     if [ "$mode" = "remote_push_failure" ] || [ "$mode" = "remote_empty_head_push_failure" ]; then
       printf 'push unavailable\n' >&2
       exit 53
@@ -5618,7 +5618,11 @@ func writeDoctorLocalSyncStamp(t *testing.T, cityPath, db string, syncedAt time.
 	if err := os.MkdirAll(stampDir, 0o755); err != nil {
 		t.Fatalf("mkdir local-backup-freshness: %v", err)
 	}
-	body := fmt.Sprintf("synced_at_epoch=%d\nartifact_dir=\n", syncedAt.Unix())
+	physical, err := filepath.EvalSymlinks(cityPath)
+	if err != nil {
+		t.Fatalf("resolve city path: %v", err)
+	}
+	body := fmt.Sprintf("synced_at_epoch=%d\nartifact_dir=%s\n", syncedAt.Unix(), filepath.Join(physical, ".dolt-backup"))
 	if err := os.WriteFile(filepath.Join(stampDir, db), []byte(body), 0o644); err != nil {
 		t.Fatalf("write sync stamp for %s: %v", db, err)
 	}

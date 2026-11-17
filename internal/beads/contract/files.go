@@ -235,6 +235,12 @@ func ReadIssuePrefix(fs fsys.FS, path string) (string, bool, error) {
 	return "", false, nil
 }
 
+// autoStartValueIsFalse reads a decoded dolt.auto-start scalar: any
+// capitalisation of false.
+func autoStartValueIsFalse(value string) bool {
+	return strings.EqualFold(strings.TrimSpace(value), "false")
+}
+
 // ReadAutoStartDisabled reports whether dolt.auto-start is disabled in config.
 func ReadAutoStartDisabled(fs fsys.FS, path string) (bool, error) {
 	doc, err := readConfigDoc(fs, path)
@@ -243,12 +249,15 @@ func ReadAutoStartDisabled(fs fsys.FS, path string) (bool, error) {
 			return false, nil
 		}
 		if value, ok := scanConfigLineValue(fs, path, "dolt.auto-start:"); ok {
-			return value == "false", nil
+			// A raw line still carries its comment; YAML starts one only
+			// after whitespace, so a hash inside a word is not one.
+			value, _, _ = strings.Cut(strings.ReplaceAll(value, "\t", " "), " #")
+			return autoStartValueIsFalse(value), nil
 		}
 		return false, err
 	}
 	if value, ok := configStringValue(mappingRoot(doc), "dolt.auto-start"); ok {
-		return value == "false", nil
+		return autoStartValueIsFalse(value), nil
 	}
 	return false, nil
 }

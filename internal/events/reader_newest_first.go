@@ -135,3 +135,84 @@ func scanActiveMatches(f *os.File, filter Filter, needles [][]byte, matches func
 	}
 	return result, nil
 }
+
+// ReadActiveTypes returns the events in the active log at path whose Type is
+// one of types, in seq order, reading no archive whatever the active log holds:
+// a missing log is an empty result, not a fall-through to the newest archive as
+// WalkFilteredTypesNewestFirst's first callback would be. Lines that cannot
+// match are skipped before decoding, so the cost is one pass over the file plus
+// a decode per match (pl-tfwh).
+func ReadActiveTypes(path string, types []string) ([]Event, error) {
+	if len(types) == 0 {
+		return nil, fmt.Errorf("ReadActiveTypes: no types given")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("reading events: %w", err)
+	}
+	defer f.Close() //nolint:errcheck // read-only file
+	return scanActiveMatches(f, Filter{}, typeNeedles(Filter{}, types), func(e Event) bool {
+		return slices.Contains(types, e.Type)
+	})
+}
+
+// ReadNewestArchiveTypes returns the events in the newest retained archive
+// beside the log at path whose Type is one of types, in seq order. The active
+// log and every older archive are left unread, so the cost is one archive
+// whatever the retained history holds. A missing directory or no archive at
+// all is an empty result, not an error.
+//
+// It serves readers whose active log is too young to hold what they need, as
+// right after a rotation, and who would otherwise fall back to a lookup per
+// item elsewhere (pl-yhyw).
+func ReadNewestArchiveTypes(path string, types []string) ([]Event, error) {
+	if len(types) == 0 {
+		return nil, fmt.Errorf("ReadNewestArchiveTypes: no types given")
+	}
+	dir := filepath.Dir(path)
+	archives, err := archiveFilesIn(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("listing event archives in %q: %w", dir, err)
+	}
+	if len(archives) == 0 {
+		return nil, nil
+	}
+	// archiveFilesIn sorts ascending by FirstSeq: the last is the newest.
+	newest := archives[len(archives)-1]
+	var evts []Event
+	err = streamArchive(filepath.Join(dir, newest.Basename), Filter{}, typeNeedles(Filter{}, types), func(e Event) bool {
+		if slices.Contains(types, e.Type) {
+			evts = append(evts, e)
+		}
+		return true
+	})
+	if err != nil {
+		return nil, fmt.Errorf("reading archive %q: %w", newest.Basename, err)
+	}
+	return evts, nil
+}
+
+// ArchiveCount reports how many retained archives sit beside the log at path.
+// A missing directory counts as none. A reader that took the newest archive
+// with ReadNewestArchiveTypes and then counts learns whether older retained
+// history went unread. Counting after the read errs toward "older history
+// exists": a rotation in between adds a newer archive and raises the count,
+// and retention reaps only archives past their age, which are no longer
+// retained history.
+func ArchiveCount(path string) (int, error) {
+	dir := filepath.Dir(path)
+	archives, err := archiveFilesIn(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("listing event archives in %q: %w", dir, err)
+	}
+	return len(archives), nil
+}
