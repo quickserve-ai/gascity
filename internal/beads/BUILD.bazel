@@ -254,6 +254,7 @@ go_test(
         "schema_cursor_drift_test.go",
         "session_key_hook_bd_integration_test.go",
         "session_key_hook_test.go",
+        "single_read_budget_test.go",
         "sqlite_sequence_floor_lock_test.go",
         "sqlite_sequence_test.go",
         "sqlite_store_atomic_close_test.go",

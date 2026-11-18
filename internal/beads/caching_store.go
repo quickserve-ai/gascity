@@ -1839,6 +1839,26 @@ func (c *CachingStore) beginFullPrime() (*fullPrimeCycle, bool) {
 	return c.startFullPrimeLocked(), true
 }
 
+// cacheFullPrimeSkipBound is how long reconcile defers to a running full
+// prime. It covers Prime's whole bounded cycle (three full-scan attempts of
+// cacheFullScanReadBudget each, plus the 5 s and 10 s retry delays) with a
+// minute to spare. Past it the prime is treated as hung and reconcile runs as
+// recovery, which is why the controller arms the reconciler at all while a
+// prime is still running (primeArmBound in cmd/gc; ga-yc0chj). It also ends
+// the skip for a cycle whose owner never cleared primeRunning.
+const cacheFullPrimeSkipBound = 3*cacheFullScanReadBudget + time.Minute
+
+// fullPrimeInFlight reports whether a full prime cycle has been running for
+// less than cacheFullPrimeSkipBound at now.
+func (c *CachingStore) fullPrimeInFlight(now time.Time) bool {
+	c.primeMu.Lock()
+	defer c.primeMu.Unlock()
+	if !c.primeRunning || c.lastFullPrimeStartedAt.IsZero() {
+		return false
+	}
+	return now.Sub(c.lastFullPrimeStartedAt) < cacheFullPrimeSkipBound
+}
+
 func (c *CachingStore) finishFullPrime(cycle *fullPrimeCycle, err error) {
 	c.primeMu.Lock()
 	defer c.primeMu.Unlock()
