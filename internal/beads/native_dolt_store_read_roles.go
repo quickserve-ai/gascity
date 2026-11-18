@@ -788,9 +788,10 @@ func filterReadyByWorkOutcomeFetchBlockers(ctx context.Context, reader issueops.
 // Everything else stays Go-side, and each has a reason the role's own contract
 // supplies:
 //
-//   - STATUS "open" and the not-closed default, because the request has no
-//     ExcludeStatus and gc's "open" is every bd status but closed and
-//     in_progress. "in_progress" and "closed" are exact: mapBdStatus maps them
+//   - STATUS "open" and the not-closed default are answered Go-side: gc's
+//     "open" is every bd status but closed and in_progress. The server is
+//     asked only to leave closed out (ExcludeStatus, nativeListExcludesClosed),
+//     which is exact. "in_progress" and "closed" are exact: mapBdStatus maps them
 //     one-to-one, and AllFlag keeps the pinned-flag default lifted under a
 //     named status. See nativeListReadRequest. The exception is a Live
 //     "open", which travels as bd's raw "open" (nativeListPushesRawOpen).
@@ -887,9 +888,10 @@ func nativeListRequestFromListQuery(query ListQuery, pushableTypes map[string]bo
 // THE COST THIS BUYS, recorded rather than discovered later: a durable-tier or
 // typed or not-closed listing now fetches the whole candidate set and cuts the
 // page in Go. That is the same class of cost as the wire's own L2 (a non-created
-// display order pages to exhaustion), and it is the price of not narrowing. It
-// ends when the request can spell an ExcludeStatus, a durable-plane selector and
-// a non-validating type filter — the upstream ask this re-point files.
+// display order pages to exhaustion), and it is the price of not narrowing.
+// ExcludeStatus now narrows closed rows out of that candidate set; a limit still
+// cannot ride until the request can also spell a durable-plane selector and a
+// non-validating type filter.
 func nativeListLimitPushdown(query ListQuery) int {
 	if query.Limit <= 0 {
 		return 0
