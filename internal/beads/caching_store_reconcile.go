@@ -123,14 +123,19 @@ func (c *CachingStore) reconcileIfDue(now time.Time) {
 	if c.reconcileGate != nil && !c.reconcileGate() {
 		return
 	}
-	if c.fullPrimeInFlight() {
+	if c.fullPrimeInFlight(now) {
 		// A full prime is already listing the whole store. The controller arms
 		// the reconciler after a bounded wait even while the initial prime
 		// still runs (primeArmBound in cmd/gc), and before the first prime
 		// lands nextReconcileDelay is always 0, so without this skip a second
 		// full scan would start beside the prime's on the same slow link
 		// (pl-nzyv, woodhouse's read). The prime's snapshot is at least as
-		// complete; the next poll reconciles once it has finished.
+		// complete; the next poll reconciles once it has finished. The skip is
+		// bounded (cacheFullPrimeSkipBound): a prime running past it is treated
+		// as hung, and this reconcile runs as the recovery primeArmBound exists
+		// for. This narrows overlap; it does not make prime and reconcile
+		// admission atomic (a prime that starts after this check can still
+		// overlap a reconcile, as before this change).
 		return
 	}
 	if c.nextReconcileDelay(now) == 0 && c.reconciling.CompareAndSwap(false, true) {

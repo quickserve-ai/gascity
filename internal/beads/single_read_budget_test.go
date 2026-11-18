@@ -280,6 +280,64 @@ func TestReconcileSkipsWhileAFullPrimeIsInFlight(t *testing.T) {
 	}
 }
 
+func TestReconcileRecoversFromAPrimeRunningPastTheSkipBound(t *testing.T) {
+	backing := &blockingFullScanStore{
+		MemStore: NewMemStore(),
+		entered:  make(chan struct{}, 4),
+		release:  make(chan struct{}),
+	}
+	if _, err := backing.MemStore.Create(Bead{Title: "one"}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	var mu sync.Mutex
+	now := time.Date(2026, 11, 18, 2, 0, 0, 0, time.UTC)
+	clock := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	cache := NewCachingStoreForTest(backing, nil, WithClock(clock))
+
+	primeDone := make(chan error, 1)
+	go func() { primeDone <- cache.Prime(context.Background()) }()
+	select {
+	case <-backing.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Prime never reached the backing List")
+	}
+
+	// The prime is hung past every bounded attempt it could make: reconcile
+	// must run as the recovery the controller armed it for.
+	mu.Lock()
+	now = now.Add(cacheFullPrimeSkipBound + time.Second)
+	mu.Unlock()
+	reconcileDone := make(chan struct{})
+	go func() {
+		cache.reconcileIfDue(cache.clockNow())
+		close(reconcileDone)
+	}()
+	select {
+	case <-backing.entered:
+	case <-reconcileDone:
+		t.Error("reconcile skipped a prime running past cacheFullPrimeSkipBound; a hung prime would never be recovered")
+	case <-time.After(5 * time.Second):
+		t.Error("reconcileIfDue neither scanned nor returned")
+	}
+
+	close(backing.release)
+	for name, ch := range map[string]<-chan struct{}{"reconcile": reconcileDone} {
+		select {
+		case <-ch:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s did not finish after release", name)
+		}
+	}
+	select {
+	case <-primeDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Prime did not finish after release")
+	}
+	if got := backing.fullScans.Load(); got != 2 {
+		t.Fatalf("full scans = %d, want 2 (the hung prime's and the recovery reconcile's)", got)
+	}
+}
+
 func TestStoresWithoutRetryChainIgnoreSingleReadBudget(t *testing.T) {
 	file, err := OpenFileStore(fsys.OSFS{}, filepath.Join(t.TempDir(), "beads.json"))
 	if err != nil {
