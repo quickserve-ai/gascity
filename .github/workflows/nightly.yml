@@ -13,7 +13,7 @@ env:
   BD_VERSION: "v1.3.1"
   # The fleet bd: the quickserve-ai/beads release go.mod's beads replace names
   # (ga-tkfdsb). scripts/beads_fleet_replace_test.go keeps it on the replace's tag.
-  FLEET_BD_TAG: "v1.3.1-fleet.20261005.1"
+  FLEET_BD_TAG: "v1.3.1-fleet.20261118.1"
 
 jobs:
   tier-b:
