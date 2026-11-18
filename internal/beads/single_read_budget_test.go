@@ -13,6 +13,7 @@ import (
 	beadslib "github.com/steveyegge/beads"
 
 	"github.com/gastownhall/gascity/internal/fsys"
+	"github.com/gastownhall/gascity/internal/testutil"
 )
 
 // These tests pin ListQuery.SingleReadBudget (pl-nzyv): the cache's full scan
@@ -237,7 +238,7 @@ func TestReconcileSkipsWhileAFullPrimeIsInFlight(t *testing.T) {
 	go func() { primeDone <- cache.Prime(context.Background()) }()
 	select {
 	case <-backing.entered:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testutil.GoroutineRaceTimeout):
 		t.Fatal("Prime never reached the backing List")
 	}
 
@@ -257,14 +258,14 @@ func TestReconcileSkipsWhileAFullPrimeIsInFlight(t *testing.T) {
 	case <-backing.entered:
 		t.Errorf("reconcile started a second full scan while the prime was in flight")
 	case <-reconcileDone:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testutil.GoroutineRaceTimeout):
 		t.Error("reconcileIfDue neither returned nor scanned")
 	}
 
 	close(backing.release)
 	select {
 	case <-reconcileDone:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testutil.GoroutineRaceTimeout):
 		t.Fatal("reconcileIfDue did not return after release")
 	}
 	select {
@@ -272,7 +273,7 @@ func TestReconcileSkipsWhileAFullPrimeIsInFlight(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Prime: %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testutil.GoroutineRaceTimeout):
 		t.Fatal("Prime did not finish after release")
 	}
 	if got := backing.fullScans.Load(); got != 1 {
@@ -298,7 +299,7 @@ func TestReconcileRecoversFromAPrimeRunningPastTheSkipBound(t *testing.T) {
 	go func() { primeDone <- cache.Prime(context.Background()) }()
 	select {
 	case <-backing.entered:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testutil.GoroutineRaceTimeout):
 		t.Fatal("Prime never reached the backing List")
 	}
 
@@ -316,7 +317,7 @@ func TestReconcileRecoversFromAPrimeRunningPastTheSkipBound(t *testing.T) {
 	case <-backing.entered:
 	case <-reconcileDone:
 		t.Error("reconcile skipped a prime running past cacheFullPrimeSkipBound; a hung prime would never be recovered")
-	case <-time.After(5 * time.Second):
+	case <-time.After(testutil.GoroutineRaceTimeout):
 		t.Error("reconcileIfDue neither scanned nor returned")
 	}
 
@@ -324,13 +325,13 @@ func TestReconcileRecoversFromAPrimeRunningPastTheSkipBound(t *testing.T) {
 	for name, ch := range map[string]<-chan struct{}{"reconcile": reconcileDone} {
 		select {
 		case <-ch:
-		case <-time.After(5 * time.Second):
+		case <-time.After(testutil.GoroutineRaceTimeout):
 			t.Fatalf("%s did not finish after release", name)
 		}
 	}
 	select {
 	case <-primeDone:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testutil.GoroutineRaceTimeout):
 		t.Fatal("Prime did not finish after release")
 	}
 	if got := backing.fullScans.Load(); got != 2 {
