@@ -63,9 +63,29 @@ var recordCacheScanLarge = telemetry.RecordCacheScanLarge
 //   - IncludeClosed is pinned false. The scan cost is O(active beads) by
 //     design; closed history grows without bound and would multiply the
 //     per-cycle bd payload without changing the diff result.
+//
+// It also carries its own read budget (cacheFullScanReadBudget) as one
+// attempt: see ListQuery.SingleReadBudget. listForReconcile, which narrows
+// this shape to ids, clears it, so delta reads keep the default budget and
+// retries.
 func cacheFullScanQuery() ListQuery {
-	return ListQuery{AllowScan: true, SkipLabels: true, IncludeClosed: false, TierMode: TierBoth, CompleteActive: true}
+	return ListQuery{
+		AllowScan:        true,
+		SkipLabels:       true,
+		IncludeClosed:    false,
+		TierMode:         TierBoth,
+		CompleteActive:   true,
+		SingleReadBudget: cacheFullScanReadBudget,
+	}
 }
+
+// cacheFullScanReadBudget bounds one attempt of the cache's full scan. The qc
+// store's scan over the hub link measured 45-75 s alone on 2026-11-17, against
+// a 90 s default budget that also covered reissues: under contention each pass
+// was cut at ~90 s and reissued inside it, and no pass completed for ~3.5 h
+// (ga-yuiof4). 300 s gives one attempt room on a slow link; a failed attempt
+// falls to the reconcile back-off (nextReconcileDelay) or Prime's own retries.
+const cacheFullScanReadBudget = 300 * time.Second
 
 func (c *CachingStore) reconcileLoop(ctx context.Context, stagger time.Duration) {
 	if stagger > 0 {

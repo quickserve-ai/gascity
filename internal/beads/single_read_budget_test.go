@@ -1,0 +1,241 @@
+package beads
+
+import (
+	"context"
+	"errors"
+	"path/filepath"
+	"reflect"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	beadslib "github.com/steveyegge/beads"
+
+	"github.com/gastownhall/gascity/internal/fsys"
+)
+
+// These tests pin ListQuery.SingleReadBudget (pl-nzyv): the cache's full scan
+// runs ONCE under its own budget on the native store, and every other read
+// keeps the default budget and its reconnect-and-retry chain.
+
+func countingSearchStorage(calls *int32, err error, issues ...*beadslib.Issue) *nativeDoltStorageSpy {
+	return &nativeDoltStorageSpy{
+		searchIssues: func(context.Context, string, beadslib.IssueFilter) ([]*beadslib.Issue, error) {
+			atomic.AddInt32(calls, 1)
+			if err != nil {
+				return nil, err
+			}
+			return issues, nil
+		},
+	}
+}
+
+func TestNativeDoltStoreListSingleReadBudgetDoesNotReissue(t *testing.T) {
+	var deadCalls, freshCalls, reopens int32
+	dead := countingSearchStorage(&deadCalls, errors.New("[mysql] i/o timeout"))
+	fresh := countingSearchStorage(&freshCalls, nil, &beadslib.Issue{
+		ID: "gc-2", Title: "live", Status: beadslib.StatusOpen, IssueType: beadslib.TypeTask, Priority: 2,
+	})
+	store := storeWithReopen(dead, fresh, &reopens)
+
+	_, err := store.List(ListQuery{AllowScan: true, TierMode: TierBoth, SingleReadBudget: 5 * time.Second})
+	if err == nil || !errContains(err, "i/o timeout") {
+		t.Fatalf("single-budget List error = %v, want the transient error returned, not retried", err)
+	}
+	if got := atomic.LoadInt32(&deadCalls); got != 1 {
+		t.Fatalf("reads on the failed handle = %d, want exactly one attempt", got)
+	}
+	if got := atomic.LoadInt32(&freshCalls); got != 0 {
+		t.Fatalf("reads on the fresh handle = %d, want 0: the scan must not be reissued", got)
+	}
+	if got := atomic.LoadInt32(&reopens); got != 1 {
+		t.Fatalf("reopens = %d, want 1: the handle is re-pointed for the next read", got)
+	}
+
+	// The next read finds the live pool without reconnecting again.
+	got, err := store.List(ListQuery{AllowScan: true, TierMode: TierBoth})
+	if err != nil {
+		t.Fatalf("next List: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "gc-2" {
+		t.Fatalf("next List = %#v, want [gc-2]", got)
+	}
+	if got := atomic.LoadInt32(&reopens); got != 1 {
+		t.Fatalf("reopens after next read = %d, want still 1", got)
+	}
+}
+
+func TestNativeDoltStoreListWithoutSingleReadBudgetStillRetries(t *testing.T) {
+	var deadCalls, freshCalls, reopens int32
+	dead := countingSearchStorage(&deadCalls, errors.New("[mysql] i/o timeout"))
+	fresh := countingSearchStorage(&freshCalls, nil, &beadslib.Issue{
+		ID: "gc-2", Title: "live", Status: beadslib.StatusOpen, IssueType: beadslib.TypeTask, Priority: 2,
+	})
+	store := storeWithReopen(dead, fresh, &reopens)
+
+	got, err := store.List(ListQuery{AllowScan: true, TierMode: TierBoth})
+	if err != nil {
+		t.Fatalf("default List after transient error: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "gc-2" {
+		t.Fatalf("default List = %#v, want [gc-2]", got)
+	}
+	if atomic.LoadInt32(&deadCalls) != 1 || atomic.LoadInt32(&freshCalls) != 1 {
+		t.Fatalf("reads dead=%d fresh=%d, want 1 and 1: the default chain reissues",
+			deadCalls, freshCalls)
+	}
+}
+
+// blockingSearchStorage blocks each read until its context ends and records
+// the read's deadline.
+func blockingSearchStorage(calls *int32, deadlines chan<- time.Time) *nativeDoltStorageSpy {
+	return &nativeDoltStorageSpy{
+		searchIssues: func(ctx context.Context, _ string, _ beadslib.IssueFilter) ([]*beadslib.Issue, error) {
+			atomic.AddInt32(calls, 1)
+			deadline, _ := ctx.Deadline()
+			select {
+			case deadlines <- deadline:
+			default:
+			}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}
+}
+
+func TestNativeDoltStoreListSingleReadBudgetReplacesStoreBudget(t *testing.T) {
+	const storeBudget = 20 * time.Millisecond
+	const scanBudget = 300 * time.Millisecond
+
+	var calls int32
+	deadlines := make(chan time.Time, 1)
+	store := newNativeDoltStoreForTest(blockingSearchStorage(&calls, deadlines))
+	store.readRetryBudgetOverride = storeBudget
+	store.reopen = func(context.Context) (beadslib.Storage, error) {
+		t.Fatal("a read cut by its own budget must not reopen")
+		return nil, nil
+	}
+
+	started := time.Now()
+	_, err := store.List(ListQuery{AllowScan: true, TierMode: TierBoth, SingleReadBudget: scanBudget})
+	elapsed := time.Since(started)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("List error = %v, want the budget's deadline", err)
+	}
+	deadline := <-deadlines
+	if got := deadline.Sub(started); got < scanBudget-50*time.Millisecond || got > scanBudget+200*time.Millisecond {
+		t.Fatalf("read deadline = start+%s, want start+~%s (the query's budget, not the store's %s)",
+			got, scanBudget, storeBudget)
+	}
+	if elapsed < scanBudget-50*time.Millisecond {
+		t.Fatalf("List returned after %s, before the query's %s budget", elapsed, scanBudget)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("reads = %d, want 1", got)
+	}
+
+	// Without the field the store's own budget still governs.
+	started = time.Now()
+	_, err = store.List(ListQuery{AllowScan: true, TierMode: TierBoth})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("default List error = %v, want the store budget's deadline", err)
+	}
+	if got := (<-deadlines).Sub(started); got > storeBudget+100*time.Millisecond {
+		t.Fatalf("default read deadline = start+%s, want start+~%s", got, storeBudget)
+	}
+}
+
+// budgetRecordingStore records the SingleReadBudget of every List the cache
+// makes, split into full scans (no IDs) and id reads.
+type budgetRecordingStore struct {
+	*MemStore
+	mu       sync.Mutex
+	fullScan []time.Duration
+	idReads  []time.Duration
+}
+
+func (s *budgetRecordingStore) List(q ListQuery) ([]Bead, error) {
+	s.mu.Lock()
+	if len(q.IDs) == 0 {
+		s.fullScan = append(s.fullScan, q.SingleReadBudget)
+	} else {
+		s.idReads = append(s.idReads, q.SingleReadBudget)
+	}
+	s.mu.Unlock()
+	return s.MemStore.List(q)
+}
+
+func TestCacheFullScanCarriesItsBudgetAndDeltaReadsDoNot(t *testing.T) {
+	if got := cacheFullScanQuery().SingleReadBudget; got != 300*time.Second {
+		t.Fatalf("cacheFullScanQuery().SingleReadBudget = %s, want 300s", got)
+	}
+
+	backing := &budgetRecordingStore{MemStore: NewMemStore()}
+	b, err := backing.Create(Bead{Title: "one"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	cache := NewCachingStoreForTest(backing, nil)
+	if err := cache.Prime(context.Background()); err != nil {
+		t.Fatalf("Prime: %v", err)
+	}
+	if _, err := cache.listForReconcile([]string{b.ID}); err != nil {
+		t.Fatalf("listForReconcile: %v", err)
+	}
+
+	backing.mu.Lock()
+	defer backing.mu.Unlock()
+	if len(backing.fullScan) == 0 {
+		t.Fatal("Prime made no full scan")
+	}
+	for i, got := range backing.fullScan {
+		if got != cacheFullScanReadBudget {
+			t.Fatalf("full scan %d budget = %s, want %s", i, got, cacheFullScanReadBudget)
+		}
+	}
+	if len(backing.idReads) == 0 {
+		t.Fatal("listForReconcile made no id read")
+	}
+	for i, got := range backing.idReads {
+		if got != 0 {
+			t.Fatalf("delta id read %d budget = %s, want 0 (default budget and retries)", i, got)
+		}
+	}
+}
+
+func TestStoresWithoutRetryChainIgnoreSingleReadBudget(t *testing.T) {
+	file, err := OpenFileStore(fsys.OSFS{}, filepath.Join(t.TempDir(), "beads.json"))
+	if err != nil {
+		t.Fatalf("OpenFileStore: %v", err)
+	}
+	for name, store := range map[string]Store{"mem": NewMemStore(), "file": file} {
+		t.Run(name, func(t *testing.T) {
+			for _, title := range []string{"a", "b"} {
+				if _, err := store.Create(Bead{Title: title}); err != nil {
+					t.Fatalf("Create: %v", err)
+				}
+			}
+			plain, err := store.List(cacheFullScanQueryWithout())
+			if err != nil {
+				t.Fatalf("List without budget: %v", err)
+			}
+			budgeted, err := store.List(cacheFullScanQuery())
+			if err != nil {
+				t.Fatalf("List with budget: %v", err)
+			}
+			if len(plain) != 2 || !reflect.DeepEqual(plain, budgeted) {
+				t.Fatalf("List with budget = %#v, want the same as without = %#v", budgeted, plain)
+			}
+			if _, err := store.List(ListQuery{SingleReadBudget: time.Second}); !errors.Is(err, ErrQueryRequiresScan) {
+				t.Fatalf("budget-only List error = %v, want ErrQueryRequiresScan: the budget is not a filter", err)
+			}
+		})
+	}
+}
+
+func cacheFullScanQueryWithout() ListQuery {
+	q := cacheFullScanQuery()
+	q.SingleReadBudget = 0
+	return q
+}

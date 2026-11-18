@@ -139,6 +139,22 @@ type ListQuery struct {
 	// from that vocabulary would hide its rows, and the cache would then evict
 	// them as closes. Other stores ignore it.
 	CompleteActive bool
+	// SingleReadBudget, when positive, asks a backing store that retries
+	// failed reads to run THIS read once, bounded by this wall-clock budget,
+	// instead of its default reconnect-and-retry chain. It exists for the
+	// cache's full scan (cacheFullScanQuery): on a contended remote link the
+	// scan alone needs most of the default budget, and a reissue inside that
+	// budget starts the whole scan again, so the scan never finished and the
+	// retries kept the link busy (pl-nzyv). A failed single read returns its
+	// error; the caller's own back-off decides when to try again.
+	//
+	// NativeDoltStore honours it: the budget replaces both its default and any
+	// WithNativeReadRetryBudget override for this read, and a transient error
+	// is answered by re-pointing the handle (so the NEXT read gets a live pool)
+	// without reissuing this one; a circuit-open error returns at once. The
+	// pre-read re-pin of a pool the guard marked stale is not a reissue and
+	// still runs. Other stores ignore it. It is not a filter (HasFilter).
+	SingleReadBudget time.Duration
 	// PushNotClosed opts a no-Status, not-IncludeClosed read into
 	// NativeDoltStore's not-closed pushdown: the store sends its derived
 	// not-closed status set as a WHERE instead of reading every row. That set

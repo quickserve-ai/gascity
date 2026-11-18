@@ -178,7 +178,7 @@ func (s *NativeDoltStore) List(query ListQuery) ([]Bead, error) {
 		tally    nativeListTally
 		narrowed bool
 	)
-	err := s.withReadRetry(func(ctx context.Context, storage beadslib.Storage) error {
+	err := s.withReadRetryOpts(context.Background(), nativeListReadOpts(query), func(ctx context.Context, storage beadslib.Storage) error {
 		tally = nativeListTally{}
 		narrowed = false
 		if latched && nativeListCanPushNotClosed(query) {
