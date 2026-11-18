@@ -382,7 +382,10 @@ jobs:
     # critical lanes (ga-vnycm2.12).
     # Fork carry: GitHub-hosted on the fork (the rule above jobs:).
     runs-on: ${{ github.repository == 'gastownhall/gascity' && ((matrix.lane == 'unit' || matrix.lane == 'acceptance') && 'blacksmith-8vcpu-ubuntu-2404' || 'blacksmith-4vcpu-ubuntu-2404') || 'ubuntu-24.04' }}
-    timeout-minutes: 90
+    # Fork carry (ga-ltp626): the fork's GitHub-hosted runners take 86-92 min
+    # for unit since //cmd/gc tests build again (#360), so the fork gets 120;
+    # upstream keeps 90. Stopgap until the //cmd/gc targets are sharded.
+    timeout-minutes: ${{ github.repository == 'gastownhall/gascity' && 90 || 120 }}
     permissions:
       contents: read
       issues: read # worker-env drift issues (tools/rbe/worker-env-drift)
