@@ -1448,6 +1448,8 @@ func TestStaleDBFormulaUnreachableStoreAtCloseIsNotAHumanRefusal(t *testing.T) {
 		{name: "circuit breaker open", err: "Error: failed to open database: dolt circuit breaker is open: server appears down, failing fast (cooldown 5s)"},
 		{name: "server unreachable", err: "Error: failed to open database: Dolt server unreachable at 100.122.207.22:3307: dial tcp 100.122.207.22:3307: i/o timeout"},
 		{name: "connection refused", err: "Error: dial tcp 127.0.0.1:51361: connect: connection refused"},
+		{name: "connection lost mid-close", err: "Error: close bead-1: driver: bad connection"},
+		{name: "connection reset", err: "Error: read tcp 127.0.0.1:53110->127.0.0.1:51361: read: connection reset by peer"},
 		{name: "an ownership refusal still reaches human", err: "Error: cannot close bead-1: assignee mismatch (actor dog-1, assignee dog-2)", human: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

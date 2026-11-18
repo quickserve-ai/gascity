@@ -439,11 +439,13 @@ if ! close_work_bead "Stale DB scan complete (orphans=${ORPHAN_TOTAL}, applied=$
   cat "$CLOSE_FILE" >&2
   CLOSE_REFUSAL="$(tr '\n' ' ' < "$CLOSE_FILE")"
   # bd could not find or reach its store: not a refusal (store_unresolved
-  # above). These are the texts bd and gc print for a missing store and for a
-  # Dolt server that cannot be reached (all seen live on 2026-11-18). Any
+  # above). These are the texts bd and gc print for a missing store, a Dolt
+  # server that cannot be reached (seen live on 2026-11-18) and a connection
+  # lost mid-call (the availability family internal/dispatch/control.go treats
+  # as retryable, never as a refusal). Any
   # OTHER close failure still takes the HIGH route below (ga-7ws7gu).
   case "$CLOSE_REFUSAL" in
-    *"no beads database found"*|*"failed to open database"*|*"circuit breaker is open"*|*"server unreachable"*|*"connection refused"*|*"i/o timeout"*)
+    *"no beads database found"*|*"failed to open database"*|*"circuit breaker is open"*|*"server unreachable"*|*"connection refused"*|*"i/o timeout"*|*"bad connection"*|*"connection reset by peer"*)
       store_unresolved "stale-db: terminal close could not reach a bead store for ${WORK_BEAD}" \
         "terminal close for ${WORK_BEAD} could not reach a bead store from $(pwd): ${CLOSE_REFUSAL}"
       ;;
