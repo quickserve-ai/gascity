@@ -1249,12 +1249,6 @@ func TestStaleDBFormulaClosesFromStoreRootWhateverTheCwd(t *testing.T) {
 	city := newStore(t)
 	otherCity := newStore(t)
 	rig := newStore(t)
-	// A rig root WITHOUT a store of its own, nested under the city: bd would
-	// walk up from it into the city store, so it must not be chosen.
-	bareRig := filepath.Join(city, "rigs", "bare")
-	if err := os.MkdirAll(bareRig, 0o755); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
-	}
 	for _, tc := range []struct {
 		name string
 		env  []string
@@ -1263,12 +1257,17 @@ func TestStaleDBFormulaClosesFromStoreRootWhateverTheCwd(t *testing.T) {
 		{name: "city path", env: []string{"GC_CITY_PATH=" + city}, want: city},
 		{name: "rig root wins over the city", env: []string{"GC_RIG_ROOT=" + rig, "GC_CITY_PATH=" + city}, want: rig},
 		{name: "empty rig root falls back to the city", env: []string{"GC_RIG_ROOT=", "GC_CITY_PATH=" + city}, want: city},
-		{name: "rig root without its own store is skipped", env: []string{"GC_RIG_ROOT=" + bareRig, "GC_CITY_PATH=" + city}, want: city},
 		{name: "GC_CITY outranks GC_CITY_PATH, as in gc", env: []string{"GC_CITY=" + otherCity, "GC_CITY_PATH=" + city}, want: otherCity},
-		{name: "a city name in GC_CITY is skipped", env: []string{"GC_CITY=mycity", "GC_CITY_PATH=" + city}, want: city},
+		{name: "a relative GC_CITY (a city name) is passed over", env: []string{"GC_CITY=mycity", "GC_CITY_PATH=" + city}, want: city},
 		{name: "GC_CITY_ROOT as the last resort", env: []string{"GC_CITY_ROOT=" + city}, want: city},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			// The stores are shared across cases: start each with no close recorded.
+			for _, store := range []string{city, otherCity, rig} {
+				if err := os.Remove(filepath.Join(store, ".beads", "closed")); err != nil && !os.IsNotExist(err) {
+					t.Fatalf("Remove: %v", err)
+				}
+			}
 			log, out, err := runStaleDBFormulaFailureCase(t, staleDBFailureCase{
 				scanJSON: staleDBCleanScan,
 				dir:      t.TempDir(), // no .beads here: the dog's temp-dir cwd
@@ -1277,8 +1276,12 @@ func TestStaleDBFormulaClosesFromStoreRootWhateverTheCwd(t *testing.T) {
 			if err != nil {
 				t.Fatalf("rendered script failed from a store-less cwd: %v\nlog:\n%s\noutput:\n%s", err, log, out)
 			}
-			if closeLine := staleDBLogLine(log, "bd close "); !strings.HasPrefix(closeLine, "bd close bead-1 --reason ") {
-				t.Fatalf("terminal close = %q, want the work bead bead-1\nlog:\n%s", closeLine, log)
+			if argv := staleDBLogLine(log, "bd-close-argv "); !strings.HasPrefix(argv, "bd-close-argv [close] [bead-1] [--reason] [Stale DB scan complete (orphans=0, applied=0, escalated=0)]") {
+				t.Fatalf("terminal close argv = %q, want exactly close bead-1 --reason <one argument>\nlog:\n%s", argv, log)
+			}
+			closed, err := os.ReadFile(filepath.Join(tc.want, ".beads", "closed"))
+			if err != nil || string(closed) != "bead-1\n" {
+				t.Fatalf("store %s recorded closed %q (err %v), want exactly bead-1\nlog:\n%s", tc.want, closed, err, log)
 			}
 			cwds := 0
 			for _, line := range strings.Split(log, "\n") {
@@ -1316,8 +1319,6 @@ func TestStaleDBFormulaStoreResolutionFailureIsNotAHumanRefusal(t *testing.T) {
 	}{
 		{name: "no store-error route", env: nil},
 		{name: "store-error route configured", env: []string{"GC_STORE_ERROR_RECIPIENT=woodhouse"}, wantMail: "gc mail send woodhouse -s stale-db: terminal close could not reach a bead store for bead-1"},
-		{name: "store root names a missing directory", env: []string{"GC_CITY_PATH=/nonexistent/gc-city"}},
-		{name: "store root names a file", env: []string{"GC_CITY_PATH=" + staleDBRegularFile(t)}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			// No store root in the environment and none under the cwd.
@@ -1350,6 +1351,72 @@ func TestStaleDBFormulaStoreResolutionFailureIsNotAHumanRefusal(t *testing.T) {
 			}
 			if tc.wantMail != "" && !strings.HasPrefix(mail, tc.wantMail) {
 				t.Fatalf("store-error mail = %q, want prefix %q\nlog:\n%s", mail, tc.wantMail, log)
+			}
+		})
+	}
+}
+
+// TestStaleDBFormulaUnusableStoreRootStopsBeforeAnyWork pins the review fix
+// on #363: a store root the session names but that holds no store (missing,
+// a file, a rig root with no .beads of its own) stops the run as
+// store-unresolved before the scan, the notes or the close, with no fallback
+// to another store or the cwd, and never on the human route.
+func TestStaleDBFormulaUnusableStoreRootStopsBeforeAnyWork(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skipf("bash not found: %v", err)
+	}
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skipf("jq not found: %v", err)
+	}
+	city := t.TempDir()
+	if err := os.Mkdir(filepath.Join(city, ".beads"), 0o755); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	bareRig := filepath.Join(city, "rigs", "bare") // under a real store, so bd could walk up into it
+	if err := os.MkdirAll(bareRig, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	// The starting cwd holds a store too: a fallback to the cwd would be caught.
+	cwd := t.TempDir()
+	if err := os.Mkdir(filepath.Join(cwd, ".beads"), 0o755); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	for _, tc := range []struct {
+		name string
+		env  []string
+	}{
+		{name: "city path names a missing directory", env: []string{"GC_CITY_PATH=/nonexistent/gc-city"}},
+		{name: "city path names a file", env: []string{"GC_CITY_PATH=" + staleDBRegularFile(t)}},
+		{name: "rig root without its own store", env: []string{"GC_RIG_ROOT=" + bareRig, "GC_CITY_PATH=" + city}},
+		{name: "store-error route configured", env: []string{"GC_CITY_PATH=/nonexistent/gc-city", "GC_STORE_ERROR_RECIPIENT=woodhouse"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			log, out, err := runStaleDBFormulaFailureCase(t, staleDBFailureCase{
+				scanJSON: staleDBCleanScan,
+				dir:      cwd,
+				env:      append([]string{"GC_TEST_BD_NEEDS_STORE=1", "GC_MAINTENANCE_DONE_TARGET=health"}, tc.env...),
+			})
+			if err == nil {
+				t.Fatalf("rendered script exited successfully; want a stop before any work\nlog:\n%s\noutput:\n%s", log, out)
+			}
+			for _, forbidden := range []string{"bd ", "bd-cwd", "gc dolt-cleanup", "gc mail send human", "[HIGH]", "mol-dog-stale-db.escalate"} {
+				if strings.Contains(log, forbidden) {
+					t.Fatalf("an unusable store root still reached %q\nlog:\n%s\noutput:\n%s", forbidden, log, out)
+				}
+			}
+			for _, want := range []string{
+				"gc event emit mol-dog-stale-db.store-unresolved --message ",
+				"gc session nudge health MAINTENANCE_WARN: stale-db ",
+				"gc runtime drain-ack",
+			} {
+				if !strings.Contains(log, want) {
+					t.Fatalf("an unusable store root did not record %q\nlog:\n%s\noutput:\n%s", want, log, out)
+				}
+			}
+			mail := staleDBLogLine(log, "gc mail send ")
+			wantRoute := strings.Contains(strings.Join(tc.env, " "), "GC_STORE_ERROR_RECIPIENT=")
+			if wantRoute != strings.HasPrefix(mail, "gc mail send woodhouse -s stale-db: ") {
+				t.Fatalf("store-error mail = %q, want one only when a route is configured\nlog:\n%s", mail, log)
 			}
 		})
 	}
@@ -1450,6 +1517,13 @@ case "${1:-}" in
       fi
     fi
     maybe_fail "$rendered"
+    if [ -n "${GC_TEST_BD_NEEDS_STORE:-}" ] && [ "${1:-}" = close ]; then
+      # Argument boundaries kept, and the close recorded in the store it ran in.
+      printf 'bd-close-argv' >> "$GC_TEST_LOG"
+      printf ' [%s]' "$@" >> "$GC_TEST_LOG"
+      printf '\n' >> "$GC_TEST_LOG"
+      printf '%s\n' "${2:-}" >> .beads/closed
+    fi
     ;;
   *)
     echo "unexpected bd command: $*" >&2

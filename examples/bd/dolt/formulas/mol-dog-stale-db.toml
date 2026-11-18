@@ -90,44 +90,81 @@ Run this as one shell script so every derived value remains in the same process:
 ```bash
 set -euo pipefail
 
-# Run from the work bead's store root, never from wherever this shell happens
-# to stand: a bare `bd` resolves its store by walking up from the cwd, and
-# seats carry GC_CITY_PATH but not BEADS_DIR. A dog that ran this script from
-# a temp dir got "no beads database found" on its note and its close, and the
-# close failure went to a human as a HIGH refusal (ga-w8ptue). The rig root
-# comes first for a rig-scoped run (gc sets it empty for a city-scoped one),
-# then the city in gc's own order (GC_CITY, GC_CITY_PATH, GC_CITY_ROOT:
-# resolveExplicitCityPathEnv). A candidate counts only when it holds a .beads
-# store itself, so a root without one cannot send bd walking up into a
-# parent's store, and a registered city NAME in GC_CITY is skipped rather than
-# read as a relative path. No candidate, or one that cannot be entered: the
-# cwd stays, as before this change. Nothing here exits, because the drain-ack
-# trap is not installed yet.
-STORE_ROOT=""
-for candidate in "${GC_RIG_ROOT:-}" "${GC_CITY:-}" "${GC_CITY_PATH:-}" "${GC_CITY_ROOT:-}"; do
-  if [ -n "$candidate" ] && [ -d "$candidate/.beads" ]; then
-    STORE_ROOT="$candidate"
-    break
-  fi
-done
-if [ -n "$STORE_ROOT" ]; then
-  cd "$STORE_ROOT" || { echo "cannot enter the store root ${STORE_ROOT}; staying in $(pwd)" >&2; STORE_ROOT=""; }
-else
-  echo "no store root with a .beads directory in GC_RIG_ROOT/GC_CITY/GC_CITY_PATH/GC_CITY_ROOT; bd resolves from $(pwd)" >&2
-fi
-
-WORK_BEAD="${GC_BEAD_ID:-${GC_TRIGGER_BEAD_ID:-$(gc hook current --id-only)}}"
-[ -n "$WORK_BEAD" ] || { echo "cannot resolve work bead id: GC_BEAD_ID/GC_TRIGGER_BEAD_ID unset and gc hook current returned nothing; aborting" >&2; exit 1; }
-TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/dolt-cleanup.XXXXXX")
+# The drain-ack trap goes in before anything that can exit, so every exit
+# below, including a failed hook lookup or mktemp, still returns the dog.
 DRAIN_ACKED=0
-
+TMP_DIR=""
 cleanup() {
-  rm -rf "$TMP_DIR"
+  if [ -n "$TMP_DIR" ]; then
+    rm -rf "$TMP_DIR"
+  fi
   if [ "$DRAIN_ACKED" -ne 1 ]; then
     gc runtime drain-ack || true
   fi
 }
 trap cleanup EXIT
+
+# store_unresolved: this run could not reach the bead store it was given.
+# Nothing refused this dog, so it is not the stranded-bead case a human must
+# close by hand: it goes to the store-error route when one is configured
+# (GC_STORE_ERROR_RECIPIENT, a platform seat), the event stream and the
+# maintenance nudge, never to the human escalation route, and exits non-zero
+# (the trap drain-acks). The bead stays open for the next firing (ga-w8ptue).
+store_unresolved() {
+  local subject="$1"
+  local message="$2"
+  echo "$message" >&2
+  if [ -n "${GC_STORE_ERROR_RECIPIENT:-}" ]; then
+    gc mail send "$GC_STORE_ERROR_RECIPIENT" -s "$subject" \
+      -m "${message}. Not an ownership refusal. The bead stays open and the next firing's dog retries." \
+      || echo "send store-unresolved notice failed; continuing to drain-ack" >&2
+  fi
+  gc event emit mol-dog-stale-db.store-unresolved --message "$message" \
+    || echo "emit store-unresolved event failed; continuing to drain-ack" >&2
+  if [ -n "${GC_MAINTENANCE_DONE_TARGET:-}" ]; then
+    gc session nudge "$GC_MAINTENANCE_DONE_TARGET" "MAINTENANCE_WARN: stale-db ${message}" || true
+  fi
+  exit 1
+}
+
+# Run from the work bead's store root, never from wherever this shell happens
+# to stand: a bare `bd` resolves its store by walking up from the cwd, and
+# seats carry GC_CITY_PATH but not BEADS_DIR. A dog that ran this script from
+# a temp dir got "no beads database found" on its note and its close, and the
+# close failure went to a human as a HIGH refusal (ga-w8ptue).
+#
+# The root is the rig root when gc set one (it sets GC_RIG_ROOT empty for a
+# city-scoped session), else the city in gc's own order: GC_CITY, GC_CITY_PATH,
+# GC_CITY_ROOT (resolveExplicitCityPathEnv). A relative GC_CITY is a
+# registered city NAME, which only gc's registry resolves, so it is passed
+# over for the next key. The root chosen is used as given: if it holds no
+# .beads store, or cannot be entered, the run stops here as store-unresolved,
+# before any cleanup, rather than fall back to another store or to the cwd.
+# With none of the four set, the cwd is the only store hint, and it stays.
+STORE_ROOT=""
+if [ -n "${GC_RIG_ROOT:-}" ]; then
+  STORE_ROOT="$GC_RIG_ROOT"
+else
+  for candidate in "${GC_CITY:-}" "${GC_CITY_PATH:-}" "${GC_CITY_ROOT:-}"; do
+    case "$candidate" in
+      /*) STORE_ROOT="$candidate"; break ;;
+    esac
+  done
+fi
+if [ -n "$STORE_ROOT" ]; then
+  if [ ! -d "$STORE_ROOT/.beads" ]; then
+    store_unresolved "stale-db: no bead store at ${STORE_ROOT}" \
+      "store root ${STORE_ROOT} holds no .beads store; nothing was scanned or cleaned"
+  fi
+  if ! cd "$STORE_ROOT"; then
+    store_unresolved "stale-db: cannot enter ${STORE_ROOT}" \
+      "cannot enter store root ${STORE_ROOT}; nothing was scanned or cleaned"
+  fi
+fi
+
+WORK_BEAD="${GC_BEAD_ID:-${GC_TRIGGER_BEAD_ID:-$(gc hook current --id-only)}}"
+[ -n "$WORK_BEAD" ] || { echo "cannot resolve work bead id: GC_BEAD_ID/GC_TRIGGER_BEAD_ID unset and gc hook current returned nothing; aborting" >&2; exit 1; }
+TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/dolt-cleanup.XXXXXX")
 
 SCAN_FILE="$TMP_DIR/scan.json"
 APPLY_FILE="$TMP_DIR/apply.json"
@@ -391,24 +428,11 @@ CLOSE_FILE="$TMP_DIR/close.log"
 if ! close_work_bead "Stale DB scan complete (orphans=${ORPHAN_TOTAL}, applied=${APPLIED}, escalated=${ESCALATED})" > "$CLOSE_FILE" 2>&1; then
   cat "$CLOSE_FILE" >&2
   CLOSE_REFUSAL="$(tr '\n' ' ' < "$CLOSE_FILE")"
-  # bd could not find a store at all: nothing refused this dog, so this is
-  # not the stranded-bead case a human must close by hand. It goes to the
-  # store-error route when one is configured (GC_STORE_ERROR_RECIPIENT, a
-  # platform seat), to the event stream and the maintenance nudge, never to
-  # the human escalation route. The bead stays open, so the next firing's
-  # dog tries again from the store root (ga-w8ptue).
+  # bd could not find a store at all: not a refusal (store_unresolved above).
   case "$CLOSE_REFUSAL" in
     *"no beads database found"*)
-      CLOSE_STORE_MESSAGE="terminal close for ${WORK_BEAD} could not reach a bead store from $(pwd): ${CLOSE_REFUSAL}"
-      if [ -n "${GC_STORE_ERROR_RECIPIENT:-}" ]; then
-        run_or_warn "send store-unresolved notice" gc mail send "$GC_STORE_ERROR_RECIPIENT" \
-          -s "stale-db: terminal close could not reach a bead store for ${WORK_BEAD}" \
-          -m "${CLOSE_STORE_MESSAGE}. Not an ownership refusal. The bead stays open and the next firing's dog retries from the store root."
-      fi
-      run_or_warn "emit store-unresolved event" gc event emit mol-dog-stale-db.store-unresolved \
-        --message "${CLOSE_STORE_MESSAGE}; leaving work bead open for the next firing"
-      maintenance_notice "MAINTENANCE_WARN: stale-db terminal close for ${WORK_BEAD} could not reach a bead store; next firing retries"
-      fail_open_after_drain "${CLOSE_STORE_MESSAGE}; leaving work bead open"
+      store_unresolved "stale-db: terminal close could not reach a bead store for ${WORK_BEAD}" \
+        "terminal close for ${WORK_BEAD} could not reach a bead store from $(pwd): ${CLOSE_REFUSAL}"
       ;;
   esac
   CLOSE_REFUSAL_MESSAGE="terminal close refused for ${WORK_BEAD} (actor presented: ${CLOSE_ACTOR:-none}): ${CLOSE_REFUSAL:-no error text}"
