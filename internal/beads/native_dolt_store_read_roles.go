@@ -59,11 +59,13 @@ import (
 // is a substitute. AllFlag is stated because it says what it does in the member
 // name rather than in a magic status value.
 //
-// There is no ExcludeStatus member to spell "everything but closed" with, so
-// gc's "open" cannot be pushed down, and its not-closed default is pushed only
-// as an allow-list for a caller that opts in (ListQuery.PushNotClosed, behind
-// guardNotClosed); gc's three-value projection (mapBdStatus, ListQuery.Matches)
-// stays the definition and runs Go-side. The two statuses that map one-to-one
+// "Everything but closed" is spelled as ExcludeStatus closed (the beads fleet
+// carry of upstream #7647) wherever the query drops closed rows anyway
+// (nativeListExcludesClosed); that is a deny-list, so it never hides a status
+// the scope's vocabulary misses. The older allow-list form is still pushed for
+// a caller that opts in (ListQuery.PushNotClosed, behind guardNotClosed), and
+// gc's three-value projection (mapBdStatus, ListQuery.Matches) stays the
+// definition and runs Go-side. The two statuses that map one-to-one
 // onto a bd status are pushed beside AllFlag (nativeListRequestFromListQuery),
 // which keeps the pinned-flag default lifted under a named status. One
 // exception: a Live "open" is pushed as bd's raw "open" (nativeListPushesRawOpen).
@@ -843,6 +845,13 @@ func nativeListRequestFromListQuery(query ListQuery, pushableTypes map[string]bo
 		// CompleteActive read: there a status the vocabulary missed would not
 		// just hide rows, the cache would evict them as closed.
 		req.Status = notClosed
+	} else if nativeListExcludesClosed(query) {
+		// Closed history, excluded at the server (ga-tyf38i). Unlike the
+		// not-closed set above this is a deny-list of the one bd status that
+		// maps to gc's closed, so a status no vocabulary names still comes
+		// back, and it is safe on a CompleteActive read: the cache's full
+		// scan stops reading every closed row in the ledger on every cycle.
+		req.ExcludeStatus = []string{string(beadslib.StatusClosed)}
 	}
 	if pushableTypes[query.Type] {
 		req.IssueType = query.Type

@@ -117,6 +117,19 @@ func nativeListCanPushNotClosed(query ListQuery) bool {
 	return query.PushNotClosed && query.Status == "" && !query.IncludeClosed && !query.CompleteActive
 }
 
+// nativeListExcludesClosed reports whether ApplyListQuery drops every row
+// whose bd status is closed for query, so its request may exclude closed at
+// the server. ListQuery.Matches drops gc's closed when no status is named and
+// IncludeClosed is false, and when a status other than closed is named; bd's
+// "closed", and no other bd status, maps to gc's closed (mapBdStatus). So the
+// exclusion is exact, never narrower than the query.
+func nativeListExcludesClosed(query ListQuery) bool {
+	if query.Status == "" {
+		return !query.IncludeClosed
+	}
+	return query.Status != "closed"
+}
+
 // nativeListPushableStatus reports whether a gc status maps one-to-one onto a
 // bd status. mapBdStatus folds every other bd status into gc's "open".
 func nativeListPushableStatus(status string) bool {
