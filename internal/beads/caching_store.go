@@ -1839,6 +1839,13 @@ func (c *CachingStore) beginFullPrime() (*fullPrimeCycle, bool) {
 	return c.startFullPrimeLocked(), true
 }
 
+// fullPrimeInFlight reports whether a full prime cycle is running now.
+func (c *CachingStore) fullPrimeInFlight() bool {
+	c.primeMu.Lock()
+	defer c.primeMu.Unlock()
+	return c.primeRunning
+}
+
 func (c *CachingStore) finishFullPrime(cycle *fullPrimeCycle, err error) {
 	c.primeMu.Lock()
 	defer c.primeMu.Unlock()

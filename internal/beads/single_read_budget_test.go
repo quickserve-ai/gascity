@@ -204,6 +204,82 @@ func TestCacheFullScanCarriesItsBudgetAndDeltaReadsDoNot(t *testing.T) {
 	}
 }
 
+// blockingFullScanStore holds every full scan until release is closed and
+// counts them; entered receives once per scan that started.
+type blockingFullScanStore struct {
+	*MemStore
+	fullScans atomic.Int32
+	entered   chan struct{}
+	release   chan struct{}
+}
+
+func (s *blockingFullScanStore) List(q ListQuery) ([]Bead, error) {
+	if len(q.IDs) == 0 {
+		s.fullScans.Add(1)
+		s.entered <- struct{}{}
+		<-s.release
+	}
+	return s.MemStore.List(q)
+}
+
+func TestReconcileSkipsWhileAFullPrimeIsInFlight(t *testing.T) {
+	backing := &blockingFullScanStore{
+		MemStore: NewMemStore(),
+		entered:  make(chan struct{}, 4),
+		release:  make(chan struct{}),
+	}
+	if _, err := backing.MemStore.Create(Bead{Title: "one"}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	cache := NewCachingStoreForTest(backing, nil)
+
+	primeDone := make(chan error, 1)
+	go func() { primeDone <- cache.Prime(context.Background()) }()
+	select {
+	case <-backing.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Prime never reached the backing List")
+	}
+
+	// The reconciler armed while the prime still runs: a reconcile is "due"
+	// (nothing has landed yet), but it must not start a second full scan.
+	if d := cache.nextReconcileDelay(cache.clockNow()); d != 0 {
+		t.Fatalf("nextReconcileDelay during the initial prime = %s, want 0 (the case under test)", d)
+	}
+	// Run it on its own goroutine: a regression would block in a second
+	// scan, and the test must fail on that, not hang.
+	reconcileDone := make(chan struct{})
+	go func() {
+		cache.reconcileIfDue(cache.clockNow())
+		close(reconcileDone)
+	}()
+	select {
+	case <-backing.entered:
+		t.Errorf("reconcile started a second full scan while the prime was in flight")
+	case <-reconcileDone:
+	case <-time.After(5 * time.Second):
+		t.Error("reconcileIfDue neither returned nor scanned")
+	}
+
+	close(backing.release)
+	select {
+	case <-reconcileDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("reconcileIfDue did not return after release")
+	}
+	select {
+	case err := <-primeDone:
+		if err != nil {
+			t.Fatalf("Prime: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Prime did not finish after release")
+	}
+	if got := backing.fullScans.Load(); got != 1 {
+		t.Fatalf("full scans after the prime = %d, want 1", got)
+	}
+}
+
 func TestStoresWithoutRetryChainIgnoreSingleReadBudget(t *testing.T) {
 	file, err := OpenFileStore(fsys.OSFS{}, filepath.Join(t.TempDir(), "beads.json"))
 	if err != nil {
@@ -216,11 +292,17 @@ func TestStoresWithoutRetryChainIgnoreSingleReadBudget(t *testing.T) {
 					t.Fatalf("Create: %v", err)
 				}
 			}
-			plain, err := store.List(cacheFullScanQueryWithout())
+			// An explicit sort on both sides: the default order of these
+			// stores is map iteration, so two correct listings may differ.
+			withoutBudget := cacheFullScanQueryWithout()
+			withoutBudget.Sort = SortCreatedAsc
+			plain, err := store.List(withoutBudget)
 			if err != nil {
 				t.Fatalf("List without budget: %v", err)
 			}
-			budgeted, err := store.List(cacheFullScanQuery())
+			withBudget := cacheFullScanQuery()
+			withBudget.Sort = SortCreatedAsc
+			budgeted, err := store.List(withBudget)
 			if err != nil {
 				t.Fatalf("List with budget: %v", err)
 			}
