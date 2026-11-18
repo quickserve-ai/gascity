@@ -229,7 +229,7 @@ func TestReconcileSkipsWhileAFullPrimeIsInFlight(t *testing.T) {
 		entered:  make(chan struct{}, 4),
 		release:  make(chan struct{}),
 	}
-	if _, err := backing.MemStore.Create(Bead{Title: "one"}); err != nil {
+	if _, err := backing.Create(Bead{Title: "one"}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	cache := NewCachingStoreForTest(backing, nil)
@@ -287,7 +287,7 @@ func TestReconcileRecoversFromAPrimeRunningPastTheSkipBound(t *testing.T) {
 		entered:  make(chan struct{}, 4),
 		release:  make(chan struct{}),
 	}
-	if _, err := backing.MemStore.Create(Bead{Title: "one"}); err != nil {
+	if _, err := backing.Create(Bead{Title: "one"}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	var mu sync.Mutex

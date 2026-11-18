@@ -148,7 +148,7 @@ type ListQuery struct {
 	// retries kept the link busy (pl-nzyv). A failed single read returns its
 	// error; the caller's own back-off decides when to try again.
 	//
-	// NativeDoltStore honours it: the budget replaces both its default and any
+	// NativeDoltStore honors it: the budget replaces both its default and any
 	// WithNativeReadRetryBudget override for this read, and a transient error
 	// is answered by re-pointing the handle (so the NEXT read gets a live pool)
 	// without reissuing this one; a circuit-open error returns at once. The
