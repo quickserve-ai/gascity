@@ -265,6 +265,7 @@ jobs:
           EVENT: ${{ github.event_name }}
           MODE: ${{ steps.decide.outputs.mode }}
           FRESH: ${{ inputs.fresh-test-results }}
+          FORK_RUNNER: ${{ github.repository != 'gastownhall/gascity' }}
         run: |
           set -euo pipefail
           case "$MODE" in remote|fork-ro|fork-rw|cache|local) ;; *) echo "::error::mode '$MODE'"; exit 1 ;; esac
@@ -308,6 +309,20 @@ jobs:
           # `gc init` no longer clones gascity-packs (#7005), and no
           # integration_packages target needs the network.
           lanes="$unit,$acceptance,$packages,$smoke"
+          # Fork carry (ga-ltp626): the fork's unit lane runs on one 4 vCPU
+          # GitHub-hosted runner capped at two local actions, and since
+          # //cmd/gc's tests build again (#360) it took 63-88 min. There it
+          # splits in two runners: unit takes //... less //cmd/gc/..., uncapped,
+          # and unit-gc takes //cmd/gc/... with the memory guards (swapfile,
+          # cpu=2) that nogo on //cmd/gc:gc_test needs. Together they test
+          # exactly //...; the gate needs every matrix lane, so unit-gc gates
+          # with no gate change. Upstream's lane list is unchanged. --config
+          # flags go before "--": after it every word is a target pattern.
+          if [ "$FORK_RUNNER" = true ]; then
+            unit='{"lane":"unit","cmd":"test --config=ci --keep_going'"$fresh"' -- //... -//cmd/gc/..."}'
+            unitgc='{"lane":"unit-gc","cmd":"test --config=ci --keep_going //cmd/gc/...'"$fresh"'"}'
+            lanes="$unit,$unitgc,$acceptance,$packages,$smoke"
+          fi
           # Dispatches and the nightly schedule only (rbe-ci-cost-latency-
           # study.md recommendation 5): evidence-only until G3, so paying its
           # wall time on every push to main bought nothing; bazel-nightly.yml
@@ -382,9 +397,10 @@ jobs:
     # critical lanes (ga-vnycm2.12).
     # Fork carry: GitHub-hosted on the fork (the rule above jobs:).
     runs-on: ${{ github.repository == 'gastownhall/gascity' && ((matrix.lane == 'unit' || matrix.lane == 'acceptance') && 'blacksmith-8vcpu-ubuntu-2404' || 'blacksmith-4vcpu-ubuntu-2404') || 'ubuntu-24.04' }}
-    # Fork carry (ga-ltp626): the fork's GitHub-hosted runners take 86-92 min
+    # Fork carry (ga-ltp626): the fork's GitHub-hosted runners took 86-92 min
     # for unit since //cmd/gc tests build again (#360), so the fork gets 120;
-    # upstream keeps 90. Stopgap until the //cmd/gc targets are sharded.
+    # upstream keeps 90. The fork now splits //cmd/gc/... into its own
+    # unit-gc lane (Lanes step); 120 stays as margin until that is measured.
     timeout-minutes: ${{ github.repository == 'gastownhall/gascity' && 90 || 120 }}
     permissions:
       contents: read
@@ -601,19 +617,23 @@ jobs:
       # kill) lets that peak page instead of killing the job, and the bazel
       # step below caps the fork's unit lane at two locally executed actions.
       # Upstream's unit lane runs on a Blacksmith host and takes neither.
-      - name: Fork runner swap for the unit lane
-        if: github.repository != 'gastownhall/gascity' && matrix.lane == 'unit' && steps.worker-env.outputs.pin-moved != 'true'
+      # Since ga-ltp626 the fork runs //cmd/gc/... in its own unit-gc lane,
+      # and both guards follow those targets there.
+      - name: Fork runner swap for the unit-gc lane
+        if: github.repository != 'gastownhall/gascity' && matrix.lane == 'unit-gc' && steps.worker-env.outputs.pin-moved != 'true'
         run: |
           sudo fallocate -l 16G /swapfile-bazel
           sudo chmod 600 /swapfile-bazel
           sudo mkswap /swapfile-bazel >/dev/null
           sudo swapon /swapfile-bazel
-          echo "bazel / unit: swap $(free -m | awk 'NR==3{print $2}') MB total after the fork swapfile" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "bazel / unit-gc: swap $(free -m | awk 'NR==3{print $2}') MB total after the fork swapfile" | tee -a "$GITHUB_STEP_SUMMARY"
 
       # --profile, --build_event_json_file, --execution_log_compact_file and
       # --experimental_build_event_upload_strategy are command options, so
-      # they go after the command (CMD's first word), never in a startup
-      # position. upload_strategy=local keeps the profile and exec log (the
+      # they go right after the command (CMD's first word): never in a startup
+      # position, and never after the targets, where a "--" in CMD (the
+      # fork's unit lane, ga-ltp626) makes every later word a target pattern.
+      # upload_strategy=local keeps the profile and exec log (the
       # BEP's local_file/uri fields) out of the farm CAS: both hold argv/env
       # values the ci-analytics extractor reads and redacts, never the farm.
       - name: bazel ${{ matrix.cmd }}
@@ -628,6 +648,12 @@ jobs:
         run: |
           set -o pipefail
           read -r -a args <<<"$CMD"
+          opts=(
+            --profile="$RUNNER_TEMP/bazel-profile.json"
+            --build_event_json_file="$RUNNER_TEMP/bazel-bep.json"
+            --execution_log_compact_file="$RUNNER_TEMP/bazel-exec.log.zst"
+            --experimental_build_event_upload_strategy=local
+          )
           # Fork carry (ga-l0b72a.3): the swapfile alone did not hold the
           # fork's unit lane (#265's first run still lost its runner at
           # 196/236 with 19 GB of swap), so on the fork that lane also
@@ -635,17 +661,14 @@ jobs:
           # //cmd/gc:gc_test and a multi-GB compile then rarely overlap.
           # --local_resources bounds local execution only: the fork cache's
           # 64 parallel lookups (--jobs, .bazelrc) are untouched, and no cache
-          # key changes.
-          if [ "$FORK_RUNNER" = true ] && [ "$LANE" = unit ]; then
-            args+=(--local_resources=cpu=2)
+          # key changes. Since ga-ltp626 the cap is on unit-gc, which holds
+          # //cmd/gc/...; the fork's unit lane no longer builds gc_test.
+          if [ "$FORK_RUNNER" = true ] && [ "$LANE" = unit-gc ]; then
+            opts+=(--local_resources=cpu=2)
           fi
           rc=0
           start=$(date +%s)
-          bazel "${args[@]}" \
-            --profile="$RUNNER_TEMP/bazel-profile.json" \
-            --build_event_json_file="$RUNNER_TEMP/bazel-bep.json" \
-            --execution_log_compact_file="$RUNNER_TEMP/bazel-exec.log.zst" \
-            --experimental_build_event_upload_strategy=local || rc=$?
+          bazel "${args[0]}" "${opts[@]}" "${args[@]:1}" || rc=$?
           echo "bazel / $LANE: exit $rc, $(( $(date +%s) - start ))s wall, mode $MODE" | tee -a "$GITHUB_STEP_SUMMARY"
           if [ "$rc" -ne 0 ] && [ "$EVIDENCE_ONLY" = true ]; then
             echo "::warning title=$LANE is evidence-only::bazel exited $rc; not gating until G3"
@@ -1007,6 +1030,7 @@ jobs:
           go run ./scripts/bazel-bep-summary.go --context "$context/$MODE" --allow-missing \
             --json-out "$dir/summary.json" \
             unit="$dir/bazel-bep-unit-$ATTEMPT/bazel-bep.json" \
+            unit-gc="$dir/bazel-bep-unit-gc-$ATTEMPT/bazel-bep.json" \
             acceptance="$dir/bazel-bep-acceptance-$ATTEMPT/bazel-bep.json" \
             integration-packages="$dir/bazel-bep-integration-packages-$ATTEMPT/bazel-bep.json" \
             integration-smoke="$dir/bazel-bep-integration-smoke-$ATTEMPT/bazel-bep.json" \
@@ -1023,6 +1047,7 @@ jobs:
           dir="$RUNNER_TEMP/bazel-bep"
           go run ./scripts/shard-budget.go \
             "$dir/bazel-bep-unit-${{ github.run_attempt }}/bazel-bep.json" \
+            "$dir/bazel-bep-unit-gc-${{ github.run_attempt }}/bazel-bep.json" \
             "$dir/bazel-bep-acceptance-${{ github.run_attempt }}/bazel-bep.json" \
             "$dir/bazel-bep-integration-packages-${{ github.run_attempt }}/bazel-bep.json" \
             "$dir/bazel-bep-integration-smoke-${{ github.run_attempt }}/bazel-bep.json" \

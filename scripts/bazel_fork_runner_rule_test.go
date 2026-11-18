@@ -58,7 +58,11 @@ func TestBazelWorkflowForkRunnerRule(t *testing.T) {
 // at nogo on //cmd/gc:gc_test and the VM shuts the runner down, so the unit
 // lane never concludes on the fork. The step must run on the fork only, and
 // before the lane's bazel step, and the bazel step caps the fork's unit lane
-// at two locally executed actions (the swap alone did not hold it).
+// at two locally executed actions (the swap alone did not hold it). Since
+// ga-ltp626 the fork tests //cmd/gc/... in its own unit-gc lane, so both
+// guards key on unit-gc. The bazel step puts its options right after the
+// command word, never after the targets: the fork's unit command has a "--",
+// after which every word is a target pattern.
 func TestBazelWorkflowForkUnitLaneSwap(t *testing.T) {
 	wf := readMultiLaneWorkflow(t)
 	job, ok := wf.Jobs["lane"]
@@ -68,10 +72,10 @@ func TestBazelWorkflowForkUnitLaneSwap(t *testing.T) {
 	swap, test := -1, -1
 	for i, step := range job.Steps {
 		switch {
-		case step.Name == "Fork runner swap for the unit lane":
+		case step.Name == "Fork runner swap for the unit-gc lane":
 			swap = i
-			if !strings.Contains(step.If, "github.repository != 'gastownhall/gascity'") || !strings.Contains(step.If, "matrix.lane == 'unit'") {
-				t.Errorf("swap step if %q: must be fork-only and unit-lane-only", step.If)
+			if !strings.Contains(step.If, "github.repository != 'gastownhall/gascity'") || !strings.Contains(step.If, "matrix.lane == 'unit-gc'") {
+				t.Errorf("swap step if %q: must be fork-only and unit-gc-lane-only", step.If)
 			}
 			if !strings.Contains(step.Run, "swapon /swapfile-bazel") {
 				t.Errorf("swap step does not enable /swapfile-bazel:\n%s", step.Run)
@@ -81,13 +85,16 @@ func TestBazelWorkflowForkUnitLaneSwap(t *testing.T) {
 			if step.Env["FORK_RUNNER"] != "${{ github.repository != 'gastownhall/gascity' }}" {
 				t.Errorf("bazel test step env FORK_RUNNER = %q; want the fork-only repository test", step.Env["FORK_RUNNER"])
 			}
-			if !strings.Contains(step.Run, `if [ "$FORK_RUNNER" = true ] && [ "$LANE" = unit ]; then`) || !strings.Contains(step.Run, "args+=(--local_resources=cpu=2)") {
-				t.Errorf("bazel test step does not cap the fork's unit lane at --local_resources=cpu=2:\n%s", step.Run)
+			if !strings.Contains(step.Run, `if [ "$FORK_RUNNER" = true ] && [ "$LANE" = unit-gc ]; then`) || !strings.Contains(step.Run, "opts+=(--local_resources=cpu=2)") {
+				t.Errorf("bazel test step does not cap the fork's unit-gc lane at --local_resources=cpu=2:\n%s", step.Run)
+			}
+			if !strings.Contains(step.Run, `bazel "${args[0]}" "${opts[@]}" "${args[@]:1}"`) {
+				t.Errorf("bazel test step must pass its options right after the command word, before any \"--\":\n%s", step.Run)
 			}
 		}
 	}
 	if swap < 0 {
-		t.Fatalf("job lane has no %q step", "Fork runner swap for the unit lane")
+		t.Fatalf("job lane has no %q step", "Fork runner swap for the unit-gc lane")
 	}
 	if test < 0 || swap > test {
 		t.Errorf("swap step (index %d) must come before the bazel test step (index %d)", swap, test)
