@@ -126,6 +126,7 @@ store_unresolved() {
   if [ -n "${GC_MAINTENANCE_DONE_TARGET:-}" ]; then
     gc session nudge "$GC_MAINTENANCE_DONE_TARGET" "MAINTENANCE_WARN: stale-db ${message}" || true
   fi
+  if gc runtime drain-ack; then DRAIN_ACKED=1; fi # drain-ack before failing open; on failure the trap tries again
   exit 1
 }
 
