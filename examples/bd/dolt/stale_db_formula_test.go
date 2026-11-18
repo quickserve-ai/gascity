@@ -1240,11 +1240,11 @@ func TestStaleDBFormulaClosesFromStoreRootWhateverTheCwd(t *testing.T) {
 		if err := os.Mkdir(filepath.Join(dir, ".beads"), 0o755); err != nil {
 			t.Fatalf("Mkdir: %v", err)
 		}
-		real, err := filepath.EvalSymlinks(dir)
+		resolved, err := filepath.EvalSymlinks(dir)
 		if err != nil {
 			t.Fatalf("EvalSymlinks: %v", err)
 		}
-		return real
+		return resolved
 	}
 	city := newStore(t)
 	otherCity := newStore(t)
