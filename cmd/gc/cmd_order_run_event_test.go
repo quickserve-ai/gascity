@@ -69,7 +69,7 @@ func TestOrderRunExecTrackedRecordsOrderFailedEvent(t *testing.T) {
 	}
 	all := trackingBeads(t, store, "order-run:tick")
 	if len(all) != 1 || !slicesContain(all[0].Labels, "exec-failed") {
-		t.Fatalf("tracking beads = %+v, want one labelled exec-failed", all)
+		t.Fatalf("tracking beads = %+v, want one labeled exec-failed", all)
 	}
 	got := outcomeEventsFor(t, ep, a.ScopedName())
 	if len(got) != 1 || got[0].Type != events.OrderFailed {
@@ -100,7 +100,7 @@ func TestOrderRunExecTrackedCursorLabelFailureStampsFailedThenRecords(t *testing
 	}
 	all := trackingBeads(t, mem, "exec-failed")
 	if len(all) != 1 {
-		t.Fatalf("beads labelled exec-failed = %d, want 1 (outcome stamped before the event)", len(all))
+		t.Fatalf("beads labeled exec-failed = %d, want 1 (outcome stamped before the event)", len(all))
 	}
 	got := outcomeEventsFor(t, ep, a.ScopedName())
 	if len(got) != 1 || got[0].Type != events.OrderFailed || !strings.Contains(got[0].Message, "seq=") {
