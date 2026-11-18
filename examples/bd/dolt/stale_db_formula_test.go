@@ -973,6 +973,8 @@ type staleDBFailureCase struct {
 	// env is appended after the scrubbed harness environment, so a case can
 	// stand in for one runtime identity shape.
 	env []string
+	// dir is the cwd the rendered script starts in ("" = the test's own).
+	dir string
 }
 
 func TestStaleDBFormulaFailurePathsDrainAck(t *testing.T) {
@@ -1220,6 +1222,107 @@ func TestStaleDBFormulaTerminalCloseCarriesClaimIdentity(t *testing.T) {
 	}
 }
 
+// TestStaleDBFormulaClosesFromStoreRootWhateverTheCwd pins ga-w8ptue's first
+// defect: a dog that ran the script from a temp dir had its bare `bd close`
+// find no store. The script now enters the store root named by the session's
+// environment, so the close lands from any starting cwd.
+func TestStaleDBFormulaClosesFromStoreRootWhateverTheCwd(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skipf("bash not found: %v", err)
+	}
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skipf("jq not found: %v", err)
+	}
+	city := t.TempDir()
+	if err := os.Mkdir(filepath.Join(city, ".beads"), 0o755); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	for _, tc := range []struct {
+		name string
+		env  []string
+	}{
+		{name: "city path", env: []string{"GC_CITY_PATH=" + city}},
+		{name: "rig root wins over an unrelated city path", env: []string{"GC_RIG_ROOT=" + city, "GC_CITY_PATH=" + t.TempDir()}},
+		{name: "empty rig root falls back to the city path", env: []string{"GC_RIG_ROOT=", "GC_CITY_PATH=" + city}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			log, out, err := runStaleDBFormulaFailureCase(t, staleDBFailureCase{
+				scanJSON: staleDBCleanScan,
+				dir:      t.TempDir(), // no .beads here: the dog's temp-dir cwd
+				env:      append([]string{"GC_TEST_BD_NEEDS_STORE=1"}, tc.env...),
+			})
+			if err != nil {
+				t.Fatalf("rendered script failed from a store-less cwd: %v\nlog:\n%s\noutput:\n%s", err, log, out)
+			}
+			if !strings.Contains(log, "bd close bead-1") {
+				t.Fatalf("script did not close the work bead\nlog:\n%s\noutput:\n%s", log, out)
+			}
+			if strings.Contains(string(out), "no beads database found") {
+				t.Fatalf("a bd call still resolved from the starting cwd\noutput:\n%s", out)
+			}
+		})
+	}
+}
+
+// TestStaleDBFormulaStoreResolutionFailureIsNotAHumanRefusal pins ga-w8ptue's
+// second defect: "no beads database found" is not an ownership refusal, so it
+// must not reach the human escalation route as a HIGH "close refused". It
+// still fails open (the bead stays open for the next firing), emits its own
+// event, nudges the maintenance target, and mails the store-error route only
+// when one is configured.
+func TestStaleDBFormulaStoreResolutionFailureIsNotAHumanRefusal(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skipf("bash not found: %v", err)
+	}
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skipf("jq not found: %v", err)
+	}
+	for _, tc := range []struct {
+		name     string
+		env      []string
+		wantMail string
+	}{
+		{name: "no store-error route", env: nil},
+		{name: "store-error route configured", env: []string{"GC_STORE_ERROR_RECIPIENT=woodhouse"}, wantMail: "gc mail send woodhouse -s stale-db: terminal close could not reach a bead store for bead-1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// No store root in the environment and none under the cwd.
+			log, out, err := runStaleDBFormulaFailureCase(t, staleDBFailureCase{
+				scanJSON: staleDBCleanScan,
+				dir:      t.TempDir(),
+				env:      append([]string{"GC_TEST_BD_NEEDS_STORE=1", "GC_MAINTENANCE_DONE_TARGET=health"}, tc.env...),
+			})
+			if err == nil {
+				t.Fatalf("rendered script exited successfully; want the unclosed bead to fail open\nlog:\n%s\noutput:\n%s", log, out)
+			}
+			for _, forbidden := range []string{"gc mail send human", "[HIGH]", "mol-dog-stale-db.escalate"} {
+				if strings.Contains(log, forbidden) {
+					t.Fatalf("store-resolution failure took the refusal path (%q)\nlog:\n%s\noutput:\n%s", forbidden, log, out)
+				}
+			}
+			for _, want := range []string{
+				"bd close bead-1",
+				"gc event emit mol-dog-stale-db.store-unresolved --message terminal close for bead-1 could not reach a bead store from ",
+				"gc session nudge health MAINTENANCE_WARN: stale-db terminal close for bead-1 could not reach a bead store",
+				"gc runtime drain-ack",
+			} {
+				if !strings.Contains(log, want) {
+					t.Fatalf("store-resolution failure did not record %q\nlog:\n%s\noutput:\n%s", want, log, out)
+				}
+			}
+			mail := staleDBLogLine(log, "gc mail send ")
+			if tc.wantMail == "" && mail != "" {
+				t.Fatalf("store-resolution failure sent mail with no route configured: %q\nlog:\n%s", mail, log)
+			}
+			if tc.wantMail != "" && !strings.HasPrefix(mail, tc.wantMail) {
+				t.Fatalf("store-error mail = %q, want prefix %q\nlog:\n%s", mail, tc.wantMail, log)
+			}
+		})
+	}
+}
+
+const staleDBCleanScan = `{"schema":"gc.dolt.cleanup.v1","dropped":{"count":0,"failed":[],"skipped":[]},"purge":{"bytes_reclaimed":0},"reaped":{"count":0,"targets":[]},"summary":{"bytes_freed_disk":0,"bytes_freed_rss":0,"errors_total":0}}`
+
 // staleDBLogLine returns the first recorded command line starting with prefix,
 // or "" when the fake binaries never logged one.
 func staleDBLogLine(log, prefix string) string {
@@ -1295,6 +1398,11 @@ case "${1:-}" in
   update|close)
     rendered="bd $*"
     echo "$rendered" >> "$GC_TEST_LOG"
+    # Like the real bd, find the store from the cwd when asked to.
+    if [ -n "${GC_TEST_BD_NEEDS_STORE:-}" ] && [ ! -d .beads ]; then
+      echo "Error: no beads database found" >&2
+      exit 1
+    fi
     maybe_fail "$rendered"
     ;;
   *)
@@ -1306,7 +1414,8 @@ esac
 
 	cmd := exec.Command("bash", "-s")
 	cmd.Stdin = strings.NewReader(script)
-	cmd.Env = append(staleDBFilteredEnv("GC_BEAD_ID", "PATH", "TMPDIR", "GC_TEST_LOG", "GC_TEST_SCAN_JSON", "GC_TEST_SCAN_EXIT", "GC_TEST_APPLY_JSON", "GC_TEST_APPLY_EXIT", "GC_TEST_FAIL_CONTAINS"),
+	cmd.Dir = tc.dir
+	cmd.Env = append(staleDBFilteredEnv("GC_BEAD_ID", "PATH", "TMPDIR", "GC_TEST_LOG", "GC_TEST_SCAN_JSON", "GC_TEST_SCAN_EXIT", "GC_TEST_APPLY_JSON", "GC_TEST_APPLY_EXIT", "GC_TEST_FAIL_CONTAINS", "GC_TEST_BD_NEEDS_STORE"),
 		"GC_BEAD_ID=bead-1",
 		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
 		"TMPDIR="+dir,

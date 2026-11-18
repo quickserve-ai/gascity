@@ -90,6 +90,18 @@ Run this as one shell script so every derived value remains in the same process:
 ```bash
 set -euo pipefail
 
+# Run from the work bead's store root, never from wherever this shell happens
+# to stand: a bare `bd` resolves its store by walking up from the cwd, and
+# seats carry GC_CITY_PATH but not BEADS_DIR. A dog that ran this script from
+# a temp dir got "no beads database found" on its note and its close, and the
+# close failure went to a human as a HIGH refusal (ga-w8ptue). The rig root
+# wins for a rig-scoped run; gc sets it empty for a city-scoped one. With
+# neither set, the cwd is the only store hint there is, so it stays.
+STORE_ROOT="${GC_RIG_ROOT:-${GC_CITY_PATH:-${GC_CITY:-}}}"
+if [ -n "$STORE_ROOT" ]; then
+  cd "$STORE_ROOT" || { echo "cannot enter the store root ${STORE_ROOT}; aborting before any work" >&2; exit 1; }
+fi
+
 WORK_BEAD="${GC_BEAD_ID:-${GC_TRIGGER_BEAD_ID:-$(gc hook current --id-only)}}"
 [ -n "$WORK_BEAD" ] || { echo "cannot resolve work bead id: GC_BEAD_ID/GC_TRIGGER_BEAD_ID unset and gc hook current returned nothing; aborting" >&2; exit 1; }
 TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/dolt-cleanup.XXXXXX")
@@ -365,6 +377,26 @@ CLOSE_FILE="$TMP_DIR/close.log"
 if ! close_work_bead "Stale DB scan complete (orphans=${ORPHAN_TOTAL}, applied=${APPLIED}, escalated=${ESCALATED})" > "$CLOSE_FILE" 2>&1; then
   cat "$CLOSE_FILE" >&2
   CLOSE_REFUSAL="$(tr '\n' ' ' < "$CLOSE_FILE")"
+  # bd could not find a store at all: nothing refused this dog, so this is
+  # not the stranded-bead case a human must close by hand. It goes to the
+  # store-error route when one is configured (GC_STORE_ERROR_RECIPIENT, a
+  # platform seat), to the event stream and the maintenance nudge, never to
+  # the human escalation route. The bead stays open, so the next firing's
+  # dog tries again from the store root (ga-w8ptue).
+  case "$CLOSE_REFUSAL" in
+    *"no beads database found"*)
+      CLOSE_STORE_MESSAGE="terminal close for ${WORK_BEAD} could not reach a bead store from $(pwd): ${CLOSE_REFUSAL}"
+      if [ -n "${GC_STORE_ERROR_RECIPIENT:-}" ]; then
+        run_or_warn "send store-unresolved notice" gc mail send "$GC_STORE_ERROR_RECIPIENT" \
+          -s "stale-db: terminal close could not reach a bead store for ${WORK_BEAD}" \
+          -m "${CLOSE_STORE_MESSAGE}. Not an ownership refusal. The bead stays open and the next firing's dog retries from the store root."
+      fi
+      run_or_warn "emit store-unresolved event" gc event emit mol-dog-stale-db.store-unresolved \
+        --message "${CLOSE_STORE_MESSAGE}; leaving work bead open for the next firing"
+      maintenance_notice "MAINTENANCE_WARN: stale-db terminal close for ${WORK_BEAD} could not reach a bead store; next firing retries"
+      fail_open_after_drain "${CLOSE_STORE_MESSAGE}; leaving work bead open"
+      ;;
+  esac
   CLOSE_REFUSAL_MESSAGE="terminal close refused for ${WORK_BEAD} (actor presented: ${CLOSE_ACTOR:-none}): ${CLOSE_REFUSAL:-no error text}"
   run_or_warn "send close-refused escalation" send_escalation \
     "ESCALATION: stale-db terminal close refused for ${WORK_BEAD} [HIGH]" \
