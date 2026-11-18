@@ -95,11 +95,25 @@ set -euo pipefail
 # seats carry GC_CITY_PATH but not BEADS_DIR. A dog that ran this script from
 # a temp dir got "no beads database found" on its note and its close, and the
 # close failure went to a human as a HIGH refusal (ga-w8ptue). The rig root
-# wins for a rig-scoped run; gc sets it empty for a city-scoped one. With
-# neither set, the cwd is the only store hint there is, so it stays.
-STORE_ROOT="${GC_RIG_ROOT:-${GC_CITY_PATH:-${GC_CITY:-}}}"
+# comes first for a rig-scoped run (gc sets it empty for a city-scoped one),
+# then the city in gc's own order (GC_CITY, GC_CITY_PATH, GC_CITY_ROOT:
+# resolveExplicitCityPathEnv). A candidate counts only when it holds a .beads
+# store itself, so a root without one cannot send bd walking up into a
+# parent's store, and a registered city NAME in GC_CITY is skipped rather than
+# read as a relative path. No candidate, or one that cannot be entered: the
+# cwd stays, as before this change. Nothing here exits, because the drain-ack
+# trap is not installed yet.
+STORE_ROOT=""
+for candidate in "${GC_RIG_ROOT:-}" "${GC_CITY:-}" "${GC_CITY_PATH:-}" "${GC_CITY_ROOT:-}"; do
+  if [ -n "$candidate" ] && [ -d "$candidate/.beads" ]; then
+    STORE_ROOT="$candidate"
+    break
+  fi
+done
 if [ -n "$STORE_ROOT" ]; then
-  cd "$STORE_ROOT" || { echo "cannot enter the store root ${STORE_ROOT}; aborting before any work" >&2; exit 1; }
+  cd "$STORE_ROOT" || { echo "cannot enter the store root ${STORE_ROOT}; staying in $(pwd)" >&2; STORE_ROOT=""; }
+else
+  echo "no store root with a .beads directory in GC_RIG_ROOT/GC_CITY/GC_CITY_PATH/GC_CITY_ROOT; bd resolves from $(pwd)" >&2
 fi
 
 WORK_BEAD="${GC_BEAD_ID:-${GC_TRIGGER_BEAD_ID:-$(gc hook current --id-only)}}"

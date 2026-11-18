@@ -1224,8 +1224,9 @@ func TestStaleDBFormulaTerminalCloseCarriesClaimIdentity(t *testing.T) {
 
 // TestStaleDBFormulaClosesFromStoreRootWhateverTheCwd pins ga-w8ptue's first
 // defect: a dog that ran the script from a temp dir had its bare `bd close`
-// find no store. The script now enters the store root named by the session's
-// environment, so the close lands from any starting cwd.
+// find no store. The script now enters the first store root (rig root, then
+// the city in gc's own order) that holds a .beads store, so every bd call runs
+// in that store from any starting cwd, and the close is the work bead's.
 func TestStaleDBFormulaClosesFromStoreRootWhateverTheCwd(t *testing.T) {
 	if _, err := exec.LookPath("bash"); err != nil {
 		t.Skipf("bash not found: %v", err)
@@ -1233,17 +1234,39 @@ func TestStaleDBFormulaClosesFromStoreRootWhateverTheCwd(t *testing.T) {
 	if _, err := exec.LookPath("jq"); err != nil {
 		t.Skipf("jq not found: %v", err)
 	}
-	city := t.TempDir()
-	if err := os.Mkdir(filepath.Join(city, ".beads"), 0o755); err != nil {
-		t.Fatalf("Mkdir: %v", err)
+	newStore := func(t *testing.T) string {
+		t.Helper()
+		dir := t.TempDir()
+		if err := os.Mkdir(filepath.Join(dir, ".beads"), 0o755); err != nil {
+			t.Fatalf("Mkdir: %v", err)
+		}
+		real, err := filepath.EvalSymlinks(dir)
+		if err != nil {
+			t.Fatalf("EvalSymlinks: %v", err)
+		}
+		return real
+	}
+	city := newStore(t)
+	otherCity := newStore(t)
+	rig := newStore(t)
+	// A rig root WITHOUT a store of its own, nested under the city: bd would
+	// walk up from it into the city store, so it must not be chosen.
+	bareRig := filepath.Join(city, "rigs", "bare")
+	if err := os.MkdirAll(bareRig, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
 	}
 	for _, tc := range []struct {
 		name string
 		env  []string
+		want string
 	}{
-		{name: "city path", env: []string{"GC_CITY_PATH=" + city}},
-		{name: "rig root wins over an unrelated city path", env: []string{"GC_RIG_ROOT=" + city, "GC_CITY_PATH=" + t.TempDir()}},
-		{name: "empty rig root falls back to the city path", env: []string{"GC_RIG_ROOT=", "GC_CITY_PATH=" + city}},
+		{name: "city path", env: []string{"GC_CITY_PATH=" + city}, want: city},
+		{name: "rig root wins over the city", env: []string{"GC_RIG_ROOT=" + rig, "GC_CITY_PATH=" + city}, want: rig},
+		{name: "empty rig root falls back to the city", env: []string{"GC_RIG_ROOT=", "GC_CITY_PATH=" + city}, want: city},
+		{name: "rig root without its own store is skipped", env: []string{"GC_RIG_ROOT=" + bareRig, "GC_CITY_PATH=" + city}, want: city},
+		{name: "GC_CITY outranks GC_CITY_PATH, as in gc", env: []string{"GC_CITY=" + otherCity, "GC_CITY_PATH=" + city}, want: otherCity},
+		{name: "a city name in GC_CITY is skipped", env: []string{"GC_CITY=mycity", "GC_CITY_PATH=" + city}, want: city},
+		{name: "GC_CITY_ROOT as the last resort", env: []string{"GC_CITY_ROOT=" + city}, want: city},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			log, out, err := runStaleDBFormulaFailureCase(t, staleDBFailureCase{
@@ -1254,11 +1277,20 @@ func TestStaleDBFormulaClosesFromStoreRootWhateverTheCwd(t *testing.T) {
 			if err != nil {
 				t.Fatalf("rendered script failed from a store-less cwd: %v\nlog:\n%s\noutput:\n%s", err, log, out)
 			}
-			if !strings.Contains(log, "bd close bead-1") {
-				t.Fatalf("script did not close the work bead\nlog:\n%s\noutput:\n%s", log, out)
+			if closeLine := staleDBLogLine(log, "bd close "); !strings.HasPrefix(closeLine, "bd close bead-1 --reason ") {
+				t.Fatalf("terminal close = %q, want the work bead bead-1\nlog:\n%s", closeLine, log)
 			}
-			if strings.Contains(string(out), "no beads database found") {
-				t.Fatalf("a bd call still resolved from the starting cwd\noutput:\n%s", out)
+			cwds := 0
+			for _, line := range strings.Split(log, "\n") {
+				if cwd, ok := strings.CutPrefix(line, "bd-cwd "); ok {
+					cwds++
+					if cwd != tc.want {
+						t.Fatalf("a bd call ran in %q, want the store root %q\nlog:\n%s", cwd, tc.want, log)
+					}
+				}
+			}
+			if cwds < 2 {
+				t.Fatalf("recorded %d bd working directories, want the note and the close at least\nlog:\n%s", cwds, log)
 			}
 		})
 	}
@@ -1284,6 +1316,8 @@ func TestStaleDBFormulaStoreResolutionFailureIsNotAHumanRefusal(t *testing.T) {
 	}{
 		{name: "no store-error route", env: nil},
 		{name: "store-error route configured", env: []string{"GC_STORE_ERROR_RECIPIENT=woodhouse"}, wantMail: "gc mail send woodhouse -s stale-db: terminal close could not reach a bead store for bead-1"},
+		{name: "store root names a missing directory", env: []string{"GC_CITY_PATH=/nonexistent/gc-city"}},
+		{name: "store root names a file", env: []string{"GC_CITY_PATH=" + staleDBRegularFile(t)}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			// No store root in the environment and none under the cwd.
@@ -1319,6 +1353,15 @@ func TestStaleDBFormulaStoreResolutionFailureIsNotAHumanRefusal(t *testing.T) {
 			}
 		})
 	}
+}
+
+// staleDBRegularFile returns the path of a plain file, for a store-root
+// variable that names something which is not a directory.
+func staleDBRegularFile(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "not-a-dir")
+	writeTestFile(t, path, "")
+	return path
 }
 
 const staleDBCleanScan = `{"schema":"gc.dolt.cleanup.v1","dropped":{"count":0,"failed":[],"skipped":[]},"purge":{"bytes_reclaimed":0},"reaped":{"count":0,"targets":[]},"summary":{"bytes_freed_disk":0,"bytes_freed_rss":0,"errors_total":0}}`
@@ -1399,9 +1442,12 @@ case "${1:-}" in
     rendered="bd $*"
     echo "$rendered" >> "$GC_TEST_LOG"
     # Like the real bd, find the store from the cwd when asked to.
-    if [ -n "${GC_TEST_BD_NEEDS_STORE:-}" ] && [ ! -d .beads ]; then
-      echo "Error: no beads database found" >&2
-      exit 1
+    if [ -n "${GC_TEST_BD_NEEDS_STORE:-}" ]; then
+      echo "bd-cwd $(pwd -P)" >> "$GC_TEST_LOG"
+      if [ ! -d .beads ]; then
+        echo "Error: no beads database found" >&2
+        exit 1
+      fi
     fi
     maybe_fail "$rendered"
     ;;
