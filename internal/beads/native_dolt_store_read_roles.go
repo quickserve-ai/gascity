@@ -885,6 +885,11 @@ func nativeListLimitPushdown(query ListQuery) int {
 	if query.Limit <= 0 {
 		return 0
 	}
+	// A caller that reads only the error (ListQuery.AnyRows) cannot be misled
+	// by a page the residual filters below would shorten, so its limit rides.
+	if query.AnyRows {
+		return query.Limit
+	}
 	// The status, type and tier predicates below are applied, or re-applied,
 	// by ApplyListQuery: gc's "open" and the tier never reach the backing (a
 	// Live "open" reaches it only as bd's raw status, nativeListPushesRawOpen),

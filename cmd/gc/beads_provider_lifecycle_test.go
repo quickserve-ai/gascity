@@ -5409,7 +5409,7 @@ func TestVerifyCanonicalBdScopeStoreReadyRetries(t *testing.T) {
 	if got, want := len(store.listQueries), 3; got != want {
 		t.Fatalf("List attempts = %d, want %d", got, want)
 	}
-	wantQuery := beads.ListQuery{AllowScan: true, Limit: 1}
+	wantQuery := beads.ListQuery{AllowScan: true, Limit: 1, AnyRows: true}
 	for attempt, query := range store.listQueries {
 		if !reflect.DeepEqual(query, wantQuery) {
 			t.Errorf("List attempt %d query = %#v, want %#v", attempt+1, query, wantQuery)

@@ -211,6 +211,16 @@ type ListQuery struct {
 	// matches the canonical order, so bounded asc reads are exact) or on stores that
 	// always resolve the limit Go-side.
 	AllowBackingCreatedLimit bool
+	// AnyRows says the caller reads only whether the List errored: any rows,
+	// in any order, including none, answer it. NativeDoltStore then sends the
+	// caller's Limit to the backing even where the backing set is wider than
+	// the query (nativeListLimitPushdown), so the page it returns after the
+	// gc-side filters may be short or empty. That is the point: a readiness
+	// probe (verifyCanonicalBdScopeStoreReady) sent with Limit 1 otherwise
+	// reads every row of the store, about 308 MB on the shared qc store
+	// (ga-yuiof4, 2026-11-18). It is not a filter (HasFilter ignores it).
+	// Never set it on a read whose rows are used. Other stores ignore it.
+	AnyRows bool
 	// TierMode selects the storage tier(s) to read from. Zero value
 	// (TierIssues) preserves the legacy single-tier behavior.
 	TierMode TierMode
