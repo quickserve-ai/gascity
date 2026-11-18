@@ -184,6 +184,8 @@ func (c *CachingStore) listForReconcile(ids []string) ([]Bead, error) {
 		query := cacheFullScanQuery()
 		query.AllowScan = false
 		query.IDs = ids[start:end]
+		// A bounded id read is not the full scan: default budget and retries.
+		query.SingleReadBudget = 0
 		rows, err := c.backing.List(query)
 		if err != nil {
 			return nil, err

@@ -63,9 +63,29 @@ var recordCacheScanLarge = telemetry.RecordCacheScanLarge
 //   - IncludeClosed is pinned false. The scan cost is O(active beads) by
 //     design; closed history grows without bound and would multiply the
 //     per-cycle bd payload without changing the diff result.
+//
+// It also carries its own read budget (cacheFullScanReadBudget) as one
+// attempt: see ListQuery.SingleReadBudget. listForReconcile, which narrows
+// this shape to ids, clears it, so delta reads keep the default budget and
+// retries.
 func cacheFullScanQuery() ListQuery {
-	return ListQuery{AllowScan: true, SkipLabels: true, IncludeClosed: false, TierMode: TierBoth, CompleteActive: true}
+	return ListQuery{
+		AllowScan:        true,
+		SkipLabels:       true,
+		IncludeClosed:    false,
+		TierMode:         TierBoth,
+		CompleteActive:   true,
+		SingleReadBudget: cacheFullScanReadBudget,
+	}
 }
+
+// cacheFullScanReadBudget bounds one attempt of the cache's full scan. The qc
+// store's scan over the hub link measured 45-75 s alone on 2026-11-17, against
+// a 90 s default budget that also covered reissues: under contention each pass
+// was cut at ~90 s and reissued inside it, and no pass completed for ~3.5 h
+// (ga-yuiof4). 300 s gives one attempt room on a slow link; a failed attempt
+// falls to the reconcile back-off (nextReconcileDelay) or Prime's own retries.
+const cacheFullScanReadBudget = 300 * time.Second
 
 func (c *CachingStore) reconcileLoop(ctx context.Context, stagger time.Duration) {
 	if stagger > 0 {
@@ -101,6 +121,21 @@ func (c *CachingStore) reconcileLoop(ctx context.Context, stagger time.Duration)
 // the reconcile gate (WithReconcileGate), if any, allows it.
 func (c *CachingStore) reconcileIfDue(now time.Time) {
 	if c.reconcileGate != nil && !c.reconcileGate() {
+		return
+	}
+	if c.fullPrimeInFlight(now) {
+		// A full prime is already listing the whole store. The controller arms
+		// the reconciler after a bounded wait even while the initial prime
+		// still runs (primeArmBound in cmd/gc), and before the first prime
+		// lands nextReconcileDelay is always 0, so without this skip a second
+		// full scan would start beside the prime's on the same slow link
+		// (pl-nzyv, woodhouse's read). The prime's snapshot is at least as
+		// complete; the next poll reconciles once it has finished. The skip is
+		// bounded (cacheFullPrimeSkipBound): a prime running past it is treated
+		// as hung, and this reconcile runs as the recovery primeArmBound exists
+		// for. This narrows overlap; it does not make prime and reconcile
+		// admission atomic (a prime that starts after this check can still
+		// overlap a reconcile, as before this change).
 		return
 	}
 	if c.nextReconcileDelay(now) == 0 && c.reconciling.CompareAndSwap(false, true) {

@@ -1015,12 +1015,41 @@ func (s *NativeDoltStore) withReadRetry(fn func(context.Context, beadslib.Storag
 // reconnects, backoff — also bounded by parent, so a caller's cancellation
 // ends a reconnect in progress instead of waiting out the budget.
 func (s *NativeDoltStore) withReadRetryContext(parent context.Context, fn func(context.Context, beadslib.Storage) error) error {
+	return s.withReadRetryOpts(parent, nativeReadOpts{}, fn)
+}
+
+// nativeReadOpts adjusts one read's retry chain. The zero value is the default
+// chain: the store's budget, reconnect-and-retry on a transient error.
+type nativeReadOpts struct {
+	// budget, when positive, replaces the store's budget (the default and any
+	// WithNativeReadRetryBudget override) for this read.
+	budget time.Duration
+	// single makes the read one attempt: a transient error still re-points the
+	// handle, so the next read gets a live pool, but this read is not reissued;
+	// a circuit-open error returns without waiting for the breaker.
+	single bool
+}
+
+// nativeListReadOpts maps a listing's ListQuery.SingleReadBudget onto the
+// retry chain.
+func nativeListReadOpts(query ListQuery) nativeReadOpts {
+	if query.SingleReadBudget > 0 {
+		return nativeReadOpts{budget: query.SingleReadBudget, single: true}
+	}
+	return nativeReadOpts{}
+}
+
+// withReadRetryOpts is withReadRetryContext with per-read options.
+func (s *NativeDoltStore) withReadRetryOpts(parent context.Context, opts nativeReadOpts, fn func(context.Context, beadslib.Storage) error) error {
 	if s == nil {
 		return fmt.Errorf("native Dolt store: %w", ErrStoreClosed)
 	}
 	budget := nativeReadRetryBudget
 	if s.readRetryBudgetOverride > 0 {
 		budget = s.readRetryBudgetOverride
+	}
+	if opts.budget > 0 {
+		budget = opts.budget
 	}
 	// One wall-clock context bounds the WHOLE chain — the read, the reconnect
 	// (env re-resolution + recovery + reopen), the retried read, and the backoff.
@@ -1095,7 +1124,7 @@ func (s *NativeDoltStore) withReadRetryContext(parent context.Context, fn func(c
 			// A handle with no reopen hook keeps the documented fail-fast
 			// contract: a test store built straight from a storage value must
 			// not start spending a 90s budget on a cooldown loop.
-			if reopen == nil {
+			if reopen == nil || opts.single {
 				return opErr
 			}
 			backoff = class.cooldown
@@ -1122,6 +1151,11 @@ func (s *NativeDoltStore) withReadRetryContext(parent context.Context, fn func(c
 				if classifyNativeDoltReadError(rcErr, s.readLane()).disposition != nativeReadTransient {
 					return reconnectErr
 				}
+			}
+			if opts.single {
+				// One attempt: the handle is re-pointed for the next read, and
+				// this one is not reissued.
+				return opErr
 			}
 		}
 		// Cancellable backoff: budget expiry during the wait aborts the chain
