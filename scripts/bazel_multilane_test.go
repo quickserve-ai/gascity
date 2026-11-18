@@ -343,9 +343,16 @@ func readStepOutput(t *testing.T, path, name string) (string, bool) {
 }
 
 // multiLaneLanes runs the rbe job's Lanes step for an event, a mode and
-// fresh-test-results ("true" or "false") and returns its raw lanes output
-// (the string the lane job's if compares).
+// fresh-test-results ("true" or "false") as upstream's repository runs it and
+// returns its raw lanes output (the string the lane job's if compares).
 func multiLaneLanes(t *testing.T, script, event, mode, fresh string) (string, error) {
+	t.Helper()
+	return multiLaneLanesOn(t, script, event, mode, fresh, "false")
+}
+
+// multiLaneLanesOn is multiLaneLanes with FORK_RUNNER ("true" on a fork
+// repository, "false" upstream).
+func multiLaneLanesOn(t *testing.T, script, event, mode, fresh, forkRunner string) (string, error) {
 	t.Helper()
 	dir := t.TempDir()
 	output := filepath.Join(dir, "output")
@@ -353,6 +360,7 @@ func multiLaneLanes(t *testing.T, script, event, mode, fresh string) (string, er
 		"EVENT":               event,
 		"MODE":                mode,
 		"FRESH":               fresh,
+		"FORK_RUNNER":         forkRunner,
 		"GITHUB_OUTPUT":       output,
 		"GITHUB_STEP_SUMMARY": filepath.Join(dir, "summary"),
 	})
@@ -376,7 +384,44 @@ var (
 	multiLaneModes  = []string{"remote", "fork-ro", "fork-rw", "cache", "local"}
 )
 
-// wantMultiLanes: the lanes each (event, mode) starts, in order.
+// multiLaneForkCommands: the fork carry's lane commands where they differ
+// from multiLaneCommands (ga-ltp626). The fork's unit lane tests //... less
+// //cmd/gc/..., and unit-gc tests //cmd/gc/...: together exactly //....
+var multiLaneForkCommands = map[string]string{
+	"unit":    "test --config=ci --keep_going -- //... -//cmd/gc/...",
+	"unit-gc": "test --config=ci --keep_going //cmd/gc/...",
+}
+
+// wantMultiLaneCommand: a lane's exact command on upstream (forkRunner
+// "false") or the fork ("true"), with or without fresh-test-results.
+// --config=fresh goes before a "--", after which every word is a target.
+func wantMultiLaneCommand(name, fresh, forkRunner string) string {
+	cmd := multiLaneCommands[name]
+	if fork, ok := multiLaneForkCommands[name]; ok && forkRunner == "true" {
+		cmd = fork
+	}
+	if fresh != "true" {
+		return cmd
+	}
+	add := multiLaneFreshTargets[name] + " --config=fresh"
+	if before, after, ok := strings.Cut(cmd, " -- "); ok {
+		return before + " --config=fresh -- " + after
+	}
+	return cmd + add
+}
+
+// wantMultiLanesOn: wantMultiLanes, plus the fork carry's unit-gc lane right
+// after unit when forkRunner is "true" (ga-ltp626).
+func wantMultiLanesOn(event, mode, forkRunner string) []string {
+	lanes := wantMultiLanes(event, mode)
+	if forkRunner != "true" {
+		return lanes
+	}
+	i := slices.Index(lanes, "unit")
+	return slices.Insert(lanes, i+1, "unit-gc")
+}
+
+// wantMultiLanes: the lanes each (event, mode) starts upstream, in order.
 func wantMultiLanes(event, _ string) []string {
 	// Every mode tests (the gate fails a run with no lane). Acceptance and
 	// the gating integration lanes run in every mode, the fork pool's
@@ -400,9 +445,10 @@ func TestBazelMultiLaneLaneList(t *testing.T) {
 	wf := readMultiLaneWorkflow(t)
 	step := multiLaneRBEStep(t, wf, "lanes")
 	wantEnv := map[string]string{
-		"EVENT": "${{ github.event_name }}",
-		"MODE":  "${{ steps.decide.outputs.mode }}",
-		"FRESH": "${{ inputs.fresh-test-results }}",
+		"EVENT":       "${{ github.event_name }}",
+		"MODE":        "${{ steps.decide.outputs.mode }}",
+		"FRESH":       "${{ inputs.fresh-test-results }}",
+		"FORK_RUNNER": "${{ github.repository != 'gastownhall/gascity' }}",
 	}
 	if step.If != "" || !reflect.DeepEqual(step.Env, wantEnv) {
 		t.Errorf("Lanes step: if %q, env %v; want it unconditional with env %v", step.If, step.Env, wantEnv)
@@ -414,45 +460,46 @@ func TestBazelMultiLaneLaneList(t *testing.T) {
 	for _, event := range multiLaneEvents {
 		for _, mode := range multiLaneModes {
 			for _, fresh := range []string{"false", "true"} {
-				raw, err := multiLaneLanes(t, step.Run, event, mode, fresh)
-				if err != nil {
-					t.Errorf("Lanes step (event %s, mode %s, fresh %s) failed: %v\n%s", event, mode, fresh, err, raw)
-					continue
-				}
-				want := wantMultiLanes(event, mode)
-				var entries []map[string]any
-				if err := json.Unmarshal([]byte(raw), &entries); err != nil {
-					t.Errorf("event %s, mode %s, fresh %s: lanes %q is not a JSON array of objects: %v", event, mode, fresh, raw, err)
-					continue
-				}
-				got := []string{}
-				for _, entry := range entries {
-					name, _ := entry["lane"].(string)
-					got = append(got, name)
-					wantCmd := multiLaneCommands[name]
-					if fresh == "true" {
-						wantCmd += multiLaneFreshTargets[name] + " --config=fresh"
+				for _, forkRunner := range []string{"false", "true"} {
+					raw, err := multiLaneLanesOn(t, step.Run, event, mode, fresh, forkRunner)
+					if err != nil {
+						t.Errorf("Lanes step (event %s, mode %s, fresh %s, fork %s) failed: %v\n%s", event, mode, fresh, forkRunner, err, raw)
+						continue
 					}
-					if cmd, _ := entry["cmd"].(string); cmd != wantCmd {
-						t.Errorf("event %s, mode %s, fresh %s: lane %s cmd %q, want %q", event, mode, fresh, name, cmd, wantCmd)
+					want := wantMultiLanesOn(event, mode, forkRunner)
+					var entries []map[string]any
+					if err := json.Unmarshal([]byte(raw), &entries); err != nil {
+						t.Errorf("event %s, mode %s, fresh %s: lanes %q is not a JSON array of objects: %v", event, mode, fresh, raw, err)
+						continue
 					}
-					// Evidence-only (exit 0 on failure) is integration's alone, until G3.
-					ev, set := entry["evidence-only"]
-					if (name == "integration") != (set && ev == true) {
-						t.Errorf("event %s, mode %s, fresh %s: lane %s evidence-only %v; want true on integration only", event, mode, fresh, name, ev)
-					}
-					for key := range entry {
-						if key != "lane" && key != "cmd" && key != "evidence-only" {
-							t.Errorf("event %s, mode %s, fresh %s: lane %s: unexpected matrix key %q", event, mode, fresh, name, key)
+					got := []string{}
+					for _, entry := range entries {
+						name, _ := entry["lane"].(string)
+						got = append(got, name)
+						wantCmd := wantMultiLaneCommand(name, fresh, forkRunner)
+						if cmd, _ := entry["cmd"].(string); cmd != wantCmd {
+							t.Errorf("event %s, mode %s, fresh %s, fork %s: lane %s cmd %q, want %q", event, mode, fresh, forkRunner, name, cmd, wantCmd)
+						}
+						// Evidence-only (exit 0 on failure) is integration's alone, until G3.
+						ev, set := entry["evidence-only"]
+						if (name == "integration") != (set && ev == true) {
+							t.Errorf("event %s, mode %s, fresh %s: lane %s evidence-only %v; want true on integration only", event, mode, fresh, name, ev)
+						}
+						for key := range entry {
+							if key != "lane" && key != "cmd" && key != "evidence-only" {
+								t.Errorf("event %s, mode %s, fresh %s: lane %s: unexpected matrix key %q", event, mode, fresh, name, key)
+							}
 						}
 					}
-				}
-				if !reflect.DeepEqual(got, want) {
-					t.Errorf("event %s, mode %s, fresh %s: lanes %v, want %v", event, mode, fresh, got, want)
-				}
-				// The decide step reaches a fork mode on pull_request runs only.
-				if event == "pull_request" && strings.HasPrefix(mode, "fork-") && len(got) > multiLaneForkCertificates {
-					t.Errorf("event %s, mode %s, fresh %s: %d lanes; a fork run mints at most %d rbe-fork certificates", event, mode, fresh, len(got), multiLaneForkCertificates)
+					if !reflect.DeepEqual(got, want) {
+						t.Errorf("event %s, mode %s, fresh %s, fork %s: lanes %v, want %v", event, mode, fresh, forkRunner, got, want)
+					}
+					// The decide step reaches a fork mode on pull_request runs
+					// only, and only upstream: a fork repository's own runs take
+					// mode local (decide step, FORK_REPO) and mint nothing.
+					if forkRunner == "false" && event == "pull_request" && strings.HasPrefix(mode, "fork-") && len(got) > multiLaneForkCertificates {
+						t.Errorf("event %s, mode %s, fresh %s: %d lanes; a fork run mints at most %d rbe-fork certificates", event, mode, fresh, len(got), multiLaneForkCertificates)
+					}
 				}
 			}
 		}
@@ -470,9 +517,11 @@ func multiLaneLaneNames() []string {
 	var names []string
 	for _, event := range multiLaneEvents {
 		for _, mode := range multiLaneModes {
-			for _, lane := range wantMultiLanes(event, mode) {
-				if !slices.Contains(names, lane) {
-					names = append(names, lane)
+			for _, forkRunner := range []string{"false", "true"} {
+				for _, lane := range wantMultiLanesOn(event, mode, forkRunner) {
+					if !slices.Contains(names, lane) {
+						names = append(names, lane)
+					}
 				}
 			}
 		}

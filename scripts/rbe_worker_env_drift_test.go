@@ -609,7 +609,7 @@ func TestBazelMultiLaneWorkerEnvPreflight(t *testing.T) {
 		skip      = "steps.worker-env.outputs.pin-moved != 'true'"
 		preflight = rbeWorkerEnvDrift + ` preflight "$RUNNER_TEMP/worker-env-base.bazel" "$RUNNER_TEMP/worker-env-changed"`
 	)
-	bazelRun := regexp.MustCompile(`(?m)^\s*bazel ("\$\{args\[@\]\}"|coverage )`)
+	bazelRun := regexp.MustCompile(`(?m)^\s*bazel ("\$\{args\[[@0]\]\}"|coverage )`)
 	wf := parseWorkflow(t, bazelMultiLaneWorkflow)
 	for _, id := range []string{"lane", "coverage"} {
 		t.Run(id, func(t *testing.T) {
