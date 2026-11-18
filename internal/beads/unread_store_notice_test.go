@@ -294,7 +294,7 @@ func TestFreshBdInitAdoptionIsNeverRefused(t *testing.T) {
 	s := beads.NewBdStore(scope, runner.run, beads.WithBdStoreNoticeSink(&notices))
 
 	// The adoption gate, verbatim from verifyCanonicalBdScopeStoreReady.
-	got, err := s.List(beads.ListQuery{AllowScan: true, Limit: 1})
+	got, err := s.List(beads.ListQuery{AllowScan: true, Limit: 1, AnyRows: true})
 	if err != nil {
 		t.Fatalf("List(AllowScan, Limit 1) error = %v, want nil: this call gates `gc rig add`", err)
 	}

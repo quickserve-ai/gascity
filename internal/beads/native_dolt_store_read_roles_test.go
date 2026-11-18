@@ -160,6 +160,11 @@ func TestNativeDoltStoreListPushesTheLimitOnlyWhenTheBackingSetIsTheQuerySet(t *
 			want:  7,
 		},
 		{
+			name:  "AnyRows: a caller that reads only the error takes any page, so the limit rides past the gc-side filters",
+			query: ListQuery{AllowScan: true, Limit: 1, AnyRows: true},
+			want:  1,
+		},
+		{
 			name:  "not-closed is a gc-side narrowing of an all-status request",
 			query: ListQuery{AllowScan: true, TierMode: TierBoth, Sort: SortCreatedAsc, Limit: 7},
 			want:  0,
