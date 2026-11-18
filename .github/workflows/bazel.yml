@@ -1045,14 +1045,16 @@ jobs:
         continue-on-error: true
         run: |
           dir="$RUNNER_TEMP/bazel-bep"
-          go run ./scripts/shard-budget.go \
+          # --allow-missing goes before the paths: Go's flag package stops at
+          # the first positional argument, so after them it would be read as
+          # a path and the first missing lane would end the run (ga-ltp626).
+          go run ./scripts/shard-budget.go --allow-missing \
             "$dir/bazel-bep-unit-${{ github.run_attempt }}/bazel-bep.json" \
             "$dir/bazel-bep-unit-gc-${{ github.run_attempt }}/bazel-bep.json" \
             "$dir/bazel-bep-acceptance-${{ github.run_attempt }}/bazel-bep.json" \
             "$dir/bazel-bep-integration-packages-${{ github.run_attempt }}/bazel-bep.json" \
             "$dir/bazel-bep-integration-smoke-${{ github.run_attempt }}/bazel-bep.json" \
-            "$dir/bazel-bep-integration-${{ github.run_attempt }}/bazel-bep.json" \
-            --allow-missing >> "$GITHUB_STEP_SUMMARY"
+            "$dir/bazel-bep-integration-${{ github.run_attempt }}/bazel-bep.json" >> "$GITHUB_STEP_SUMMARY"
       - name: Upload bazel test cache report
         if: always()
         continue-on-error: true
