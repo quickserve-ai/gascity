@@ -117,6 +117,19 @@ func nativeListCanPushNotClosed(query ListQuery) bool {
 	return query.PushNotClosed && query.Status == "" && !query.IncludeClosed && !query.CompleteActive
 }
 
+// nativeListExcludesClosed reports whether ApplyListQuery drops every row
+// whose bd status is closed for query, so its request may exclude closed at
+// the server. ListQuery.Matches drops gc's closed when no status is named and
+// IncludeClosed is false, and when a status other than closed is named; bd's
+// "closed", and no other bd status, maps to gc's closed (mapBdStatus). So the
+// exclusion is exact, never narrower than the query.
+func nativeListExcludesClosed(query ListQuery) bool {
+	if query.Status == "" {
+		return !query.IncludeClosed
+	}
+	return query.Status != "closed"
+}
+
 // nativeListPushableStatus reports whether a gc status maps one-to-one onto a
 // bd status. mapBdStatus folds every other bd status into gc's "open".
 func nativeListPushableStatus(status string) bool {
@@ -311,8 +324,9 @@ func nativeListStatusNameOK(name string) bool {
 // afresh (readListNotClosedStatus), so a custom status added after open is
 // pushed by the next one.
 //
-// WHAT THE SET CANNOT NAME until ExcludeStatus (beads #7647) lets the pushdown
-// say "not closed" directly: a row whose status is in no current status.custom,
+// WHAT THE SET CANNOT NAME (an allow-list; the ExcludeStatus deny-list from
+// beads #7647, nativeListExcludesClosed, does not have this gap): a row whose
+// status is in no current status.custom,
 // either a name since removed from the setting while rows still carry it, or
 // one kept only in a server's config.yaml. A pushed read would hide it, so
 // guardNotClosed probes for such rows before each push and reads that listing

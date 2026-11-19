@@ -59,11 +59,13 @@ import (
 // is a substitute. AllFlag is stated because it says what it does in the member
 // name rather than in a magic status value.
 //
-// There is no ExcludeStatus member to spell "everything but closed" with, so
-// gc's "open" cannot be pushed down, and its not-closed default is pushed only
-// as an allow-list for a caller that opts in (ListQuery.PushNotClosed, behind
-// guardNotClosed); gc's three-value projection (mapBdStatus, ListQuery.Matches)
-// stays the definition and runs Go-side. The two statuses that map one-to-one
+// "Everything but closed" is spelled as ExcludeStatus closed (the beads fleet
+// carry of upstream #7647) wherever the query drops closed rows anyway
+// (nativeListExcludesClosed); that is a deny-list, so it never hides a status
+// the scope's vocabulary misses. The older allow-list form is still pushed for
+// a caller that opts in (ListQuery.PushNotClosed, behind guardNotClosed), and
+// gc's three-value projection (mapBdStatus, ListQuery.Matches) stays the
+// definition and runs Go-side. The two statuses that map one-to-one
 // onto a bd status are pushed beside AllFlag (nativeListRequestFromListQuery),
 // which keeps the pinned-flag default lifted under a named status. One
 // exception: a Live "open" is pushed as bd's raw "open" (nativeListPushesRawOpen).
@@ -786,9 +788,10 @@ func filterReadyByWorkOutcomeFetchBlockers(ctx context.Context, reader issueops.
 // Everything else stays Go-side, and each has a reason the role's own contract
 // supplies:
 //
-//   - STATUS "open" and the not-closed default, because the request has no
-//     ExcludeStatus and gc's "open" is every bd status but closed and
-//     in_progress. "in_progress" and "closed" are exact: mapBdStatus maps them
+//   - STATUS "open" and the not-closed default are answered Go-side: gc's
+//     "open" is every bd status but closed and in_progress. The server is
+//     asked only to leave closed out (ExcludeStatus, nativeListExcludesClosed),
+//     which is exact. "in_progress" and "closed" are exact: mapBdStatus maps them
 //     one-to-one, and AllFlag keeps the pinned-flag default lifted under a
 //     named status. See nativeListReadRequest. The exception is a Live
 //     "open", which travels as bd's raw "open" (nativeListPushesRawOpen).
@@ -829,9 +832,10 @@ func nativeListRequestFromListQuery(query ListQuery, pushableTypes map[string]bo
 	if !query.CreatedBefore.IsZero() {
 		req.CreatedBefore = zeroTimePtr(query.CreatedBefore)
 	}
-	if nativeListPushableStatus(query.Status) || nativeListPushesRawOpen(query) {
+	switch {
+	case nativeListPushableStatus(query.Status) || nativeListPushesRawOpen(query):
 		req.Status = query.Status
-	} else if nativeListCanPushNotClosed(query) && notClosed != "" {
+	case nativeListCanPushNotClosed(query) && notClosed != "":
 		// The not-closed default: every status of the scope's vocabulary but
 		// closed, as the request's OR set (nativeListNotClosedStatusFor). It
 		// replaces the status exclusions AllFlag lifted, and names pinned and
@@ -843,6 +847,13 @@ func nativeListRequestFromListQuery(query ListQuery, pushableTypes map[string]bo
 		// CompleteActive read: there a status the vocabulary missed would not
 		// just hide rows, the cache would evict them as closed.
 		req.Status = notClosed
+	case nativeListExcludesClosed(query):
+		// Closed history, excluded at the server (ga-tyf38i). Unlike the
+		// not-closed set above this is a deny-list of the one bd status that
+		// maps to gc's closed, so a status no vocabulary names still comes
+		// back, and it is safe on a CompleteActive read: the cache's full
+		// scan stops reading every closed row in the ledger on every cycle.
+		req.ExcludeStatus = []string{string(beadslib.StatusClosed)}
 	}
 	if pushableTypes[query.Type] {
 		req.IssueType = query.Type
@@ -878,9 +889,10 @@ func nativeListRequestFromListQuery(query ListQuery, pushableTypes map[string]bo
 // THE COST THIS BUYS, recorded rather than discovered later: a durable-tier or
 // typed or not-closed listing now fetches the whole candidate set and cuts the
 // page in Go. That is the same class of cost as the wire's own L2 (a non-created
-// display order pages to exhaustion), and it is the price of not narrowing. It
-// ends when the request can spell an ExcludeStatus, a durable-plane selector and
-// a non-validating type filter — the upstream ask this re-point files.
+// display order pages to exhaustion), and it is the price of not narrowing.
+// ExcludeStatus now narrows closed rows out of that candidate set; a limit still
+// cannot ride until the request can also spell a durable-plane selector and a
+// non-validating type filter.
 func nativeListLimitPushdown(query ListQuery) int {
 	if query.Limit <= 0 {
 		return 0

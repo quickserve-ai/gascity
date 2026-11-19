@@ -611,6 +611,9 @@ func (r filteringReader) list(_ context.Context, req issueops.ListRequest) (issu
 		if req.Status != "" && string(issue.Status) != req.Status {
 			continue
 		}
+		if slices.Contains(req.ExcludeStatus, string(issue.Status)) {
+			continue
+		}
 		if req.IssueType != "" {
 			if string(issue.IssueType) != req.IssueType {
 				continue
