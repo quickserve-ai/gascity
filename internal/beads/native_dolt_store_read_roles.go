@@ -832,9 +832,10 @@ func nativeListRequestFromListQuery(query ListQuery, pushableTypes map[string]bo
 	if !query.CreatedBefore.IsZero() {
 		req.CreatedBefore = zeroTimePtr(query.CreatedBefore)
 	}
-	if nativeListPushableStatus(query.Status) || nativeListPushesRawOpen(query) {
+	switch {
+	case nativeListPushableStatus(query.Status) || nativeListPushesRawOpen(query):
 		req.Status = query.Status
-	} else if nativeListCanPushNotClosed(query) && notClosed != "" {
+	case nativeListCanPushNotClosed(query) && notClosed != "":
 		// The not-closed default: every status of the scope's vocabulary but
 		// closed, as the request's OR set (nativeListNotClosedStatusFor). It
 		// replaces the status exclusions AllFlag lifted, and names pinned and
@@ -846,7 +847,7 @@ func nativeListRequestFromListQuery(query ListQuery, pushableTypes map[string]bo
 		// CompleteActive read: there a status the vocabulary missed would not
 		// just hide rows, the cache would evict them as closed.
 		req.Status = notClosed
-	} else if nativeListExcludesClosed(query) {
+	case nativeListExcludesClosed(query):
 		// Closed history, excluded at the server (ga-tyf38i). Unlike the
 		// not-closed set above this is a deny-list of the one bd status that
 		// maps to gc's closed, so a status no vocabulary names still comes
