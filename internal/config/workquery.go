@@ -835,15 +835,43 @@ func inProgressBlockedByEnrichmentScriptWithServeAction(federated bool, checkHol
 func assignedReadyTierCommand(shellVar string, topo QueryTopology) string {
 	fed := topo.FederatedReady
 	return `r=$(` + readyReaderCommand(fed) + bdReadyIncludeEphemeralArg(topo.includeEphemeralReady()) +
-		` --assignee="$` + shellVar + `" --json --limit=1` + readyReaderStderrSink(fed) + `)` +
+		` --assignee="$` + shellVar + `"` +
+		(PoolDemandServeRules{ExcludeLabels: beadmeta.DispatchHoldLabels}).ShellArgs() +
+		` --json --limit=20` + readyReaderStderrSink(fed) + `)` +
 		readyReaderFailurePropagation(fed) + `; `
+}
+
+// assignedReadyServeScript filters dispatch holds before the first-row cut.
+// A held head cannot hide another assigned bead or the routed tier behind it.
+// Preserve malformed reader output rather than turning a read failure into
+// false-empty work.
+func assignedReadyServeScript() string {
+	filter := `[.[]` + excludeHoldLabelsJQClause() + `] | .[:1]`
+	return `if [ -n "$r" ] && [ "$r" != "[]" ]; then ` +
+		`gc_assigned_ready=$(printf "%s" "$r" | jq -c ` + shellquote.Quote(filter) + ` 2>/dev/null); ` +
+		`[ -n "$gc_assigned_ready" ] && r="$gc_assigned_ready"; ` +
+		`[ "$r" = "[]" ] || { printf "%s" "$r"; exit 0; }; ` +
+		`fi; `
+}
+
+// assignedReadyEphemeralServeScript is the serving form of the assignee-scoped
+// ephemeral fallback. It drops dispatch holds from the candidate stream BEFORE
+// the fast and slow cuts take their first row and before either can exit, so a
+// held head (oldest first) cannot hide the unheld assignment behind it. The
+// existence probe (ephemeralAssignedReadyProbeScript) stays hold-transparent.
+// The candidate read is the same raw snapshot either way, so the per-query
+// memo (ephemeralStatusSnapshotShell, #5712) is shared and survives into the
+// next identity.
+func assignedReadyEphemeralServeScript(shellVar string, topo QueryTopology) string {
+	read, filter := ephemeralAssignedReadyProbeParts(shellVar, topo, true)
+	return read + filter
 }
 
 func standardAssignedReadyWorkQueryScript(topo QueryTopology) string {
 	return identityLoopHead() +
 		assignedReadyTierCommand("id", topo) +
-		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
-		ephemeralAssignedReadyProbeScript("id", topo) +
+		assignedReadyServeScript() +
+		assignedReadyEphemeralServeScript("id", topo) +
 		`done; `
 }
 
@@ -893,8 +921,8 @@ func legacyControlAssignedReadyWorkQueryScript(topo QueryTopology) string {
 		`for cand in "$id" "$legacy"; do ` +
 		`[ -z "$cand" ] && continue; ` +
 		assignedReadyTierCommand("cand", topo) +
-		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
-		ephemeralAssignedReadyProbeScript("cand", topo) +
+		assignedReadyServeScript() +
+		assignedReadyEphemeralServeScript("cand", topo) +
 		`done; ` +
 		`done; `
 }
@@ -997,16 +1025,28 @@ func ephemeralAssignedInProgressProbeScriptDeferringGraphAnchor(shellVar string,
 // through the same fast and slow filters: `bd query status=open` is not a
 // readiness query, since dependency-blocked issues keep status "open".
 func ephemeralAssignedReadyProbeScript(shellVar string, topo QueryTopology) string {
-	fastFilter := legacyEphemeralReadyFilterJQ(`select((.assignee // "") == $id)`, 1, false)
-	slowFilter := ephemeralReadyDependencyCandidateFilterJQ(`select((.assignee // "") == $id)`, 1, false)
+	read, filter := ephemeralAssignedReadyProbeParts(shellVar, topo, false)
+	return read + filter
+}
+
+// ephemeralAssignedReadyProbeParts splits the probe into its candidate read and
+// the filter-and-serve script that consumes it. excludeHolds drops dispatch
+// holds in the candidate selector itself, ahead of both first-row cuts; the
+// serving fallback sets it, the hold-transparent existence probe does not.
+func ephemeralAssignedReadyProbeParts(shellVar string, topo QueryTopology, excludeHolds bool) (read, filter string) {
+	selector := `select((.assignee // "") == $id)`
+	if excludeHolds {
+		selector += excludeHoldLabelsJQClause()
+	}
+	fastFilter := legacyEphemeralReadyFilterJQ(selector, 1, false)
+	slowFilter := ephemeralReadyDependencyCandidateFilterJQ(selector, 1, false)
 	candidatesVar := "open_ephemeral"
-	read := ephemeralStatusSnapshotShell(candidatesVar, "open")
+	read = ephemeralStatusSnapshotShell(candidatesVar, "open")
 	if topo.includeEphemeralReady() {
 		candidatesVar = "assigned_open_ephemeral"
 		read = candidatesVar + `=$(` + bdQueryEphemeralAssignedStatusQuietShell("open", shellVar) + `); `
 	}
-	return read +
-		`r=$(printf "%s" "$` + candidatesVar + `" | jq --arg id "$` + shellVar + `" ` + shellquote.Quote(fastFilter) + ` 2>/dev/null); ` +
+	return read, `r=$(printf "%s" "$` + candidatesVar + `" | jq --arg id "$` + shellVar + `" ` + shellquote.Quote(fastFilter) + ` 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		`r=$(printf "%s" "$` + candidatesVar + `" | jq --arg id "$` + shellVar + `" ` + shellquote.Quote(slowFilter) + ` 2>/dev/null); ` +
 		`if [ -n "$r" ] && [ "$r" != "[]" ]; then ` +
