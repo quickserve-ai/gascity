@@ -53,6 +53,7 @@ func TestMain(m *testing.M) {
 		tmuxtest.KillAllTestSessions(mainTB{})
 	}
 	_ = os.RemoveAll(tmuxSocketParent)
+	_ = os.RemoveAll(nudgeLockDir)
 	os.Exit(code)
 }
 

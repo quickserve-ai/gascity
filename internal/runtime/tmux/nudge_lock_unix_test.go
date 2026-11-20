@@ -3,6 +3,7 @@
 package tmux
 
 import (
+	"context"
 	"errors"
 	"os"
 	"syscall"
@@ -159,9 +160,9 @@ func TestNudgeLockFailsOpenWhenTheLockDirIsUnusable(t *testing.T) {
 func TestNudgeLockFailsOpenOnAnUntrustedLockDir(t *testing.T) {
 	// A symlink in place of the directory is never trusted: it could point at
 	// a directory another user controls.
-	real := t.TempDir()
+	target := t.TempDir()
 	link := t.TempDir() + "/locks"
-	if err := os.Symlink(real, link); err != nil {
+	if err := os.Symlink(target, link); err != nil {
 		t.Fatal(err)
 	}
 	old := nudgeXLockDir
@@ -214,5 +215,18 @@ func TestNudgeLockCrossProcessWaitIsCapped(t *testing.T) {
 	}
 	if waited := time.Since(start); waited > 5*time.Second {
 		t.Fatalf("waited %v, past the cross-process cap", waited)
+	}
+}
+
+// A lock timeout wraps ErrNudgeLockBusy, so queue callers can back off on it
+// without spending a delivery attempt (ga-bz7eo5).
+func TestNudgeLockTimeoutWrapsErrNudgeLockBusy(t *testing.T) {
+	withScratchNudgeXLockDir(t)
+	release := holdAsOtherProcess(t, "zeta")
+	defer release()
+	tm := &Tmux{cfg: Config{NudgeLockTimeout: 100 * time.Millisecond}}
+	err := tm.ClearInput(context.Background(), "zeta", 0)
+	if !errors.Is(err, ErrNudgeLockBusy) {
+		t.Fatalf("ClearInput under another process's lock: err = %v, want ErrNudgeLockBusy", err)
 	}
 }
