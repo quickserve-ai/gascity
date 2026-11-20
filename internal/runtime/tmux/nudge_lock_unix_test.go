@@ -51,7 +51,7 @@ func otherProcessCanLock(t *testing.T, key string) bool {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 	if err == nil {
 		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
@@ -84,24 +84,20 @@ func TestNudgeLockWaitsForAnotherProcessDelivery(t *testing.T) {
 	releaseNudgeLock(session)
 }
 
-// A delivery that starts while another process holds the lock proceeds as
-// soon as that process releases it, inside its timeout.
+// A delivery waiting on another process's hold proceeds once that process
+// releases, inside its timeout. (That it WAITS while the hold stands is
+// TestNudgeLockWaitsForAnotherProcessDelivery; this one needs no timing.)
 func TestNudgeLockProceedsWhenTheOtherProcessReleases(t *testing.T) {
 	withScratchNudgeXLockDir(t)
 	const session = "krieger"
 	release := holdAsOtherProcess(t, session)
-	start := time.Now() // before the releaser starts, so the release is always >=100ms after it
-	go func() {
-		time.Sleep(100 * time.Millisecond)
-		release()
-	}()
-	if !acquireNudgeLock(session, 10*time.Second) {
-		t.Fatal("timed out although the other process released after 100ms")
+	got := make(chan bool, 1)
+	go func() { got <- acquireNudgeLock(session, 10*time.Second) }()
+	release()
+	if !<-got {
+		t.Fatal("timed out although the other process released")
 	}
-	defer releaseNudgeLock(session)
-	if waited := time.Since(start); waited < 100*time.Millisecond {
-		t.Fatalf("acquired after %v, before the other process released", waited)
-	}
+	releaseNudgeLock(session)
 }
 
 // While this process holds the lock, another process cannot take it; after

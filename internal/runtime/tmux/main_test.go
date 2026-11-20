@@ -21,7 +21,7 @@ func TestMain(m *testing.M) {
 
 	// Keep the cross-process nudge lock (ga-bz7eo5) out of the live per-user
 	// directory: package tests nudge fixed names ("worker-1", "sess"), and two
-	// test runs, or a test run and the city, must not serialise on them.
+	// test runs, or a test run and the city, must not serialize on them.
 	nudgeLockDir, err := os.MkdirTemp("", "gc-nudge-locks-test-")
 	if err != nil {
 		panic("tmux tests: creating nudge lock dir: " + err.Error())

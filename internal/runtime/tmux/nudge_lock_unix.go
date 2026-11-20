@@ -34,7 +34,7 @@ import (
 // leaves the session locked.
 //
 // Failure to open the lock file fails OPEN (the in-process lock still
-// holds, which is the behaviour before this change): a nudge plane that
+// holds, which is the behavior before this change): a nudge plane that
 // stops delivering because /tmp is unwritable is worse than the race.
 
 // nudgeXLockDir is a variable so tests can point it at a scratch directory.
