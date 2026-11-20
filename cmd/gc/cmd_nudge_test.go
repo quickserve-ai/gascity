@@ -3343,6 +3343,7 @@ func TestQueuedNudgeReleaseAfter(t *testing.T) {
 		{"permission prompt the runtime would not type into", fmt.Errorf("sending message to session: %w: sess-worker", runtime.ErrPendingInteraction), true, backoff},
 		{"session pending-interaction refusal", session.ErrPendingInteraction, true, backoff},
 		{"runtime could not be observed", fmt.Errorf("sending message to session: %w: bridge down", runtime.ErrRuntimeUnavailable), true, backoff},
+		{"nudge lock held by another delivery", fmt.Errorf("sending message to session: nudge lock timeout for session %q: previous nudge may be hung: %w", "sess-worker", tmux.ErrNudgeLockBusy), true, backoff},
 		{"busy timeout", errors.New(`agent "sess-worker" busy, timed out waiting for idle`), false, time.Time{}},
 		{"submit delivered but unobserved", fmt.Errorf("nudging: %w", tmux.ErrNudgeSubmitDeliveredUnobserved), false, time.Time{}},
 	}

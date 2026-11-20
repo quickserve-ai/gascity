@@ -3797,6 +3797,11 @@ func queuedNudgeReleaseAfter(err error, now time.Time) (time.Time, bool) {
 	// without spending an attempt, so an outage cannot dead-letter the queue.
 	case errors.Is(err, runtime.ErrRuntimeUnavailable):
 		return now.Add(defaultQueuedNudgeRetryDelay), true
+	// Another delivery held the session's nudge lock past the timeout and
+	// nothing was typed (ga-bz7eo5): back off without spending an attempt,
+	// so a stuck holder in another process cannot dead-letter the queue.
+	case errors.Is(err, tmux.ErrNudgeLockBusy):
+		return now.Add(defaultQueuedNudgeRetryDelay), true
 	case errors.Is(err, runtime.ErrSessionNotFound):
 		return time.Time{}, true
 	default:

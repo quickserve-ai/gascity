@@ -19,6 +19,15 @@ import (
 func TestMain(m *testing.M) {
 	_ = os.Unsetenv(AgentSliceEnv)
 
+	// Keep the cross-process nudge lock (ga-bz7eo5) out of the live per-user
+	// directory: package tests nudge fixed names ("worker-1", "sess"), and two
+	// test runs, or a test run and the city, must not serialize on them.
+	nudgeLockDir, err := os.MkdirTemp("", "gc-nudge-locks-test-")
+	if err != nil {
+		panic("tmux tests: creating nudge lock dir: " + err.Error())
+	}
+	nudgeXLockDir = func() string { return nudgeLockDir }
+
 	// NewSocketParentDir sweeps orphaned siblings left by a prior SIGKILL'd
 	// run before creating this run's own dir. tmuxSocketAliveSentinel must
 	// stay referenced for the process lifetime: the runtime finalizes
@@ -44,6 +53,7 @@ func TestMain(m *testing.M) {
 		tmuxtest.KillAllTestSessions(mainTB{})
 	}
 	_ = os.RemoveAll(tmuxSocketParent)
+	_ = os.RemoveAll(nudgeLockDir)
 	os.Exit(code)
 }
 
