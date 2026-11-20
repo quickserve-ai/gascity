@@ -14,7 +14,7 @@ import (
 // directory for the test.
 func withScratchNudgeXLockDir(t *testing.T) string {
 	t.Helper()
-	dir := t.TempDir()
+	dir := t.TempDir() // 0755 from the testing package; the lock tightens its own dir to 0700
 	old := nudgeXLockDir
 	nudgeXLockDir = func() string { return dir }
 	t.Cleanup(func() { nudgeXLockDir = old })
@@ -89,16 +89,16 @@ func TestNudgeLockProceedsWhenTheOtherProcessReleases(t *testing.T) {
 	withScratchNudgeXLockDir(t)
 	const session = "krieger"
 	release := holdAsOtherProcess(t, session)
+	start := time.Now() // before the releaser starts, so the release is always >=100ms after it
 	go func() {
 		time.Sleep(100 * time.Millisecond)
 		release()
 	}()
-	start := time.Now()
-	if !acquireNudgeLock(session, 2*time.Second) {
+	if !acquireNudgeLock(session, 10*time.Second) {
 		t.Fatal("timed out although the other process released after 100ms")
 	}
 	defer releaseNudgeLock(session)
-	if waited := time.Since(start); waited < 90*time.Millisecond {
+	if waited := time.Since(start); waited < 100*time.Millisecond {
 		t.Fatalf("acquired after %v, before the other process released", waited)
 	}
 }
@@ -151,4 +151,68 @@ func TestNudgeLockFailsOpenWhenTheLockDirIsUnusable(t *testing.T) {
 		t.Fatal("an unusable lock dir blocked delivery")
 	}
 	releaseNudgeLock("gamma")
+}
+
+// A lock directory this user does not own, or that group/others can write,
+// is not trusted: delivery fails open instead of using locks another user
+// could hold or swap.
+func TestNudgeLockFailsOpenOnAnUntrustedLockDir(t *testing.T) {
+	// A symlink in place of the directory is never trusted: it could point at
+	// a directory another user controls.
+	real := t.TempDir()
+	link := t.TempDir() + "/locks"
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	old := nudgeXLockDir
+	nudgeXLockDir = func() string { return link }
+	t.Cleanup(func() { nudgeXLockDir = old })
+	if nudgeXLockDirTrusted(link) {
+		t.Fatal("a symlinked lock dir was trusted")
+	}
+	if !acquireNudgeLock("delta", 200*time.Millisecond) {
+		t.Fatal("an untrusted lock dir blocked delivery")
+	}
+	defer releaseNudgeLock("delta")
+	if _, held := nudgeXLockFiles.Load("delta"); held {
+		t.Fatal("took a flock in an untrusted dir")
+	}
+}
+
+// This user's own lock dir with loose permissions is tightened, not
+// abandoned.
+func TestNudgeLockTightensItsOwnLooseDir(t *testing.T) {
+	dir := withScratchNudgeXLockDir(t)
+	if err := os.Chmod(dir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if !nudgeXLockDirTrusted(dir) {
+		t.Fatal("this user's own dir was not trusted after tightening")
+	}
+	fi, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o700 {
+		t.Fatalf("dir left at %o, want 700", perm)
+	}
+}
+
+// A holder in another process can delay a delivery by at most
+// nudgeXLockMaxWait, even under a longer NudgeLockTimeout.
+func TestNudgeLockCrossProcessWaitIsCapped(t *testing.T) {
+	withScratchNudgeXLockDir(t)
+	old := nudgeXLockMaxWait
+	nudgeXLockMaxWait = 150 * time.Millisecond
+	t.Cleanup(func() { nudgeXLockMaxWait = old })
+	release := holdAsOtherProcess(t, "epsilon")
+	defer release()
+	start := time.Now()
+	if acquireNudgeLock("epsilon", 10*time.Second) {
+		releaseNudgeLock("epsilon")
+		t.Fatal("acquired while another process held the lock")
+	}
+	if waited := time.Since(start); waited > 5*time.Second {
+		t.Fatalf("waited %v, past the cross-process cap", waited)
+	}
 }

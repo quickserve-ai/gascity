@@ -45,6 +45,15 @@ var nudgeXLockDir = func() string {
 // nudgeXLockPoll is how often a waiting delivery retries the flock.
 var nudgeXLockPoll = 25 * time.Millisecond
 
+// nudgeXLockMaxWait caps how long a delivery waits on ANOTHER process's
+// hold, below the in-process NudgeLockTimeout: the supervisor's dispatcher
+// delivers to sessions one after another on its main loop, so a holder in
+// another process that is stopped or stuck must not cost it the full
+// timeout per session per tick. A normal delivery holds the lock for a few
+// seconds; a wait that times out returns the usual lock-timeout error and
+// the nudge stays queued.
+var nudgeXLockMaxWait = 15 * time.Second
+
 // nudgeXLockFiles holds the open lock file per key while this process holds
 // the lock. The in-process semaphore guarantees one holder per key here, so
 // a plain Store / LoadAndDelete pairing is enough.
@@ -68,12 +77,19 @@ func nudgeXLockPath(key string) string {
 // deadline. It returns false only when another holder kept the lock past the
 // deadline; any other failure fails open (true, nothing held).
 func acquireNudgeXLock(key string, deadline time.Time) bool {
+	if limit := time.Now().Add(nudgeXLockMaxWait); limit.Before(deadline) {
+		deadline = limit
+	}
 	dir := nudgeXLockDir()
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil || !nudgeXLockDirTrusted(dir) {
 		return true
 	}
-	f, err := os.OpenFile(nudgeXLockPath(key), os.O_RDWR|os.O_CREATE, 0o600)
+	f, err := os.OpenFile(nudgeXLockPath(key), os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
+		return true
+	}
+	if !ownedByMe(f) {
+		_ = f.Close()
 		return true
 	}
 	for {
@@ -92,6 +108,40 @@ func acquireNudgeXLock(key string, deadline time.Time) bool {
 		}
 		time.Sleep(nudgeXLockPoll)
 	}
+}
+
+// nudgeXLockDirTrusted reports whether dir is a real directory (not a
+// symlink) owned by this user, tightening it to 0700 if group or others can
+// reach it. A directory ANOTHER local user created in /tmp first could
+// otherwise hold this user's locks (stalling deliveries) or swap the files
+// under them (splitting the exclusion), so it is never trusted and delivery
+// fails open to the in-process lock. One of this user's own with loose
+// permissions (an older umask, a hand-made dir) is ours to fix.
+func nudgeXLockDirTrusted(dir string) bool {
+	fi, err := os.Lstat(dir)
+	if err != nil || !fi.IsDir() || fi.Mode()&os.ModeSymlink != 0 {
+		return false
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok || int(st.Uid) != os.Getuid() {
+		return false
+	}
+	if fi.Mode().Perm()&0o077 != 0 {
+		if err := os.Chmod(dir, 0o700); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// ownedByMe reports whether the opened lock file belongs to this user.
+func ownedByMe(f *os.File) bool {
+	fi, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	return ok && int(st.Uid) == os.Getuid()
 }
 
 // releaseNudgeXLock drops the cross-process lock for key, if this process
