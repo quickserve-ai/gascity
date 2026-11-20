@@ -2021,18 +2021,31 @@ func getSessionNudgeSem(session string) chan struct{} {
 
 // acquireNudgeLock attempts to acquire the per-session nudge lock with a timeout.
 // Returns true if the lock was acquired, false if the timeout expired.
+//
+// The lock has two halves: this process's semaphore, then a cross-process
+// flock (acquireNudgeXLock, ga-bz7eo5) so a delivery from another gc process
+// (the supervisor's dispatcher, a live wait-idle nudge, a legacy poller)
+// cannot type into the same composer at the same time. Both share the one
+// timeout.
 func acquireNudgeLock(session string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
 	sem := getSessionNudgeSem(session)
 	select {
 	case sem <- struct{}{}:
-		return true
 	case <-time.After(timeout):
 		return false
 	}
+	if !acquireNudgeXLock(session, deadline) {
+		<-sem
+		return false
+	}
+	return true
 }
 
-// releaseNudgeLock releases the per-session nudge lock.
+// releaseNudgeLock releases the per-session nudge lock, cross-process half
+// first.
 func releaseNudgeLock(session string) {
+	releaseNudgeXLock(session)
 	sem := getSessionNudgeSem(session)
 	select {
 	case <-sem:
