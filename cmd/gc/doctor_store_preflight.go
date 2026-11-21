@@ -39,22 +39,9 @@ func defaultDoctorBeadStorePreflight(cityPath string, _ func(string) (beads.Stor
 	// projection deleted for a local target (a rig seat carries its rig's
 	// BEADS_DOLT_SERVER_HOST) reached bd paired with the city port and the
 	// preflight reported a false outage (ga-7v6z4k).
-	exact := environToMap(mergeRuntimeEnv(processEnvSnapshotExcludingNativeDoltOpen(), env))
+	exact := runtimeEnvEntriesToMap(mergeRuntimeEnv(processEnvSnapshotExcludingNativeDoltOpen(), env))
 	_, err = beads.ExecCommandRunnerWithExactEnvContext(ctx, exact)(cityPath, "bd", "list", "--json", "--limit", "1")
 	return err
-}
-
-// environToMap converts KEY=VALUE entries to a map; a later entry wins.
-func environToMap(environ []string) map[string]string {
-	out := make(map[string]string, len(environ))
-	for _, entry := range environ {
-		key, value, ok := strings.Cut(entry, "=")
-		if !ok || key == "" {
-			continue
-		}
-		out[key] = value
-	}
-	return out
 }
 
 // True for live store outages (breaker/conn/timeout), not missing/uninitialized stores.
