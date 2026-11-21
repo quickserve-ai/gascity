@@ -33,8 +33,28 @@ func defaultDoctorBeadStorePreflight(cityPath string, _ func(string) (beads.Stor
 	if err != nil {
 		return err
 	}
-	_, err = beads.ExecCommandRunnerWithEnvContext(ctx, env)(cityPath, "bd", "list", "--json", "--limit", "1")
+	// Exact env, built the way gc bd builds it: mergeRuntimeEnv strips the
+	// ambient projected Dolt keys before applying the city's projection. A
+	// layered runner only overwrites keys present in env, so a host the
+	// projection deleted for a local target (a rig seat carries its rig's
+	// BEADS_DOLT_SERVER_HOST) reached bd paired with the city port and the
+	// preflight reported a false outage (ga-7v6z4k).
+	exact := environToMap(mergeRuntimeEnv(processEnvSnapshotExcludingNativeDoltOpen(), env))
+	_, err = beads.ExecCommandRunnerWithExactEnvContext(ctx, exact)(cityPath, "bd", "list", "--json", "--limit", "1")
 	return err
+}
+
+// environToMap converts KEY=VALUE entries to a map; a later entry wins.
+func environToMap(environ []string) map[string]string {
+	out := make(map[string]string, len(environ))
+	for _, entry := range environ {
+		key, value, ok := strings.Cut(entry, "=")
+		if !ok || key == "" {
+			continue
+		}
+		out[key] = value
+	}
+	return out
 }
 
 // True for live store outages (breaker/conn/timeout), not missing/uninitialized stores.
