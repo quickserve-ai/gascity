@@ -388,3 +388,82 @@ func TestBuildDoctorChecks_SkipStorePreflightSkipsProbe(t *testing.T) {
 		t.Fatalf("store checks omitted with SkipStorePreflight; names=%v", names)
 	}
 }
+
+// installPreflightBdStub puts a stub bd first on PATH (and pins BD_BIN to it)
+// that records the Dolt host it was given and answers an empty list.
+func installPreflightBdStub(t *testing.T) string {
+	t.Helper()
+	stubDir := t.TempDir()
+	record := filepath.Join(stubDir, "seen")
+	script := "#!/bin/sh\n" +
+		"printf 'host=%s:%s\\n' \"${BEADS_DOLT_SERVER_HOST+set}\" \"${BEADS_DOLT_SERVER_HOST}\" > " + record + "\n" +
+		"echo '[]'\n"
+	stub := filepath.Join(stubDir, "bd")
+	if err := os.WriteFile(stub, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", stubDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("BD_BIN", stub)
+	return record
+}
+
+func readPreflightBdRecord(t *testing.T, record string) string {
+	t.Helper()
+	data, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatalf("stub bd never ran: %v", err)
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// A rig seat carries its rig's BEADS_DOLT_SERVER_HOST. The city projection
+// deletes the host for a local target; the preflight's bd must not inherit the
+// seat's host and pair it with the city port (ga-7v6z4k).
+func TestDoctorBeadStorePreflight_LocalCityDropsAmbientSeatHost(t *testing.T) {
+	t.Setenv("GC_BEADS", "bd")
+	t.Setenv("GC_DOLT", "skip")
+	t.Setenv("GC_DOLT_HOST", "")
+	t.Setenv("GC_DOLT_PORT", "")
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "stale-seat.example")
+	record := installPreflightBdStub(t)
+
+	cityPath := t.TempDir()
+	if err := defaultDoctorBeadStorePreflight(cityPath, nil); err != nil {
+		t.Fatalf("preflight error = %v", err)
+	}
+	if got := readPreflightBdRecord(t, record); got != "host=:" {
+		t.Fatalf("bd saw %q, want host unset (the seat's ambient host leaked)", got)
+	}
+}
+
+// Control: an external city target still delivers its own host to bd over a
+// stale ambient BEADS_DOLT_SERVER_HOST.
+func TestDoctorBeadStorePreflight_ExternalCityDeliversItsHost(t *testing.T) {
+	t.Setenv("GC_BEADS", "bd")
+	t.Setenv("GC_DOLT", "skip")
+	t.Setenv("GC_DOLT_HOST", "")
+	t.Setenv("GC_DOLT_PORT", "")
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "stale-seat.example")
+	record := installPreflightBdStub(t)
+
+	cityPath := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cityPath, ".beads"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityPath, ".beads", "config.yaml"), []byte(`issue_prefix: demo
+gc.endpoint_origin: city_canonical
+gc.endpoint_status: verified
+dolt.auto-start: false
+dolt.host: db.example.com
+dolt.port: 3307
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := defaultDoctorBeadStorePreflight(cityPath, nil); err != nil {
+		t.Fatalf("preflight error = %v", err)
+	}
+	if got, want := readPreflightBdRecord(t, record), "host=set:db.example.com"; got != want {
+		t.Fatalf("bd saw %q, want %q", got, want)
+	}
+}
