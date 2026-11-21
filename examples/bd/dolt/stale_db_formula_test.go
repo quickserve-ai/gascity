@@ -1115,7 +1115,7 @@ func TestStaleDBFormulaSuccessPathFailuresDrainAck(t *testing.T) {
 				"gc event emit mol-dog-stale-db.escalate --message terminal close refused for bead-1 (actor presented: none): ",
 				"gc session nudge health MAINTENANCE_ESCALATE: stale-db terminal close REFUSED for bead-1",
 			},
-			wantMail: "assignee mismatch",
+			wantMail: `assignee is "dog-2", actor is "dog-1"`,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1316,7 +1316,9 @@ func TestStaleDBFormulaStoreResolutionFailureIsNotAHumanRefusal(t *testing.T) {
 		env      []string
 		wantMail string
 	}{
-		{name: "no store-error route", env: nil},
+		// No route: one plain infrastructure mail to the escalation recipient,
+		// never a HIGH refusal (ga-w8ptue, ga-7ws7gu).
+		{name: "no store-error route", env: nil, wantMail: "gc mail send human -s stale-db: terminal close could not reach a bead store for bead-1"},
 		{name: "store-error route configured", env: []string{"GC_STORE_ERROR_RECIPIENT=woodhouse"}, wantMail: "gc mail send woodhouse -s stale-db: terminal close could not reach a bead store for bead-1"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1329,7 +1331,7 @@ func TestStaleDBFormulaStoreResolutionFailureIsNotAHumanRefusal(t *testing.T) {
 			if err == nil {
 				t.Fatalf("rendered script exited successfully; want the unclosed bead to fail open\nlog:\n%s\noutput:\n%s", log, out)
 			}
-			for _, forbidden := range []string{"gc mail send human", "[HIGH]", "mol-dog-stale-db.escalate"} {
+			for _, forbidden := range []string{"gc mail send human -s ESCALATION", "[HIGH]", "mol-dog-stale-db.escalate"} {
 				if strings.Contains(log, forbidden) {
 					t.Fatalf("store-resolution failure took the refusal path (%q)\nlog:\n%s\noutput:\n%s", forbidden, log, out)
 				}
@@ -1345,11 +1347,8 @@ func TestStaleDBFormulaStoreResolutionFailureIsNotAHumanRefusal(t *testing.T) {
 				}
 			}
 			mail := staleDBLogLine(log, "gc mail send ")
-			if tc.wantMail == "" && mail != "" {
-				t.Fatalf("store-resolution failure sent mail with no route configured: %q\nlog:\n%s", mail, log)
-			}
-			if tc.wantMail != "" && !strings.HasPrefix(mail, tc.wantMail) {
-				t.Fatalf("store-error mail = %q, want prefix %q\nlog:\n%s", mail, tc.wantMail, log)
+			if !strings.HasPrefix(mail, tc.wantMail) || strings.Count(log, "gc mail send ") != 1 {
+				t.Fatalf("store-error mail = %q (%d mail lines), want exactly one with prefix %q\nlog:\n%s", mail, strings.Count(log, "gc mail send "), tc.wantMail, log)
 			}
 		})
 	}
@@ -1402,7 +1401,7 @@ func TestStaleDBFormulaUnusableStoreRootStopsBeforeAnyWork(t *testing.T) {
 			if err == nil {
 				t.Fatalf("rendered script exited successfully; want a stop before any work\nlog:\n%s\noutput:\n%s", log, out)
 			}
-			for _, forbidden := range []string{"bd ", "bd-cwd", "gc dolt-cleanup", "gc mail send human", "[HIGH]", "mol-dog-stale-db.escalate"} {
+			for _, forbidden := range []string{"bd ", "bd-cwd", "gc dolt-cleanup", "gc mail send human -s ESCALATION", "[HIGH]", "mol-dog-stale-db.escalate"} {
 				if strings.Contains(log, forbidden) {
 					t.Fatalf("an unusable store root still reached %q\nlog:\n%s\noutput:\n%s", forbidden, log, out)
 				}
@@ -1416,10 +1415,19 @@ func TestStaleDBFormulaUnusableStoreRootStopsBeforeAnyWork(t *testing.T) {
 					t.Fatalf("an unusable store root did not record %q\nlog:\n%s\noutput:\n%s", want, log, out)
 				}
 			}
+			// With a store-error route the notice goes there; with none, one
+			// plain infrastructure mail goes to the escalation recipient
+			// (ga-w8ptue: an unread event alone reaches nobody).
 			mail := staleDBLogLine(log, "gc mail send ")
-			wantRoute := strings.Contains(strings.Join(tc.env, " "), "GC_STORE_ERROR_RECIPIENT=")
-			if wantRoute != strings.HasPrefix(mail, "gc mail send woodhouse -s stale-db: ") {
-				t.Fatalf("store-error mail = %q, want one only when a route is configured\nlog:\n%s", mail, log)
+			wantMail := "gc mail send human -s stale-db: "
+			if strings.Contains(strings.Join(tc.env, " "), "GC_STORE_ERROR_RECIPIENT=") {
+				wantMail = "gc mail send woodhouse -s stale-db: "
+			}
+			if !strings.HasPrefix(mail, wantMail) || strings.Count(log, "gc mail send ") != 1 {
+				t.Fatalf("store-error mail = %q (%d mail lines), want exactly one starting %q\nlog:\n%s", mail, strings.Count(log, "gc mail send "), wantMail, log)
+			}
+			if !strings.HasPrefix(mail, "gc mail send woodhouse") && !strings.Contains(mail, "an infrastructure failure, sent here because no store-error route") {
+				t.Fatalf("fallback mail does not say why it came to the escalation recipient: %q", mail)
 			}
 		})
 	}
@@ -1450,7 +1458,7 @@ func TestStaleDBFormulaUnreachableStoreAtCloseIsNotAHumanRefusal(t *testing.T) {
 		{name: "connection refused", err: "Error: dial tcp 127.0.0.1:51361: connect: connection refused"},
 		{name: "connection lost mid-close", err: "Error: close bead-1: driver: bad connection"},
 		{name: "connection reset", err: "Error: read tcp 127.0.0.1:53110->127.0.0.1:51361: read: connection reset by peer"},
-		{name: "an ownership refusal still reaches human", err: "Error: cannot close bead-1: assignee mismatch (actor dog-1, assignee dog-2)", human: true},
+		{name: "an ownership refusal still reaches human", err: `Error: cannot close bead-1: assignee is "dog-2", actor is "dog-1"; reclaim or use --force to override`, human: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			log, out, err := runStaleDBFormulaFailureCase(t, staleDBFailureCase{
@@ -1471,6 +1479,106 @@ func TestStaleDBFormulaUnreachableStoreAtCloseIsNotAHumanRefusal(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestStaleDBFormulaTerminalCloseRoutesByRefusalText pins ga-7ws7gu: only an
+// authority refusal of the terminal close (bd's ownership guard, or the pinned
+// flag) reaches the human route as HIGH, and it wins over an availability text
+// printed in the same output. Every other failure takes the platform route as
+// close-failed, with no advice to close the bead by hand. The texts are bd's
+// own at 1.3.1-fleet.20261005.1 (internal/validation/issue.go,
+// cmd/bd/close_direct.go).
+func TestStaleDBFormulaTerminalCloseRoutesByRefusalText(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skipf("bash not found: %v", err)
+	}
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skipf("jq not found: %v", err)
+	}
+	city := t.TempDir()
+	if err := os.Mkdir(filepath.Join(city, ".beads"), 0o755); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	const (
+		human       = "human"
+		store       = "store-unresolved"
+		closeFailed = "close-failed"
+	)
+	for _, tc := range []struct {
+		name  string
+		err   string
+		route string
+	}{
+		{name: "ownership refusal", err: `Error: cannot close bead-1: assignee is "dog-2", actor is "dog-1"; reclaim or use --force to override`, route: human},
+		{name: "pinned refusal", err: "Error: cannot modify pinned issue bead-1 (use --force to override)", route: human},
+		{name: "refusal beside an availability text", err: "warning: driver: bad connection (retried)\nError: cannot close bead-1: assignee is \"dog-2\", actor is \"dog-1\"; reclaim or use --force to override", route: human},
+		{name: "store unreachable", err: "Error: dial tcp 127.0.0.1:51361: connect: connection refused", route: store},
+		{name: "gate refusal", err: "Error: cannot close bead-1: gate not satisfied: timer has not elapsed", route: closeFailed},
+		{name: "template", err: "Error: cannot modify template bead-1: templates are read-only; use 'bd mol pour' to create a work item", route: closeFailed},
+		{name: "unknown failure", err: "Error: something nobody anticipated", route: closeFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			log, out, err := runStaleDBFormulaFailureCase(t, staleDBFailureCase{
+				scanJSON: staleDBCleanScan,
+				dir:      t.TempDir(),
+				env: []string{"GC_TEST_BD_NEEDS_STORE=1", "GC_TEST_BD_CLOSE_ERR=" + tc.err, "GC_CITY_PATH=" + city,
+					"GC_STORE_ERROR_RECIPIENT=platform-seat", "GC_MAINTENANCE_DONE_TARGET=health"},
+			})
+			if err == nil {
+				t.Fatalf("rendered script exited successfully; want the unclosed bead to fail open\nlog:\n%s\noutput:\n%s", log, out)
+			}
+			if !strings.Contains(log, "gc runtime drain-ack") {
+				t.Fatalf("no drain-ack\nlog:\n%s", log)
+			}
+			got := map[string]bool{
+				human:       strings.Contains(log, "gc mail send human -s ESCALATION: stale-db terminal close refused for bead-1 [HIGH]"),
+				store:       strings.Contains(log, "gc event emit mol-dog-stale-db.store-unresolved --message terminal close for bead-1 could not reach a bead store"),
+				closeFailed: strings.Contains(log, "gc event emit mol-dog-stale-db.close-failed --message terminal close for bead-1 failed, not an ownership refusal: "),
+			}
+			for route, took := range got {
+				if took != (route == tc.route) {
+					t.Fatalf("routes taken %v; want only %q\nlog:\n%s\noutput:\n%s", got, tc.route, log, out)
+				}
+			}
+			if tc.route == human {
+				return
+			}
+			for _, forbidden := range []string{"[HIGH]", "mol-dog-stale-db.escalate", "--actor <assignee>"} {
+				if strings.Contains(log, forbidden) {
+					t.Fatalf("non-refusal close failure carried %q\nlog:\n%s", forbidden, log)
+				}
+			}
+			if tc.route == closeFailed {
+				for _, want := range []string{
+					"gc mail send platform-seat -s stale-db: terminal close failed for bead-1",
+					"gc session nudge health MAINTENANCE_WARN: stale-db terminal close for bead-1 failed, not an ownership refusal",
+				} {
+					if !strings.Contains(log, want) {
+						t.Fatalf("close-failed route did not record %q\nlog:\n%s", want, log)
+					}
+				}
+			}
+		})
+	}
+	// With no store-error route, close-failed still tells someone: one plain
+	// infrastructure mail to the escalation recipient, not a HIGH refusal.
+	t.Run("close-failed with no store-error route", func(t *testing.T) {
+		log, out, err := runStaleDBFormulaFailureCase(t, staleDBFailureCase{
+			scanJSON: staleDBCleanScan,
+			dir:      t.TempDir(),
+			env: []string{"GC_TEST_BD_NEEDS_STORE=1", "GC_TEST_BD_CLOSE_ERR=Error: something nobody anticipated",
+				"GC_CITY_PATH=" + city, "GC_ESCALATION_RECIPIENT=ops"},
+		})
+		if err == nil {
+			t.Fatalf("rendered script exited successfully; want fail open\nlog:\n%s\noutput:\n%s", log, out)
+		}
+		mail := staleDBLogLine(log, "gc mail send ")
+		if !strings.HasPrefix(mail, "gc mail send ops -s stale-db: terminal close failed for bead-1") ||
+			!strings.Contains(mail, "an infrastructure failure, sent here because no store-error route") ||
+			strings.Count(log, "gc mail send ") != 1 || strings.Contains(log, "[HIGH]") {
+			t.Fatalf("no-route close-failed mail = %q; want one plain infrastructure mail to ops\nlog:\n%s", mail, log)
+		}
+	})
 }
 
 // staleDBRegularFile returns the path of a plain file, for a store-root
@@ -1550,9 +1658,16 @@ set -euo pipefail
 maybe_fail() {
   local rendered="$1"
   if [ -n "${GC_TEST_FAIL_CONTAINS:-}" ] && [[ "$rendered" == *"$GC_TEST_FAIL_CONTAINS"* ]]; then
-    # Refuse the way bd's ownership guard does: with a reason on stderr.
-    echo "bd: ${rendered} refused: assignee mismatch" >&2
-    exit 70
+    if [ "${rendered#bd close }" != "$rendered" ]; then
+      # Refuse a close in bd's own ownership-guard words
+      # (internal/validation/issue.go, bd 1.3.1-fleet.20261005.1).
+      local id
+      id=$(printf '%s\n' "$rendered" | awk '{print $3}')
+      echo "Error: cannot close ${id}: assignee is \"dog-2\", actor is \"dog-1\"; reclaim or use --force to override" >&2
+    else
+      echo "bd: ${rendered} failed" >&2
+    fi
+    exit 1
   fi
 }
 case "${1:-}" in
