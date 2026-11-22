@@ -1115,6 +1115,26 @@ func TestOrderFiringCurrent_EvenCronWarnsAtOneAndAHalfIntervals(t *testing.T) {
 	}
 }
 
+// The stale boundary for an evenly spaced schedule fired on its slots: just under
+// three intervals is overdue, three intervals and just over are stale.
+func TestOrderFiringCurrent_EvenCronStaleBoundary(t *testing.T) {
+	order := orders.Order{Name: "every-4h", Trigger: "cron", Schedule: "0 */4 * * *", TZ: "UTC"}
+	fired := time.Date(2026, 5, 17, 0, 0, 0, 0, time.UTC) // on its slot
+	start := fired.Add(-48 * time.Hour)
+	for _, tc := range []struct {
+		after time.Duration
+		want  CheckStatus
+	}{
+		{12*time.Hour - time.Minute, StatusWarning},
+		{12 * time.Hour, StatusError},
+		{12*time.Hour + time.Minute, StatusError},
+	} {
+		if status, _, detail, _ := classifyOrderFiring(order, fired.Add(tc.after), 4*time.Hour, fired, start); status != tc.want {
+			t.Errorf("%s after an on-slot firing: status = %v (%s), want %v", tc.after, status, detail, tc.want)
+		}
+	}
+}
+
 // A cron order last fired longer ago than the dispatcher's catch-up lookback
 // must not read as current (Astra's finding on #373).
 func TestOrderFiringCurrent_LongDeadAnnualCronIsNotCurrent(t *testing.T) {
