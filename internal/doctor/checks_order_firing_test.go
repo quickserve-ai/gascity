@@ -11,6 +11,9 @@ import (
 	"testing"
 	"time"
 
+	// Embedded zoneinfo: named-zone results must not depend on the host's tzdata.
+	_ "time/tzdata"
+
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
@@ -1036,5 +1039,63 @@ func TestOrderFiringCurrent_TimesOutStalledOrderHistory(t *testing.T) {
 	}
 	if !result.TimedOut {
 		t.Fatalf("TimedOut = false, want true so callers (JSON output, doctor summary) can distinguish this from a confirmed failure")
+	}
+}
+
+// TestOrderFiringCurrent_UnevenCronJudgedFromItsNextSlot is the ga-6703d7
+// regression: a cron order with uneven gaps ("50 1-5 * * *", expected = its
+// 1 h minimum gap) is current between its last run of the day and its first
+// run of the next, and is overdue or stale only once a scheduled slot passes
+// without a firing.
+func TestOrderFiringCurrent_UnevenCronJudgedFromItsNextSlot(t *testing.T) {
+	la, err := time.LoadLocation("America/Los_Angeles")
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := func(d, h, m int) time.Time { return time.Date(2026, 11, d, h, m, 0, 0, la) }
+	order := orders.Order{Name: "tool-cache-reclaim", Trigger: "cron", Schedule: "50 1-5 * * *", TZ: "America/Los_Angeles"}
+	expected, err := computeExpectedIntervalForCronSchedule(order.Schedule)
+	if err != nil || expected != time.Hour {
+		t.Fatalf("expected interval = %v, %v; want 1h", expected, err)
+	}
+	start := at(1, 0, 0)
+	cases := []struct {
+		name       string
+		lastFired  time.Time
+		now        time.Time
+		wantStatus CheckStatus
+	}{
+		{"evening after the morning's last run", at(21, 5, 51), at(21, 21, 48), StatusOK},
+		{"first slot missed by 40 min", at(20, 5, 51), at(21, 2, 30), StatusWarning},
+		{"a whole day of slots missed", at(20, 5, 51), at(21, 21, 48), StatusError},
+		{"first slot missed by 20 min, inside tolerance", at(20, 5, 51), at(21, 2, 10), StatusOK},
+	}
+	for _, tc := range cases {
+		status, _, detail, _ := classifyOrderFiring(order, tc.now, expected, tc.lastFired, start)
+		if status != tc.wantStatus {
+			t.Errorf("%s: status = %v (%s), want %v", tc.name, status, detail, tc.wantStatus)
+		}
+	}
+}
+
+// An evenly spaced cron order fired on its slots keeps the age-based verdicts:
+// overdue at 1.5 intervals, stale at 3 (ga-6703d7 changes uneven schedules only).
+func TestOrderFiringCurrent_EvenCronKeepsAgeThresholds(t *testing.T) {
+	order := orders.Order{Name: "every-4h", Trigger: "cron", Schedule: "0 */4 * * *", TZ: "UTC"}
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	start := now.Add(-48 * time.Hour)
+	cases := []struct {
+		lastFired  time.Time
+		wantStatus CheckStatus
+	}{
+		{now.Add(-4 * time.Hour), StatusOK},
+		{now.Add(-8 * time.Hour), StatusWarning},
+		{now.Add(-12 * time.Hour), StatusError},
+	}
+	for _, tc := range cases {
+		status, _, detail, _ := classifyOrderFiring(order, now, 4*time.Hour, tc.lastFired, start)
+		if status != tc.wantStatus {
+			t.Errorf("last fired %s ago: status = %v (%s), want %v", now.Sub(tc.lastFired), status, detail, tc.wantStatus)
+		}
 	}
 }

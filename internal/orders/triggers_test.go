@@ -1280,3 +1280,46 @@ func TestCheckTriggerConditionExitAbove1IsProbeError(t *testing.T) {
 		t.Errorf("Reason = %q, want prefix %q (a broken probe must not read as a quiet not-met)", result.Reason, ConditionProbeErrorMarker)
 	}
 }
+
+// TestNextCronOccurrenceAfter pins the slot a reader judges a cron order
+// against (ga-6703d7): the first matching wall-clock minute strictly after the
+// last firing and no later than now, in the order's own zone.
+func TestNextCronOccurrenceAfter(t *testing.T) {
+	la, err := time.LoadLocation("America/Los_Angeles")
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := func(d, h, m int) time.Time { return time.Date(2026, 11, d, h, m, 0, 0, la) }
+	uneven := Order{Name: "tool-cache-reclaim", Trigger: "cron", Schedule: "50 1-5 * * *", TZ: "America/Los_Angeles"}
+	cases := []struct {
+		name       string
+		order      Order
+		after, now time.Time
+		want       time.Time
+		wantOK     bool
+	}{
+		{"between runs: next slot is tomorrow 01:50, not yet due", uneven, at(21, 5, 51), at(21, 21, 48), time.Time{}, false},
+		{"next slot reached", uneven, at(21, 5, 51), at(22, 1, 50), at(22, 1, 50), true},
+		{"fired on its slot: the next hourly slot", uneven, at(22, 1, 50), at(22, 3, 0), at(22, 2, 50), true},
+		{"a day missed: the first missed slot", uneven, at(20, 5, 51), at(21, 21, 48), at(21, 1, 50), true},
+		{
+			"seconds on the firing do not re-match its own minute",
+			Order{Trigger: "cron", Schedule: "*/30 * * * *", TZ: "UTC"},
+			time.Date(2026, 11, 21, 11, 0, 42, 0, time.UTC), time.Date(2026, 11, 21, 11, 29, 0, 0, time.UTC),
+			time.Time{},
+			false,
+		},
+	}
+	for _, tc := range cases {
+		got, ok, err := NextCronOccurrenceAfter(tc.order, tc.after, tc.now)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if ok != tc.wantOK || (ok && !got.Equal(tc.want)) {
+			t.Errorf("%s: got (%v, %v), want (%v, %v)", tc.name, got, ok, tc.want, tc.wantOK)
+		}
+	}
+	if _, _, err := NextCronOccurrenceAfter(Order{Trigger: "cron", Schedule: "61 * * * *"}, at(21, 0, 0), at(21, 1, 0)); err == nil {
+		t.Error("an unparseable schedule must return an error, not 'not due'")
+	}
+}

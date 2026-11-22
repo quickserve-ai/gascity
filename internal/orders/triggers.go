@@ -226,6 +226,39 @@ func resolveOrderLocation(a Order, now time.Time) (*time.Location, error) {
 	return loc, nil
 }
 
+// maxNextCronOccurrenceScan bounds NextCronOccurrenceAfter's minute scan. An
+// order last fired longer ago than this is judged from the start of the window,
+// which still finds its first missed occurrence for any schedule that fires at
+// least once a year.
+const maxNextCronOccurrenceScan = 400 * 24 * time.Hour
+
+// NextCronOccurrenceAfter returns the first wall-clock minute strictly after
+// `after`, and no later than `until`, that a's cron schedule matches. It
+// evaluates in the same location checkCron does (resolveOrderLocation, with
+// `until` standing in for now), so a reader judging whether a cron order is
+// overdue sees the slots the dispatcher would fire. ok is false when no
+// occurrence falls in (after, until]: the order is not yet due again.
+func NextCronOccurrenceAfter(a Order, after, until time.Time) (time.Time, bool, error) {
+	if err := ValidateCronSchedule(a.Schedule); err != nil {
+		return time.Time{}, false, err
+	}
+	loc, err := resolveOrderLocation(a, until)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	fields := strings.Fields(a.Schedule)
+	if until.Sub(after) > maxNextCronOccurrenceScan {
+		after = until.Add(-maxNextCronOccurrenceScan)
+	}
+	end := until.In(loc)
+	for t := after.In(loc).Truncate(time.Minute).Add(time.Minute); !t.After(end); t = t.Add(time.Minute) {
+		if matched, err := CronScheduleMatchesAt(fields, t); err == nil && matched {
+			return t, true, nil
+		}
+	}
+	return time.Time{}, false, nil
+}
+
 // wallMinuteLayout renders a wall-clock reading to minute granularity.
 // Two instants with the same rendering occupy the same wall-clock slot —
 // including the DST fall-back hour, where two distinct instants share one

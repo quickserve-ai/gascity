@@ -982,10 +982,29 @@ func classifyOrderFiring(order orders.Order, now time.Time, expected time.Durati
 	}
 
 	age := nonNegativeDuration(now.Sub(lastFired))
+	// judged is what the thresholds below compare. For a cooldown it is the
+	// age of the last firing. For a cron order it is measured from the first
+	// scheduled slot after that firing, shifted by one interval so the
+	// thresholds keep their meaning (overdue: half an interval past a missed
+	// slot; stale: two intervals past it). For an evenly spaced schedule that
+	// fired on its slot the next slot is lastFired+expected, so the verdict is
+	// the same as judging age (a firing that ran late is judged from the slot
+	// after it, slightly stricter); for an uneven one ("50 1-5 * * *", whose expected is its 1 h
+	// minimum gap) the long gap between runs is no longer read as stale
+	// (ga-6703d7). A cron order whose next slot has not come yet is current.
+	judged := age
+	if order.Trigger == "cron" {
+		if due, ok, err := orders.NextCronOccurrenceAfter(order, lastFired, now); err == nil {
+			judged = 0
+			if ok {
+				judged = nonNegativeDuration(now.Sub(due)) + expected
+			}
+		}
+	}
 	switch {
-	case age >= expected*3:
+	case judged >= expected*3:
 		return StatusError, SeverityBlocking, fmt.Sprintf("%s: last fired %s ago, expected every %s (CRITICAL: stale)", name, formatOrderFiringDuration(age), formatOrderFiringDuration(expected)), false
-	case age >= expected+expected/2:
+	case judged >= expected+expected/2:
 		return StatusWarning, SeverityBlocking, fmt.Sprintf("%s: last fired %s ago, expected every %s (overdue)", name, formatOrderFiringDuration(age), formatOrderFiringDuration(expected)), false
 	default:
 		return StatusOK, SeverityBlocking, fmt.Sprintf("%s: last fired %s ago, expected every %s", name, formatOrderFiringDuration(age), formatOrderFiringDuration(expected)), true
