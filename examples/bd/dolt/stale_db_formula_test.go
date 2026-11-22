@@ -1528,8 +1528,10 @@ func TestStaleDBFormulaTerminalCloseRoutesByRefusalText(t *testing.T) {
 			log, out, err := runStaleDBFormulaFailureCase(t, staleDBFailureCase{
 				scanJSON: staleDBCleanScan,
 				dir:      t.TempDir(),
-				env: []string{"GC_TEST_BD_NEEDS_STORE=1", closeErr, "GC_CITY_PATH=" + city,
-					"GC_STORE_ERROR_RECIPIENT=platform-seat", "GC_MAINTENANCE_DONE_TARGET=health"},
+				env: []string{
+					"GC_TEST_BD_NEEDS_STORE=1", closeErr, "GC_CITY_PATH=" + city,
+					"GC_STORE_ERROR_RECIPIENT=platform-seat", "GC_MAINTENANCE_DONE_TARGET=health",
+				},
 			})
 			if tc.err == "" && !strings.Contains(log, "failed, not an ownership refusal: no error text") {
 				t.Fatalf("a silent close failure did not say so\nlog:\n%s", log)
@@ -1576,8 +1578,10 @@ func TestStaleDBFormulaTerminalCloseRoutesByRefusalText(t *testing.T) {
 		log, out, err := runStaleDBFormulaFailureCase(t, staleDBFailureCase{
 			scanJSON: staleDBCleanScan,
 			dir:      t.TempDir(),
-			env: []string{"GC_TEST_BD_NEEDS_STORE=1", "GC_TEST_BD_CLOSE_ERR=Error: something nobody anticipated",
-				"GC_CITY_PATH=" + city, "GC_ESCALATION_RECIPIENT=ops"},
+			env: []string{
+				"GC_TEST_BD_NEEDS_STORE=1", "GC_TEST_BD_CLOSE_ERR=Error: something nobody anticipated",
+				"GC_CITY_PATH=" + city, "GC_ESCALATION_RECIPIENT=ops",
+			},
 		})
 		if err == nil {
 			t.Fatalf("rendered script exited successfully; want fail open\nlog:\n%s\noutput:\n%s", log, out)
@@ -1597,9 +1601,11 @@ func TestStaleDBFormulaTerminalCloseRoutesByRefusalText(t *testing.T) {
 		log, out, err := runStaleDBFormulaFailureCase(t, staleDBFailureCase{
 			scanJSON: staleDBCleanScan,
 			dir:      t.TempDir(),
-			env: []string{"GC_TEST_BD_NEEDS_STORE=1", "GC_TEST_BD_CLOSE_ERR=Error: something nobody anticipated",
+			env: []string{
+				"GC_TEST_BD_NEEDS_STORE=1", "GC_TEST_BD_CLOSE_ERR=Error: something nobody anticipated",
 				"GC_CITY_PATH=" + city, "GC_MAINTENANCE_DONE_TARGET=health",
-				"GC_TEST_HANG_NOTICES=1", "GC_STALE_DB_NOTICE_TIMEOUT_SECS=1"},
+				"GC_TEST_HANG_NOTICES=1", "GC_STALE_DB_NOTICE_TIMEOUT_SECS=1",
+			},
 		})
 		elapsed := time.Since(start)
 		if err == nil {
