@@ -910,3 +910,74 @@ func TestRetireSuspendedRigScopeOncePerSuspensionEpisode(t *testing.T) {
 		t.Fatalf("provider ops = %q, want exactly one stop for the episode", ops)
 	}
 }
+
+// A cache reconcile that passed the quiescence gate before the city went
+// quiescent is store work: the retire waits for it, because its next read (the
+// ready projection) would restart the pair retired under it. A reconcile that
+// starts once the city is quiescent reads nothing. Acceptance caught the first
+// case: TestProxiedSuspensionIsQuiescenceSuspendedCity, gascity #377's
+// pre-window note, list -> ephemeral query -> dolt stop -> is_blocked SQL ->
+// a second dolt stop (ga-vblzkw).
+func TestBeadsQuiescenceWaitsForAnInFlightCacheReconcile(t *testing.T) {
+	cr, _, _, logPath := quiescenceRuntime(t, "")
+	t.Setenv("GC_SUSPENDED", "1")
+	cr.cs = &controllerState{beadsQuiescent: new(atomic.Bool), cacheReconciles: new(atomic.Int64)}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	backing := &reconcileHoldingStore{Store: beads.NewMemStore(), entered: entered, release: release}
+	cache := beads.NewCachingStore(backing, nil, cr.cs.reconcileGate())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		cache.ReconcileIfDueForTest()
+	}()
+	<-entered // the reconcile is past the gate and reading the store
+
+	for i := 0; i < 3; i++ {
+		if !cr.enterBeadsQuiescenceIfDue(context.Background()) {
+			t.Fatal("a suspended city with nothing running is not quiescent")
+		}
+	}
+	if ops := providerOpsLogged(t, logPath); ops != "" {
+		t.Fatalf("provider ops while a cache reconcile was reading = %q, want none", ops)
+	}
+
+	close(release)
+	<-done
+	// A fresh cache is due at once (never primed), so only the gate can keep
+	// a reconcile started after quiescence from scanning.
+	late := &reconcileHoldingStore{Store: beads.NewMemStore(), entered: make(chan struct{}), release: make(chan struct{})}
+	close(late.release)
+	lateCache := beads.NewCachingStore(late, nil, cr.cs.reconcileGate())
+	lateCache.ReconcileIfDueForTest()
+	if got := late.lists.Load(); got != 0 {
+		t.Fatalf("a reconcile started after quiescence scanned the store %d time(s), want 0", got)
+	}
+	cr.enterBeadsQuiescenceIfDue(context.Background())
+	if ops := providerOpsLogged(t, logPath); ops != "" {
+		t.Fatalf("provider ops on the first tick with no reconcile in flight = %q, want none yet", ops)
+	}
+	cr.enterBeadsQuiescenceIfDue(context.Background())
+	if ops := providerOpsLogged(t, logPath); ops != "stop" {
+		t.Fatalf("provider ops = %q, want one stop once the reconcile finished", ops)
+	}
+}
+
+// reconcileHoldingStore's first List signals entered and waits for release.
+type reconcileHoldingStore struct {
+	beads.Store
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+	lists   atomic.Int64
+}
+
+func (s *reconcileHoldingStore) List(q beads.ListQuery) ([]beads.Bead, error) {
+	s.lists.Add(1)
+	s.once.Do(func() {
+		close(s.entered)
+		<-s.release
+	})
+	return s.Store.List(q)
+}

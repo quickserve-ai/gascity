@@ -80,6 +80,13 @@ type controllerState struct {
 	// work that passed its quiescence check before the city went quiescent is
 	// still reading, and its next read would restart a pair retired under it.
 	storeWork atomic.Int64
+	// cacheReconciles counts the periodic reconcile steps of the caches this
+	// state owns that are in flight (beads.WithReconcileTracker). It is store
+	// work too: a step that passed the quiescence gate before the city went
+	// quiescent goes on reading, and the retire must wait for it (ga-vblzkw:
+	// a reconcile's ready-projection read restarted a just-retired pair). A
+	// pointer, shared with the caches built before this state is.
+	cacheReconciles *atomic.Int64
 	// suspendedRigs is the set of rigs the city runtime last saw suspended,
 	// published every tick. A suspended rig's cache skips its periodic
 	// reconcile from the next tick on, with no reload: any bd read restarts
@@ -300,7 +307,8 @@ func newControllerStateWithRoutes(
 	// A split city's binding gets the CachingStore its work ledger has, before
 	// the class-routed services below are built over it (class_store_cache.go).
 	beadsQuiescent := new(atomic.Bool)
-	routes = routes.withControllerCache(ctx, ep, reconcileGateFor(beadsQuiescent))
+	cacheReconciles := new(atomic.Int64)
+	routes = routes.withControllerCache(ctx, ep, reconcileGateFor(beadsQuiescent, cacheReconciles))
 	// Latch the rollout-gate snapshot ONCE from the boot config. A resolve error
 	// (nil cfg or an out-of-enum config value) is warn-and-continue: the zero
 	// Flags is degraded-safe (legacy paths), and this constructor returns no
@@ -314,6 +322,7 @@ func newControllerStateWithRoutes(
 	nativeTransport := resolvedNativeTransportMode(cfg)
 	cs := &controllerState{
 		beadsQuiescent:      beadsQuiescent,
+		cacheReconciles:     cacheReconciles,
 		cfg:                 cfg,
 		sp:                  sp,
 		cacheCtx:            ctx,
@@ -623,23 +632,42 @@ func rigStoreBackgroundRefresh(suspState suspensionstate.State, rig config.Rig) 
 // reconcileGate is the CachingStoreOption every cache this state owns carries:
 // it pauses the cache's periodic reconcile while the city is quiescent.
 func (cs *controllerState) reconcileGate() beads.CachingStoreOption {
-	return reconcileGateFor(cs.beadsQuiescent)
+	return reconcileGateFor(cs.beadsQuiescent, cs.cacheReconciles)
 }
 
-// reconcileGateFor pauses a cache's periodic reconcile while quiescent is set.
-func reconcileGateFor(quiescent *atomic.Bool) beads.CachingStoreOption {
-	return beads.WithReconcileGate(func() bool { return quiescent == nil || !quiescent.Load() })
+// reconcileGateFor pauses a cache's periodic reconcile while quiescent is set,
+// and counts each reconcile step in inFlight (reconcileTrackerFor).
+func reconcileGateFor(quiescent *atomic.Bool, inFlight *atomic.Int64) beads.CachingStoreOption {
+	return withReconcileTracking(beads.WithReconcileGate(func() bool { return quiescent == nil || !quiescent.Load() }), inFlight)
+}
+
+// withReconcileTracking adds the in-flight count to a gate option, so every
+// cache that carries a quiescence gate also reports its reconcile steps to
+// the count the retire waits on. A nil inFlight leaves the gate alone.
+func withReconcileTracking(gate beads.CachingStoreOption, inFlight *atomic.Int64) beads.CachingStoreOption {
+	if inFlight == nil {
+		return gate
+	}
+	track := beads.WithReconcileTracker(func() func() {
+		inFlight.Add(1)
+		var once sync.Once
+		return func() { once.Do(func() { inFlight.Add(-1) }) }
+	})
+	return func(c *beads.CachingStore) {
+		gate(c)
+		track(c)
+	}
 }
 
 // rigReconcileGate is reconcileGate for one rig's cache: it also pauses while
 // that rig is suspended (suspendedRigs).
 func (cs *controllerState) rigReconcileGate(rigName string) beads.CachingStoreOption {
-	return beads.WithReconcileGate(func() bool {
+	return withReconcileTracking(beads.WithReconcileGate(func() bool {
 		if cs.beadsQuiescent != nil && cs.beadsQuiescent.Load() {
 			return false
 		}
 		return !cs.rigSuspended(rigName)
-	})
+	}), cs.cacheReconciles)
 }
 
 // rigSuspended reports whether the city runtime last saw rigName suspended.
@@ -699,9 +727,13 @@ func (cs *controllerState) trackStoreWork(fn func()) func() {
 	}
 }
 
-// storeWorkInFlight reports whether any store work is in flight.
+// storeWorkInFlight reports whether any store work is in flight: counted
+// work (storeWork) or a cache's reconcile step (cacheReconciles).
 func (cs *controllerState) storeWorkInFlight() bool {
-	return cs != nil && cs.storeWork.Load() > 0
+	if cs == nil {
+		return false
+	}
+	return cs.storeWork.Load() > 0 || (cs.cacheReconciles != nil && cs.cacheReconciles.Load() > 0)
 }
 
 // storesQuiescent reports whether the city is quiescent (see beadsQuiescent):
