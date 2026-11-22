@@ -616,8 +616,9 @@ func logControllerStoreLines(run *helpers.TopologyRun, label string) {
 	}
 }
 
-// firstOrderCycleTimeout caps how long doctor-after-start waits for
-// order-firing-current to read ok. Right after a start every cron and cooldown
+// firstOrderCycleTimeout bounds when doctor-after-start may START a poll of
+// order-firing-current while waiting for it to read ok; a poll already running
+// at the bound runs to completion (see firstOrderCyclePollCheck). Right after a start every cron and cooldown
 // order is due at once and each orders-lane pass dispatches at most
 // orders.max_dispatches_per_tick (4) of them, several passes apart. On the
 // failing nightly runs recorded on ga-riugvm the supervisor's "per-tick budget
@@ -634,19 +635,23 @@ const firstOrderCycleTimeout = 4 * time.Minute
 // their own process groups, which gc cleans up only on its own exit.
 const firstOrderCyclePollCheck = 30 * time.Second
 
-// waitForFirstOrderCycle waits, up to firstOrderCycleTimeout, for one doctor
-// read in which order-firing-current is ok, before doctor-after-start judges
+// waitForFirstOrderCycle polls, starting polls only within
+// firstOrderCycleTimeout, for one doctor read in which order-firing-current
+// is ok, before doctor-after-start judges
 // the city (ga-riugvm). It observes one healthy read, not a completed dispatch
 // cycle, and it never decides the step: the full doctor run that follows is
 // unchanged and judges the city as it is then. So an order the check reports
 // as stale at that run still fails the step; one the check itself grades ok
 // (never fired, controller up less than 1.5 of its intervals) passes as it
-// always did. On the cap it returns without a verdict.
+// always did. When no further poll may start it returns without a verdict. The
+gc CLI has no whole-command deadline, so a poll can overrun the bound by the
+CLI's own start-up and exit time, and one that hangs outside its check holds
+the step, as any gc call in this test would.
 func waitForFirstOrderCycle(t *testing.T, run *helpers.TopologyRun) {
 	t.Helper()
 	start := time.Now()
 	deadline := start.Add(firstOrderCycleTimeout)
-	for time.Until(deadline) > firstOrderCyclePollCheck {
+	for time.Until(deadline) >= firstOrderCyclePollCheck {
 		out, _ := run.City.GC("doctor", "--json", "--check", "order-firing-current", "--check-timeout", firstOrderCyclePollCheck.String())
 		if report, ok := parseDoctorReport(out); ok {
 			for _, r := range report.Results {
