@@ -11,6 +11,9 @@ import (
 	"testing"
 	"time"
 
+	// Embedded zoneinfo: named-zone results must not depend on the host's tzdata.
+	_ "time/tzdata"
+
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
@@ -1036,5 +1039,223 @@ func TestOrderFiringCurrent_TimesOutStalledOrderHistory(t *testing.T) {
 	}
 	if !result.TimedOut {
 		t.Fatalf("TimedOut = false, want true so callers (JSON output, doctor summary) can distinguish this from a confirmed failure")
+	}
+}
+
+// TestOrderFiringCurrent_UnevenCronJudgedFromItsNextSlot is the ga-6703d7
+// regression: a cron order with uneven gaps ("50 1-5 * * *", expected = its
+// 1 h minimum gap) is current between its last run of the day and its first
+// run of the next, and is overdue or stale only once a scheduled slot passes
+// without a firing.
+func TestOrderFiringCurrent_UnevenCronJudgedFromItsNextSlot(t *testing.T) {
+	la, err := time.LoadLocation("America/Los_Angeles")
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := func(d, h, m int) time.Time { return time.Date(2026, 11, d, h, m, 0, 0, la) }
+	order := orders.Order{Name: "tool-cache-reclaim", Trigger: "cron", Schedule: "50 1-5 * * *", TZ: "America/Los_Angeles"}
+	expected, err := computeExpectedIntervalForCronSchedule(order.Schedule)
+	if err != nil || expected != time.Hour {
+		t.Fatalf("expected interval = %v, %v; want 1h", expected, err)
+	}
+	start := at(1, 0, 0)
+	cases := []struct {
+		name       string
+		lastFired  time.Time
+		now        time.Time
+		wantStatus CheckStatus
+	}{
+		{"evening after the morning's last run", at(21, 5, 51), at(21, 21, 48), StatusOK},
+		{"first slot missed by 40 min", at(20, 5, 51), at(21, 2, 30), StatusWarning},
+		{"a whole day of slots missed", at(20, 5, 51), at(21, 21, 48), StatusError},
+		{"first slot missed by 20 min, inside tolerance", at(20, 5, 51), at(21, 2, 10), StatusOK},
+	}
+	for _, tc := range cases {
+		status, _, detail, _ := classifyOrderFiring(order, tc.now, expected, tc.lastFired, start)
+		if status != tc.wantStatus {
+			t.Errorf("%s: status = %v (%s), want %v", tc.name, status, detail, tc.wantStatus)
+		}
+	}
+}
+
+// An evenly spaced cron order fired on its slots keeps the age-based verdicts:
+// overdue at 1.5 intervals, stale at 3 (ga-6703d7 changes uneven schedules only).
+func TestOrderFiringCurrent_EvenCronKeepsAgeThresholds(t *testing.T) {
+	order := orders.Order{Name: "every-4h", Trigger: "cron", Schedule: "0 */4 * * *", TZ: "UTC"}
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	start := now.Add(-48 * time.Hour)
+	cases := []struct {
+		lastFired  time.Time
+		wantStatus CheckStatus
+	}{
+		{now.Add(-4 * time.Hour), StatusOK},
+		{now.Add(-8 * time.Hour), StatusWarning},
+		{now.Add(-12 * time.Hour), StatusError},
+	}
+	for _, tc := range cases {
+		status, _, detail, _ := classifyOrderFiring(order, now, 4*time.Hour, tc.lastFired, start)
+		if status != tc.wantStatus {
+			t.Errorf("last fired %s ago: status = %v (%s), want %v", now.Sub(tc.lastFired), status, detail, tc.wantStatus)
+		}
+	}
+}
+
+// The even-schedule warning boundary: exactly 1.5 intervals after an on-slot
+// firing is overdue, as before ga-6703d7.
+func TestOrderFiringCurrent_EvenCronWarnsAtOneAndAHalfIntervals(t *testing.T) {
+	order := orders.Order{Name: "every-4h", Trigger: "cron", Schedule: "0 */4 * * *", TZ: "UTC"}
+	now := time.Date(2026, 5, 17, 14, 0, 0, 0, time.UTC)
+	start := now.Add(-48 * time.Hour)
+	if status, _, detail, _ := classifyOrderFiring(order, now, 4*time.Hour, now.Add(-6*time.Hour), start); status != StatusWarning {
+		t.Errorf("6 h after an on-slot firing: status = %v (%s), want warning", status, detail)
+	}
+	// On-slot firing at 08:00, judged a minute before the 1.5x mark.
+	if status, _, detail, _ := classifyOrderFiring(order, now.Add(-time.Minute), 4*time.Hour, now.Add(-6*time.Hour), start); status != StatusOK {
+		t.Errorf("5h59m after an on-slot firing: status = %v (%s), want OK", status, detail)
+	}
+}
+
+// The stale boundary for an evenly spaced schedule fired on its slots: just under
+// three intervals is overdue, three intervals and just over are stale.
+func TestOrderFiringCurrent_EvenCronStaleBoundary(t *testing.T) {
+	order := orders.Order{Name: "every-4h", Trigger: "cron", Schedule: "0 */4 * * *", TZ: "UTC"}
+	fired := time.Date(2026, 5, 17, 0, 0, 0, 0, time.UTC) // on its slot
+	start := fired.Add(-48 * time.Hour)
+	for _, tc := range []struct {
+		after time.Duration
+		want  CheckStatus
+	}{
+		{12*time.Hour - time.Minute, StatusWarning},
+		{12 * time.Hour, StatusError},
+		{12*time.Hour + time.Minute, StatusError},
+	} {
+		if status, _, detail, _ := classifyOrderFiring(order, fired.Add(tc.after), 4*time.Hour, fired, start); status != tc.want {
+			t.Errorf("%s after an on-slot firing: status = %v (%s), want %v", tc.after, status, detail, tc.want)
+		}
+	}
+}
+
+// A cron order last fired longer ago than the dispatcher's catch-up lookback
+// must not read as current (Astra's finding on #373).
+func TestOrderFiringCurrent_LongDeadAnnualCronIsNotCurrent(t *testing.T) {
+	order := orders.Order{Name: "yearly", Trigger: "cron", Schedule: "0 0 1 1 *", TZ: "UTC"}
+	expected, err := computeExpectedIntervalForCronSchedule(order.Schedule)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	status, _, detail, _ := classifyOrderFiring(order, now, expected, time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), now.Add(-24*time.Hour))
+	if status != StatusError {
+		t.Errorf("an annual order dead since 2020 (first missed slot 2021-01-01): status = %v (%s), want stale", status, detail)
+	}
+	// The real tolerance survives a year: two days past a missed 1 January is not overdue yet.
+	status, _, detail, _ = classifyOrderFiring(order, time.Date(2026, 1, 3, 0, 0, 0, 0, time.UTC), expected, time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC), now.Add(-24*time.Hour))
+	if status != StatusOK {
+		t.Errorf("annual, last fired a year and two days ago: status = %v (%s), want OK", status, detail)
+	}
+	// A leap-day order between leap years has missed nothing.
+	leap := orders.Order{Name: "leap", Trigger: "cron", Schedule: "0 0 29 2 *", TZ: "UTC"}
+	leapExpected, err := computeExpectedIntervalForCronSchedule(leap.Schedule)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, _, detail, _ = classifyOrderFiring(leap, now, leapExpected, time.Date(2024, 2, 29, 0, 0, 0, 0, time.UTC), now.Add(-24*time.Hour))
+	if status != StatusOK {
+		t.Errorf("leap-day order between leap years: status = %v (%s), want OK", status, detail)
+	}
+}
+
+// End to end through Run: an hourly order whose newest EVENT missed the 11:00
+// slot but whose order-run store holds an 11:00 firing is current, because the
+// event evidence does not suffice and the newer store firing wins. Control:
+// with no newer store firing the same order is overdue.
+func TestOrderFiringCurrent_NewerStoreFiringBehindAStaleEvent(t *testing.T) {
+	now := time.Date(2026, 11, 21, 11, 40, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name  string
+		store time.Time
+		want  CheckStatus
+	}{
+		{"store has the 11:00 firing", time.Date(2026, 11, 21, 11, 0, 0, 0, time.UTC), StatusOK},
+		{"store has nothing newer", time.Time{}, StatusWarning},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cityPath, cfg := orderFiringTestCity(t)
+			writeOrderFiringTestOrder(t, cityPath, "hourly", "cron", "0 * * * *")
+			writeOrderFiringTestEvents(t, cityPath,
+				events.Event{Type: events.ControllerStarted, Ts: now.Add(-24 * time.Hour)},
+				events.Event{Type: events.OrderFired, Subject: "hourly", Ts: time.Date(2026, 11, 21, 10, 59, 0, 0, time.UTC)},
+			)
+			asked := 0
+			check := NewOrderFiringCurrentCheck(cfg, cityPath, WithOrderFiringCurrentLastRunFunc(func(orders.Order) (time.Time, error) {
+				asked++
+				return tc.store, nil
+			}))
+			check.clock = func() time.Time { return now }
+			result := check.Run(&CheckContext{CityPath: cityPath})
+			if asked == 0 {
+				t.Fatal("the store was never read for an order whose events show a missed slot")
+			}
+			if result.Status != tc.want {
+				t.Fatalf("status = %v, want %v; msg = %s; details = %v", result.Status, tc.want, result.Message, result.Details)
+			}
+		})
+	}
+}
+
+// eventEvidenceSuffices uses the classifier's own measure, so the event log is
+// enough exactly when it alone would judge the order current. An hourly order
+// whose newest event is one missed slot ago must be confirmed against the
+// store (a newer store-only firing may exist); an uneven order in its long
+// gap needs no store read.
+func TestOrderFiringCurrent_EventEvidenceAgreesWithClassifier(t *testing.T) {
+	hourly := orders.Order{Name: "hourly", Trigger: "cron", Schedule: "0 * * * *", TZ: "UTC"}
+	now := time.Date(2026, 11, 21, 11, 40, 0, 0, time.UTC)
+	if eventEvidenceSuffices(hourly, time.Date(2026, 11, 21, 10, 59, 0, 0, time.UTC), time.Hour, now) {
+		t.Error("an hourly order whose newest event missed the 11:00 slot was judged from events alone; the store must be read")
+	}
+	la, err := time.LoadLocation("America/Los_Angeles")
+	if err != nil {
+		t.Fatal(err)
+	}
+	uneven := orders.Order{Name: "tool-cache-reclaim", Trigger: "cron", Schedule: "50 1-5 * * *", TZ: "America/Los_Angeles"}
+	if !eventEvidenceSuffices(uneven, time.Date(2026, 11, 21, 5, 51, 0, 0, la), time.Hour, time.Date(2026, 11, 21, 21, 48, 0, 0, la)) {
+		t.Error("an uneven order in its long gap forced a store read")
+	}
+}
+
+// End to end through Run: an uneven cron order in the long gap after its last
+// run of the day is current from the event log alone, and the store is never
+// read for it.
+func TestOrderFiringCurrent_UnevenCronInItsLongGapNeedsNoStoreRead(t *testing.T) {
+	now := time.Date(2026, 11, 21, 21, 48, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	writeOrderFiringTestOrder(t, cityPath, "tool-cache-reclaim", "cron", "50 1-5 * * *")
+	writeOrderFiringTestEvents(t, cityPath,
+		events.Event{Type: events.ControllerStarted, Ts: now.Add(-48 * time.Hour)},
+		events.Event{Type: events.OrderFired, Subject: "tool-cache-reclaim", Ts: time.Date(2026, 11, 21, 5, 51, 0, 0, time.UTC)},
+	)
+	check := NewOrderFiringCurrentCheck(cfg, cityPath, WithOrderFiringCurrentLastRunFunc(func(order orders.Order) (time.Time, error) {
+		t.Errorf("store read for %s, whose event log already shows it current", order.Name)
+		return time.Time{}, nil
+	}))
+	check.clock = func() time.Time { return now }
+	if result := check.Run(&CheckContext{CityPath: cityPath}); result.Status != StatusOK {
+		t.Fatalf("status = %v, want OK; msg = %s; details = %v", result.Status, result.Message, result.Details)
+	}
+}
+
+// A cron order whose bounded next-slot scan runs out is judged by its plain age,
+// never as current: "0 0 1 1 1" last fired 2024-01-01, checked in 2032.
+func TestOrderFiringCurrent_ExhaustedScanFallsBackToAge(t *testing.T) {
+	order := orders.Order{Name: "jan1-monday", Trigger: "cron", Schedule: "0 0 1 1 1", TZ: "UTC"}
+	expected, err := computeExpectedIntervalForCronSchedule(order.Schedule)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2032, 1, 2, 0, 0, 0, 0, time.UTC)
+	status, _, detail, _ := classifyOrderFiring(order, now, expected, time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC), now.Add(-24*time.Hour))
+	if status == StatusOK {
+		t.Errorf("an exhausted scan read as current (%s)", detail)
 	}
 }
