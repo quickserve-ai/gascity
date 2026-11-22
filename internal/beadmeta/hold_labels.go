@@ -91,3 +91,34 @@ func HasDispatchHold(labels []string) bool {
 	}
 	return false
 }
+
+// FreezeDeferredLabel marks work deferred by a fork freeze. A town parks
+// unclaimed work under it or under any hold:* label ("hold:human",
+// "hold:clock", "hold:human-decision", ...), and none of those values is a
+// canonical dispatch hold, so before HasOpenWorkPark a named seat's
+// `gc hook --claim` served the parked bead back as work and flipped it to
+// in_progress (ga-v28pab).
+const FreezeDeferredLabel = "freeze:deferred"
+
+// HasOpenWorkPark reports whether labels park an UNCLAIMED bead: a canonical
+// dispatch hold (HasDispatchHold, trimmed and case-insensitive), any hold:*
+// label (HasHoldLabel, the single definition in hold.go, the same rule the
+// route-scoped work query's jq clause applies), or "freeze:deferred" (trimmed,
+// exact). It answers the same "is this WORK for whoever asks?" question as
+// HasDispatchHold, for unclaimed rows only: the hook's serve filter (for
+// candidates not yet in_progress or hooked), the controller's open-work wake
+// gate (assignedOpenWorkHeld), the drain-ack claimability classifier and
+// continuation-group pre-assignment. A claimed bead stays on HasDispatchHold
+// alone, so a seat's own in_progress park (a hold:cert-wait park is
+// in_progress by town doctrine) is still served to it.
+func HasOpenWorkPark(labels []string) bool {
+	if HasDispatchHold(labels) || HasHoldLabel(labels) {
+		return true
+	}
+	for _, label := range labels {
+		if strings.TrimSpace(label) == FreezeDeferredLabel {
+			return true
+		}
+	}
+	return false
+}

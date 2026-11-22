@@ -1793,7 +1793,7 @@ func preassignHookContinuationGroup(bead beads.Bead, opts hookClaimOptions, ops 
 			// sibling's required next actor is, by construction, not this
 			// claimant — the same beadmeta.HasDispatchHold answer the hook's
 			// serve filter (isHeldHookCandidate) gives (gas-kg6, #6026).
-			beadmeta.HasDispatchHold(sibling.Labels) {
+			beadmeta.HasOpenWorkPark(sibling.Labels) {
 			continue
 		}
 		if err := ops.AssignContinuation(ctx, dir, opts.Env, sibling.ID, pinAssignee); err != nil {

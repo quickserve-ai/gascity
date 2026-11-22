@@ -1712,10 +1712,11 @@ func isSelfBlockedHookCandidate(item map[string]any) bool {
 // hold dimension is filtered here, in the one seam every hook path already runs
 // through (the claim, the cross-store federation, and plain `gc hook`).
 //
-// Only the two canonical values match: each label is trimmed and compared
-// whole, case-insensitively, against the shared beadmeta constants, so
-// unrelated labels that merely look hold-ish (`mpr-human-hold`, the routing
-// label `needs-mayor`) are ordinary work and must not be stranded.
+// For a claimed candidate only the two canonical values match; an unclaimed
+// one also matches any "hold:" label or "freeze:deferred" (see below). Each
+// label is trimmed and compared case-insensitively, so unrelated labels that
+// merely look hold-ish (`mpr-human-hold`, the routing label `needs-mayor`)
+// are ordinary work and must not be stranded.
 //
 // An absent or null labels field means "no labels", never "unknown" — bd emits
 // labels:null for an unlabeled bead — so this fails open exactly like the
@@ -1742,8 +1743,20 @@ func isHeldHookCandidate(item map[string]any) bool {
 	// One predicate for "held": the controller's wake-demand and drain-ack
 	// claimability gates (assignedOpenWorkHeld, classifyDemandRowClaimability)
 	// answer with the same function, so they cannot drift from what the hook
-	// actually refuses to serve.
-	return beadmeta.HasDispatchHold(labels)
+	// actually refuses to serve. An UNCLAIMED candidate is also held by any
+	// town park label (beadmeta.HasOpenWorkPark: "hold:*", "freeze:deferred"),
+	// the same rule those open-row gates use; a claimed (in_progress or hooked)
+	// one is held only by a canonical dispatch hold, so a seat's own
+	// in_progress park is still served to it (ga-v28pab).
+	if beadmeta.HasDispatchHold(labels) {
+		return true
+	}
+	status, _ := item["status"].(string)
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "in_progress", "hooked":
+		return false
+	}
+	return beadmeta.HasOpenWorkPark(labels)
 }
 
 // isFailedPartialMoleculeHookCandidate reports whether item is a bead of a
