@@ -616,42 +616,51 @@ func logControllerStoreLines(run *helpers.TopologyRun, label string) {
 	}
 }
 
-// firstOrderCycleTimeout caps how long doctor-after-start waits for the order
-// dispatcher's first cycle. At start every cron and cooldown order is due at
-// once and each orders-lane pass dispatches at most
+// firstOrderCycleTimeout caps how long doctor-after-start waits for
+// order-firing-current to read ok. Right after a start every cron and cooldown
+// order is due at once and each orders-lane pass dispatches at most
 // orders.max_dispatches_per_tick (4) of them, so on a loaded runner, with
 // passes ~40 s apart, a fresh city's ~24 orders take about four minutes to be
-// reached (ga-riugvm). The cap covers that and no more: the doctor target runs
-// every topology in one bazel action capped at 1100 s, and most topologies read
-// ok on the first poll.
+// reached (ga-riugvm). The doctor target (BUILD.bazel TOPOLOGY_PHASES) selects
+// M1 and M5, under one 1100 s action, so the cap adds at most 8 minutes there.
 const firstOrderCycleTimeout = 4 * time.Minute
 
-// waitForFirstOrderCycle waits until gc doctor's order-firing-current reports
-// ok, or the cap passes, before doctor-after-start judges the city: the step
-// asserts the settled city, not one the dispatcher is still working through
-// (ga-riugvm). It never fails the test itself. On the cap it returns, and the
-// full doctor run that follows reports the check with its per-order details,
-// so an order that really never fires still fails the step.
+// firstOrderCyclePollCheckTimeout bounds each poll's check. The CLI has no
+// whole-command deadline, so this is what keeps one poll from running long
+// past the cap; order-firing-current also has its own lookup timer.
+const firstOrderCyclePollCheckTimeout = "30s"
+
+// waitForFirstOrderCycle waits, up to firstOrderCycleTimeout, for one doctor
+// read in which order-firing-current is ok, before doctor-after-start judges
+// the city (ga-riugvm). It observes one healthy read, not a completed dispatch
+// cycle, and it never decides the step: the full doctor run that follows is
+// unchanged and judges the city as it is then. So an order the check reports
+// as stale at that run still fails the step; one the check itself grades ok
+// (never fired, controller up less than 1.5 of its intervals) passes as it
+// always did. On the cap it returns without a verdict.
 func waitForFirstOrderCycle(t *testing.T, run *helpers.TopologyRun) {
 	t.Helper()
-	deadline := time.Now().Add(firstOrderCycleTimeout)
 	start := time.Now()
-	for {
-		out, _ := run.City.GC("doctor", "--json", "--check", "order-firing-current", "--check-timeout", topologyDoctorCheckTimeout)
+	deadline := start.Add(firstOrderCycleTimeout)
+	for time.Now().Before(deadline) {
+		out, _ := run.City.GC("doctor", "--json", "--check", "order-firing-current", "--check-timeout", firstOrderCyclePollCheckTimeout)
 		if report, ok := parseDoctorReport(out); ok {
 			for _, r := range report.Results {
 				if r.Name == "order-firing-current" && r.Status == "ok" {
-					t.Logf("order-firing-current ok after %s", time.Since(start).Round(time.Second))
+					t.Logf("order-firing-current read ok after %s", time.Since(start).Round(time.Second))
 					return
 				}
 			}
 		}
-		if time.Now().After(deadline) {
-			t.Logf("order-firing-current not ok after %s; judging the city as it stands", firstOrderCycleTimeout)
-			return
+		pause := 15 * time.Second
+		if left := time.Until(deadline); left < pause {
+			pause = left
 		}
-		time.Sleep(15 * time.Second)
+		if pause > 0 {
+			time.Sleep(pause)
+		}
 	}
+	t.Logf("order-firing-current not ok within %s; judging the city as it stands", firstOrderCycleTimeout)
 }
 
 // parseDoctorReport is lastJSONLine without the fatal: a poll that reads a
