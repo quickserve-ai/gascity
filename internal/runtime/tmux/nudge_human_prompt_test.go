@@ -1808,7 +1808,7 @@ func TestClassifyHumanPrompt_ConfirmDialogIsTheBottomBlockOnly(t *testing.T) {
 	// lastComposerLine is unchanged: the trust prompt's cursor row still reads
 	// as a composer line to it, exactly as on carry.
 	if idx, _ := lastComposerLine(strings.Split(trust, "\n"), DefaultReadyPromptPrefix); idx < 0 {
-		t.Fatalf("lastComposerLine changed behaviour on the trust prompt")
+		t.Fatalf("lastComposerLine changed behavior on the trust prompt")
 	}
 }
 
@@ -1900,15 +1900,15 @@ func TestResumeSelectorExemptionIsStructural(t *testing.T) {
 		})
 	}
 	if !isClaudeResumeSelectorBlock(strings.Split(strings.TrimSpace(resumeSelectorFixture), "\n")) {
-		t.Fatalf("the real resume selector is not recognised")
+		t.Fatalf("the real resume selector is not recognized")
 	}
 }
 
-// Third and fourth reviews on #376: the resume selector is recognised by its
+// Third and fourth reviews on #376: the resume selector is recognized by its
 // exact rows; blank padding under the heading is the only variation allowed.
 // The guard classifies it as nothing (the existing dismissal handles it).
 // Decorated or extended rows are refused: a look-alike must never reach the
-// dismissal, and an unrecognised real selector only makes the seat wait.
+// dismissal, and an unrecognized real selector only makes the seat wait.
 func TestResumeSelectorRecognisedExactly(t *testing.T) {
 	padded := "Resume previous conversation?\n\n\n\n❯ Resume from summary\n  Resume full session as-is\nEnter to confirm · Esc to cancel\n"
 	if got := classifyHumanPrompt(strings.Split(padded, "\n"), DefaultReadyPromptPrefix, false); got != "" {

@@ -398,7 +398,7 @@ func isClaudeResumeSelectorBlock(block []string) bool {
 	// trimmed text, with no box border stripped and no other cursor glyph,
 	// must equal the captured row. Blank rows are the only variation allowed.
 	// Any other rendering is refused: the guard fails closed, so an
-	// unrecognised real selector makes the seat wait (visible as a deferral),
+	// unrecognized real selector makes the seat wait (visible as a deferral),
 	// where accepting a look-alike would let the dismissal press Enter on a
 	// person's dialog.
 	want := []string{
