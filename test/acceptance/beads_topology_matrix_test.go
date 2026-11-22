@@ -644,9 +644,9 @@ const firstOrderCyclePollCheck = 30 * time.Second
 // as stale at that run still fails the step; one the check itself grades ok
 // (never fired, controller up less than 1.5 of its intervals) passes as it
 // always did. When no further poll may start it returns without a verdict. The
-gc CLI has no whole-command deadline, so a poll can overrun the bound by the
-CLI's own start-up and exit time, and one that hangs outside its check holds
-the step, as any gc call in this test would.
+// gc CLI has no whole-command deadline, so a poll can overrun the bound by the
+// CLI's own start-up and exit time, and one that hangs outside its check holds
+// the step, as any gc call in this test would.
 func waitForFirstOrderCycle(t *testing.T, run *helpers.TopologyRun) {
 	t.Helper()
 	start := time.Now()
