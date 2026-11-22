@@ -44,3 +44,35 @@ func TestHasDispatchHold(t *testing.T) {
 		}
 	}
 }
+
+// TestHasOpenWorkPark pins the unclaimed-work park rule (ga-v28pab): the two
+// canonical dispatch holds (case-folded), any "hold:" label and
+// "freeze:deferred" (trimmed, exact, as the route query's jq compares them).
+// Hold-ish labels without the "hold:" prefix are ordinary work.
+func TestHasOpenWorkPark(t *testing.T) {
+	cases := []struct {
+		name   string
+		labels []string
+		want   bool
+	}{
+		{"nil", nil, false},
+		{"unrelated", []string{"mysql-cutover", "needs-mayor", "mpr-human-hold", "holding-pattern", "hold"}, false},
+		{"freeze label other than deferred", []string{"freeze:a"}, false},
+		{"canonical hold", []string{HoldExternalLabel}, true},
+		{"town human hold", []string{"hold:human"}, true},
+		{"town decision hold", []string{"x", "hold:human-decision"}, true},
+		{"clock hold", []string{"hold:clock"}, true},
+		{"cert-wait hold", []string{"hold:cert-wait"}, true},
+		{"freeze deferred", []string{"freeze:deferred"}, true},
+		{"space trimmed", []string{"  hold:human ", "x"}, true},
+		{"canonical hold case-folded", []string{" Hold:External"}, true},
+		{"town hold is case-exact like the route query", []string{"Hold:Human"}, false},
+		{"freeze deferred trimmed", []string{" freeze:deferred "}, true},
+		{"freeze deferred is case-exact", []string{"Freeze:Deferred"}, false},
+	}
+	for _, tc := range cases {
+		if got := HasOpenWorkPark(tc.labels); got != tc.want {
+			t.Errorf("%s: HasOpenWorkPark(%q) = %v, want %v", tc.name, tc.labels, got, tc.want)
+		}
+	}
+}

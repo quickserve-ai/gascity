@@ -560,5 +560,5 @@ func readyAssignedFlagsForBeads(readyAssigned map[storeScopedBeadKey]bool, beadL
 // and stays hold-transparent for demand/liveness accounting (ga-5736js), so its
 // owner remains visible to crash recovery.
 func assignedOpenWorkHeld(b beads.Bead) bool {
-	return b.Status == "open" && beadmeta.HasDispatchHold(b.Labels)
+	return b.Status == "open" && beadmeta.HasOpenWorkPark(b.Labels)
 }

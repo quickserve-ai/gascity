@@ -44,9 +44,11 @@ func heldAssignedOpenWorkCity() *config.City {
 }
 
 // heldLabelVariants is every canonical hold value plus a case/space variant the
-// hook's EqualFold filter also strips.
+// hook's EqualFold filter also strips, plus the town park labels an unclaimed
+// bead is parked under (beadmeta.HasOpenWorkPark, ga-v28pab).
 func heldLabelVariants() []string {
-	return append(append([]string(nil), beadmeta.DispatchHoldLabels...), " Hold:External ")
+	return append(append([]string(nil), beadmeta.DispatchHoldLabels...),
+		" Hold:External ", "hold:human", "hold:human-decision", "hold:clock", " freeze:deferred ")
 }
 
 func TestBuildDesiredState_OnDemandNamedSession_HeldAssignedOpenWorkIsNotWakeDemand(t *testing.T) {
@@ -206,17 +208,21 @@ func TestHeldHookCandidateAgreesWithDispatchHoldPredicate(t *testing.T) {
 		{beadmeta.HoldExternalLabel},
 		{"x", beadmeta.HoldMayorLabel},
 		{" Hold:External "},
+		{"hold:human"},
+		{"hold:clock", "freeze:deferred"},
+		{"freeze:deferred"},
+		{"holding-pattern", "hold"},
 	}
 	for _, labels := range cases {
 		raw := make([]any, len(labels))
 		for i, l := range labels {
 			raw[i] = l
 		}
-		item := map[string]any{"labels": raw}
+		item := map[string]any{"status": "open", "labels": raw}
 		bead := beads.Bead{Status: "open", Assignee: "olivia", Labels: labels}
 		hook := isHeldHookCandidate(item)
-		if want := beadmeta.HasDispatchHold(labels); hook != want {
-			t.Errorf("labels %q: isHeldHookCandidate = %v, beadmeta.HasDispatchHold = %v", labels, hook, want)
+		if want := beadmeta.HasOpenWorkPark(labels); hook != want {
+			t.Errorf("labels %q: isHeldHookCandidate(open) = %v, beadmeta.HasOpenWorkPark = %v", labels, hook, want)
 		}
 		if wakes := !assignedOpenWorkHeld(bead); wakes == hook {
 			t.Errorf("labels %q: hook serves=%v but controller wake gate counts=%v; they must agree", labels, !hook, wakes)

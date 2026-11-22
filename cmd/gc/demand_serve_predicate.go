@@ -240,7 +240,7 @@ func classifyDemandRowClaimability(b beads.Bead, now time.Time) demandRowClaimab
 	if beads.IsDeferred(b, now) {
 		return demandRowDeferred
 	}
-	if beadmeta.HasDispatchHold(b.Labels) {
+	if beadmeta.HasOpenWorkPark(b.Labels) {
 		return demandRowHeld
 	}
 	if b.IsBlocked == nil || *b.IsBlocked {
