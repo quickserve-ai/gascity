@@ -2362,6 +2362,21 @@ type OrdersConfig struct {
 	Overrides []OrderOverride `toml:"overrides,omitempty"`
 }
 
+// DefaultMaxDispatchesPerTick is the orders-lane dispatch budget a city gets
+// when it leaves orders.max_dispatches_per_tick unset.
+const DefaultMaxDispatchesPerTick = 4
+
+// DispatchesPerTick returns the dispatch budget the supervisor uses per
+// orders-lane pass: the configured value when it is positive, otherwise
+// DefaultMaxDispatchesPerTick. The dispatcher and gc doctor's
+// order-firing-current read it here so the two cannot disagree.
+func (o OrdersConfig) DispatchesPerTick() int {
+	if o.MaxDispatchesPerTick != nil && *o.MaxDispatchesPerTick > 0 {
+		return *o.MaxDispatchesPerTick
+	}
+	return DefaultMaxDispatchesPerTick
+}
+
 // OrderOverride modifies a scanned order's scheduling fields and exec env.
 // Uses pointer fields to distinguish "not set" from "set to zero value."
 type OrderOverride struct {
