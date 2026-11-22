@@ -18,9 +18,11 @@
 package acceptance_test
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -619,15 +621,16 @@ func logControllerStoreLines(run *helpers.TopologyRun, label string) {
 // firstOrderCycleTimeout caps how long doctor-after-start waits for
 // order-firing-current to read ok. Right after a start every cron and cooldown
 // order is due at once and each orders-lane pass dispatches at most
-// orders.max_dispatches_per_tick (4) of them, so on a loaded runner, with
-// passes ~40 s apart, a fresh city's ~24 orders take about four minutes to be
-// reached (ga-riugvm). The doctor target (BUILD.bazel TOPOLOGY_PHASES) selects
-// M1 and M5, under one 1100 s action, so the cap adds at most 8 minutes there.
+// orders.max_dispatches_per_tick (4) of them, several passes apart. On the
+// failing nightly runs recorded on ga-riugvm the supervisor's "per-tick budget
+// 4 spent" lines were about 40 s apart, so a first rotation over a few dozen
+// orders can take minutes. The doctor target (BUILD.bazel TOPOLOGY_PHASES)
+// selects the M1 and M5 rows under one 1100 s action; every poll below is
+// killed at the cap, so the wait adds at most the cap per row there.
 const firstOrderCycleTimeout = 4 * time.Minute
 
-// firstOrderCyclePollCheckTimeout bounds each poll's check. The CLI has no
-// whole-command deadline, so this is what keeps one poll from running long
-// past the cap; order-firing-current also has its own lookup timer.
+// firstOrderCyclePollCheckTimeout bounds each poll's check inside gc; the
+// poll's process is also killed at the wait's deadline (pollDoctorCheck).
 const firstOrderCyclePollCheckTimeout = "30s"
 
 // waitForFirstOrderCycle waits, up to firstOrderCycleTimeout, for one doctor
@@ -643,7 +646,7 @@ func waitForFirstOrderCycle(t *testing.T, run *helpers.TopologyRun) {
 	start := time.Now()
 	deadline := start.Add(firstOrderCycleTimeout)
 	for time.Now().Before(deadline) {
-		out, _ := run.City.GC("doctor", "--json", "--check", "order-firing-current", "--check-timeout", firstOrderCyclePollCheckTimeout)
+		out := pollDoctorCheck(t, run, deadline, "order-firing-current")
 		if report, ok := parseDoctorReport(out); ok {
 			for _, r := range report.Results {
 				if r.Name == "order-firing-current" && r.Status == "ok" {
@@ -661,6 +664,27 @@ func waitForFirstOrderCycle(t *testing.T, run *helpers.TopologyRun) {
 		}
 	}
 	t.Logf("order-firing-current not ok within %s; judging the city as it stands", firstOrderCycleTimeout)
+}
+
+// pollDoctorCheck runs one gc doctor --check read, killed at deadline: the
+// helpers' GC has no deadline of its own, and a poll must not outlive the wait
+// that started it. Its error is not returned: a poll that fails or is killed
+// simply did not read ok.
+func pollDoctorCheck(t *testing.T, run *helpers.TopologyRun, deadline time.Time, check string) string {
+	t.Helper()
+	gcPath, err := helpers.ResolveGCPath(run.City.Env)
+	if err != nil {
+		t.Logf("poll %s: %v", check, err)
+		return ""
+	}
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, gcPath, "doctor", "--json", "--check", check, "--check-timeout", firstOrderCyclePollCheckTimeout)
+	cmd.Dir = run.City.Dir
+	cmd.Env = run.City.Env.List()
+	cmd.WaitDelay = 5 * time.Second
+	out, _ := cmd.CombinedOutput()
+	return string(out)
 }
 
 // parseDoctorReport is lastJSONLine without the fatal: a poll that reads a
