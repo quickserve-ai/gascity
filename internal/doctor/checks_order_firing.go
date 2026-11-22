@@ -343,6 +343,16 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext) *CheckResult {
 			inconclusive++
 		} else {
 			status, severity, detail, routine = classifyOrderFiring(order, now, expected, lastFired, started.at, rotation)
+			// A fired order was dated against the active log's start only. When
+			// that is gone (rotated into the archive) and the order reads late,
+			// resolve the start the way a never-fired order does, so the
+			// cold-start window is not lost to a log rotation. An unreadable or
+			// unknown start leaves the verdict as it is.
+			if status != StatusOK && !lastFired.IsZero() && started.at.IsZero() && rotation > 0 {
+				if resolved, err := controllerStart(); err == nil && !resolved.unknown && !resolved.at.IsZero() {
+					status, severity, detail, routine = classifyOrderFiring(order, now, expected, lastFired, resolved.at, rotation)
+				}
+			}
 		}
 		worst = worseStatus(worst, status)
 		if routine {
@@ -1046,21 +1056,29 @@ func classifyOrderFiring(order orders.Order, now time.Time, expected time.Durati
 
 	age := nonNegativeDuration(now.Sub(lastFired))
 	judged := judgedFiringAge(order, lastFired, expected, now)
-	// A firing from before this controller started, with the order due by the
-	// time the new controller's first rotation could reach it: it waits for
-	// that rotation, not for its own interval, so it is late only once 1.5
-	// rotations have passed since it was due or the controller started,
-	// whichever is later. The grace is the rotation's, never the interval's:
-	// an annual order dead for years is still stale minutes after a restart.
-	if rotation > 0 && !controllerStarted.IsZero() && lastFired.Before(controllerStarted) && judged >= expected+expected/2 {
-		due := orderDueAt(order, lastFired, expected, now)
-		if !due.IsZero() && !due.After(controllerStarted.Add(rotation)) {
+	// The cold-start window: for two rotations after a controller start the
+	// dispatcher is still working through the burst of orders that were all due
+	// at once, and an order waits for the rotation to reach it, whether its last
+	// firing was the previous controller's or this one's first pass. So inside
+	// the window an order the rule below would call late is late only once 1.5
+	// rotations have passed since it was due, or since the start if it was
+	// already due then. Past the window nothing changes: a stale order on a
+	// settled city is judged exactly as before, and the grace is the
+	// rotation's, never the interval's, so an annual order dead for years is
+	// still stale once the window ends.
+	if rotation > 0 && !controllerStarted.IsZero() && judged >= expected+expected/2 {
+		uptime := nonNegativeDuration(now.Sub(controllerStarted))
+		if due := orderDueAt(order, lastFired, expected, now); uptime < 2*rotation && !due.IsZero() {
 			from := controllerStarted
 			if due.After(from) {
 				from = due
 			}
 			if waited := nonNegativeDuration(now.Sub(from)); waited < rotation+rotation/2 {
-				return StatusOK, SeverityBlocking, fmt.Sprintf("%s: last fired %s ago, before the controller started %s ago (within first cycle)", name, formatOrderFiringDuration(age), formatOrderFiringDuration(nonNegativeDuration(now.Sub(controllerStarted)))), false
+				when := "since"
+				if lastFired.Before(controllerStarted) {
+					when = "before"
+				}
+				return StatusOK, SeverityBlocking, fmt.Sprintf("%s: last fired %s ago, %s the controller started %s ago (within first cycle)", name, formatOrderFiringDuration(age), when, formatOrderFiringDuration(uptime)), false
 			}
 		}
 	}
@@ -1094,12 +1112,16 @@ func worseStatus(a, b CheckStatus) CheckStatus {
 	return WorseOf(a, b)
 }
 
-// orderDispatchRotation is the longest the dispatcher's first cycle after a
-// controller start can take to reach every order: each orders-lane pass (one
-// per patrol interval) dispatches at most orders.max_dispatches_per_tick of the
-// clock-driven orders, cron, cooldown and event, in a rotation, and at cold
-// start they are all due at once. Condition orders are outside the budget.
-// Suspended rigs' orders are not dispatched, so they are not counted.
+// orderDispatchRotation estimates how long the dispatcher's first cycle after a
+// controller start takes to reach every order: each orders-lane pass (about
+// one per patrol interval) dispatches at most orders.max_dispatches_per_tick
+// orders, in a rotation, and at cold start the cron and cooldown orders are
+// due together. Only those are counted. An event order spends budget only when
+// a matching event has arrived, and a condition order only when its trigger
+// env fails to build (a due one is outside the budget), so counting them would
+// stretch the grace on an ordinary city; a city with many failing condition
+// orders can see its first cycle run longer than this. Suspended rigs' orders
+// are not dispatched, so they are not counted.
 func orderDispatchRotation(cfg *config.City, all []orders.Order, suspendedRigs map[string]bool) time.Duration {
 	if cfg == nil {
 		return 0
@@ -1107,7 +1129,7 @@ func orderDispatchRotation(cfg *config.City, all []orders.Order, suspendedRigs m
 	n := 0
 	for _, order := range all {
 		switch order.Trigger {
-		case "cron", "cooldown", "event":
+		case "cron", "cooldown":
 		default:
 			continue
 		}

@@ -914,6 +914,11 @@ func writeOrderFiringArchivedEvents(t *testing.T, cityPath string, firstSeq, las
 		t.Fatalf("verifying archive fixture %s: %v", basename, err)
 	}
 	for _, want := range evts {
+		// The read above is filtered to firings; other events (a controller
+		// start) are proven by the test that relies on them.
+		if want.Type != events.OrderFired {
+			continue
+		}
 		found := false
 		for _, got := range archived {
 			if got.Subject == want.Subject && got.Ts.Equal(want.Ts) {
@@ -1330,16 +1335,23 @@ func TestOrderFiringCurrent_FiredBeforeRestartJudgedFromTheStart(t *testing.T) {
 	if status != StatusError {
 		t.Fatalf("6m after restart: status = %v (%s), want error", status, detail)
 	}
-	// A firing after the start is judged exactly as before, rotation or not.
+	// A firing after the start waits for the rotation too while the cold-start
+	// window (two rotations) is open, and is judged exactly as before once it
+	// has closed.
 	status, _, detail, _ = classifyOrderFiring(order, start.Add(4*time.Minute), 30*time.Second, start.Add(time.Minute), start, rotation)
+	if status != StatusOK {
+		t.Fatalf("fired after the start, judged inside the window: status = %v (%s), want OK", status, detail)
+	}
+	status, _, detail, _ = classifyOrderFiring(order, start.Add(7*time.Minute), 30*time.Second, start.Add(time.Minute), start, rotation)
 	if status != StatusError {
-		t.Fatalf("fired after the start, 3m ago: status = %v (%s), want error", status, detail)
+		t.Fatalf("fired after the start, judged after the window: status = %v (%s), want error", status, detail)
 	}
 }
 
-// The rotation counts the clock-driven orders the dispatcher budgets (cron,
-// cooldown, event; not condition, not a suspended rig's) at the configured
-// budget and patrol interval.
+// The rotation counts the cron and cooldown orders the dispatcher budgets at
+// cold start (not event or condition orders, which spend budget only when an
+// event arrives or a trigger env fails; not a suspended rig's) at the
+// configured budget and patrol interval.
 func TestOrderDispatchRotation(t *testing.T) {
 	var all []orders.Order
 	for i := 0; i < 8; i++ {
@@ -1354,14 +1366,14 @@ func TestOrderDispatchRotation(t *testing.T) {
 	suspended := map[string]bool{"sleepy": true}
 
 	cfg := &config.City{}
-	if got := orderDispatchRotation(cfg, all, suspended); got != 3*time.Minute {
-		t.Errorf("24 budgeted orders, default budget 4 and patrol 30s: rotation = %v, want 3m", got)
+	if got := orderDispatchRotation(cfg, all, suspended); got != 2*time.Minute {
+		t.Errorf("16 cron+cooldown orders, default budget 4 and patrol 30s: rotation = %v, want 2m", got)
 	}
 	one := 1
 	cfg.Orders.MaxDispatchesPerTick = &one
 	cfg.Daemon.PatrolInterval = "10s"
-	if got := orderDispatchRotation(cfg, all, suspended); got != 4*time.Minute {
-		t.Errorf("budget 1, patrol 10s: rotation = %v, want 4m", got)
+	if got := orderDispatchRotation(cfg, all, suspended); got != 160*time.Second {
+		t.Errorf("budget 1, patrol 10s: rotation = %v, want 2m40s", got)
 	}
 	if got := orderDispatchRotation(nil, all, suspended); got != 0 {
 		t.Errorf("nil config: rotation = %v, want 0", got)
@@ -1389,5 +1401,117 @@ func TestOrderFiringCurrent_RestartGraceIsBoundedByTheRotation(t *testing.T) {
 	}
 	if status, _, detail, _ := classifyOrderFiring(fast, start.Add(5*time.Minute), 30*time.Second, fired, start, rotation); status != StatusError {
 		t.Errorf("due 20s after start, judged 4m40s after due: status = %v (%s), want error", status, detail)
+	}
+}
+
+// Review finding 1 on #375: the orders the first pass fired are waiting for the
+// rotation to come back to them too. 24 cooldown orders at 30 s, budget 4,
+// patrol 30 s: the rotation is 3 minutes, so the first four, fired at the
+// start and due 30 s later, are not late at 2m02s; they are at 5m15s, once
+// 1.5 rotations have passed since they were due.
+func TestOrderFiringCurrent_FirstPassOrdersWaitForTheRotation(t *testing.T) {
+	start := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	evts := []events.Event{{Type: events.ControllerStarted, Ts: start}}
+	for i := 0; i < 24; i++ {
+		name := fmt.Sprintf("fast-%02d", i)
+		writeOrderFiringTestOrder(t, cityPath, name, "cooldown", "30s")
+		if i < 4 {
+			evts = append(evts, events.Event{Type: events.OrderFired, Subject: name, Ts: start})
+		}
+	}
+	writeOrderFiringTestEvents(t, cityPath, evts...)
+
+	if result := runOrderFiringCurrentTest(t, cfg, cityPath, start.Add(2*time.Minute+2*time.Second)); result.Status != StatusOK {
+		t.Fatalf("2m02s after start: status = %v, want OK; details = %v", result.Status, result.Details)
+	}
+	result := runOrderFiringCurrentTest(t, cfg, cityPath, start.Add(5*time.Minute+15*time.Second))
+	if result.Status != StatusError {
+		t.Fatalf("5m15s after start: status = %v, want error; details = %v", result.Status, result.Details)
+	}
+	if !strings.Contains(strings.Join(result.Details, "\n"), "fast-00: last fired 5m ago") || !strings.Contains(strings.Join(result.Details, "\n"), "CRITICAL: stale") {
+		t.Fatalf("details = %v, want fast-00 reported stale", result.Details)
+	}
+}
+
+// Review finding 2 on #375: event orders spend no budget without an event, so
+// they do not stretch the grace. One 30 s cooldown and 23 idle event orders at
+// budget 1 and a 1 minute patrol: the rotation is one pass, and a cooldown that
+// stopped firing before a restart half an hour ago is stale.
+func TestOrderFiringCurrent_EventOrdersDoNotStretchTheGrace(t *testing.T) {
+	start := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	one := 1
+	cfg.Orders.MaxDispatchesPerTick = &one
+	cfg.Daemon.PatrolInterval = "1m"
+	writeOrderFiringTestOrder(t, cityPath, "heartbeat", "cooldown", "30s")
+	for i := 0; i < 23; i++ {
+		writeOrderFiringTestOrder(t, cityPath, fmt.Sprintf("on-event-%02d", i), "event", "bead.closed")
+	}
+	writeOrderFiringTestEvents(t, cityPath,
+		events.Event{Type: events.OrderFired, Subject: "heartbeat", Ts: start.Add(-10 * time.Minute)},
+		events.Event{Type: events.ControllerStarted, Ts: start},
+	)
+	result := runOrderFiringCurrentTest(t, cfg, cityPath, start.Add(30*time.Minute))
+	if result.Status != StatusError || !strings.Contains(strings.Join(result.Details, "\n"), "heartbeat: last fired 40m ago") {
+		t.Fatalf("status = %v, want heartbeat stale; details = %v", result.Status, result.Details)
+	}
+}
+
+// Review finding 4 on #375: a log rotation right after the start moves the
+// start into the archive. An order the first pass fired, read from the active
+// log, still gets the cold-start window, from the start the archive holds;
+// dated against the active log alone it would read stale (2m05s since its
+// firing, 3 intervals of 30 s).
+func TestOrderFiringCurrent_ColdStartWindowSurvivesALogRotation(t *testing.T) {
+	start := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	var active []events.Event
+	for i := 0; i < 24; i++ {
+		name := fmt.Sprintf("fast-%02d", i)
+		writeOrderFiringTestOrder(t, cityPath, name, "cooldown", "30s")
+		ts := start.Add(2 * time.Minute)
+		if i == 0 {
+			ts = start.Add(5 * time.Second)
+		}
+		active = append(active, events.Event{Type: events.OrderFired, Subject: name, Ts: ts})
+	}
+	writeOrderFiringTestEvents(t, cityPath, active...)
+	writeOrderFiringArchivedEvents(t, cityPath, 1, 8,
+		events.Event{Seq: 1, Type: events.ControllerStarted, Ts: start},
+	)
+
+	result := runOrderFiringCurrentTest(t, cfg, cityPath, start.Add(2*time.Minute+10*time.Second))
+	if result.Status != StatusOK {
+		t.Fatalf("status = %v, want OK inside the window with the start archived; details = %v", result.Status, result.Details)
+	}
+	if !strings.Contains(strings.Join(result.Details, "\n"), "fast-00: last fired 2m ago, since the controller started 2m ago (within first cycle)") {
+		t.Fatalf("details = %v, want fast-00 inside its first cycle", result.Details)
+	}
+}
+
+// The mutant the bead asks for, on a settled city: a 30 s cooldown that has
+// not fired for 40 minutes, an hour after the start, is stale with or without
+// the rotation; the cold-start window ended long ago.
+func TestOrderFiringCurrent_SettledCityStaleOrderStillFails(t *testing.T) {
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	evts := []events.Event{{Type: events.ControllerStarted, Ts: now.Add(-time.Hour)}}
+	for i := 0; i < 24; i++ {
+		name := fmt.Sprintf("fast-%02d", i)
+		writeOrderFiringTestOrder(t, cityPath, name, "cooldown", "30s")
+		ts := now.Add(-10 * time.Second)
+		if i == 7 {
+			ts = now.Add(-40 * time.Minute)
+		}
+		evts = append(evts, events.Event{Type: events.OrderFired, Subject: name, Ts: ts})
+	}
+	writeOrderFiringTestEvents(t, cityPath, evts...)
+	result := runOrderFiringCurrentTest(t, cfg, cityPath, now)
+	if result.Status != StatusError || result.Severity != SeverityBlocking {
+		t.Fatalf("status = %v severity = %v, want a blocking error; details = %v", result.Status, result.Severity, result.Details)
+	}
+	if !strings.Contains(strings.Join(result.Details, "\n"), "fast-07: last fired 40m ago") || !strings.Contains(strings.Join(result.Details, "\n"), "CRITICAL: stale") {
+		t.Fatalf("details = %v, want fast-07 stale", result.Details)
 	}
 }
