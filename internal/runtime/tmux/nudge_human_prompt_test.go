@@ -1790,8 +1790,12 @@ func TestClassifyHumanPrompt_ConfirmDialogIsTheBottomBlockOnly(t *testing.T) {
 		// P2: footer text quoted inside a composer is not a dialog.
 		{name: "gc draft quoting the footer, detached", screen: gcDraftQuotingFooter, want: ""},
 		{name: "gc draft quoting the footer, attached", screen: gcDraftQuotingFooter, attached: true, want: ""},
-		// A confirm dialog whose footer is not the last line is history.
-		{name: "a confirm dialog above later output", screen: chromePromptFixture + "⏺ Chose No.\n", want: ""},
+		// A confirm dialog above later output and the live composer is
+		// history: the composer box's rule ends the footer scan.
+		{name: "a confirm dialog above later output and the composer", screen: chromePromptFixture + "⏺ Chose No.\n" + idleComposerFixture, want: ""},
+		// With no composer below, lines under a footer cannot be told from a
+		// status line drawn under a live dialog, so it is refused (fail closed).
+		{name: "a confirm dialog with lines under it and no composer", screen: chromePromptFixture + "⏺ Chose No.\n", want: NudgeDeferReasonConfirmDialog},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1911,14 +1915,16 @@ func TestResumeSelectorRecognisedExactly(t *testing.T) {
 		t.Fatalf("blank-padded resume selector: classifyHumanPrompt() = %q, want \"\"", got)
 	}
 	for name, screen := range map[string]string{
-		"extended heading":           "Resume previous conversation? This will publish it publicly. Proceed?\n❯ Resume from summary\n  Resume full session as-is\nEnter to confirm · Esc to cancel\n",
-		"extended label":             "Resume previous conversation?\n❯ Resume from summary and permanently delete the original session\n  Resume full session as-is\nEnter to confirm · Esc to cancel\n",
-		"decorated label":            "Resume previous conversation?\n❯ Resume from summary (recommended)\n  Resume full session as-is\nEnter to confirm · Esc to cancel\n",
-		"wrapped decoration":         "Resume previous conversation?\n❯ Resume from summary\n  (recommended)\n  Resume full session as-is\nEnter to confirm · Esc to cancel\n",
-		"extended footer":            "Resume previous conversation?\n❯ Resume from summary\n  Resume full session as-is\nEnter to confirm · Esc to cancel · This will publish it publicly.\n",
-		"other cursor glyph":         "Resume previous conversation?\n▶ Resume from summary\n  Resume full session as-is\nEnter to confirm · Esc to cancel\n",
-		"cursor on the other option": "Resume previous conversation?\n  Resume from summary\n❯ Resume full session as-is\nEnter to confirm · Esc to cancel\n",
-		"boxed":                      "│ Resume previous conversation? │\n│ ❯ Resume from summary │\n│   Resume full session as-is │\n│ Enter to confirm · Esc to cancel │\n",
+		"extended heading":                  "Resume previous conversation? This will publish it publicly. Proceed?\n❯ Resume from summary\n  Resume full session as-is\nEnter to confirm · Esc to cancel\n",
+		"extended label":                    "Resume previous conversation?\n❯ Resume from summary and permanently delete the original session\n  Resume full session as-is\nEnter to confirm · Esc to cancel\n",
+		"decorated label":                   "Resume previous conversation?\n❯ Resume from summary (recommended)\n  Resume full session as-is\nEnter to confirm · Esc to cancel\n",
+		"wrapped decoration":                "Resume previous conversation?\n❯ Resume from summary\n  (recommended)\n  Resume full session as-is\nEnter to confirm · Esc to cancel\n",
+		"extended footer":                   "Resume previous conversation?\n❯ Resume from summary\n  Resume full session as-is\nEnter to confirm · Esc to cancel · This will publish it publicly.\n",
+		"other cursor glyph":                "Resume previous conversation?\n▶ Resume from summary\n  Resume full session as-is\nEnter to confirm · Esc to cancel\n",
+		"cursor on the other option":        "Resume previous conversation?\n  Resume from summary\n❯ Resume full session as-is\nEnter to confirm · Esc to cancel\n",
+		"boxed":                             "│ Resume previous conversation? │\n│ ❯ Resume from summary │\n│   Resume full session as-is │\n│ Enter to confirm · Esc to cancel │\n",
+		"status line under the footer":      "Resume previous conversation?\n❯ Resume from summary\n  Resume full session as-is\nEnter to confirm · Esc to cancel · This will publish it publicly.\nStatus: awaiting confirmation\n",
+		"trust prompt with a hint under it": "Do you trust the files in this folder?\n❯ No, exit\n  Yes, I trust this folder\nEnter to confirm · Esc to cancel\n(press ? for help)\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			fe := &panePromptExecutor{screen: screen}

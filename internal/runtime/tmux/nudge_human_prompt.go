@@ -319,7 +319,8 @@ const confirmDialogHeadingRows = 3
 
 // bottomConfirmDialog reports an UNNUMBERED confirm dialog that is the active
 // bottom block of the pane (ga-fu4dtk): its "Enter to confirm" footer is the
-// last non-blank line captured, and a cursor row ("❯ <label>", not a numbered
+// lowest footer with no horizontal rule below it (trailing status or hint
+// lines allowed), and a cursor row ("❯ <label>", not a numbered
 // or radio option) sits above it within confirmDialogCursorMaxRows lines with
 // no horizontal rule between. Claude Code draws its folder-trust prompt
 // ("❯ No, exit" / "Yes, I trust this folder", captured live 2026-11-22 on
@@ -331,14 +332,25 @@ const confirmDialogHeadingRows = 3
 // in a composer (which Claude closes with a rule and status lines below), is
 // history, not the prompt on screen.
 func bottomConfirmDialog(lines []string) ([]string, bool) {
+	// The footer is the lowest footer line with no horizontal rule below it,
+	// within the last confirmDialogCursorMaxRows lines: a status or hint line
+	// drawn under the dialog does not hide it (fail closed), while a footer
+	// quoted above Claude's composer box is cut off by the box's rules.
 	last := -1
-	for i := len(lines) - 1; i >= 0; i-- {
-		if strings.TrimSpace(lines[i]) != "" {
+	for i, seen := len(lines)-1, 0; i >= 0 && seen <= confirmDialogCursorMaxRows; i-- {
+		if strings.TrimSpace(lines[i]) == "" {
+			continue
+		}
+		if isHorizontalRule(lines[i]) {
+			break
+		}
+		if confirmDialogFooter(normalizePaneLine(lines[i])) {
 			last = i
 			break
 		}
+		seen++
 	}
-	if last < 0 || !confirmDialogFooter(normalizePaneLine(lines[last])) {
+	if last < 0 {
 		return nil, false
 	}
 	for i := last - 1; i >= 0 && i >= last-confirmDialogCursorMaxRows; i-- {
