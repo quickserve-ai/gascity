@@ -106,6 +106,38 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# run_bounded: run one notice command (a mail or a nudge) under a wall-clock
+# bound, GC_STALE_DB_NOTICE_TIMEOUT_SECS (default 30). A mail can stall opening
+# the store or waking its recipient (gc mail send waits for the wake), and a
+# notice that hangs would keep this run from its drain-ack and its exit, the
+# very things the notice is reporting on (the reason escalate.sh bounds its
+# send). Delivery is best-effort either way. Portable bash, no timeout(1):
+# the command runs in the background and is killed when the bound passes.
+run_bounded() {
+  local secs="${GC_STALE_DB_NOTICE_TIMEOUT_SECS:-30}"
+  case "$secs" in
+    ''|*[!0-9]*) secs=30 ;;
+    *[1-9]*) ;;
+    *) secs=30 ;;
+  esac
+  "$@" &
+  local pid=$!
+  local tenths=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$tenths" -ge $((secs * 10)) ]; then
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      echo "notice abandoned after ${secs}s: $1 $2 ${3:-}" >&2
+      return 124
+    fi
+    sleep 0.1
+    tenths=$((tenths + 1))
+  done
+  local rc=0
+  wait "$pid" || rc=$?
+  return "$rc"
+}
+
 # platform_failure: a failure that no ownership refusal explains. Nothing
 # refused this dog, so it is not the stranded-bead case a human must close by
 # hand: it goes to the store-error route (GC_STORE_ERROR_RECIPIENT, a platform
@@ -124,18 +156,18 @@ platform_failure() {
   local message="$3"
   echo "$message" >&2
   if [ -n "${GC_STORE_ERROR_RECIPIENT:-}" ]; then
-    gc mail send "$GC_STORE_ERROR_RECIPIENT" -s "$subject" \
+    run_bounded gc mail send "$GC_STORE_ERROR_RECIPIENT" -s "$subject" \
       -m "${message}. Not an ownership refusal. The bead stays open and the next firing's dog retries." \
       || echo "send ${kind} notice failed; continuing to drain-ack" >&2
   else
-    gc mail send "${GC_ESCALATION_RECIPIENT:-human}" -s "$subject" \
+    run_bounded gc mail send "${GC_ESCALATION_RECIPIENT:-human}" -s "$subject" \
       -m "${message}. Not an ownership refusal: an infrastructure failure, sent here because no store-error route (GC_STORE_ERROR_RECIPIENT) is set. Nothing to close by hand: the bead stays open and the next firing's dog retries." \
       || echo "send ${kind} notice failed; continuing to drain-ack" >&2
   fi
   gc event emit "mol-dog-stale-db.${kind}" --message "$message" \
     || echo "emit ${kind} event failed; continuing to drain-ack" >&2
   if [ -n "${GC_MAINTENANCE_DONE_TARGET:-}" ]; then
-    gc session nudge "$GC_MAINTENANCE_DONE_TARGET" "MAINTENANCE_WARN: stale-db ${message}" || true
+    run_bounded gc session nudge "$GC_MAINTENANCE_DONE_TARGET" "MAINTENANCE_WARN: stale-db ${message}" || true
   fi
   if gc runtime drain-ack; then DRAIN_ACKED=1; fi # drain-ack before failing open; on failure the trap tries again
   exit 1
@@ -243,14 +275,14 @@ send_escalation() {
     "$ESCALATE_SCRIPT" --subject "$subject" --message "$message"
     return
   fi
-  gc mail send "${GC_ESCALATION_RECIPIENT:-human}" -s "$subject" -m "$message"
+  run_bounded gc mail send "${GC_ESCALATION_RECIPIENT:-human}" -s "$subject" -m "$message"
 }
 
 maintenance_notice() {
   local message="$1"
   local target="${GC_MAINTENANCE_DONE_TARGET:-}"
   [ -n "$target" ] || return 0
-  gc session nudge "$target" "$message" || true
+  run_bounded gc session nudge "$target" "$message" || true
 }
 
 drain_ack_once() {

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/formula"
 	"github.com/gastownhall/gascity/internal/orders"
@@ -1513,7 +1514,8 @@ func TestStaleDBFormulaTerminalCloseRoutesByRefusalText(t *testing.T) {
 		{name: "pinned refusal", err: "Error: cannot modify pinned issue bead-1 (use --force to override)", route: human},
 		{name: "refusal beside an availability text", err: "warning: driver: bad connection (retried)\nError: cannot close bead-1: assignee is \"dog-2\", actor is \"dog-1\"; reclaim or use --force to override", route: human},
 		{name: "store unreachable", err: "Error: dial tcp 127.0.0.1:51361: connect: connection refused", route: store},
-		{name: "gate refusal", err: "Error: cannot close bead-1: gate not satisfied: timer has not elapsed", route: closeFailed},
+		{name: "gate refusal", err: "Error: cannot close bead-1: gate condition not satisfied: timer has not elapsed (use --force to override)", route: closeFailed},
+		{name: "blank error text", err: " ", route: closeFailed},
 		{name: "template", err: "Error: cannot modify template bead-1: templates are read-only; use 'bd mol pour' to create a work item", route: closeFailed},
 		{name: "unknown failure", err: "Error: something nobody anticipated", route: closeFailed},
 	} {
@@ -1577,6 +1579,34 @@ func TestStaleDBFormulaTerminalCloseRoutesByRefusalText(t *testing.T) {
 			!strings.Contains(mail, "an infrastructure failure, sent here because no store-error route") ||
 			strings.Count(log, "gc mail send ") != 1 || strings.Contains(log, "[HIGH]") {
 			t.Fatalf("no-route close-failed mail = %q; want one plain infrastructure mail to ops\nlog:\n%s", mail, log)
+		}
+	})
+	// A notice that stalls (a store open, a recipient wake) is abandoned at
+	// its bound, so the run still drain-acks and fails open (Astra's finding
+	// on #370). Without the bound this case waits out the fake's 60 s sleep.
+	t.Run("a stalled notice cannot hold the drain-ack", func(t *testing.T) {
+		start := time.Now()
+		log, out, err := runStaleDBFormulaFailureCase(t, staleDBFailureCase{
+			scanJSON: staleDBCleanScan,
+			dir:      t.TempDir(),
+			env: []string{"GC_TEST_BD_NEEDS_STORE=1", "GC_TEST_BD_CLOSE_ERR=Error: something nobody anticipated",
+				"GC_CITY_PATH=" + city, "GC_MAINTENANCE_DONE_TARGET=health",
+				"GC_TEST_HANG_NOTICES=1", "GC_STALE_DB_NOTICE_TIMEOUT_SECS=1"},
+		})
+		elapsed := time.Since(start)
+		if err == nil {
+			t.Fatalf("rendered script exited successfully; want fail open\nlog:\n%s\noutput:\n%s", log, out)
+		}
+		if elapsed > 30*time.Second {
+			t.Fatalf("run took %s with stalled notices; the bound did not hold\nlog:\n%s", elapsed, log)
+		}
+		for _, want := range []string{"gc mail send human -s stale-db: terminal close failed for bead-1", "gc session nudge health ", "gc runtime drain-ack"} {
+			if !strings.Contains(log, want) {
+				t.Fatalf("stalled-notice run did not record %q\nlog:\n%s\noutput:\n%s", want, log, out)
+			}
+		}
+		if !strings.Contains(string(out), "notice abandoned after 1s: gc mail send") {
+			t.Fatalf("stalled mail was not reported as abandoned\noutput:\n%s", out)
 		}
 	})
 }
@@ -1646,6 +1676,12 @@ case "${1:-} ${2:-}" in
     rendered="gc $*"
     echo "$rendered" >> "$GC_TEST_LOG"
     maybe_fail "$rendered"
+    if [ -n "${GC_TEST_HANG_NOTICES:-}" ] && { [ "${1:-} ${2:-}" = "mail send" ] || [ "${1:-} ${2:-}" = "session nudge" ]; }; then
+      # Stall the way a send waiting on a store open or a recipient wake does.
+      # exec, so the formula's bound kills the sleep itself and no orphan
+      # holds the test's output pipe open.
+      exec sleep 60
+    fi
     ;;
   *)
     echo "unexpected gc command: $*" >&2
