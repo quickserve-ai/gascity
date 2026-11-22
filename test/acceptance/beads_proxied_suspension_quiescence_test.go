@@ -89,6 +89,10 @@ const suspendDrainWait = 3 * time.Minute
 type scopeRecordingBD struct {
 	path    string
 	logPath string
+	// offset is the log's size at the last reset: calls before it are kept
+	// on disk, so a failure can show what ran just before its window opened.
+	offset  int64
+	resetAt time.Time
 }
 
 func newScopeRecordingBD(t *testing.T, realBD string) *scopeRecordingBD {
@@ -120,16 +124,25 @@ exec %s "$@"
 
 func shellQuoteArg(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 
-// reset forgets every call recorded so far.
+// reset starts a new window: callsUnder sees only calls recorded after it.
+// The earlier calls stay in the log for callsUnderBefore.
 func (r *scopeRecordingBD) reset(t *testing.T) {
 	t.Helper()
-	if err := os.Remove(r.logPath); err != nil && !os.IsNotExist(err) {
+	r.resetAt = time.Now()
+	info, err := os.Stat(r.logPath)
+	switch {
+	case os.IsNotExist(err):
+		r.offset = 0
+	case err != nil:
 		t.Fatal(err)
+	default:
+		r.offset = info.Size()
 	}
 }
 
-// callsUnder returns the recorded calls that targeted a scope under root.
-func (r *scopeRecordingBD) callsUnder(t *testing.T, root string) []string {
+// logLines returns the log's lines after the last reset (after=true) or
+// before it (after=false).
+func (r *scopeRecordingBD) logLines(t *testing.T, after bool) []string {
 	t.Helper()
 	data, err := os.ReadFile(r.logPath)
 	if os.IsNotExist(err) {
@@ -138,8 +151,22 @@ func (r *scopeRecordingBD) callsUnder(t *testing.T, root string) []string {
 	if err != nil {
 		t.Fatal(err)
 	}
+	cut := r.offset
+	if cut > int64(len(data)) {
+		cut = int64(len(data))
+	}
+	if after {
+		data = data[cut:]
+	} else {
+		data = data[:cut]
+	}
+	return strings.Split(string(data), "\n")
+}
+
+// underRoot keeps the lines whose target (not their callers) names root.
+func underRoot(lines []string, root string) []string {
 	var hits []string
-	for _, line := range strings.Split(string(data), "\n") {
+	for _, line := range lines {
 		// The callers only explain a call; the scope is what it targeted.
 		target, _, _ := strings.Cut(line, " callers=")
 		if line != "" && strings.Contains(target, root) {
@@ -147,6 +174,40 @@ func (r *scopeRecordingBD) callsUnder(t *testing.T, root string) []string {
 		}
 	}
 	return hits
+}
+
+// callsUnderBefore returns the calls under root recorded in the span before
+// the last reset. A call that started before the window and caused something
+// inside it (a proxy it started, a stop that followed) shows up here.
+func (r *scopeRecordingBD) callsUnderBefore(t *testing.T, root string, span time.Duration) []string {
+	t.Helper()
+	from := r.resetAt.Add(-span).Unix()
+	var hits []string
+	for _, line := range underRoot(r.logLines(t, false), root) {
+		var ts int64
+		if _, err := fmt.Sscanf(line, "ts=%d", &ts); err == nil && ts >= from {
+			hits = append(hits, line)
+		}
+	}
+	return hits
+}
+
+// preWindowNote renders callsUnderBefore for a failure message.
+func (r *scopeRecordingBD) preWindowNote(t *testing.T, root string) string {
+	t.Helper()
+	const span = 30 * time.Second
+	before := r.callsUnderBefore(t, root, span)
+	if len(before) == 0 {
+		return fmt.Sprintf("\nno call under %s in the %s before the window opened", root, span)
+	}
+	return fmt.Sprintf("\n%d call(s) under %s in the %s before the window opened:\n%s", len(before), root, span, strings.Join(before, "\n"))
+}
+
+// callsUnder returns the calls recorded since the last reset that targeted a
+// scope under root.
+func (r *scopeRecordingBD) callsUnder(t *testing.T, root string) []string {
+	t.Helper()
+	return underRoot(r.logLines(t, true), root)
 }
 
 // runEveryCityOrder runs each city-level order once with `gc order run`, all
@@ -274,7 +335,7 @@ func TestProxiedSuspensionIsQuiescenceSuspendedRig(t *testing.T) {
 		t.Logf("gc touched the running city %d time(s) in the %s window", n, window)
 	}
 	if calls := shim.callsUnder(t, rigDir); len(calls) > 0 {
-		t.Fatalf("gc touched the suspended rig %d time(s) in %s (orders run: %s):\n%s", len(calls), time.Since(start).Round(time.Second), strings.Join(ran, ", "), strings.Join(calls, "\n"))
+		t.Fatalf("gc touched the suspended rig %d time(s) in %s (orders run: %s):\n%s%s", len(calls), time.Since(start).Round(time.Second), strings.Join(ran, ", "), strings.Join(calls, "\n"), shim.preWindowNote(t, rigDir))
 	}
 	if started := doltProcessesUnder(t, rigDir); len(started) > 0 {
 		t.Fatalf("the suspended rig's pair came back:\n%s", strings.Join(started, "\n"))
@@ -309,7 +370,7 @@ func TestProxiedSuspensionIsQuiescenceSuspendedCity(t *testing.T) {
 	time.Sleep(window)
 	for _, root := range []string{cityRoot, rigDir} {
 		if calls := shim.callsUnder(t, root); len(calls) > 0 {
-			t.Errorf("gc touched %s %d time(s) in %s while the city was suspended:\n%s", root, len(calls), window, strings.Join(calls, "\n"))
+			t.Errorf("gc touched %s %d time(s) in %s while the city was suspended:\n%s%s", root, len(calls), window, strings.Join(calls, "\n"), shim.preWindowNote(t, root))
 		}
 		if started := doltProcessesUnder(t, root); len(started) > 0 {
 			t.Errorf("a pair under %s came back while the city was suspended:\n%s", root, strings.Join(started, "\n"))
