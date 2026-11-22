@@ -1756,16 +1756,62 @@ func TestClassifyHumanPrompt_UnnumberedConfirmDialogs(t *testing.T) {
 	}
 }
 
-// The cursor row of an unnumbered confirm dialog is not the composer, so its
-// label is never read as a draft; the composer box is unaffected.
-func TestLastComposerLine_SkipsConfirmDialogCursorRow(t *testing.T) {
-	lines := strings.Split(readTrustFixture(t), "\n")
-	if idx, rest := lastComposerLine(lines, DefaultReadyPromptPrefix); idx != -1 {
-		t.Fatalf("lastComposerLine on the trust prompt = %d (%q), want -1", idx, rest)
+// Review on #376: the confirm-dialog check reads only the pane's bottom block
+// and changes nothing else. lastComposerLine, which the model-switch
+// dismisser, draft detection and lifecycle reads also use, is as on carry.
+func TestClassifyHumanPrompt_ConfirmDialogIsTheBottomBlockOnly(t *testing.T) {
+	trust := readTrustFixture(t)
+	gcDraftQuotingFooter := "⏺ Done.\n" +
+		"────────────────────────────────────────────────────────────────────────────\n" +
+		"❯ <system-reminder> Investigate this footer:\n" +
+		"  Enter to confirm · Esc to cancel\n" +
+		"  </system-reminder>\n" +
+		"────────────────────────────────────────────────────────────────────────────\n" +
+		"  cherub@mac /repo (main)\n" +
+		"  -- INSERT -- ⏵⏵ bypass permissions on (shift+tab to cycle)"
+	tests := []struct {
+		name     string
+		screen   string
+		attached bool
+		want     string
+	}{
+		// F1: a stale resume selector above a live trust prompt does not exempt it.
+		{name: "stale resume selector above a live trust prompt", screen: resumeSelectorFixture + trust, want: NudgeDeferReasonSelectionPrompt},
+		{name: "stale resume selector above a short live confirm", screen: resumeSelectorFixture + "Proceed?\n❯ No, exit\n  Yes, continue\nEnter to confirm · Esc to cancel\n", want: NudgeDeferReasonSelectionPrompt},
+		// F3: a quoted question dialog in history does not stall a real resume
+		// selector below it: the old rules run, and they read the selector's
+		// cursor row as the composer, as before this change.
+		{name: "quoted question footer above a real resume selector", screen: "❯ 1. Alpha\n  2. Beta\nEnter to select · Esc to cancel\n" + resumeSelectorFixture, want: ""},
+		// P2: footer text quoted inside a composer is not a dialog.
+		{name: "gc draft quoting the footer, detached", screen: gcDraftQuotingFooter, want: ""},
+		{name: "gc draft quoting the footer, attached", screen: gcDraftQuotingFooter, attached: true, want: ""},
+		// A confirm dialog whose footer is not the last line is history.
+		{name: "a confirm dialog above later output", screen: chromePromptFixture + "⏺ Chose No.\n", want: ""},
 	}
-	idle := strings.Split(idleComposerFixture, "\n")
-	if idx, _ := lastComposerLine(idle, DefaultReadyPromptPrefix); idx < 0 {
-		t.Fatalf("lastComposerLine lost the idle composer")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := classifyHumanPrompt(strings.Split(tt.screen, "\n"), DefaultReadyPromptPrefix, tt.attached)
+			if got != tt.want {
+				t.Fatalf("classifyHumanPrompt() = %q, want %q\nscreen:\n%s", got, tt.want, tt.screen)
+			}
+		})
+	}
+	// lastComposerLine is unchanged: the trust prompt's cursor row still reads
+	// as a composer line to it, exactly as on carry.
+	if idx, _ := lastComposerLine(strings.Split(trust, "\n"), DefaultReadyPromptPrefix); idx < 0 {
+		t.Fatalf("lastComposerLine changed behaviour on the trust prompt")
+	}
+}
+
+// F2 on #376: model-switch keywords in scrollback above a live trust prompt
+// must not make the model-switch dismisser answer the trust prompt.
+func TestModelSwitchDismissLeavesATrustPromptAlone(t *testing.T) {
+	scrollback := "Switch to gpt-5.4-mini for lower credit usage?\n  2. Keep current model\n"
+	fe := &panePromptExecutor{screen: scrollback + readTrustFixture(t)}
+	tm, session := newGuardTestTmux(fe)
+	tm.DismissModelSwitchModalIfPresent(session)
+	if keys := fe.keyCalls(); len(keys) != 0 {
+		t.Fatalf("model-switch dismiss sent %q into the folder-trust prompt", keys)
 	}
 }
 
