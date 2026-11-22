@@ -2070,7 +2070,11 @@ func launchOrchestration(ctx context.Context, ops startOps, name string, cfg run
 			// afterward. Persist a diagnostic artifact alongside the
 			// warning so a later observer (gc trace, a human, or an
 			// automated sweep) can find and act on it.
-			fmt.Fprintf(os.Stderr, "warning: startup nudge to %q delivered but not confirmed after retries: %v\n", name, err)
+			if errors.Is(err, ErrNudgeDeferredHumanPrompt) {
+				fmt.Fprintf(os.Stderr, "warning: startup nudge to %q not delivered: the pane holds a prompt for a person (nothing was typed): %v\n", name, err)
+			} else {
+				fmt.Fprintf(os.Stderr, "warning: startup nudge to %q delivered but not confirmed after retries: %v\n", name, err)
+			}
 			ops.recordUnconfirmedNudge(name, cfg.Nudge, err)
 		}
 	}

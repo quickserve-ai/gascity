@@ -42,10 +42,13 @@ const (
 	// requires approval" layout parseApprovalPrompt reads).
 	NudgeDeferReasonApprovalPrompt = "approval_prompt"
 	// NudgeDeferReasonSelectionPrompt: any other numbered option list with a
-	// cursor on it, or an unnumbered confirm dialog (a cursor row over an
-	// "Enter to confirm" footer, ga-fu4dtk). Enter picks the highlighted row,
-	// so it is refused too.
+	// cursor on it. Enter picks the highlighted row, so it is refused too.
 	NudgeDeferReasonSelectionPrompt = "selection_prompt"
+	// NudgeDeferReasonConfirmDialog: an unnumbered confirm dialog at the
+	// bottom of the pane, a cursor row over an "Enter to confirm" footer
+	// (Claude Code's folder-trust prompt, the Chrome-extension prompt, the
+	// spend-limit modal; ga-fu4dtk). Enter picks the highlighted row.
+	NudgeDeferReasonConfirmDialog = "confirm_dialog"
 	// NudgeDeferReasonHumanDraft: the composer holds text on an ATTACHED
 	// session, so a person may be mid-message. Before the first Enter
 	// (stage before_submit) it means the composer holds text that is not
@@ -206,13 +209,13 @@ func lastComposerLine(lines []string, promptPrefix string) (int, string) {
 func classifyHumanPrompt(lines []string, promptPrefix string, checkDraft bool) string {
 	// An unnumbered confirm dialog at the bottom of the pane is refused before
 	// the composer is looked for: its cursor row starts with the prompt glyph
-	// and would read as the composer (ga-fu4dtk). The machine dialogs the nudge
-	// path dismisses itself (runtime.MidSessionDialogOnScreen, judged on that
-	// bottom block only; the resume selector has this shape) fall through to
-	// the rules below unchanged, as do panes with no such dialog, so every
-	// other caller of lastComposerLine and classifyDialog sees what it did.
-	if block, ok := bottomConfirmDialog(lines); ok && runtime.MidSessionDialogOnScreen(strings.Join(block, "\n")) == "" {
-		return NudgeDeferReasonSelectionPrompt
+	// and would read as the composer (ga-fu4dtk). The one machine dialog of
+	// that shape the nudge path dismisses itself, the token-ceiling resume
+	// selector, matched structurally (isClaudeResumeSelectorBlock: never by
+	// substrings, which quoted text or scrollback could supply), falls through
+	// to the rules below unchanged, as do panes with no such dialog.
+	if block, ok := bottomConfirmDialog(lines); ok && !isClaudeResumeSelectorBlock(block) {
+		return NudgeDeferReasonConfirmDialog
 	}
 	composerIdx, _ := lastComposerLine(lines, promptPrefix)
 	if reason := classifyDialog(lines[composerIdx+1:]); reason != "" {
@@ -357,6 +360,36 @@ func bottomConfirmDialog(lines []string) ([]string, bool) {
 		return lines[start : last+1], true
 	}
 	return nil, false
+}
+
+// isClaudeResumeSelectorBlock reports whether a bottom confirm block (from
+// bottomConfirmDialog) is exactly Claude Code's token-ceiling resume selector:
+// the line directly above the cursor row is "Resume previous conversation?",
+// the cursor row is "Resume from summary", and the only other row before the
+// footer is "Resume full session as-is" (blank rows ignored). Anything else,
+// a dialog that merely quotes those labels or a stale selector above a live
+// dialog included, is not it.
+func isClaudeResumeSelectorBlock(block []string) bool {
+	var rows []string
+	for _, line := range block {
+		if s := normalizePaneLine(line); s != "" {
+			rows = append(rows, s)
+		}
+	}
+	cursor := -1
+	for i, s := range rows {
+		if _, ok := cutCursorGlyph(s); ok {
+			cursor = i
+		}
+	}
+	if cursor < 1 || len(rows) != cursor+3 {
+		return false
+	}
+	label, _ := cutCursorGlyph(rows[cursor])
+	return rows[cursor-1] == "Resume previous conversation?" &&
+		label == "Resume from summary" &&
+		rows[cursor+1] == "Resume full session as-is" &&
+		confirmDialogFooter(rows[cursor+2])
 }
 
 // cutCursorGlyph strips a leading selection-cursor glyph and the space after
@@ -817,6 +850,13 @@ func (t *Tmux) classifyLifecycleHumanPrompt(session, target string, lines []stri
 	switch reason {
 	case NudgeDeferReasonSelectionPrompt:
 		return ""
+	case NudgeDeferReasonConfirmDialog:
+		// Before ga-fu4dtk the confirm dialog's cursor row read as a composer
+		// draft, which held an attached Claude seat. Keep that hold, and only
+		// that one: a detached pane's dialog does not hold, as before.
+		if t.sessionClientCount(session) == 0 || !t.paneIsClaudeFamily(target) {
+			return ""
+		}
 	case NudgeDeferReasonHumanDraft:
 		if t.composerHoldsOnlyDimText(target, prefix) {
 			return ""

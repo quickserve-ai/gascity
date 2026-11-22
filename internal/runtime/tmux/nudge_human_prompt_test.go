@@ -419,6 +419,11 @@ func TestSnapshotIdleHumanPrompts(t *testing.T) {
 		// Upgrade" has this shape) is not a question dialog: the idle timeout
 		// reclaims such a seat as it did before.
 		{name: "selection prompt does not hold", screen: "⏺ You've used your limit.\nPick one\n❯ 1. Stop and wait\n  2. Upgrade\n", wantIdle: true},
+		// ga-fu4dtk: a confirm dialog holds an ATTACHED Claude seat, as it did
+		// before the change (its cursor row read as a person's draft then),
+		// and a detached one does not, as before.
+		{name: "attached folder-trust prompt holds", screen: readTrustFixture(t), attached: true},
+		{name: "detached folder-trust prompt does not hold", screen: readTrustFixture(t), wantIdle: true},
 		{name: "idle composer", screen: idleComposerFixture, wantIdle: true},
 		{name: "quoted dialog", screen: quotedDialogAboveComposerFixture, wantIdle: true},
 		{name: "other provider placeholder", screen: humanDraftFixture, provider: "codex", wantIdle: true},
@@ -1734,11 +1739,11 @@ func TestClassifyHumanPrompt_UnnumberedConfirmDialogs(t *testing.T) {
 		attached bool
 		want     string
 	}{
-		{name: "folder-trust prompt, live capture v2.1.330", screen: trust, want: NudgeDeferReasonSelectionPrompt},
-		{name: "folder-trust prompt, attached", screen: trust, attached: true, want: NudgeDeferReasonSelectionPrompt},
-		{name: "Chrome-extension prompt", screen: chromePromptFixture, want: NudgeDeferReasonSelectionPrompt},
-		{name: "spend-limit modal: Enter would raise the limit", screen: spendLimitModalFixture, want: NudgeDeferReasonSelectionPrompt},
-		{name: "trust prompt below a scrollback echo of an old prompt", screen: "❯ fix the build\n⏺ done\n" + trust, want: NudgeDeferReasonSelectionPrompt},
+		{name: "folder-trust prompt, live capture v2.1.330", screen: trust, want: NudgeDeferReasonConfirmDialog},
+		{name: "folder-trust prompt, attached", screen: trust, attached: true, want: NudgeDeferReasonConfirmDialog},
+		{name: "Chrome-extension prompt", screen: chromePromptFixture, want: NudgeDeferReasonConfirmDialog},
+		{name: "spend-limit modal: Enter would raise the limit", screen: spendLimitModalFixture, want: NudgeDeferReasonConfirmDialog},
+		{name: "trust prompt below a scrollback echo of an old prompt", screen: "❯ fix the build\n⏺ done\n" + trust, want: NudgeDeferReasonConfirmDialog},
 		// Controls: what must keep delivering.
 		{name: "resume selector stays with its own dismissal", screen: resumeSelectorFixture, want: ""},
 		{name: "idle composer", screen: idleComposerFixture, want: ""},
@@ -1776,8 +1781,8 @@ func TestClassifyHumanPrompt_ConfirmDialogIsTheBottomBlockOnly(t *testing.T) {
 		want     string
 	}{
 		// F1: a stale resume selector above a live trust prompt does not exempt it.
-		{name: "stale resume selector above a live trust prompt", screen: resumeSelectorFixture + trust, want: NudgeDeferReasonSelectionPrompt},
-		{name: "stale resume selector above a short live confirm", screen: resumeSelectorFixture + "Proceed?\n❯ No, exit\n  Yes, continue\nEnter to confirm · Esc to cancel\n", want: NudgeDeferReasonSelectionPrompt},
+		{name: "stale resume selector above a live trust prompt", screen: resumeSelectorFixture + trust, want: NudgeDeferReasonConfirmDialog},
+		{name: "stale resume selector above a short live confirm", screen: resumeSelectorFixture + "Proceed?\n❯ No, exit\n  Yes, continue\nEnter to confirm · Esc to cancel\n", want: NudgeDeferReasonConfirmDialog},
 		// F3: a quoted question dialog in history does not stall a real resume
 		// selector below it: the old rules run, and they read the selector's
 		// cursor row as the composer, as before this change.
@@ -1834,7 +1839,7 @@ func TestNudgePathsSendNoKeysIntoAnUnnumberedConfirmDialog(t *testing.T) {
 				if keys := fe.keyCalls(); len(keys) != 0 {
 					t.Fatalf("NudgeSession sent %d key call(s) into the dialog: %q", len(keys), keys)
 				}
-				assertDeferred(t, err, NudgeDeferReasonSelectionPrompt)
+				assertDeferred(t, err, NudgeDeferReasonConfirmDialog)
 			})
 		}
 		// Startup: the startup ladder accepts the dialogs it knows (the trust
@@ -1849,7 +1854,7 @@ func TestNudgePathsSendNoKeysIntoAnUnnumberedConfirmDialog(t *testing.T) {
 			if keys := fe.keyCalls(); len(keys) != 0 {
 				t.Fatalf("startup nudge sent %d key call(s) into the dialog: %q", len(keys), keys)
 			}
-			assertDeferred(t, err, NudgeDeferReasonSelectionPrompt)
+			assertDeferred(t, err, NudgeDeferReasonConfirmDialog)
 		})
 		t.Run(name+", NudgePane", func(t *testing.T) {
 			fe := &panePromptExecutor{screen: screen}
@@ -1858,7 +1863,38 @@ func TestNudgePathsSendNoKeysIntoAnUnnumberedConfirmDialog(t *testing.T) {
 			if keys := fe.keyCalls(); len(keys) != 0 {
 				t.Fatalf("NudgePane sent %d key call(s) into the dialog: %q", len(keys), keys)
 			}
-			assertDeferred(t, err, NudgeDeferReasonSelectionPrompt)
+			assertDeferred(t, err, NudgeDeferReasonConfirmDialog)
 		})
+	}
+}
+
+// Second review on #376: the resume-selector exemption is structural. A stale
+// selector directly above a live confirm (no heading between) and a person's
+// dialog that only QUOTES the selector's labels are refused, and no path sends
+// a key into them; the real selector still goes to its own dismissal.
+func TestResumeSelectorExemptionIsStructural(t *testing.T) {
+	staleAboveLive := resumeSelectorFixture + "❯ No, exit\n  Yes, continue\nEnter to confirm · Esc to cancel\n"
+	quotesTheLabels := "Delete saved “Resume from summary” and “Resume full session as-is”?\n" +
+		"❯ Delete permanently\n  Keep both\nEnter to confirm · Esc to cancel\n"
+	for name, screen := range map[string]string{
+		"stale selector directly above a live confirm":  staleAboveLive,
+		"a dialog quoting the selector's labels":        quotesTheLabels,
+		"selector labels in scrollback above a confirm": "Resume previous conversation?\n" + "❯ Delete permanently\n  Resume full session as-is\nEnter to confirm · Esc to cancel\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := classifyHumanPrompt(strings.Split(screen, "\n"), DefaultReadyPromptPrefix, false); got != NudgeDeferReasonConfirmDialog {
+				t.Fatalf("classifyHumanPrompt() = %q, want %q", got, NudgeDeferReasonConfirmDialog)
+			}
+			fe := &panePromptExecutor{screen: screen}
+			tm, session := newGuardTestTmux(fe)
+			err := tm.NudgeSession(session, guardTestNudge)
+			if keys := fe.keyCalls(); len(keys) != 0 {
+				t.Fatalf("NudgeSession sent %d key call(s): %q", len(keys), keys)
+			}
+			assertDeferred(t, err, NudgeDeferReasonConfirmDialog)
+		})
+	}
+	if !isClaudeResumeSelectorBlock(strings.Split(strings.TrimSpace(resumeSelectorFixture), "\n")) {
+		t.Fatalf("the real resume selector is not recognised")
 	}
 }
