@@ -309,8 +309,9 @@ func confirmDialogFooter(s string) bool {
 // dialog's cursor row may sit: the remaining option rows plus blank padding.
 const confirmDialogCursorMaxRows = 8
 
-// confirmDialogHeadingRows is how many lines above the cursor row belong to the
-// dialog's own block for naming it (its title and any line under it).
+// confirmDialogHeadingRows is how many non-blank lines above the cursor row
+// belong to the dialog's own block for naming it (its title and any line
+// under it); blank padding between them is skipped.
 const confirmDialogHeadingRows = 3
 
 // bottomConfirmDialog reports an UNNUMBERED confirm dialog that is the active
@@ -350,12 +351,17 @@ func bottomConfirmDialog(lines []string) ([]string, bool) {
 			// A numbered or radio list: classifyDialog's own rules judge it.
 			return nil, false
 		}
-		start := i
-		for j := i - 1; j >= 0 && j >= i-confirmDialogHeadingRows; j-- {
+		// The heading rows are counted as NON-BLANK lines: a dialog may pad
+		// its heading with blank rows, which must not push the heading out.
+		start, seen := i, 0
+		for j := i - 1; j >= 0 && seen < confirmDialogHeadingRows; j-- {
 			if isHorizontalRule(lines[j]) {
 				break
 			}
 			start = j
+			if strings.TrimSpace(lines[j]) != "" {
+				seen++
+			}
 		}
 		return lines[start : last+1], true
 	}
@@ -366,7 +372,8 @@ func bottomConfirmDialog(lines []string) ([]string, bool) {
 // bottomConfirmDialog) is exactly Claude Code's token-ceiling resume selector:
 // the line directly above the cursor row is "Resume previous conversation?",
 // the cursor row is "Resume from summary", and the only other row before the
-// footer is "Resume full session as-is" (blank rows ignored). Anything else,
+// footer is "Resume full session as-is" (blank rows ignored; each row may
+// carry a suffix after that text). Anything else,
 // a dialog that merely quotes those labels or a stale selector above a live
 // dialog included, is not it.
 func isClaudeResumeSelectorBlock(block []string) bool {
@@ -385,10 +392,13 @@ func isClaudeResumeSelectorBlock(block []string) bool {
 	if cursor < 1 || len(rows) != cursor+3 {
 		return false
 	}
+	// Each row must START with the selector's own text, so a decorated label
+	// ("Resume from summary (recommended)") still matches, while a dialog
+	// that only quotes the labels inside other text does not.
 	label, _ := cutCursorGlyph(rows[cursor])
-	return rows[cursor-1] == "Resume previous conversation?" &&
-		label == "Resume from summary" &&
-		rows[cursor+1] == "Resume full session as-is" &&
+	return strings.HasPrefix(rows[cursor-1], "Resume previous conversation?") &&
+		strings.HasPrefix(label, "Resume from summary") &&
+		strings.HasPrefix(rows[cursor+1], "Resume full session as-is") &&
 		confirmDialogFooter(rows[cursor+2])
 }
 

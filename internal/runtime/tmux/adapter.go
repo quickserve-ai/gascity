@@ -2071,7 +2071,7 @@ func launchOrchestration(ctx context.Context, ops startOps, name string, cfg run
 			// warning so a later observer (gc trace, a human, or an
 			// automated sweep) can find and act on it.
 			if errors.Is(err, ErrNudgeDeferredHumanPrompt) {
-				fmt.Fprintf(os.Stderr, "warning: startup nudge to %q not delivered: the pane holds a prompt for a person (nothing was typed): %v\n", name, err)
+				fmt.Fprintf(os.Stderr, "warning: startup nudge to %q %s: %v\n", name, startupDeferralWarning(err), err)
 			} else {
 				fmt.Fprintf(os.Stderr, "warning: startup nudge to %q delivered but not confirmed after retries: %v\n", name, err)
 			}
@@ -2531,4 +2531,20 @@ func writePromptToDir(dir, agentName, raw string) (string, error) {
 		return "", err
 	}
 	return f.Name(), nil
+}
+
+// startupDeferralWarning says what a guard-refused startup nudge did and did
+// not do, from the deferral itself: refused before any text was typed, refused
+// after the text reached the pane (Enter withheld, or a paste cut short), or
+// refused because the pane could not be read.
+func startupDeferralWarning(err error) string {
+	reason, _ := NudgeDeferredReason(err)
+	switch {
+	case NudgeDeferredAfterTyping(err):
+		return "typed but not submitted: a prompt for a person appeared before Enter (Enter was withheld)"
+	case reason == NudgeDeferReasonCaptureFailed:
+		return "not delivered: the pane could not be read, so a prompt for a person could not be ruled out (nothing was typed)"
+	default:
+		return "not delivered: the pane holds a prompt for a person (nothing was typed)"
+	}
 }

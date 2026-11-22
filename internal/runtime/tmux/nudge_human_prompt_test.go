@@ -1820,10 +1820,11 @@ func TestModelSwitchDismissLeavesATrustPromptAlone(t *testing.T) {
 	}
 }
 
-// ga-fu4dtk, end to end: every path that types into a seat's pane leaves an
-// unnumbered confirm dialog alone and keeps the nudge queued (deferred, not
-// failed). On the folder-trust prompt a nudge's Enter used to pick its default,
-// "No, exit", and end the session.
+// ga-fu4dtk, end to end: every guarded path sends no keys into an unnumbered
+// confirm dialog and returns a deferral (the CLI's nudge queue keeps such a
+// message; the startup path records a diagnostic instead). On the
+// folder-trust prompt a nudge's Enter used to pick its default, "No, exit",
+// and end the session.
 func TestNudgePathsSendNoKeysIntoAnUnnumberedConfirmDialog(t *testing.T) {
 	screens := map[string]string{
 		"folder-trust prompt (live capture)": readTrustFixture(t),
@@ -1896,5 +1897,43 @@ func TestResumeSelectorExemptionIsStructural(t *testing.T) {
 	}
 	if !isClaudeResumeSelectorBlock(strings.Split(strings.TrimSpace(resumeSelectorFixture), "\n")) {
 		t.Fatalf("the real resume selector is not recognised")
+	}
+}
+
+// Third review on #376: the real resume selector is still recognised with blank
+// padding under its heading and with a suffix on its labels, and the nudge path
+// dismisses it (keys go to the selector) rather than deferring.
+func TestResumeSelectorRecognisedAcrossFormatting(t *testing.T) {
+	for name, screen := range map[string]string{
+		"blank rows under the heading": "Resume previous conversation?\n\n\n\n❯ Resume from summary\n  Resume full session as-is\nEnter to confirm · Esc to cancel\n",
+		"suffixed labels":              "Resume previous conversation?\n❯ Resume from summary (recommended)\n  Resume full session as-is (uses more context)\nEnter to confirm · Esc to exit\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := classifyHumanPrompt(strings.Split(screen, "\n"), DefaultReadyPromptPrefix, false); got == NudgeDeferReasonConfirmDialog {
+				t.Fatalf("classifyHumanPrompt() = %q: the resume selector was refused", got)
+			}
+			block, ok := bottomConfirmDialog(strings.Split(screen, "\n"))
+			if !ok || !isClaudeResumeSelectorBlock(block) {
+				t.Fatalf("bottom block %q not recognised as the resume selector", block)
+			}
+		})
+	}
+}
+
+// The startup warning says what happened: refused before typing, typed but
+// Enter withheld, or the pane unreadable.
+func TestStartupDeferralWarning(t *testing.T) {
+	cases := []struct {
+		err  error
+		want string
+	}{
+		{&NudgeDeferredError{Reason: NudgeDeferReasonConfirmDialog, Stage: nudgeGuardStageBeforeType}, "nothing was typed"},
+		{&NudgeDeferredError{Reason: NudgeDeferReasonConfirmDialog, Stage: nudgeGuardStageBeforeSubmit}, "typed but not submitted"},
+		{&NudgeDeferredError{Reason: NudgeDeferReasonCaptureFailed, Stage: nudgeGuardStageBeforeType}, "could not be read"},
+	}
+	for _, c := range cases {
+		if got := startupDeferralWarning(c.err); !strings.Contains(got, c.want) {
+			t.Errorf("startupDeferralWarning(%v) = %q, want it to say %q", c.err, got, c.want)
+		}
 	}
 }
