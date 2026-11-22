@@ -1164,7 +1164,7 @@ func TestOrderFiringCurrent_NewerStoreFiringBehindAStaleEvent(t *testing.T) {
 			writeOrderFiringTestOrder(t, cityPath, "hourly", "cron", "0 * * * *")
 			writeOrderFiringTestEvents(t, cityPath,
 				events.Event{Type: events.ControllerStarted, Ts: now.Add(-24 * time.Hour)},
-				events.Event{Type: events.OrderFired, Subject: "hourly", Ts: time.Date(2026, 11, 21, 10, 0, 30, 0, time.UTC)},
+				events.Event{Type: events.OrderFired, Subject: "hourly", Ts: time.Date(2026, 11, 21, 10, 59, 0, 0, time.UTC)},
 			)
 			asked := 0
 			check := NewOrderFiringCurrentCheck(cfg, cityPath, WithOrderFiringCurrentLastRunFunc(func(orders.Order) (time.Time, error) {
@@ -1201,5 +1201,41 @@ func TestOrderFiringCurrent_EventEvidenceAgreesWithClassifier(t *testing.T) {
 	uneven := orders.Order{Name: "tool-cache-reclaim", Trigger: "cron", Schedule: "50 1-5 * * *", TZ: "America/Los_Angeles"}
 	if !eventEvidenceSuffices(uneven, time.Date(2026, 11, 21, 5, 51, 0, 0, la), time.Hour, time.Date(2026, 11, 21, 21, 48, 0, 0, la)) {
 		t.Error("an uneven order in its long gap forced a store read")
+	}
+}
+
+// End to end through Run: an uneven cron order in the long gap after its last
+// run of the day is current from the event log alone, and the store is never
+// read for it.
+func TestOrderFiringCurrent_UnevenCronInItsLongGapNeedsNoStoreRead(t *testing.T) {
+	now := time.Date(2026, 11, 21, 21, 48, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	writeOrderFiringTestOrder(t, cityPath, "tool-cache-reclaim", "cron", "50 1-5 * * *")
+	writeOrderFiringTestEvents(t, cityPath,
+		events.Event{Type: events.ControllerStarted, Ts: now.Add(-48 * time.Hour)},
+		events.Event{Type: events.OrderFired, Subject: "tool-cache-reclaim", Ts: time.Date(2026, 11, 21, 5, 51, 0, 0, time.UTC)},
+	)
+	check := NewOrderFiringCurrentCheck(cfg, cityPath, WithOrderFiringCurrentLastRunFunc(func(order orders.Order) (time.Time, error) {
+		t.Errorf("store read for %s, whose event log already shows it current", order.Name)
+		return time.Time{}, nil
+	}))
+	check.clock = func() time.Time { return now }
+	if result := check.Run(&CheckContext{CityPath: cityPath}); result.Status != StatusOK {
+		t.Fatalf("status = %v, want OK; msg = %s; details = %v", result.Status, result.Message, result.Details)
+	}
+}
+
+// A cron order whose bounded next-slot scan runs out is judged by its plain age,
+// never as current: "0 0 1 1 1" last fired 2024-01-01, checked in 2032.
+func TestOrderFiringCurrent_ExhaustedScanFallsBackToAge(t *testing.T) {
+	order := orders.Order{Name: "jan1-monday", Trigger: "cron", Schedule: "0 0 1 1 1", TZ: "UTC"}
+	expected, err := computeExpectedIntervalForCronSchedule(order.Schedule)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2032, 1, 2, 0, 0, 0, 0, time.UTC)
+	status, _, detail, _ := classifyOrderFiring(order, now, expected, time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC), now.Add(-24*time.Hour))
+	if status == StatusOK {
+		t.Errorf("an exhausted scan read as current (%s)", detail)
 	}
 }

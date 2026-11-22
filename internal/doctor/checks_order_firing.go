@@ -867,7 +867,9 @@ func eventEvidenceSuffices(order orders.Order, latest time.Time, expected time.D
 // slot is lastFired+expected, so this equals the plain age; for an uneven one
 // ("50 1-5 * * *", whose expected is its 1 h minimum gap) the long gap between
 // runs no longer reads as stale (ga-6703d7). A schedule the helper cannot
-// evaluate falls back to the plain age.
+// evaluate, or whose bounded scan ran out before now without a slot
+// (orders.ErrCronScanExhausted), falls back to the plain age: never to
+// "current".
 func judgedFiringAge(order orders.Order, lastFired time.Time, expected time.Duration, now time.Time) time.Duration {
 	age := nonNegativeDuration(now.Sub(lastFired))
 	if order.Trigger != "cron" {

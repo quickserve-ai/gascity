@@ -372,10 +372,17 @@ func scanCronCatchup(matchesAt func(time.Time) bool, last, start, now time.Time)
 }
 
 // maxNextCronOccurrenceScan bounds NextCronOccurrenceAfter's scan forward from
-// the last firing: four years and a day, so a leap-day schedule always reaches
-// its next slot. A schedule that matches nothing in that span is reported as
-// not due.
+// the last firing: 1,465 days (four leap years and a day), which reaches the
+// next slot of an ordinary leap-day schedule. A schedule whose next slot lies
+// further out (a leap day across a non-leap century year, "0 0 1 1 1") makes
+// the scan run out before until; that is ErrCronScanExhausted, never "not due".
 const maxNextCronOccurrenceScan = (4*366 + 1) * 24 * time.Hour
+
+// ErrCronScanExhausted is NextCronOccurrenceAfter's answer when its bounded
+// scan ended before until without finding a slot: nothing is proven either
+// way, so a caller must not read it as "not due" (a doctor falls back to the
+// plain age of the last firing).
+var ErrCronScanExhausted = errors.New("cron: no slot within the scan bound after the last firing")
 
 // NextCronOccurrenceAfter returns the first slot after the firing at last that
 // the dispatcher would treat as due, judged at until: the same location
@@ -386,7 +393,8 @@ const maxNextCronOccurrenceScan = (4*366 + 1) * 24 * time.Hour
 // names is the real first missed one however old last is. ok is false when no
 // slot has come due by until (including until at or before last). The scan
 // stops at the first slot or at until, so its cost is the gap to the next
-// slot, bounded by maxNextCronOccurrenceScan.
+// slot, bounded by maxNextCronOccurrenceScan; a scan that reaches that bound
+// before until without a slot returns ErrCronScanExhausted.
 func NextCronOccurrenceAfter(a Order, last, until time.Time) (time.Time, bool, error) {
 	if err := ValidateCronSchedule(a.Schedule); err != nil {
 		return time.Time{}, false, err
@@ -402,11 +410,15 @@ func NextCronOccurrenceAfter(a Order, last, until time.Time) (time.Time, bool, e
 	}
 	now := until.In(loc)
 	last = last.In(loc)
+	exhausted := false
 	if end := last.Add(maxNextCronOccurrenceScan); now.After(end) {
-		now = end
+		now, exhausted = end, true
 	}
 	start := last.Truncate(time.Minute).Add(time.Minute)
 	slot, _, found := scanCronCatchup(matchesAt, last, start, now)
+	if !found && exhausted {
+		return time.Time{}, false, ErrCronScanExhausted
+	}
 	return slot, found, nil
 }
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -1381,5 +1382,22 @@ func TestNextCronOccurrenceAfterBoundsAndZones(t *testing.T) {
 		if slot, ok, err := NextCronOccurrenceAfter(hourly, utc(2026, 1, 1, 10, 30), until); err != nil || ok {
 			t.Errorf("until %v at or before last: got (%v, %v, %v), want not due", until, slot, ok, err)
 		}
+	}
+}
+
+// A scan that reaches its bound before until without a slot is
+// ErrCronScanExhausted, never "not due": "0 0 1 1 1" (1 January AND a Monday)
+// fired on Monday 2024-01-01 next fires on Monday 2029-01-01, past the bound.
+func TestNextCronOccurrenceAfterExhaustedIsAnError(t *testing.T) {
+	order := Order{Name: "jan1-monday", Trigger: "cron", Schedule: "0 0 1 1 1", TZ: "UTC"}
+	last := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	if _, ok, err := NextCronOccurrenceAfter(order, last, last.Add(maxNextCronOccurrenceScan)); err != nil || ok {
+		t.Errorf("until exactly at the bound: got (%v, %v), want not due and no error", ok, err)
+	}
+	if _, ok, err := NextCronOccurrenceAfter(order, last, last.Add(maxNextCronOccurrenceScan+time.Minute)); !errors.Is(err, ErrCronScanExhausted) || ok {
+		t.Errorf("until a minute past the bound: got (%v, %v), want ErrCronScanExhausted", ok, err)
+	}
+	if _, _, err := NextCronOccurrenceAfter(order, last, time.Date(2032, 1, 2, 0, 0, 0, 0, time.UTC)); !errors.Is(err, ErrCronScanExhausted) {
+		t.Errorf("checked in 2032: err = %v, want ErrCronScanExhausted", err)
 	}
 }
