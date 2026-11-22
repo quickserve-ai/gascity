@@ -1323,3 +1323,46 @@ func TestNextCronOccurrenceAfter(t *testing.T) {
 		t.Error("an unparseable schedule must return an error, not 'not due'")
 	}
 }
+
+// TestNextCronOccurrenceAfterFollowsCheckCronDST pins the helper to checkCron's
+// DST policy (both run scanCronCatchup): on fall-back the repeated wall-clock
+// minute is one slot, and on spring-forward a slot inside the skipped hour is
+// due at the first real minute after the jump.
+func TestNextCronOccurrenceAfterFollowsCheckCronDST(t *testing.T) {
+	ny, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Fall-back: 2026-11-01 01:59:59 EDT -> 01:00 EST. The order fired at the
+	// first 01:30 (EDT); the second 01:30 (EST) is the same wall-clock slot.
+	daily0130 := Order{Name: "fb", Trigger: "cron", Schedule: "30 1 * * *", TZ: "America/New_York"}
+	firstOneThirty := time.Date(2026, 11, 1, 5, 30, 0, 0, time.UTC) // 01:30 EDT
+	if got := firstOneThirty.In(ny); got.Hour() != 1 || got.Minute() != 30 {
+		t.Fatalf("fixture: %v is not 01:30 New York", got)
+	}
+	if slot, ok, err := NextCronOccurrenceAfter(daily0130, firstOneThirty, time.Date(2026, 11, 1, 13, 30, 0, 0, ny)); err != nil || ok {
+		t.Errorf("fall-back repeat counted as a new slot: got (%v, %v, %v), want not due", slot, ok, err)
+	}
+	// Spring-forward: 2027-03-14 02:00 EST -> 03:00 EDT, so 02:30 never exists.
+	daily0230 := Order{Name: "sf", Trigger: "cron", Schedule: "30 2 * * *", TZ: "America/New_York"}
+	slot, ok, err := NextCronOccurrenceAfter(daily0230, time.Date(2027, 3, 13, 2, 30, 0, 0, ny), time.Date(2027, 3, 14, 15, 0, 0, 0, ny))
+	want := time.Date(2027, 3, 14, 3, 0, 0, 0, ny)
+	if err != nil || !ok || !slot.Equal(want) {
+		t.Errorf("spring-forward slot = (%v, %v, %v), want (%v, true) as checkCron fires it", slot, ok, err, want)
+	}
+}
+
+// A firing older than the catch-up lookback cannot name its first missed slot;
+// the helper returns the lookback floor as a lower bound (due at least that
+// long), never "not due".
+func TestNextCronOccurrenceAfterBeyondLookbackIsDue(t *testing.T) {
+	annual := Order{Name: "yearly", Trigger: "cron", Schedule: "0 0 1 1 *", TZ: "UTC"}
+	until := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	slot, ok, err := NextCronOccurrenceAfter(annual, time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), until)
+	if err != nil || !ok {
+		t.Fatalf("long-dead annual order = (%v, %v, %v), want due", slot, ok, err)
+	}
+	if want := until.Add(-cronCatchupLookback); !slot.Equal(want) {
+		t.Errorf("slot = %v, want the lookback floor %v", slot, want)
+	}
+}

@@ -1099,3 +1099,54 @@ func TestOrderFiringCurrent_EvenCronKeepsAgeThresholds(t *testing.T) {
 		}
 	}
 }
+
+// The even-schedule warning boundary: exactly 1.5 intervals after an on-slot
+// firing is overdue, as before ga-6703d7.
+func TestOrderFiringCurrent_EvenCronWarnsAtOneAndAHalfIntervals(t *testing.T) {
+	order := orders.Order{Name: "every-4h", Trigger: "cron", Schedule: "0 */4 * * *", TZ: "UTC"}
+	now := time.Date(2026, 5, 17, 14, 0, 0, 0, time.UTC)
+	start := now.Add(-48 * time.Hour)
+	if status, _, detail, _ := classifyOrderFiring(order, now, 4*time.Hour, now.Add(-6*time.Hour), start); status != StatusWarning {
+		t.Errorf("6 h after an on-slot firing: status = %v (%s), want warning", status, detail)
+	}
+	// On-slot firing at 08:00, judged a minute before the 1.5x mark.
+	if status, _, detail, _ := classifyOrderFiring(order, now.Add(-time.Minute), 4*time.Hour, now.Add(-6*time.Hour), start); status != StatusOK {
+		t.Errorf("5h59m after an on-slot firing: status = %v (%s), want OK", status, detail)
+	}
+}
+
+// A cron order last fired longer ago than the dispatcher's catch-up lookback
+// must not read as current (Astra's finding on #373).
+func TestOrderFiringCurrent_LongDeadAnnualCronIsNotCurrent(t *testing.T) {
+	order := orders.Order{Name: "yearly", Trigger: "cron", Schedule: "0 0 1 1 *", TZ: "UTC"}
+	expected, err := computeExpectedIntervalForCronSchedule(order.Schedule)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	status, _, detail, _ := classifyOrderFiring(order, now, expected, time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), now.Add(-24*time.Hour))
+	if status == StatusOK {
+		t.Errorf("an annual order dead for six years reads OK (%s)", detail)
+	}
+}
+
+// eventEvidenceSuffices uses the classifier's own measure, so the event log is
+// enough exactly when it alone would judge the order current. An hourly order
+// whose newest event is one missed slot ago must be confirmed against the
+// store (a newer store-only firing may exist); an uneven order in its long
+// gap needs no store read.
+func TestOrderFiringCurrent_EventEvidenceAgreesWithClassifier(t *testing.T) {
+	hourly := orders.Order{Name: "hourly", Trigger: "cron", Schedule: "0 * * * *", TZ: "UTC"}
+	now := time.Date(2026, 11, 21, 11, 40, 0, 0, time.UTC)
+	if eventEvidenceSuffices(hourly, time.Date(2026, 11, 21, 10, 59, 0, 0, time.UTC), time.Hour, now) {
+		t.Error("an hourly order whose newest event missed the 11:00 slot was judged from events alone; the store must be read")
+	}
+	la, err := time.LoadLocation("America/Los_Angeles")
+	if err != nil {
+		t.Fatal(err)
+	}
+	uneven := orders.Order{Name: "tool-cache-reclaim", Trigger: "cron", Schedule: "50 1-5 * * *", TZ: "America/Los_Angeles"}
+	if !eventEvidenceSuffices(uneven, time.Date(2026, 11, 21, 5, 51, 0, 0, la), time.Hour, time.Date(2026, 11, 21, 21, 48, 0, 0, la)) {
+		t.Error("an uneven order in its long gap forced a store read")
+	}
+}
