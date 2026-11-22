@@ -14,8 +14,10 @@ import (
 	"github.com/gastownhall/gascity/internal/sessionlog"
 )
 
-// ErrNudgeDeferredHumanPrompt means a nudge sent NO keys because the target
-// pane was showing something that answers to keystrokes on a human's behalf:
+// ErrNudgeDeferredHumanPrompt means a nudge sent no further keys because the
+// target pane was showing something that answers to keystrokes on a human's
+// behalf (before typing, nothing was typed; at stage before_submit the text had
+// reached the pane and the Enter was withheld, see NudgeDeferredAfterTyping):
 // a question dialog, an approval prompt, another numbered selection list, or a
 // human's half-typed draft on an attached session (ga-ubfc7j). Claude Code's
 // AskUserQuestion dialog is quiet and shows no spinner, so to the old
@@ -23,7 +25,7 @@ import (
 // Enter the nudge path sent SELECTED the highlighted option, then submitted
 // the dialog as "User answered Claude's questions".
 //
-// The nudge was not delivered and nothing was typed, so a caller that can
+// The nudge was not delivered, so a caller that can
 // retry must keep the message queued and try again on a later pass. It is not
 // a delivery failure: the queue must not spend one of the item's bounded
 // attempts on it, or a dialog left open for an hour would dead-letter every
@@ -298,9 +300,10 @@ func isHorizontalRule(line string) bool {
 	return utf8.RuneCountInString(s) >= 8 && strings.Trim(s, "─━") == ""
 }
 
-// confirmDialogFooter reports whether a normalized line is the footer Claude
-// Code draws under an unnumbered confirm dialog ("Enter to confirm · Esc to
-// cancel"; the resume selector says "Esc to exit").
+// confirmDialogFooter reports whether a normalized line looks like the footer
+// Claude Code draws under an unnumbered confirm dialog ("Enter to confirm ·
+// Esc to cancel"). It is deliberately broad, because it only ever adds a
+// refusal; the resume-selector exemption compares its footer exactly.
 func confirmDialogFooter(s string) bool {
 	return strings.Contains(s, "Enter to confirm") && strings.Contains(s, "Esc to ")
 }
@@ -376,30 +379,37 @@ func bottomConfirmDialog(lines []string) ([]string, bool) {
 // a dialog that merely quotes those labels or a stale selector above a live
 // dialog included, is not it.
 func isClaudeResumeSelectorBlock(block []string) bool {
+	// Exact rows, as captured (runtime's claudeResumeDialogPane): each row's
+	// trimmed text, with no box border stripped and no other cursor glyph,
+	// must equal the captured row. Blank rows are the only variation allowed.
+	// Any other rendering is refused: the guard fails closed, so an
+	// unrecognised real selector makes the seat wait (visible as a deferral),
+	// where accepting a look-alike would let the dismissal press Enter on a
+	// person's dialog.
+	want := []string{
+		"Resume previous conversation?",
+		"❯ Resume from summary",
+		"Resume full session as-is",
+		"Enter to confirm · Esc to cancel",
+	}
 	var rows []string
 	for _, line := range block {
-		if s := normalizePaneLine(line); s != "" {
+		if s := strings.TrimSpace(strings.ReplaceAll(line, "\u00a0", " ")); s != "" {
 			rows = append(rows, s)
 		}
 	}
-	cursor := -1
-	for i, s := range rows {
-		if _, ok := cutCursorGlyph(s); ok {
-			cursor = i
-		}
-	}
-	if cursor < 1 || len(rows) != cursor+3 {
+	// The block may carry unrelated rows above the heading (bottomConfirmDialog
+	// keeps a few for naming); the dialog is its last four non-blank rows.
+	if len(rows) < len(want) {
 		return false
 	}
-	// Exact rows, as captured (runtime's claudeResumeDialogPane). Any other
-	// rendering is refused: the guard fails closed, so an unrecognised real
-	// selector makes the seat wait (visible as a deferral), where accepting a
-	// look-alike would let the dismissal press Enter on a person's dialog.
-	label, _ := cutCursorGlyph(rows[cursor])
-	return rows[cursor-1] == "Resume previous conversation?" &&
-		label == "Resume from summary" &&
-		rows[cursor+1] == "Resume full session as-is" &&
-		confirmDialogFooter(rows[cursor+2])
+	rows = rows[len(rows)-len(want):]
+	for i := range want {
+		if rows[i] != want[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // cutCursorGlyph strips a leading selection-cursor glyph and the space after

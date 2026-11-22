@@ -1911,10 +1911,14 @@ func TestResumeSelectorRecognisedExactly(t *testing.T) {
 		t.Fatalf("blank-padded resume selector: classifyHumanPrompt() = %q, want \"\"", got)
 	}
 	for name, screen := range map[string]string{
-		"extended heading":   "Resume previous conversation? This will publish it publicly. Proceed?\n❯ Resume from summary\n  Resume full session as-is\nEnter to confirm · Esc to cancel\n",
-		"extended label":     "Resume previous conversation?\n❯ Resume from summary and permanently delete the original session\n  Resume full session as-is\nEnter to confirm · Esc to cancel\n",
-		"decorated label":    "Resume previous conversation?\n❯ Resume from summary (recommended)\n  Resume full session as-is\nEnter to confirm · Esc to cancel\n",
-		"wrapped decoration": "Resume previous conversation?\n❯ Resume from summary\n  (recommended)\n  Resume full session as-is\nEnter to confirm · Esc to cancel\n",
+		"extended heading":           "Resume previous conversation? This will publish it publicly. Proceed?\n❯ Resume from summary\n  Resume full session as-is\nEnter to confirm · Esc to cancel\n",
+		"extended label":             "Resume previous conversation?\n❯ Resume from summary and permanently delete the original session\n  Resume full session as-is\nEnter to confirm · Esc to cancel\n",
+		"decorated label":            "Resume previous conversation?\n❯ Resume from summary (recommended)\n  Resume full session as-is\nEnter to confirm · Esc to cancel\n",
+		"wrapped decoration":         "Resume previous conversation?\n❯ Resume from summary\n  (recommended)\n  Resume full session as-is\nEnter to confirm · Esc to cancel\n",
+		"extended footer":            "Resume previous conversation?\n❯ Resume from summary\n  Resume full session as-is\nEnter to confirm · Esc to cancel · This will publish it publicly.\n",
+		"other cursor glyph":         "Resume previous conversation?\n▶ Resume from summary\n  Resume full session as-is\nEnter to confirm · Esc to cancel\n",
+		"cursor on the other option": "Resume previous conversation?\n  Resume from summary\n❯ Resume full session as-is\nEnter to confirm · Esc to cancel\n",
+		"boxed":                      "│ Resume previous conversation? │\n│ ❯ Resume from summary │\n│   Resume full session as-is │\n│ Enter to confirm · Esc to cancel │\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			fe := &panePromptExecutor{screen: screen}

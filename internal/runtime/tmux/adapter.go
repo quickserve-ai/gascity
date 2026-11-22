@@ -2055,8 +2055,10 @@ func launchOrchestration(ctx context.Context, ops startOps, name string, cfg run
 			// delivery is proven and only the observation missed it. Any
 			// other error still fails the start.
 			// A startup nudge refused by the human-prompt guard
-			// (ErrNudgeDeferredHumanPrompt, ga-ubfc7j) sent NO keys: the pane
-			// is showing a dialog or an attached person's draft. It takes the
+			// (ErrNudgeDeferredHumanPrompt, ga-ubfc7j) sent no further keys: the
+			// pane is showing a dialog or an attached person's draft (refused
+			// before typing, or, after the text was typed, with Enter withheld;
+			// startupDeferralWarning says which). It takes the
 			// same warning-not-failure path: tearing the session down would
 			// kill the pane a person may be answering, and the ladder above
 			// does not retry it, because what is on screen needs a human, not
