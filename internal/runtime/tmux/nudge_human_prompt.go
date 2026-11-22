@@ -42,7 +42,9 @@ const (
 	// requires approval" layout parseApprovalPrompt reads).
 	NudgeDeferReasonApprovalPrompt = "approval_prompt"
 	// NudgeDeferReasonSelectionPrompt: any other numbered option list with a
-	// cursor on it. Enter picks the highlighted row, so it is refused too.
+	// cursor on it, or an unnumbered confirm dialog (a cursor row over an
+	// "Enter to confirm" footer, ga-fu4dtk). Enter picks the highlighted row,
+	// so it is refused too.
 	NudgeDeferReasonSelectionPrompt = "selection_prompt"
 	// NudgeDeferReasonHumanDraft: the composer holds text on an ATTACHED
 	// session, so a person may be mid-message. Before the first Enter
@@ -183,6 +185,11 @@ func lastComposerLine(lines []string, promptPrefix string) (int, string) {
 		if option, _ := selectionOption(s); option {
 			continue
 		}
+		// The cursor row of an unnumbered confirm dialog ("❯ No, exit" over
+		// an "Enter to confirm" footer) starts with the prompt glyph too.
+		if confirmDialogCursorRow(lines, i) {
+			continue
+		}
 		idx, remainder = i, strings.TrimSpace(rest)
 	}
 	return idx, remainder
@@ -283,6 +290,59 @@ func isHorizontalRule(line string) bool {
 	return utf8.RuneCountInString(s) >= 8 && strings.Trim(s, "─━") == ""
 }
 
+// confirmDialogFooter reports whether a normalized line is the footer Claude
+// Code draws under an unnumbered confirm dialog ("Enter to confirm · Esc to
+// cancel"; the resume selector says "Esc to exit").
+func confirmDialogFooter(s string) bool {
+	return strings.Contains(s, "Enter to confirm") && strings.Contains(s, "Esc to ")
+}
+
+// confirmDialogCursorMaxRows bounds how far below a cursor row its dialog's
+// footer may sit: the remaining option rows plus blank padding.
+const confirmDialogCursorMaxRows = 8
+
+// confirmDialogCursorRow reports whether lines[i] is the cursor row of an
+// UNNUMBERED confirm dialog (ga-fu4dtk): a cursor glyph and a label, not a
+// numbered or radio option, with a confirm footer below it inside the same
+// block (no horizontal rule between, within confirmDialogCursorMaxRows lines).
+// Claude Code draws its folder-trust prompt ("❯ No, exit" / "Yes, I trust
+// this folder", captured live 2026-11-22 on v2.1.330) and the Chrome-extension
+// prompt this way. Enter picks the cursor row, so a nudge's Enter answers the
+// dialog; on the trust prompt the default answer exits the session.
+//
+// The live composer is not one: Claude draws it between two horizontal rules,
+// so the look-ahead from it stops at the lower rule.
+func confirmDialogCursorRow(lines []string, i int) bool {
+	s := normalizePaneLine(lines[i])
+	label, ok := cutCursorGlyph(s)
+	if !ok || label == "" {
+		return false
+	}
+	if option, _ := selectionOption(s); option {
+		return false
+	}
+	for j := i + 1; j < len(lines) && j <= i+confirmDialogCursorMaxRows; j++ {
+		if isHorizontalRule(lines[j]) {
+			return false
+		}
+		if confirmDialogFooter(normalizePaneLine(lines[j])) {
+			return true
+		}
+	}
+	return false
+}
+
+// cutCursorGlyph strips a leading selection-cursor glyph and the space after
+// it, reporting whether one was there.
+func cutCursorGlyph(s string) (string, bool) {
+	for _, glyph := range []string{"❯", "›", "▸", "▶", "→"} {
+		if rest, ok := strings.CutPrefix(s, glyph); ok {
+			return strings.TrimSpace(rest), true
+		}
+	}
+	return "", false
+}
+
 // classifyDialog looks for a dialog in the live region of a pane.
 func classifyDialog(live []string) string {
 	norm := make([]string, 0, len(live))
@@ -328,6 +388,19 @@ func classifyDialog(live []string) string {
 			}
 		}
 		return NudgeDeferReasonSelectionPrompt
+	}
+	// An unnumbered confirm dialog (ga-fu4dtk). The machine dialogs the nudge
+	// path dismisses itself (runtime.MidSessionDialogOnScreen: the resume
+	// selector draws this same shape) are left to that path, which already
+	// dismisses them on a detached pane and defers on an attached one; refusing
+	// them here would stop the dismissal and strand the seat on the dialog.
+	for i := range live {
+		if confirmDialogCursorRow(live, i) {
+			if runtime.MidSessionDialogOnScreen(strings.Join(live, "\n")) != "" {
+				return ""
+			}
+			return NudgeDeferReasonSelectionPrompt
+		}
 	}
 	return ""
 }

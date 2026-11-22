@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1676,4 +1677,142 @@ func countAnswer(args []string, count string) string {
 		}
 	}
 	return name + "|" + count
+}
+
+// ga-fu4dtk: unnumbered confirm dialogs. Claude Code draws some dialogs as a
+// cursor row and plain option rows over an "Enter to confirm" footer, with no
+// number or radio mark for selectionOption to see. Before this change the
+// cursor row read as the composer, nothing below it matched, and a nudge's
+// Enter picked the highlighted option.
+
+// chromePromptFixture is the Chrome-extension prompt's shape as recorded on
+// ga-fu4dtk (2026-09-29, Claude Code 2.x): no live capture of it exists.
+const chromePromptFixture = `Claude in Chrome extension detected
+
+ Use the browser tools in this session?
+
+ ❯ No, keep browser tools off
+   Yes, turn on browser tools
+
+ Enter to confirm · Esc to cancel
+`
+
+// spendLimitModalFixture is Claude's spend-limit modal (the runtime package's
+// claudeSpendLimitModalPane): the pre-selected row raises the spend limit.
+const spendLimitModalFixture = `What do you want to do?
+Usage credit balance: $573.37
+❯ Adjust monthly spend limit: $1503.19
+  Wait for limit to reset      Resets Jul 12 at 11pm (America/Los_Angeles)
+Enter to confirm · Esc to cancel
+`
+
+// resumeSelectorFixture is the token-ceiling resume selector, which the nudge
+// path dismisses itself (runtime.midSessionDialogs, "claude-resume").
+const resumeSelectorFixture = `Resume previous conversation?
+❯ Resume from summary
+  Resume full session as-is
+Enter to confirm · Esc to cancel
+`
+
+func readTrustFixture(t *testing.T) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("testdata", "claude-trust", "folder-trust-v2.1.330.txt"))
+	if err != nil {
+		t.Fatalf("reading fixture: %v", err)
+	}
+	return string(data)
+}
+
+func TestClassifyHumanPrompt_UnnumberedConfirmDialogs(t *testing.T) {
+	trust := readTrustFixture(t)
+	if !strings.Contains(trust, "❯ No, exit") || !strings.Contains(trust, "Enter to confirm") {
+		t.Fatalf("trust fixture is not the folder-trust prompt:\n%s", trust)
+	}
+	tests := []struct {
+		name     string
+		screen   string
+		attached bool
+		want     string
+	}{
+		{name: "folder-trust prompt, live capture v2.1.330", screen: trust, want: NudgeDeferReasonSelectionPrompt},
+		{name: "folder-trust prompt, attached", screen: trust, attached: true, want: NudgeDeferReasonSelectionPrompt},
+		{name: "Chrome-extension prompt", screen: chromePromptFixture, want: NudgeDeferReasonSelectionPrompt},
+		{name: "spend-limit modal: Enter would raise the limit", screen: spendLimitModalFixture, want: NudgeDeferReasonSelectionPrompt},
+		{name: "trust prompt below a scrollback echo of an old prompt", screen: "❯ fix the build\n⏺ done\n" + trust, want: NudgeDeferReasonSelectionPrompt},
+		// Controls: what must keep delivering.
+		{name: "resume selector stays with its own dismissal", screen: resumeSelectorFixture, want: ""},
+		{name: "idle composer", screen: idleComposerFixture, want: ""},
+		{name: "idle composer, attached", screen: idleComposerFixture, attached: true, want: ""},
+		{name: "a confirm dialog quoted in scrollback above the live composer", screen: chromePromptFixture + "⏺ That was the Chrome prompt.\n" + idleComposerFixture, want: ""},
+		{name: "a cursor row with no confirm footer is not a dialog", screen: "❯ No, exit\n  Yes, I trust this folder\n", want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := classifyHumanPrompt(strings.Split(tt.screen, "\n"), DefaultReadyPromptPrefix, tt.attached)
+			if got != tt.want {
+				t.Fatalf("classifyHumanPrompt() = %q, want %q\nscreen:\n%s", got, tt.want, tt.screen)
+			}
+		})
+	}
+}
+
+// The cursor row of an unnumbered confirm dialog is not the composer, so its
+// label is never read as a draft; the composer box is unaffected.
+func TestLastComposerLine_SkipsConfirmDialogCursorRow(t *testing.T) {
+	lines := strings.Split(readTrustFixture(t), "\n")
+	if idx, rest := lastComposerLine(lines, DefaultReadyPromptPrefix); idx != -1 {
+		t.Fatalf("lastComposerLine on the trust prompt = %d (%q), want -1", idx, rest)
+	}
+	idle := strings.Split(idleComposerFixture, "\n")
+	if idx, _ := lastComposerLine(idle, DefaultReadyPromptPrefix); idx < 0 {
+		t.Fatalf("lastComposerLine lost the idle composer")
+	}
+}
+
+// ga-fu4dtk, end to end: every path that types into a seat's pane leaves an
+// unnumbered confirm dialog alone and keeps the nudge queued (deferred, not
+// failed). On the folder-trust prompt a nudge's Enter used to pick its default,
+// "No, exit", and end the session.
+func TestNudgePathsSendNoKeysIntoAnUnnumberedConfirmDialog(t *testing.T) {
+	screens := map[string]string{
+		"folder-trust prompt (live capture)": readTrustFixture(t),
+		"Chrome-extension prompt":            chromePromptFixture,
+		"spend-limit modal":                  spendLimitModalFixture,
+	}
+	for name, screen := range screens {
+		for _, attached := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s, attached=%v, NudgeSession", name, attached), func(t *testing.T) {
+				fe := &panePromptExecutor{screen: screen, attached: attached}
+				tm, session := newGuardTestTmux(fe)
+				err := tm.NudgeSession(session, guardTestNudge)
+				if keys := fe.keyCalls(); len(keys) != 0 {
+					t.Fatalf("NudgeSession sent %d key call(s) into the dialog: %q", len(keys), keys)
+				}
+				assertDeferred(t, err, NudgeDeferReasonSelectionPrompt)
+			})
+		}
+		// Startup: the startup ladder accepts the dialogs it knows (the trust
+		// prompt among them) before the prompt is typed. One it does not know
+		// is refused like any other, and the start goes on with the warning
+		// and durable record TestStartupNudgeRefusedByTheGuardDoesNotFailTheStart
+		// pins, rather than answering the dialog by accident.
+		t.Run(name+", startup prompt", func(t *testing.T) {
+			fe := &panePromptExecutor{screen: screen}
+			tm, session := newGuardTestTmux(fe)
+			err := tm.nudgeStartupSession(session, "startup role prompt")
+			if keys := fe.keyCalls(); len(keys) != 0 {
+				t.Fatalf("startup nudge sent %d key call(s) into the dialog: %q", len(keys), keys)
+			}
+			assertDeferred(t, err, NudgeDeferReasonSelectionPrompt)
+		})
+		t.Run(name+", NudgePane", func(t *testing.T) {
+			fe := &panePromptExecutor{screen: screen}
+			tm, _ := newGuardTestTmux(fe)
+			err := tm.NudgePane("%1", guardTestNudge)
+			if keys := fe.keyCalls(); len(keys) != 0 {
+				t.Fatalf("NudgePane sent %d key call(s) into the dialog: %q", len(keys), keys)
+			}
+			assertDeferred(t, err, NudgeDeferReasonSelectionPrompt)
+		})
+	}
 }
