@@ -106,26 +106,39 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# run_bounded: run one notice command (a mail or a nudge) under a wall-clock
-# bound, GC_STALE_DB_NOTICE_TIMEOUT_SECS (default 30). A mail can stall opening
-# the store or waking its recipient (gc mail send waits for the wake), and a
-# notice that hangs would keep this run from its drain-ack and its exit, the
-# very things the notice is reporting on (the reason escalate.sh bounds its
-# send). Delivery is best-effort either way. Portable bash, no timeout(1):
-# the command runs in the background and is killed when the bound passes.
+# run_bounded: run one notice command (a mail, a nudge, the escalation script)
+# under a wall-clock bound, GC_STALE_DB_NOTICE_TIMEOUT_SECS (whole seconds,
+# 1-3600, default 60: above escalate.sh's own 30 s send bound). A mail can
+# stall opening the store or waking its recipient (gc mail send waits for the
+# wake), and a notice that hangs would keep this run from its drain-ack and its
+# exit, the very things the notice is reporting on. Delivery is best-effort
+# either way. Portable bash, no timeout(1), which a stock macOS lacks: the
+# command runs in the background; when the bound passes it and its direct
+# children get TERM, then KILL after a 2 s grace, and it is reaped.
 run_bounded() {
-  local secs="${GC_STALE_DB_NOTICE_TIMEOUT_SECS:-30}"
+  local secs="${GC_STALE_DB_NOTICE_TIMEOUT_SECS:-60}"
   case "$secs" in
-    ''|*[!0-9]*) secs=30 ;;
-    *[1-9]*) ;;
-    *) secs=30 ;;
+    ''|*[!0-9]*) secs=60 ;;
   esac
+  if [ "${#secs}" -gt 4 ]; then secs=3600; fi # no overflow, before any arithmetic
+  secs=$((10#$secs))                           # base 10: 010 is ten, 08 is eight
+  if [ "$secs" -lt 1 ]; then secs=60; fi
+  if [ "$secs" -gt 3600 ]; then secs=3600; fi
+  local limit=$((secs * 10))
   "$@" &
   local pid=$!
   local tenths=0
   while kill -0 "$pid" 2>/dev/null; do
-    if [ "$tenths" -ge $((secs * 10)) ]; then
-      kill "$pid" 2>/dev/null || true
+    if [ "$tenths" -ge "$limit" ]; then
+      pkill -TERM -P "$pid" 2>/dev/null || true
+      kill -TERM "$pid" 2>/dev/null || true
+      local grace=0
+      while kill -0 "$pid" 2>/dev/null && [ "$grace" -lt 20 ]; do
+        sleep 0.1
+        grace=$((grace + 1))
+      done
+      pkill -KILL -P "$pid" 2>/dev/null || true
+      kill -KILL "$pid" 2>/dev/null || true
       wait "$pid" 2>/dev/null || true
       echo "notice abandoned after ${secs}s: $1 $2 ${3:-}" >&2
       return 124
@@ -272,7 +285,7 @@ send_escalation() {
   local subject="$1"
   local message="$2"
   if [ -n "$ESCALATE_SCRIPT" ] && [ -x "$ESCALATE_SCRIPT" ]; then
-    "$ESCALATE_SCRIPT" --subject "$subject" --message "$message"
+    run_bounded "$ESCALATE_SCRIPT" --subject "$subject" --message "$message"
     return
   fi
   run_bounded gc mail send "${GC_ESCALATION_RECIPIENT:-human}" -s "$subject" -m "$message"

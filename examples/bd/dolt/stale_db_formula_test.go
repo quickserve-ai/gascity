@@ -1514,18 +1514,26 @@ func TestStaleDBFormulaTerminalCloseRoutesByRefusalText(t *testing.T) {
 		{name: "pinned refusal", err: "Error: cannot modify pinned issue bead-1 (use --force to override)", route: human},
 		{name: "refusal beside an availability text", err: "warning: driver: bad connection (retried)\nError: cannot close bead-1: assignee is \"dog-2\", actor is \"dog-1\"; reclaim or use --force to override", route: human},
 		{name: "store unreachable", err: "Error: dial tcp 127.0.0.1:51361: connect: connection refused", route: store},
-		{name: "gate refusal", err: "Error: cannot close bead-1: gate condition not satisfied: timer has not elapsed (use --force to override)", route: closeFailed},
+		{name: "gate refusal", err: "Error: cannot close bead-1: gate condition not satisfied: expires in 4m59s (use --force to override)", route: closeFailed},
 		{name: "blank error text", err: " ", route: closeFailed},
+		{name: "no error text at all", err: "", route: closeFailed},
 		{name: "template", err: "Error: cannot modify template bead-1: templates are read-only; use 'bd mol pour' to create a work item", route: closeFailed},
 		{name: "unknown failure", err: "Error: something nobody anticipated", route: closeFailed},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			closeErr := "GC_TEST_BD_CLOSE_ERR=" + tc.err
+			if tc.err == "" {
+				closeErr = "GC_TEST_BD_CLOSE_SILENT=1" // fail with zero bytes of output
+			}
 			log, out, err := runStaleDBFormulaFailureCase(t, staleDBFailureCase{
 				scanJSON: staleDBCleanScan,
 				dir:      t.TempDir(),
-				env: []string{"GC_TEST_BD_NEEDS_STORE=1", "GC_TEST_BD_CLOSE_ERR=" + tc.err, "GC_CITY_PATH=" + city,
+				env: []string{"GC_TEST_BD_NEEDS_STORE=1", closeErr, "GC_CITY_PATH=" + city,
 					"GC_STORE_ERROR_RECIPIENT=platform-seat", "GC_MAINTENANCE_DONE_TARGET=health"},
 			})
+			if tc.err == "" && !strings.Contains(log, "failed, not an ownership refusal: no error text") {
+				t.Fatalf("a silent close failure did not say so\nlog:\n%s", log)
+			}
 			if err == nil {
 				t.Fatalf("rendered script exited successfully; want the unclosed bead to fail open\nlog:\n%s\noutput:\n%s", log, out)
 			}
@@ -1597,7 +1605,11 @@ func TestStaleDBFormulaTerminalCloseRoutesByRefusalText(t *testing.T) {
 		if err == nil {
 			t.Fatalf("rendered script exited successfully; want fail open\nlog:\n%s\noutput:\n%s", log, out)
 		}
-		if elapsed > 30*time.Second {
+		// Three stalls (the completion nudge, the mail, the warning nudge) at a
+		// 1 s bound plus the 2 s TERM grace: about 9 s, measured 21 s on a
+		// loaded host. Unbounded, the fake's sleeps take 180 s. 90 s keeps
+		// the two apart with room for a busy CI runner.
+		if elapsed > 90*time.Second {
 			t.Fatalf("run took %s with stalled notices; the bound did not hold\nlog:\n%s", elapsed, log)
 		}
 		for _, want := range []string{"gc mail send human -s stale-db: terminal close failed for bead-1", "gc session nudge health ", "gc runtime drain-ack"} {
@@ -1677,9 +1689,10 @@ case "${1:-} ${2:-}" in
     echo "$rendered" >> "$GC_TEST_LOG"
     maybe_fail "$rendered"
     if [ -n "${GC_TEST_HANG_NOTICES:-}" ] && { [ "${1:-} ${2:-}" = "mail send" ] || [ "${1:-} ${2:-}" = "session nudge" ]; }; then
-      # Stall the way a send waiting on a store open or a recipient wake does.
-      # exec, so the formula's bound kills the sleep itself and no orphan
-      # holds the test's output pipe open.
+      # Stall the way a send waiting on a store open or a recipient wake does,
+      # and ignore TERM (an ignored signal survives exec), so only the bound's
+      # KILL ends it. exec, so no orphan holds the test's output pipe open.
+      trap '' TERM
       exec sleep 60
     fi
     ;;
@@ -1723,6 +1736,9 @@ case "${1:-}" in
       echo "$GC_TEST_BD_CLOSE_ERR" >&2
       exit 1
     fi
+    if [ -n "${GC_TEST_BD_CLOSE_SILENT:-}" ] && [ "${1:-}" = close ]; then
+      exit 1
+    fi
     if [ -n "${GC_TEST_BD_NEEDS_STORE:-}" ] && [ "${1:-}" = close ]; then
       # Argument boundaries kept, and the close recorded in the store it ran in.
       printf 'bd-close-argv' >> "$GC_TEST_LOG"
@@ -1741,7 +1757,7 @@ esac
 	cmd := exec.Command("bash", "-s")
 	cmd.Stdin = strings.NewReader(script)
 	cmd.Dir = tc.dir
-	cmd.Env = append(staleDBFilteredEnv("GC_BEAD_ID", "PATH", "TMPDIR", "GC_TEST_LOG", "GC_TEST_SCAN_JSON", "GC_TEST_SCAN_EXIT", "GC_TEST_APPLY_JSON", "GC_TEST_APPLY_EXIT", "GC_TEST_FAIL_CONTAINS", "GC_TEST_BD_NEEDS_STORE", "GC_TEST_BD_CLOSE_ERR"),
+	cmd.Env = append(staleDBFilteredEnv("GC_BEAD_ID", "PATH", "TMPDIR", "GC_TEST_LOG", "GC_TEST_SCAN_JSON", "GC_TEST_SCAN_EXIT", "GC_TEST_APPLY_JSON", "GC_TEST_APPLY_EXIT", "GC_TEST_FAIL_CONTAINS", "GC_TEST_BD_NEEDS_STORE", "GC_TEST_BD_CLOSE_ERR", "GC_TEST_BD_CLOSE_SILENT", "GC_TEST_HANG_NOTICES", "GC_STALE_DB_NOTICE_TIMEOUT_SECS"),
 		"GC_BEAD_ID=bead-1",
 		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
 		"TMPDIR="+dir,
