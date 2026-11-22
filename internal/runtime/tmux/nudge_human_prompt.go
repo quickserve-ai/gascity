@@ -372,8 +372,7 @@ func bottomConfirmDialog(lines []string) ([]string, bool) {
 // bottomConfirmDialog) is exactly Claude Code's token-ceiling resume selector:
 // the line directly above the cursor row is "Resume previous conversation?",
 // the cursor row is "Resume from summary", and the only other row before the
-// footer is "Resume full session as-is" (blank rows ignored; each row may
-// carry a suffix after that text). Anything else,
+// footer is "Resume full session as-is" (blank rows ignored, text exact). Anything else,
 // a dialog that merely quotes those labels or a stale selector above a live
 // dialog included, is not it.
 func isClaudeResumeSelectorBlock(block []string) bool {
@@ -392,13 +391,14 @@ func isClaudeResumeSelectorBlock(block []string) bool {
 	if cursor < 1 || len(rows) != cursor+3 {
 		return false
 	}
-	// Each row must START with the selector's own text, so a decorated label
-	// ("Resume from summary (recommended)") still matches, while a dialog
-	// that only quotes the labels inside other text does not.
+	// Exact rows, as captured (runtime's claudeResumeDialogPane). Any other
+	// rendering is refused: the guard fails closed, so an unrecognised real
+	// selector makes the seat wait (visible as a deferral), where accepting a
+	// look-alike would let the dismissal press Enter on a person's dialog.
 	label, _ := cutCursorGlyph(rows[cursor])
-	return strings.HasPrefix(rows[cursor-1], "Resume previous conversation?") &&
-		strings.HasPrefix(label, "Resume from summary") &&
-		strings.HasPrefix(rows[cursor+1], "Resume full session as-is") &&
+	return rows[cursor-1] == "Resume previous conversation?" &&
+		label == "Resume from summary" &&
+		rows[cursor+1] == "Resume full session as-is" &&
 		confirmDialogFooter(rows[cursor+2])
 }
 

@@ -2540,6 +2540,8 @@ func writePromptToDir(dir, agentName, raw string) (string, error) {
 func startupDeferralWarning(err error) string {
 	reason, _ := NudgeDeferredReason(err)
 	switch {
+	case NudgeDeferredAfterTyping(err) && reason == NudgeDeferReasonCaptureFailed:
+		return "typed but not submitted: the pane could not be read before Enter, so Enter was withheld"
 	case NudgeDeferredAfterTyping(err):
 		return "typed but not submitted: a prompt for a person appeared before Enter (Enter was withheld)"
 	case reason == NudgeDeferReasonCaptureFailed:

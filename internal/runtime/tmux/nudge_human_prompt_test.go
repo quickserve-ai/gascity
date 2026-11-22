@@ -1900,22 +1900,30 @@ func TestResumeSelectorExemptionIsStructural(t *testing.T) {
 	}
 }
 
-// Third review on #376: the real resume selector is still recognised with blank
-// padding under its heading and with a suffix on its labels, and the nudge path
-// dismisses it (keys go to the selector) rather than deferring.
-func TestResumeSelectorRecognisedAcrossFormatting(t *testing.T) {
+// Third and fourth reviews on #376: the resume selector is recognised by its
+// exact rows; blank padding under the heading is the only variation allowed.
+// The guard classifies it as nothing (the existing dismissal handles it).
+// Decorated or extended rows are refused: a look-alike must never reach the
+// dismissal, and an unrecognised real selector only makes the seat wait.
+func TestResumeSelectorRecognisedExactly(t *testing.T) {
+	padded := "Resume previous conversation?\n\n\n\n❯ Resume from summary\n  Resume full session as-is\nEnter to confirm · Esc to cancel\n"
+	if got := classifyHumanPrompt(strings.Split(padded, "\n"), DefaultReadyPromptPrefix, false); got != "" {
+		t.Fatalf("blank-padded resume selector: classifyHumanPrompt() = %q, want \"\"", got)
+	}
 	for name, screen := range map[string]string{
-		"blank rows under the heading": "Resume previous conversation?\n\n\n\n❯ Resume from summary\n  Resume full session as-is\nEnter to confirm · Esc to cancel\n",
-		"suffixed labels":              "Resume previous conversation?\n❯ Resume from summary (recommended)\n  Resume full session as-is (uses more context)\nEnter to confirm · Esc to exit\n",
+		"extended heading":   "Resume previous conversation? This will publish it publicly. Proceed?\n❯ Resume from summary\n  Resume full session as-is\nEnter to confirm · Esc to cancel\n",
+		"extended label":     "Resume previous conversation?\n❯ Resume from summary and permanently delete the original session\n  Resume full session as-is\nEnter to confirm · Esc to cancel\n",
+		"decorated label":    "Resume previous conversation?\n❯ Resume from summary (recommended)\n  Resume full session as-is\nEnter to confirm · Esc to cancel\n",
+		"wrapped decoration": "Resume previous conversation?\n❯ Resume from summary\n  (recommended)\n  Resume full session as-is\nEnter to confirm · Esc to cancel\n",
 	} {
 		t.Run(name, func(t *testing.T) {
-			if got := classifyHumanPrompt(strings.Split(screen, "\n"), DefaultReadyPromptPrefix, false); got == NudgeDeferReasonConfirmDialog {
-				t.Fatalf("classifyHumanPrompt() = %q: the resume selector was refused", got)
+			fe := &panePromptExecutor{screen: screen}
+			tm, session := newGuardTestTmux(fe)
+			err := tm.NudgeSession(session, guardTestNudge)
+			if keys := fe.keyCalls(); len(keys) != 0 {
+				t.Fatalf("NudgeSession sent %d key call(s) into a look-alike: %q", len(keys), keys)
 			}
-			block, ok := bottomConfirmDialog(strings.Split(screen, "\n"))
-			if !ok || !isClaudeResumeSelectorBlock(block) {
-				t.Fatalf("bottom block %q not recognised as the resume selector", block)
-			}
+			assertDeferred(t, err, NudgeDeferReasonConfirmDialog)
 		})
 	}
 }
@@ -1930,6 +1938,7 @@ func TestStartupDeferralWarning(t *testing.T) {
 		{&NudgeDeferredError{Reason: NudgeDeferReasonConfirmDialog, Stage: nudgeGuardStageBeforeType}, "nothing was typed"},
 		{&NudgeDeferredError{Reason: NudgeDeferReasonConfirmDialog, Stage: nudgeGuardStageBeforeSubmit}, "typed but not submitted"},
 		{&NudgeDeferredError{Reason: NudgeDeferReasonCaptureFailed, Stage: nudgeGuardStageBeforeType}, "could not be read"},
+		{&NudgeDeferredError{Reason: NudgeDeferReasonCaptureFailed, Stage: nudgeGuardStageBeforeSubmit}, "could not be read before Enter"},
 	}
 	for _, c := range cases {
 		if got := startupDeferralWarning(c.err); !strings.Contains(got, c.want) {
