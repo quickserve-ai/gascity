@@ -945,10 +945,14 @@ func TestBeadsQuiescenceWaitsForAnInFlightCacheReconcile(t *testing.T) {
 
 	close(release)
 	<-done
-	before := backing.lists.Load()
-	cache.ReconcileIfDueForTest() // the city is quiescent now: the gate refuses
-	if got := backing.lists.Load(); got != before {
-		t.Fatalf("a reconcile started after quiescence scanned the store (%d -> %d)", before, got)
+	// A fresh cache is due at once (never primed), so only the gate can keep
+	// a reconcile started after quiescence from scanning.
+	late := &reconcileHoldingStore{Store: beads.NewMemStore(), entered: make(chan struct{}), release: make(chan struct{})}
+	close(late.release)
+	lateCache := beads.NewCachingStore(late, nil, cr.cs.reconcileGate())
+	lateCache.ReconcileIfDueForTest()
+	if got := late.lists.Load(); got != 0 {
+		t.Fatalf("a reconcile started after quiescence scanned the store %d time(s), want 0", got)
 	}
 	cr.enterBeadsQuiescenceIfDue(context.Background())
 	if ops := providerOpsLogged(t, logPath); ops != "" {

@@ -187,6 +187,10 @@ func (cr *CityRuntime) tickRetireSuspendedRigScopes(p *tickPass) bool {
 		runningNames[name] = true
 	}
 	open := p.sessionBeads.OpenInfos()
+	// Known gap (ga-kwf3q6): this drained test reads sessions only.
+	// A rig cache reconcile already past rigReconcileGate when the rig was
+	// suspended is not waited for here, as it is for a quiescent city
+	// (enterBeadsQuiescenceIfDue counts it in storeWorkInFlight).
 	drained := func(scopeRoot string) bool {
 		for _, info := range open {
 			if runningNames[info.SessionName] && sessionInScope(cr.cityPath, cr.cfg, info, scopeRoot) {
