@@ -2055,8 +2055,10 @@ func launchOrchestration(ctx context.Context, ops startOps, name string, cfg run
 			// delivery is proven and only the observation missed it. Any
 			// other error still fails the start.
 			// A startup nudge refused by the human-prompt guard
-			// (ErrNudgeDeferredHumanPrompt, ga-ubfc7j) sent NO keys: the pane
-			// is showing a dialog or an attached person's draft. It takes the
+			// (ErrNudgeDeferredHumanPrompt, ga-ubfc7j) sent no further keys: the
+			// pane is showing a dialog or an attached person's draft (refused
+			// before typing, or, after the text was typed, with Enter withheld;
+			// startupDeferralWarning says which). It takes the
 			// same warning-not-failure path: tearing the session down would
 			// kill the pane a person may be answering, and the ladder above
 			// does not retry it, because what is on screen needs a human, not
@@ -2070,7 +2072,11 @@ func launchOrchestration(ctx context.Context, ops startOps, name string, cfg run
 			// afterward. Persist a diagnostic artifact alongside the
 			// warning so a later observer (gc trace, a human, or an
 			// automated sweep) can find and act on it.
-			fmt.Fprintf(os.Stderr, "warning: startup nudge to %q delivered but not confirmed after retries: %v\n", name, err)
+			if errors.Is(err, ErrNudgeDeferredHumanPrompt) {
+				fmt.Fprintf(os.Stderr, "warning: startup nudge to %q %s: %v\n", name, startupDeferralWarning(err), err)
+			} else {
+				fmt.Fprintf(os.Stderr, "warning: startup nudge to %q delivered but not confirmed after retries: %v\n", name, err)
+			}
 			ops.recordUnconfirmedNudge(name, cfg.Nudge, err)
 		}
 	}
@@ -2527,4 +2533,22 @@ func writePromptToDir(dir, agentName, raw string) (string, error) {
 		return "", err
 	}
 	return f.Name(), nil
+}
+
+// startupDeferralWarning says what a guard-refused startup nudge did and did
+// not do, from the deferral itself: refused before any text was typed, refused
+// after the text reached the pane (Enter withheld, or a paste cut short), or
+// refused because the pane could not be read.
+func startupDeferralWarning(err error) string {
+	reason, _ := NudgeDeferredReason(err)
+	switch {
+	case NudgeDeferredAfterTyping(err) && reason == NudgeDeferReasonCaptureFailed:
+		return "typed but not submitted: the pane could not be read before Enter, so Enter was withheld"
+	case NudgeDeferredAfterTyping(err):
+		return "typed but not submitted: a prompt for a person appeared before Enter (Enter was withheld)"
+	case reason == NudgeDeferReasonCaptureFailed:
+		return "not delivered: the pane could not be read, so a prompt for a person could not be ruled out (nothing was typed)"
+	default:
+		return "not delivered: the pane holds a prompt for a person (nothing was typed)"
+	}
 }
