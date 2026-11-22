@@ -661,7 +661,8 @@ func waitForFirstOrderCycle(t *testing.T, run *helpers.TopologyRun) {
 				}
 			}
 		}
-		// Sleep only toward a poll that can still start.
+		// The pause aims at the last moment a poll may start; a late wake-up
+		// can miss it, and then no further poll starts.
 		pause := 15 * time.Second
 		if room := time.Until(deadline) - firstOrderCyclePollCheck; room < pause {
 			pause = room
