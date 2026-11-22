@@ -89,7 +89,7 @@ const (
 	// the index and pays one LIMIT-1 LastRun fallback (itself limit-pushed
 	// now), after which cachedLastRun remembers it across ticks and rebuilds.
 	orderTrackingHistoryIndexLimit   = 256
-	defaultMaxOrderDispatchesPerTick = config.DefaultMaxDispatchesPerTick
+	defaultMaxOrderDispatchesPerTick = 4
 	orderTrackingSweepCloseBudget    = 4
 
 	// orderTrackingRetentionWatchdogInterval is the minimum time between
@@ -497,7 +497,10 @@ func newMemoryOrderDispatcher(routes *storageRoutes, aa []orders.Order, cityPath
 		ep = p
 	}
 
-	maxDispatchesPerTick := cfg.Orders.DispatchesPerTick()
+	maxDispatchesPerTick := defaultMaxOrderDispatchesPerTick
+	if cfg.Orders.MaxDispatchesPerTick != nil && *cfg.Orders.MaxDispatchesPerTick > 0 {
+		maxDispatchesPerTick = *cfg.Orders.MaxDispatchesPerTick
+	}
 
 	dispatchCtx, dispatchCancel := context.WithCancel(context.Background())
 	return &memoryOrderDispatcher{

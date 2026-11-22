@@ -284,7 +284,6 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext) *CheckResult {
 		return start, nil
 	}
 	inconclusive := 0
-	rotation := orderDispatchRotation(c.cfg, allOrders, suspendedRigs)
 
 	for _, order := range allOrders {
 		if order.Trigger != "cron" && order.Trigger != "cooldown" {
@@ -314,10 +313,7 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext) *CheckResult {
 			blockingErrors++
 			continue
 		}
-		// A fired order is dated against the active log's controller start
-		// only: it costs no further read, and an order that fired after that
-		// start is judged as before.
-		started := orderFiringControllerStart{at: activeStartedAt}
+		var started orderFiringControllerStart
 		if lastFired.IsZero() {
 			if started, err = controllerStart(); err != nil {
 				return &CheckResult{
@@ -342,17 +338,7 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext) *CheckResult {
 			detail = fmt.Sprintf("%s: never fired; no controller start in the active event log or the newest event archive (inconclusive)", orderDisplayName(order))
 			inconclusive++
 		} else {
-			status, severity, detail, routine = classifyOrderFiring(order, now, expected, lastFired, started.at, rotation)
-			// A fired order was dated against the active log's start only. When
-			// that is gone (rotated into the archive) and the order reads late,
-			// resolve the start the way a never-fired order does, so the
-			// cold-start window is not lost to a log rotation. An unreadable or
-			// unknown start leaves the verdict as it is.
-			if status != StatusOK && !lastFired.IsZero() && started.at.IsZero() && rotation > 0 {
-				if resolved, err := controllerStart(); err == nil && !resolved.unknown && !resolved.at.IsZero() {
-					status, severity, detail, routine = classifyOrderFiring(order, now, expected, lastFired, resolved.at, rotation)
-				}
-			}
+			status, severity, detail, routine = classifyOrderFiring(order, now, expected, lastFired, started.at)
 		}
 		worst = worseStatus(worst, status)
 		if routine {
@@ -884,22 +870,6 @@ func eventEvidenceSuffices(order orders.Order, latest time.Time, expected time.D
 // evaluate, or whose bounded scan ran out before now without a slot
 // (orders.ErrCronScanExhausted), falls back to the plain age: never to
 // "current".
-// orderDueAt is when an order that last fired at lastFired was next due: its
-// next cron slot after the firing, or the firing plus its interval. Zero when
-// a cron order has no slot after the firing before now.
-func orderDueAt(order orders.Order, lastFired time.Time, expected time.Duration, now time.Time) time.Time {
-	if order.Trigger == "cron" {
-		due, ok, err := orders.NextCronOccurrenceAfter(order, lastFired, now)
-		if err == nil {
-			if !ok {
-				return time.Time{}
-			}
-			return due
-		}
-	}
-	return lastFired.Add(expected)
-}
-
 func judgedFiringAge(order orders.Order, lastFired time.Time, expected time.Duration, now time.Time) time.Duration {
 	age := nonNegativeDuration(now.Sub(lastFired))
 	if order.Trigger != "cron" {
@@ -1021,17 +991,8 @@ func latestOrderFiredAt(evts []events.Event, subject string) time.Time {
 // "fired within its interval" case: an OK that carries a caveat (never fired,
 // start unknown or within the first cycle) is not routine, because it says the
 // check could not fully judge.
-//
-// rotation is how long the dispatcher's first cycle after a controller start
-// can take to reach every order (orderDispatchRotation). At cold start every
-// order is due at once and the per-pass budget reaches them a few at a time
-// (ga-riugvm), so an order that never fired is inside its first cycle until
-// the controller has run 1.5 times (expected + rotation), and one last fired
-// before the start is covered as described below.
-func classifyOrderFiring(order orders.Order, now time.Time, expected time.Duration, lastFired, controllerStarted time.Time, rotation time.Duration) (status CheckStatus, severity CheckSeverity, detail string, routine bool) {
+func classifyOrderFiring(order orders.Order, now time.Time, expected time.Duration, lastFired, controllerStarted time.Time) (status CheckStatus, severity CheckSeverity, detail string, routine bool) {
 	name := orderDisplayName(order)
-	firstCycle := expected + rotation
-	firstCycle += firstCycle / 2
 	if lastFired.IsZero() {
 		if controllerStarted.IsZero() {
 			// Nothing shows the controller ever ran. Controller-down is its own
@@ -1041,7 +1002,7 @@ func classifyOrderFiring(order orders.Order, now time.Time, expected time.Durati
 			return StatusOK, SeverityBlocking, fmt.Sprintf("%s: never fired (controller start unknown)", name), false
 		}
 		uptime := nonNegativeDuration(now.Sub(controllerStarted))
-		if uptime >= firstCycle {
+		if uptime >= expected+expected/2 {
 			// Advisory only for cron: a cron order that has never fired since
 			// controller start may be the cron-scheduler bug (ga-97qngx), not
 			// a real outage. Cooldown never-fired/stale paths remain blocking
@@ -1056,32 +1017,6 @@ func classifyOrderFiring(order orders.Order, now time.Time, expected time.Durati
 
 	age := nonNegativeDuration(now.Sub(lastFired))
 	judged := judgedFiringAge(order, lastFired, expected, now)
-	// The cold-start window: for two rotations after a controller start the
-	// dispatcher is still working through the burst of orders that were all due
-	// at once, and an order waits for the rotation to reach it, whether its last
-	// firing was the previous controller's or this one's first pass. So inside
-	// the window an order the rule below would call late is late only once 1.5
-	// rotations have passed since it was due, or since the start if it was
-	// already due then. Past the window nothing changes: a stale order on a
-	// settled city is judged exactly as before, and the grace is the
-	// rotation's, never the interval's, so an annual order dead for years is
-	// still stale once the window ends.
-	if rotation > 0 && !controllerStarted.IsZero() && judged >= expected+expected/2 {
-		uptime := nonNegativeDuration(now.Sub(controllerStarted))
-		if due := orderDueAt(order, lastFired, expected, now); uptime < 2*rotation && !due.IsZero() {
-			from := controllerStarted
-			if due.After(from) {
-				from = due
-			}
-			if waited := nonNegativeDuration(now.Sub(from)); waited < rotation+rotation/2 {
-				when := "since"
-				if lastFired.Before(controllerStarted) {
-					when = "before"
-				}
-				return StatusOK, SeverityBlocking, fmt.Sprintf("%s: last fired %s ago, %s the controller started %s ago (within first cycle)", name, formatOrderFiringDuration(age), when, formatOrderFiringDuration(uptime)), false
-			}
-		}
-	}
 	switch {
 	case judged >= expected*3:
 		return StatusError, SeverityBlocking, fmt.Sprintf("%s: last fired %s ago, expected every %s (CRITICAL: stale)", name, formatOrderFiringDuration(age), formatOrderFiringDuration(expected)), false
@@ -1110,37 +1045,6 @@ func worseStatus(a, b CheckStatus) CheckStatus {
 	// Delegates to WorseOf, whose explicit ranking keeps a not-assessed
 	// result from ever masking a real finding (ga-51iq0s).
 	return WorseOf(a, b)
-}
-
-// orderDispatchRotation estimates how long the dispatcher's first cycle after a
-// controller start takes to reach every order: each orders-lane pass (about
-// one per patrol interval) dispatches at most orders.max_dispatches_per_tick
-// orders, in a rotation, and at cold start the cron and cooldown orders are
-// due together. Only those are counted. An event order spends budget only when
-// a matching event has arrived, and a condition order only when its trigger
-// env fails to build (a due one is outside the budget), so counting them would
-// stretch the grace on an ordinary city; a city with many failing condition
-// orders can see its first cycle run longer than this. Suspended rigs' orders
-// are not dispatched, so they are not counted.
-func orderDispatchRotation(cfg *config.City, all []orders.Order, suspendedRigs map[string]bool) time.Duration {
-	if cfg == nil {
-		return 0
-	}
-	n := 0
-	for _, order := range all {
-		switch order.Trigger {
-		case "cron", "cooldown":
-		default:
-			continue
-		}
-		if orderFiringCurrentOrderSuspended(suspendedRigs, order) {
-			continue
-		}
-		n++
-	}
-	budget := cfg.Orders.DispatchesPerTick()
-	passes := (n + budget - 1) / budget
-	return time.Duration(passes) * cfg.Daemon.PatrolIntervalDuration()
 }
 
 func nonNegativeDuration(d time.Duration) time.Duration {

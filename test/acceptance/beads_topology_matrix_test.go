@@ -111,6 +111,7 @@ func TestBeadsInitTopologyMatrix(t *testing.T) {
 		})
 
 		t.Run("doctor-after-start", func(t *testing.T) {
+			waitForFirstOrderCycle(t, run)
 			assertTopologyDoctor(t, run, nil, "after start")
 		})
 
@@ -613,4 +614,59 @@ func logControllerStoreLines(run *helpers.TopologyRun, label string) {
 	if printed == 0 {
 		diagnosticLine("%s: controller store lines: none in %d log file(s): %s", label, len(files), strings.Join(files, ", "))
 	}
+}
+
+// firstOrderCycleTimeout caps how long doctor-after-start waits for the order
+// dispatcher's first cycle. At start every cron and cooldown order is due at
+// once and each orders-lane pass dispatches at most
+// orders.max_dispatches_per_tick (4) of them, so on a loaded runner, with
+// passes ~40 s apart, a fresh city's ~24 orders take about four minutes to be
+// reached (ga-riugvm). The cap covers that and no more: the doctor target runs
+// every topology in one bazel action capped at 1100 s, and most topologies read
+// ok on the first poll.
+const firstOrderCycleTimeout = 4 * time.Minute
+
+// waitForFirstOrderCycle waits until gc doctor's order-firing-current reports
+// ok, or the cap passes, before doctor-after-start judges the city: the step
+// asserts the settled city, not one the dispatcher is still working through
+// (ga-riugvm). It never fails the test itself. On the cap it returns, and the
+// full doctor run that follows reports the check with its per-order details,
+// so an order that really never fires still fails the step.
+func waitForFirstOrderCycle(t *testing.T, run *helpers.TopologyRun) {
+	t.Helper()
+	deadline := time.Now().Add(firstOrderCycleTimeout)
+	start := time.Now()
+	for {
+		out, _ := run.City.GC("doctor", "--json", "--check", "order-firing-current", "--check-timeout", topologyDoctorCheckTimeout)
+		if report, ok := parseDoctorReport(out); ok {
+			for _, r := range report.Results {
+				if r.Name == "order-firing-current" && r.Status == "ok" {
+					t.Logf("order-firing-current ok after %s", time.Since(start).Round(time.Second))
+					return
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Logf("order-firing-current not ok after %s; judging the city as it stands", firstOrderCycleTimeout)
+			return
+		}
+		time.Sleep(15 * time.Second)
+	}
+}
+
+// parseDoctorReport is lastJSONLine without the fatal: a poll that reads a
+// half-written or empty doctor answer tries again instead of failing.
+func parseDoctorReport(out string) (doctorReport, bool) {
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if !strings.HasPrefix(line, "{") {
+			continue
+		}
+		var report doctorReport
+		if err := json.Unmarshal([]byte(line), &report); err == nil {
+			return report, true
+		}
+	}
+	return doctorReport{}, false
 }
