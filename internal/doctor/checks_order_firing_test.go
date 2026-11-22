@@ -1125,8 +1125,61 @@ func TestOrderFiringCurrent_LongDeadAnnualCronIsNotCurrent(t *testing.T) {
 	}
 	now := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
 	status, _, detail, _ := classifyOrderFiring(order, now, expected, time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), now.Add(-24*time.Hour))
-	if status == StatusOK {
-		t.Errorf("an annual order dead for six years reads OK (%s)", detail)
+	if status != StatusError {
+		t.Errorf("an annual order dead since 2020 (first missed slot 2021-01-01): status = %v (%s), want stale", status, detail)
+	}
+	// The real tolerance survives a year: two days past a missed 1 January is not overdue yet.
+	status, _, detail, _ = classifyOrderFiring(order, time.Date(2026, 1, 3, 0, 0, 0, 0, time.UTC), expected, time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC), now.Add(-24*time.Hour))
+	if status != StatusOK {
+		t.Errorf("annual, last fired a year and two days ago: status = %v (%s), want OK", status, detail)
+	}
+	// A leap-day order between leap years has missed nothing.
+	leap := orders.Order{Name: "leap", Trigger: "cron", Schedule: "0 0 29 2 *", TZ: "UTC"}
+	leapExpected, err := computeExpectedIntervalForCronSchedule(leap.Schedule)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, _, detail, _ = classifyOrderFiring(leap, now, leapExpected, time.Date(2024, 2, 29, 0, 0, 0, 0, time.UTC), now.Add(-24*time.Hour))
+	if status != StatusOK {
+		t.Errorf("leap-day order between leap years: status = %v (%s), want OK", status, detail)
+	}
+}
+
+// End to end through Run: an hourly order whose newest EVENT missed the 11:00
+// slot but whose order-run store holds an 11:00 firing is current, because the
+// event evidence does not suffice and the newer store firing wins. Control:
+// with no newer store firing the same order is overdue.
+func TestOrderFiringCurrent_NewerStoreFiringBehindAStaleEvent(t *testing.T) {
+	now := time.Date(2026, 11, 21, 11, 40, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name  string
+		store time.Time
+		want  CheckStatus
+	}{
+		{"store has the 11:00 firing", time.Date(2026, 11, 21, 11, 0, 0, 0, time.UTC), StatusOK},
+		{"store has nothing newer", time.Time{}, StatusWarning},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cityPath, cfg := orderFiringTestCity(t)
+			writeOrderFiringTestOrder(t, cityPath, "hourly", "cron", "0 * * * *")
+			writeOrderFiringTestEvents(t, cityPath,
+				events.Event{Type: events.ControllerStarted, Ts: now.Add(-24 * time.Hour)},
+				events.Event{Type: events.OrderFired, Subject: "hourly", Ts: time.Date(2026, 11, 21, 10, 0, 30, 0, time.UTC)},
+			)
+			asked := 0
+			check := NewOrderFiringCurrentCheck(cfg, cityPath, WithOrderFiringCurrentLastRunFunc(func(orders.Order) (time.Time, error) {
+				asked++
+				return tc.store, nil
+			}))
+			check.clock = func() time.Time { return now }
+			result := check.Run(&CheckContext{CityPath: cityPath})
+			if asked == 0 {
+				t.Fatal("the store was never read for an order whose events show a missed slot")
+			}
+			if result.Status != tc.want {
+				t.Fatalf("status = %v, want %v; msg = %s; details = %v", result.Status, tc.want, result.Message, result.Details)
+			}
+		})
 	}
 }
 

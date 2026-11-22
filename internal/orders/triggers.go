@@ -307,7 +307,7 @@ func checkCron(a Order, now time.Time, lastRunFn LastRunFunc) TriggerResult {
 	// floor keeps a freshly-enabled order from firing for an occurrence that
 	// elapsed long before it existed, unlike the year-long lookback a warm
 	// order's lastRun-anchored catch-up gets.
-	const maxCatchupLookback = cronCatchupLookback
+	const maxCatchupLookback = 366 * 24 * time.Hour
 	const neverRunCatchupLookback = 25 * time.Hour
 	lookback := maxCatchupLookback
 	start := last.Truncate(time.Minute).Add(time.Minute)
@@ -371,20 +371,22 @@ func scanCronCatchup(matchesAt func(time.Time) bool, last, start, now time.Time)
 	return time.Time{}, false, false
 }
 
-// cronCatchupLookback is the longest a catch-up scan looks back from now:
-// checkCron's maxCatchupLookback, shared so a reader and the dispatcher stop
-// at the same floor.
-const cronCatchupLookback = 366 * 24 * time.Hour
+// maxNextCronOccurrenceScan bounds NextCronOccurrenceAfter's scan forward from
+// the last firing: four years and a day, so a leap-day schedule always reaches
+// its next slot. A schedule that matches nothing in that span is reported as
+// not due.
+const maxNextCronOccurrenceScan = (4*366 + 1) * 24 * time.Hour
 
-// NextCronOccurrenceAfter returns the first slot after the firing at last
-// that the dispatcher would treat as due, judged at until: the same location
-// (resolveOrderLocation, with until standing in for now), the same catch-up
-// scan (scanCronCatchup, so DST fall-back and spring-forward are handled as
-// checkCron handles them) and the same lookback floor. ok is false when no
-// slot has come due yet. When last is older than the floor, the first missed
-// slot lies before it and cannot be named; the floor itself is returned, with
-// ok true, as a lower bound on how long the order has been due, so a long-
-// dead order reads as due for at least that long rather than as current.
+// NextCronOccurrenceAfter returns the first slot after the firing at last that
+// the dispatcher would treat as due, judged at until: the same location
+// (resolveOrderLocation, with until standing in for now) and the same
+// catch-up scan (scanCronCatchup, so the DST fall-back repeat is one slot and
+// a slot in a spring-forward gap is due at the first real minute after the
+// jump). It scans forward from last, never back from until, so the slot it
+// names is the real first missed one however old last is. ok is false when no
+// slot has come due by until (including until at or before last). The scan
+// stops at the first slot or at until, so its cost is the gap to the next
+// slot, bounded by maxNextCronOccurrenceScan.
 func NextCronOccurrenceAfter(a Order, last, until time.Time) (time.Time, bool, error) {
 	if err := ValidateCronSchedule(a.Schedule); err != nil {
 		return time.Time{}, false, err
@@ -400,10 +402,10 @@ func NextCronOccurrenceAfter(a Order, last, until time.Time) (time.Time, bool, e
 	}
 	now := until.In(loc)
 	last = last.In(loc)
-	start := last.Truncate(time.Minute).Add(time.Minute)
-	if floor := now.Add(-cronCatchupLookback).Truncate(time.Minute); start.Before(floor) {
-		return floor, true, nil
+	if end := last.Add(maxNextCronOccurrenceScan); now.After(end) {
+		now = end
 	}
+	start := last.Truncate(time.Minute).Add(time.Minute)
 	slot, _, found := scanCronCatchup(matchesAt, last, start, now)
 	return slot, found, nil
 }
