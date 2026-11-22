@@ -1357,7 +1357,7 @@ func TestNextCronOccurrenceAfterFollowsCheckCronDST(t *testing.T) {
 // schedule reaches its next slot, an explicit tz wins over until's location,
 // and until at or before the firing is never due.
 func TestNextCronOccurrenceAfterBoundsAndZones(t *testing.T) {
-	utc := func(y int, m time.Month, d, h, min int) time.Time { return time.Date(y, m, d, h, min, 0, 0, time.UTC) }
+	utc := func(y int, m time.Month, d, h, mi int) time.Time { return time.Date(y, m, d, h, mi, 0, 0, time.UTC) }
 	annual := Order{Name: "yearly", Trigger: "cron", Schedule: "0 0 1 1 *", TZ: "UTC"}
 	if slot, ok, err := NextCronOccurrenceAfter(annual, utc(2020, 1, 1, 0, 0), utc(2026, 6, 1, 0, 0)); err != nil || !ok || !slot.Equal(utc(2021, 1, 1, 0, 0)) {
 		t.Errorf("annual dead since 2020: got (%v, %v, %v), want its first missed slot 2021-01-01", slot, ok, err)
