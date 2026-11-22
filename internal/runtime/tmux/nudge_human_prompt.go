@@ -327,7 +327,7 @@ const confirmDialogHeadingRows = 3
 // v2.1.330), the Chrome-extension prompt and the spend-limit modal this way.
 // Enter picks the cursor row: on the trust prompt that exits the session.
 //
-// It returns the block's lines (heading through footer) and true. Only the
+// It returns the block's lines (heading through the bottom of the pane) and true. Only the
 // bottom block counts: a dialog left above a later one, or footer text quoted
 // in a composer (which Claude closes with a rule and status lines below), is
 // history, not the prompt on screen.
@@ -378,7 +378,10 @@ func bottomConfirmDialog(lines []string) ([]string, bool) {
 				seen++
 			}
 		}
-		return lines[start : last+1], true
+		// The block runs to the bottom of the pane, trailing lines included, so
+		// the resume-selector exemption compares what is really at the bottom:
+		// content under the footer can never be dropped from that comparison.
+		return lines[start:], true
 	}
 	return nil, false
 }
