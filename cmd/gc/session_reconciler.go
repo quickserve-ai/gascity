@@ -6990,11 +6990,14 @@ func shouldDeferNamedSessionConfigDrift(info sessionpkg.Info, sessFront *session
 	// A pinned configured named session is an operator-declared critical
 	// conversation (for example, the mayor). Config drift must never collaterally
 	// recycle it. The deferral timer is still recorded so the drift stays
-	// observable rather than silently ignored.
+	// observable rather than silently ignored. A failed record write still
+	// defers: the pin never depends on that record, so a busy store must not
+	// turn it into a restart (ga-8cfg5e). The error is returned for the
+	// caller's stderr line.
 	if pinnedConfiguredNamedSessionKillProtected(info) {
 		if clk != nil && (info.ConfigDriftDeferredKey != driftKey || info.ConfigDriftDeferredAt == "") {
 			if err := recordNamedSessionConfigDriftDeferredAt(info, sessFront, clk.Now().UTC(), driftKey); err != nil {
-				return "", false, err
+				return "pinned", true, err
 			}
 		}
 		return "pinned", true, nil

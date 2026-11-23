@@ -111,6 +111,7 @@ func TestBeadsInitTopologyMatrix(t *testing.T) {
 		})
 
 		t.Run("doctor-after-start", func(t *testing.T) {
+			waitForFirstOrderCycle(t, run)
 			assertTopologyDoctor(t, run, nil, "after start")
 		})
 
@@ -613,4 +614,80 @@ func logControllerStoreLines(run *helpers.TopologyRun, label string) {
 	if printed == 0 {
 		diagnosticLine("%s: controller store lines: none in %d log file(s): %s", label, len(files), strings.Join(files, ", "))
 	}
+}
+
+// firstOrderCycleTimeout bounds when doctor-after-start may START a poll of
+// order-firing-current while waiting for it to read ok; a poll already running
+// at the bound runs to completion (see firstOrderCyclePollCheck). Right after a start every cron and cooldown
+// order is due at once and each orders-lane pass dispatches at most
+// orders.max_dispatches_per_tick (4) of them, several passes apart. On the
+// failing nightly runs recorded on ga-riugvm the supervisor's "per-tick budget
+// 4 spent" lines were about 40 s apart, so a first rotation over a few dozen
+// orders can take minutes. The doctor target (BUILD.bazel TOPOLOGY_PHASES)
+// selects the M1 and M5 rows under one 1100 s action; a poll starts only while
+// its whole check budget fits before the cap, so the wait adds about the cap
+// per row there (plus the CLI's own start-up and exit time on the last poll).
+const firstOrderCycleTimeout = 4 * time.Minute
+
+// firstOrderCyclePollCheck bounds each poll's check inside gc. A poll is
+// started only while this much time is left before the wait's deadline, and it
+// is never killed: killing gc mid-read would orphan the bd processes it runs in
+// their own process groups, which gc cleans up only on its own exit.
+const firstOrderCyclePollCheck = 30 * time.Second
+
+// waitForFirstOrderCycle polls, starting polls only within
+// firstOrderCycleTimeout, for one doctor read in which order-firing-current
+// is ok, before doctor-after-start judges
+// the city (ga-riugvm). It observes one healthy read, not a completed dispatch
+// cycle, and it never decides the step: the full doctor run that follows is
+// unchanged and judges the city as it is then. So an order the check reports
+// as stale at that run still fails the step; one the check itself grades ok
+// (never fired, controller up less than 1.5 of its intervals) passes as it
+// always did. When no further poll may start it returns without a verdict. The
+// gc CLI has no whole-command deadline, so a poll can overrun the bound by the
+// CLI's own start-up and exit time, and one that hangs outside its check holds
+// the step, as any gc call in this test would.
+func waitForFirstOrderCycle(t *testing.T, run *helpers.TopologyRun) {
+	t.Helper()
+	start := time.Now()
+	deadline := start.Add(firstOrderCycleTimeout)
+	for time.Until(deadline) >= firstOrderCyclePollCheck {
+		out, _ := run.City.GC("doctor", "--json", "--check", "order-firing-current", "--check-timeout", firstOrderCyclePollCheck.String())
+		if report, ok := parseDoctorReport(out); ok {
+			for _, r := range report.Results {
+				if r.Name == "order-firing-current" && r.Status == "ok" {
+					t.Logf("order-firing-current read ok after %s", time.Since(start).Round(time.Second))
+					return
+				}
+			}
+		}
+		// The pause aims at the last moment a poll may start; a late wake-up
+		// can miss it, and then no further poll starts.
+		pause := 15 * time.Second
+		if room := time.Until(deadline) - firstOrderCyclePollCheck; room < pause {
+			pause = room
+		}
+		if pause <= 0 {
+			break
+		}
+		time.Sleep(pause)
+	}
+	t.Logf("order-firing-current not ok within %s; judging the city as it stands", firstOrderCycleTimeout)
+}
+
+// parseDoctorReport is lastJSONLine without the fatal: a poll that reads a
+// half-written or empty doctor answer tries again instead of failing.
+func parseDoctorReport(out string) (doctorReport, bool) {
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if !strings.HasPrefix(line, "{") {
+			continue
+		}
+		var report doctorReport
+		if err := json.Unmarshal([]byte(line), &report); err == nil {
+			return report, true
+		}
+	}
+	return doctorReport{}, false
 }

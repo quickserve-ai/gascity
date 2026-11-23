@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -482,6 +483,42 @@ func TestShouldDeferNamedSessionConfigDriftDoesNotDeferWhenMarkerWriteFails(t *t
 	}
 	if deferDrift {
 		t.Fatal("expected config drift not to defer when marker write fails")
+	}
+}
+
+// A pinned configured named session (gc session pin; the mayor) is never
+// drift-restarted, so its deferral record only keeps the drift observable: a
+// failed write must still defer and report the error, never fall through to a
+// restart (ga-8cfg5e). The unpinned case above stays fail-to-restart, because
+// its deferral is time-bounded by that record.
+func TestShouldDeferNamedSessionConfigDriftPinnedDefersWhenMarkerWriteFails(t *testing.T) {
+	clk := &clock.Fake{Time: time.Date(2026, 3, 8, 12, 0, 0, 0, time.UTC)}
+	sp := runtime.NewFake()
+	name := "mayor"
+	if err := sp.Start(context.Background(), name, runtime.Config{Command: "test"}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	provider := capabilityOverrideProvider{Provider: sp}
+	session := beads.Bead{
+		ID:    "missing", // not in the store below, so the deferral write fails
+		Title: name,
+		Type:  sessionBeadType,
+		Metadata: map[string]string{
+			"session_name":                     name,
+			sessionpkg.NamedSessionMetadataKey: "true",
+			"pin_awake":                        "true",
+		},
+	}
+
+	reason, deferDrift, err := shouldDeferNamedSessionConfigDrift(sessiontest.SeedBead(t, session), sessionFrontDoor(beads.NewMemStore()), provider, name, clk, "drift-1")
+	if err == nil {
+		t.Fatal("expected the marker write error to be reported")
+	}
+	if errors.Is(err, runtime.ErrRuntimeUnavailable) {
+		t.Fatalf("fixture must fail with a store error, not ErrRuntimeUnavailable: %v", err)
+	}
+	if !deferDrift || reason != "pinned" {
+		t.Fatalf("pinned session must defer when its marker write fails: got reason=%q defer=%v", reason, deferDrift)
 	}
 }
 

@@ -4077,7 +4077,7 @@ func (t *Tmux) DismissModelSwitchModalIfPresent(session string) {
 	composerIdx, _ := lastComposerLine(lines, t.resolveIdlePromptPrefix(session))
 	live := strings.Join(lines[composerIdx+1:], "\n")
 	switch t.classifyPaneLines(session, target, lines, true) {
-	case NudgeDeferReasonQuestionDialog, NudgeDeferReasonApprovalPrompt, NudgeDeferReasonHumanDraft:
+	case NudgeDeferReasonQuestionDialog, NudgeDeferReasonApprovalPrompt, NudgeDeferReasonHumanDraft, NudgeDeferReasonConfirmDialog:
 		return
 	}
 	_, _ = dismissModelSwitchModal(live,

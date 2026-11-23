@@ -38,6 +38,10 @@ type CachingStore struct {
 	// reconcileGate, when set, is asked before each periodic reconcile; a
 	// false answer skips that cycle (WithReconcileGate).
 	reconcileGate func() bool
+	// reconcileTracker, when set, is called as each periodic reconcile step
+	// starts, before the gate is asked, and the func it returns when the step
+	// ends (WithReconcileTracker).
+	reconcileTracker func() (end func())
 	// now is the clock every window and due time reads (WithClock); nil
 	// reads the real one. Read it through clockNow.
 	now func() time.Time
@@ -608,6 +612,20 @@ func WithEventIDPrefixes(prefixes ...string) CachingStoreOption {
 func WithReconcileGate(allowed func() bool) CachingStoreOption {
 	return func(c *CachingStore) {
 		c.reconcileGate = allowed
+	}
+}
+
+// WithReconcileTracker reports each periodic reconcile step to begin, which
+// returns the func that ends it. The step begins BEFORE the reconcile gate is
+// asked and ends when the step returns, whether the gate allowed it or not, so
+// a caller that flips the gate shut and then reads its own count of steps in
+// flight either sees this step (and waits for it) or this step sees the gate
+// shut (and reads nothing). A caller that retires a store once its gate is shut
+// and nothing is in flight uses it so a reconcile already past the gate cannot
+// read the store after the retire (ga-vblzkw).
+func WithReconcileTracker(begin func() (end func())) CachingStoreOption {
+	return func(c *CachingStore) {
+		c.reconcileTracker = begin
 	}
 }
 
