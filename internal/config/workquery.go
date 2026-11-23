@@ -834,16 +834,16 @@ func inProgressBlockedByEnrichmentScriptWithServeAction(federated bool, checkHol
 // held head from hiding an unheld assignment for the same identity. The wisp
 // probe behind it (ephemeralAssignedReadyProbeScript) filters the same way.
 //
-// The CONTROLLER mirrors this predicate before it counts such a row as capacity
+// The CONTROLLER mirrors this predicate, with the exception below, before it counts such a row as capacity
 // demand — cmd/gc poolWakeReadiness, the assigned-arm counterpart to
 // PoolDemandServeRules below. It answers from the Ready() snapshot the demand
 // phase already holds, and deliberately declines to answer for the cases where
 // this command is not what will run: a template carrying its own WorkQuery
 // (which replaces this tier verbatim, see effectiveQuery), and a bead type or
 // label Ready() structurally excludes but ephemeralAssignedReadyProbeScript
-// still serves. It does not yet drop a dispatch-held assigned row (ga-v28pab):
-// a seat woken for one now reads past it to the routed tier instead of reading
-// nothing, which is the hook's behaviour before this filter too.
+// still serves. EXCEPTION, not yet mirrored: the controller does not drop a
+// dispatch-held assigned row (ga-v28pab step 2), so a seat can be woken for one;
+// that seat now reads past it to the routed tier instead of reading nothing.
 //
 // Change the flags here and that mirror needs the same change, or the pool goes
 // back to spawning seats for rows their own hooks are forbidden to claim.
@@ -965,10 +965,26 @@ func ephemeralAssignedInProgressProbeScript(shellVar string, topo QueryTopology)
 // assignee itself, so the rows are one identity's bounded window rather than the
 // unbounded full-tier scan ephemeralStatusSnapshotShell memoizes. The window is
 // ordered by creation and holds up to 20 rows, so the jq filters that follow
-// still see past a held or blocked first row. The identity is quoted inside the
+// still see past a blocked first row. The dispatch holds
+// (beadmeta.DispatchHoldLabels, never the human label) are excluded INSIDE the
+// query, ahead of that 20-row window: both callers drop held rows anyway, and
+// filtering only after the window let 20 older held rows hide an unheld
+// assignment behind them (#8010 carry review). The identity is quoted inside the
 // query language because aliases contain '/'.
 func bdQueryEphemeralAssignedStatusQuietShell(status, shellVar string) string {
-	return `bd query --json "ephemeral=true AND status=` + status + ` AND assignee=\"$` + shellVar + `\"" --sort created --limit=20 2>/dev/null`
+	return `bd query --json "ephemeral=true AND status=` + status + ` AND assignee=\"$` + shellVar + `\"` +
+		bdQueryExcludeLabelClauses(beadmeta.DispatchHoldLabels) + `" --sort created --limit=20 2>/dev/null`
+}
+
+// bdQueryExcludeLabelClauses renders one ` AND NOT label=\"<l>\"` clause per
+// label for a double-quoted bd query expression (bd's label= matches any one of
+// a bead's labels, so NOT drops every bead carrying it).
+func bdQueryExcludeLabelClauses(labels []string) string {
+	var clauses string
+	for _, label := range labels {
+		clauses += ` AND NOT label=\"` + label + `\"`
+	}
+	return clauses
 }
 
 func ephemeralAssignedInProgressProbeScriptDeferringGraphAnchor(shellVar string, topo QueryTopology) string {
@@ -1209,8 +1225,9 @@ func (a *Agent) effectiveQuery(kind queryKind, topo QueryTopology) string {
 // above.
 //
 // The assigned-ready tier skips dispatch-held rows (never the human label),
-// in its ready read and in its wisp probe alike, so a held assignment is
-// neither served nor able to mask other work (#8010).
+// in its ready read and in its wisp probe alike (inside the bd-1.0.5+ server
+// query, ahead of its 20-row window), so a held assignment is not served and
+// does not mask an unheld one behind it (#8010).
 //
 // When the reconciler runs the query for demand detection (no session
 // context), all identity vars are empty → assignee tiers skip → only

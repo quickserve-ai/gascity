@@ -422,3 +422,23 @@ func TestAssignedReadyWispStaysHumanTransparent(t *testing.T) {
 		}
 	}
 }
+
+// The bd-1.0.5+ server query behind the assigned wisp probes caps its window at
+// 20 rows, so the dispatch holds must be excluded inside the query, ahead of the
+// cap, or 20 older held rows hide an unheld assignment (#8010 carry review).
+// The human label is never excluded.
+func TestBdQueryAssignedWispWindowExcludesDispatchHoldsAheadOfItsLimit(t *testing.T) {
+	for _, status := range []string{"open", "in_progress"} {
+		got := bdQueryEphemeralAssignedStatusQuietShell(status, "id")
+		for _, label := range beadmeta.DispatchHoldLabels {
+			clause := `AND NOT label=\"` + label + `\"`
+			i, j := strings.Index(got, clause), strings.Index(got, "--limit=20")
+			if i < 0 || j < 0 || i > j {
+				t.Fatalf("status %s: want %q inside the query ahead of --limit=20, got %s", status, clause, got)
+			}
+		}
+		if strings.Contains(got, beadmeta.HumanLabel) {
+			t.Fatalf("status %s: the human label must stay eligible, got %s", status, got)
+		}
+	}
+}
