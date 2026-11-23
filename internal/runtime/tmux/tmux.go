@@ -192,6 +192,14 @@ type RuntimeTmuxConfig struct {
 	ReadyDelayMs      int      // fixed delay used when prompt detection unavailable
 }
 
+// ErrNudgeLockBusy is wrapped by every "nudge lock timeout" error: another
+// delivery (in this process or, since ga-bz7eo5, another gc process) held the
+// session's nudge lock past the timeout, and NOTHING was typed. Queue callers
+// back off on it without spending a delivery attempt, so a holder stuck in
+// another process cannot dead-letter a seat's queued nudges (the deafness the
+// cross-process lock exists to prevent).
+var ErrNudgeLockBusy = errors.New("nudge lock busy: nothing was delivered")
+
 // sessionNudgeLocks serializes nudges to the same session.
 // This prevents interleaving when multiple nudges arrive concurrently,
 // which can cause garbled input and missed Enter keys.
@@ -2021,18 +2029,31 @@ func getSessionNudgeSem(session string) chan struct{} {
 
 // acquireNudgeLock attempts to acquire the per-session nudge lock with a timeout.
 // Returns true if the lock was acquired, false if the timeout expired.
+//
+// The lock has two halves: this process's semaphore, then a cross-process
+// flock (acquireNudgeXLock, ga-bz7eo5) so a delivery from another gc process
+// (the supervisor's dispatcher, a live wait-idle nudge, a legacy poller)
+// cannot type into the same composer at the same time. Both share the one
+// timeout.
 func acquireNudgeLock(session string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
 	sem := getSessionNudgeSem(session)
 	select {
 	case sem <- struct{}{}:
-		return true
 	case <-time.After(timeout):
 		return false
 	}
+	if !acquireNudgeXLock(session, deadline) {
+		<-sem
+		return false
+	}
+	return true
 }
 
-// releaseNudgeLock releases the per-session nudge lock.
+// releaseNudgeLock releases the per-session nudge lock, cross-process half
+// first.
 func releaseNudgeLock(session string) {
+	releaseNudgeXLock(session)
 	sem := getSessionNudgeSem(session)
 	select {
 	case <-sem:
@@ -3418,7 +3439,7 @@ func (t *Tmux) nudgeSession(
 	// Serialize nudges to this session to prevent interleaving.
 	// Use a timed lock to avoid permanent blocking if a previous nudge hung.
 	if !acquireNudgeLock(session, t.cfg.NudgeLockTimeout) {
-		return fmt.Errorf("nudge lock timeout for session %q: previous nudge may be hung", session)
+		return fmt.Errorf("nudge lock timeout for session %q: previous nudge may be hung: %w", session, ErrNudgeLockBusy)
 	}
 	defer releaseNudgeLock(session)
 
@@ -3777,7 +3798,7 @@ func (t *Tmux) NudgePane(pane, message string) error {
 	// Serialize nudges to this pane to prevent interleaving.
 	// Use a timed lock to avoid permanent blocking if a previous nudge hung.
 	if !acquireNudgeLock(pane, t.cfg.NudgeLockTimeout) {
-		return fmt.Errorf("nudge lock timeout for pane %q: previous nudge may be hung", pane)
+		return fmt.Errorf("nudge lock timeout for pane %q: previous nudge may be hung: %w", pane, ErrNudgeLockBusy)
 	}
 	defer releaseNudgeLock(pane)
 
