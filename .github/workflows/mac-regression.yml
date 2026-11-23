@@ -83,7 +83,7 @@ env:
   # upstream release, TestBeadsProxiedDefaultNativeLane/status-zero-forks forks bd
   # 4 times (gc-xol7, ga-tkfdsb). scripts/beads_fleet_replace_test.go keeps this
   # on the replace's tag.
-  FLEET_BD_TAG: "v1.3.1-fleet.20261118.1"
+  FLEET_BD_TAG: "v1.3.1-fleet.20261120.1"
 
 # Tier routing is centralized in the `gate` job below, which always runs
 # and computes run_smoke/run_full/run_review_formulas plus a human-readable
