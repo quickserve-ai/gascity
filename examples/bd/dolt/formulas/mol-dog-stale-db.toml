@@ -106,28 +106,90 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# store_unresolved: this run could not reach the bead store it was given.
-# Nothing refused this dog, so it is not the stranded-bead case a human must
-# close by hand: it goes to the store-error route when one is configured
-# (GC_STORE_ERROR_RECIPIENT, a platform seat), the event stream and the
-# maintenance nudge, never to the human escalation route, and exits non-zero
-# (the trap drain-acks). The bead stays open for the next firing (ga-w8ptue).
-store_unresolved() {
-  local subject="$1"
-  local message="$2"
+# run_bounded: run one notice command (a mail, a nudge, the escalation script)
+# under a wall-clock bound, GC_STALE_DB_NOTICE_TIMEOUT_SECS (whole seconds,
+# 1-3600, default 60: above escalate.sh's own 30 s send bound). A mail can
+# stall opening the store or waking its recipient (gc mail send waits for the
+# wake), and a notice that hangs would keep this run from its drain-ack and its
+# exit, the very things the notice is reporting on. Delivery is best-effort
+# either way. Portable bash, no timeout(1), which a stock macOS lacks: the
+# command runs in the background; when the bound passes it and its direct
+# children get TERM, then KILL after a 2 s grace, and it is reaped.
+run_bounded() {
+  local secs="${GC_STALE_DB_NOTICE_TIMEOUT_SECS:-60}"
+  case "$secs" in
+    ''|*[!0-9]*) secs=60 ;;
+  esac
+  if [ "${#secs}" -gt 4 ]; then secs=3600; fi # no overflow, before any arithmetic
+  secs=$((10#$secs))                           # base 10: 010 is ten, 08 is eight
+  if [ "$secs" -lt 1 ]; then secs=60; fi
+  if [ "$secs" -gt 3600 ]; then secs=3600; fi
+  local limit=$((secs * 10))
+  "$@" &
+  local pid=$!
+  local tenths=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$tenths" -ge "$limit" ]; then
+      pkill -TERM -P "$pid" 2>/dev/null || true
+      kill -TERM "$pid" 2>/dev/null || true
+      local grace=0
+      while kill -0 "$pid" 2>/dev/null && [ "$grace" -lt 20 ]; do
+        sleep 0.1
+        grace=$((grace + 1))
+      done
+      pkill -KILL -P "$pid" 2>/dev/null || true
+      kill -KILL "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      echo "notice abandoned after ${secs}s: $1 $2 ${3:-}" >&2
+      return 124
+    fi
+    sleep 0.1
+    tenths=$((tenths + 1))
+  done
+  local rc=0
+  wait "$pid" || rc=$?
+  return "$rc"
+}
+
+# platform_failure: a failure that no ownership refusal explains. Nothing
+# refused this dog, so it is not the stranded-bead case a human must close by
+# hand: it goes to the store-error route (GC_STORE_ERROR_RECIPIENT, a platform
+# seat), the event stream and the maintenance nudge, never as a HIGH refusal,
+# and exits non-zero (the trap drain-acks). The bead stays open for the next
+# firing. $1 is the event's short name (store-unresolved, close-failed).
+# With no store-error route set, one plain infrastructure mail goes to the
+# escalation recipient instead: an event and an unset nudge reach nobody, and
+# a failure that recurs every firing with nobody told is the re-dispatch loop
+# this formula fails loudly to prevent (we-m34w5; ga-w8ptue, 2026-11-21: no
+# city had set the route). It is a direct mail, not send_escalation, because
+# this runs before the escalation script is resolved below.
+platform_failure() {
+  local kind="$1"
+  local subject="$2"
+  local message="$3"
   echo "$message" >&2
   if [ -n "${GC_STORE_ERROR_RECIPIENT:-}" ]; then
-    gc mail send "$GC_STORE_ERROR_RECIPIENT" -s "$subject" \
+    run_bounded gc mail send "$GC_STORE_ERROR_RECIPIENT" -s "$subject" \
       -m "${message}. Not an ownership refusal. The bead stays open and the next firing's dog retries." \
-      || echo "send store-unresolved notice failed; continuing to drain-ack" >&2
+      || echo "send ${kind} notice failed; continuing to drain-ack" >&2
+  else
+    run_bounded gc mail send "${GC_ESCALATION_RECIPIENT:-human}" -s "$subject" \
+      -m "${message}. Not an ownership refusal: an infrastructure failure, sent here because no store-error route (GC_STORE_ERROR_RECIPIENT) is set. Nothing to close by hand: the bead stays open and the next firing's dog retries." \
+      || echo "send ${kind} notice failed; continuing to drain-ack" >&2
   fi
-  gc event emit mol-dog-stale-db.store-unresolved --message "$message" \
-    || echo "emit store-unresolved event failed; continuing to drain-ack" >&2
+  gc event emit "mol-dog-stale-db.${kind}" --message "$message" \
+    || echo "emit ${kind} event failed; continuing to drain-ack" >&2
   if [ -n "${GC_MAINTENANCE_DONE_TARGET:-}" ]; then
-    gc session nudge "$GC_MAINTENANCE_DONE_TARGET" "MAINTENANCE_WARN: stale-db ${message}" || true
+    run_bounded gc session nudge "$GC_MAINTENANCE_DONE_TARGET" "MAINTENANCE_WARN: stale-db ${message}" || true
   fi
   if gc runtime drain-ack; then DRAIN_ACKED=1; fi # drain-ack before failing open; on failure the trap tries again
   exit 1
+}
+
+# store_unresolved: this run could not reach the bead store it was given
+# (ga-w8ptue).
+store_unresolved() {
+  platform_failure store-unresolved "$1" "$2"
 }
 
 # Run from the work bead's store root, never from wherever this shell happens
@@ -223,17 +285,17 @@ send_escalation() {
   local subject="$1"
   local message="$2"
   if [ -n "$ESCALATE_SCRIPT" ] && [ -x "$ESCALATE_SCRIPT" ]; then
-    "$ESCALATE_SCRIPT" --subject "$subject" --message "$message"
+    run_bounded "$ESCALATE_SCRIPT" --subject "$subject" --message "$message"
     return
   fi
-  gc mail send "${GC_ESCALATION_RECIPIENT:-human}" -s "$subject" -m "$message"
+  run_bounded gc mail send "${GC_ESCALATION_RECIPIENT:-human}" -s "$subject" -m "$message"
 }
 
 maintenance_notice() {
   local message="$1"
   local target="${GC_MAINTENANCE_DONE_TARGET:-}"
   [ -n "$target" ] || return 0
-  gc session nudge "$target" "$message" || true
+  run_bounded gc session nudge "$target" "$message" || true
 }
 
 drain_ack_once() {
@@ -439,16 +501,32 @@ CLOSE_FILE="$TMP_DIR/close.log"
 if ! close_work_bead "Stale DB scan complete (orphans=${ORPHAN_TOTAL}, applied=${APPLIED}, escalated=${ESCALATED})" > "$CLOSE_FILE" 2>&1; then
   cat "$CLOSE_FILE" >&2
   CLOSE_REFUSAL="$(tr '\n' ' ' < "$CLOSE_FILE")"
-  # bd could not find or reach its store: not a refusal (store_unresolved
-  # above). These are the texts bd and gc print for a missing store, a Dolt
-  # server that cannot be reached (seen live on 2026-11-18) and a connection
-  # lost mid-call (the availability family internal/dispatch/control.go treats
-  # as retryable, never as a refusal). Any
-  # OTHER close failure still takes the HIGH route below (ga-7ws7gu).
+  # Classify the failure, the authority refusals FIRST (ga-7ws7gu). bd refuses
+  # a close for authority in two texts (bd 1.3.1-fleet.20261005.1,
+  # internal/validation/issue.go): the ownership guard, 'cannot close <id>:
+  # assignee is "<A>", actor is "<B>"; reclaim or use --force to override',
+  # and the deletion-protection flag, 'cannot modify pinned issue <id> (use
+  # --force to override)'. Only someone with authority may --force past
+  # either, so only these take the HIGH route below, and they are matched
+  # before the availability texts so a refusal printed beside an unrelated
+  # connection warning still reaches a person.
+  # Next, bd could not find or reach its store (store_unresolved above): the
+  # texts bd and gc print for a missing store, a Dolt server that cannot be
+  # reached (seen live on 2026-11-18) and a connection lost mid-call (the
+  # availability family internal/dispatch/control.go treats as retryable).
+  # Anything else (a gate refusal, a template, no error text at all) is not
+  # an ownership refusal either: it takes the platform route as close-failed,
+  # never the human route with advice to close the bead by hand.
   case "$CLOSE_REFUSAL" in
+    *'assignee is "'*'actor is "'*'reclaim or use --force'*|*'cannot modify pinned issue'*)
+      ;;
     *"no beads database found"*|*"failed to open database"*|*"circuit breaker is open"*|*"server unreachable"*|*"connection refused"*|*"i/o timeout"*|*"bad connection"*|*"connection reset by peer"*)
       store_unresolved "stale-db: terminal close could not reach a bead store for ${WORK_BEAD}" \
         "terminal close for ${WORK_BEAD} could not reach a bead store from $(pwd): ${CLOSE_REFUSAL}"
+      ;;
+    *)
+      platform_failure close-failed "stale-db: terminal close failed for ${WORK_BEAD}" \
+        "terminal close for ${WORK_BEAD} failed, not an ownership refusal: ${CLOSE_REFUSAL:-no error text}"
       ;;
   esac
   CLOSE_REFUSAL_MESSAGE="terminal close refused for ${WORK_BEAD} (actor presented: ${CLOSE_ACTOR:-none}): ${CLOSE_REFUSAL:-no error text}"

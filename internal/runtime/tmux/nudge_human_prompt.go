@@ -14,8 +14,10 @@ import (
 	"github.com/gastownhall/gascity/internal/sessionlog"
 )
 
-// ErrNudgeDeferredHumanPrompt means a nudge sent NO keys because the target
-// pane was showing something that answers to keystrokes on a human's behalf:
+// ErrNudgeDeferredHumanPrompt means a nudge sent no further keys because the
+// target pane was showing something that answers to keystrokes on a human's
+// behalf (before typing, nothing was typed; at stage before_submit the text had
+// reached the pane and the Enter was withheld, see NudgeDeferredAfterTyping):
 // a question dialog, an approval prompt, another numbered selection list, or a
 // human's half-typed draft on an attached session (ga-ubfc7j). Claude Code's
 // AskUserQuestion dialog is quiet and shows no spinner, so to the old
@@ -23,7 +25,7 @@ import (
 // Enter the nudge path sent SELECTED the highlighted option, then submitted
 // the dialog as "User answered Claude's questions".
 //
-// The nudge was not delivered and nothing was typed, so a caller that can
+// The nudge was not delivered, so a caller that can
 // retry must keep the message queued and try again on a later pass. It is not
 // a delivery failure: the queue must not spend one of the item's bounded
 // attempts on it, or a dialog left open for an hour would dead-letter every
@@ -44,6 +46,11 @@ const (
 	// NudgeDeferReasonSelectionPrompt: any other numbered option list with a
 	// cursor on it. Enter picks the highlighted row, so it is refused too.
 	NudgeDeferReasonSelectionPrompt = "selection_prompt"
+	// NudgeDeferReasonConfirmDialog: an unnumbered confirm dialog at the
+	// bottom of the pane, a cursor row over an "Enter to confirm" footer
+	// (Claude Code's folder-trust prompt, the Chrome-extension prompt, the
+	// spend-limit modal; ga-fu4dtk). Enter picks the highlighted row.
+	NudgeDeferReasonConfirmDialog = "confirm_dialog"
 	// NudgeDeferReasonHumanDraft: the composer holds text on an ATTACHED
 	// session, so a person may be mid-message. Before the first Enter
 	// (stage before_submit) it means the composer holds text that is not
@@ -202,6 +209,16 @@ func lastComposerLine(lines []string, promptPrefix string) (int, string) {
 // checkDraft asks whether a non-empty composer should defer too. The caller
 // sets it only for an attached claude pane (see Tmux.humanPromptGuard).
 func classifyHumanPrompt(lines []string, promptPrefix string, checkDraft bool) string {
+	// An unnumbered confirm dialog at the bottom of the pane is refused before
+	// the composer is looked for: its cursor row starts with the prompt glyph
+	// and would read as the composer (ga-fu4dtk). The one machine dialog of
+	// that shape the nudge path dismisses itself, the token-ceiling resume
+	// selector, matched structurally (isClaudeResumeSelectorBlock: never by
+	// substrings, which quoted text or scrollback could supply), falls through
+	// to the rules below unchanged, as do panes with no such dialog.
+	if block, ok := bottomConfirmDialog(lines); ok && !isClaudeResumeSelectorBlock(block) {
+		return NudgeDeferReasonConfirmDialog
+	}
 	composerIdx, _ := lastComposerLine(lines, promptPrefix)
 	if reason := classifyDialog(lines[composerIdx+1:]); reason != "" {
 		return reason
@@ -281,6 +298,144 @@ func composerBoxText(lines []string, promptPrefix string) (string, bool) {
 func isHorizontalRule(line string) bool {
 	s := strings.TrimSpace(line)
 	return utf8.RuneCountInString(s) >= 8 && strings.Trim(s, "─━") == ""
+}
+
+// confirmDialogFooter reports whether a normalized line looks like the footer
+// Claude Code draws under an unnumbered confirm dialog ("Enter to confirm ·
+// Esc to cancel"). It is deliberately broad, because it only ever adds a
+// refusal; the resume-selector exemption compares its footer exactly.
+func confirmDialogFooter(s string) bool {
+	return strings.Contains(s, "Enter to confirm") && strings.Contains(s, "Esc to ")
+}
+
+// confirmDialogCursorMaxRows bounds how far above its footer a confirm
+// dialog's cursor row may sit: the remaining option rows plus blank padding.
+const confirmDialogCursorMaxRows = 8
+
+// confirmDialogHeadingRows is how many non-blank lines above the cursor row
+// belong to the dialog's own block for naming it (its title and any line
+// under it); blank padding between them is skipped.
+const confirmDialogHeadingRows = 3
+
+// bottomConfirmDialog reports an UNNUMBERED confirm dialog that is the active
+// bottom block of the pane (ga-fu4dtk): its "Enter to confirm" footer is the
+// lowest footer with no horizontal rule below it (trailing status or hint
+// lines allowed), and a cursor row ("❯ <label>", not a numbered
+// or radio option) sits above it within confirmDialogCursorMaxRows lines with
+// no horizontal rule between. Claude Code draws its folder-trust prompt
+// ("❯ No, exit" / "Yes, I trust this folder", captured live 2026-11-22 on
+// v2.1.330), the Chrome-extension prompt and the spend-limit modal this way.
+// Enter picks the cursor row: on the trust prompt that exits the session.
+//
+// It returns the block's lines (heading through the bottom of the pane) and true. Only the
+// bottom block counts: a dialog left above a later one, or footer text quoted
+// in a composer (which Claude closes with a rule and status lines below), is
+// history, not the prompt on screen.
+func bottomConfirmDialog(lines []string) ([]string, bool) {
+	// The footer is the lowest footer line with no horizontal rule below it,
+	// within the last confirmDialogCursorMaxRows lines: a status or hint line
+	// drawn under the dialog does not hide it (fail closed), while a footer
+	// quoted above Claude's composer box is cut off by the box's rules.
+	last := -1
+	for i, seen := len(lines)-1, 0; i >= 0 && seen <= confirmDialogCursorMaxRows; i-- {
+		if strings.TrimSpace(lines[i]) == "" {
+			continue
+		}
+		if isHorizontalRule(lines[i]) {
+			break
+		}
+		if confirmDialogFooter(normalizePaneLine(lines[i])) {
+			last = i
+			break
+		}
+		seen++
+	}
+	if last < 0 {
+		return nil, false
+	}
+	for i := last - 1; i >= 0 && i >= last-confirmDialogCursorMaxRows; i-- {
+		if isHorizontalRule(lines[i]) {
+			return nil, false
+		}
+		s := normalizePaneLine(lines[i])
+		label, ok := cutCursorGlyph(s)
+		if !ok || label == "" {
+			continue
+		}
+		if option, _ := selectionOption(s); option {
+			// A numbered or radio list: classifyDialog's own rules judge it.
+			return nil, false
+		}
+		// The heading rows are counted as NON-BLANK lines: a dialog may pad
+		// its heading with blank rows, which must not push the heading out.
+		start, seen := i, 0
+		for j := i - 1; j >= 0 && seen < confirmDialogHeadingRows; j-- {
+			if isHorizontalRule(lines[j]) {
+				break
+			}
+			start = j
+			if strings.TrimSpace(lines[j]) != "" {
+				seen++
+			}
+		}
+		// The block runs to the bottom of the pane, trailing lines included, so
+		// the resume-selector exemption compares what is really at the bottom:
+		// content under the footer can never be dropped from that comparison.
+		return lines[start:], true
+	}
+	return nil, false
+}
+
+// isClaudeResumeSelectorBlock reports whether a bottom confirm block (from
+// bottomConfirmDialog) is exactly Claude Code's token-ceiling resume selector:
+// the line directly above the cursor row is "Resume previous conversation?",
+// the cursor row is "Resume from summary", and the only other row before the
+// footer is "Resume full session as-is" (blank rows ignored, text exact). Anything else,
+// a dialog that merely quotes those labels or a stale selector above a live
+// dialog included, is not it.
+func isClaudeResumeSelectorBlock(block []string) bool {
+	// Exact rows, as captured (runtime's claudeResumeDialogPane): each row's
+	// trimmed text, with no box border stripped and no other cursor glyph,
+	// must equal the captured row. Blank rows are the only variation allowed.
+	// Any other rendering is refused: the guard fails closed, so an
+	// unrecognized real selector makes the seat wait (visible as a deferral),
+	// where accepting a look-alike would let the dismissal press Enter on a
+	// person's dialog.
+	want := []string{
+		"Resume previous conversation?",
+		"❯ Resume from summary",
+		"Resume full session as-is",
+		"Enter to confirm · Esc to cancel",
+	}
+	var rows []string
+	for _, line := range block {
+		if s := strings.TrimSpace(strings.ReplaceAll(line, "\u00a0", " ")); s != "" {
+			rows = append(rows, s)
+		}
+	}
+	// The block may carry unrelated rows above the heading (bottomConfirmDialog
+	// keeps a few for naming); the dialog is its last four non-blank rows.
+	if len(rows) < len(want) {
+		return false
+	}
+	rows = rows[len(rows)-len(want):]
+	for i := range want {
+		if rows[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// cutCursorGlyph strips a leading selection-cursor glyph and the space after
+// it, reporting whether one was there.
+func cutCursorGlyph(s string) (string, bool) {
+	for _, glyph := range []string{"❯", "›", "▸", "▶", "→"} {
+		if rest, ok := strings.CutPrefix(s, glyph); ok {
+			return strings.TrimSpace(rest), true
+		}
+	}
+	return "", false
 }
 
 // classifyDialog looks for a dialog in the live region of a pane.
@@ -730,6 +885,13 @@ func (t *Tmux) classifyLifecycleHumanPrompt(session, target string, lines []stri
 	switch reason {
 	case NudgeDeferReasonSelectionPrompt:
 		return ""
+	case NudgeDeferReasonConfirmDialog:
+		// Before ga-fu4dtk the confirm dialog's cursor row read as a composer
+		// draft, which held an attached Claude seat. Keep that hold, and only
+		// that one: a detached pane's dialog does not hold, as before.
+		if t.sessionClientCount(session) == 0 || !t.paneIsClaudeFamily(target) {
+			return ""
+		}
 	case NudgeDeferReasonHumanDraft:
 		if t.composerHoldsOnlyDimText(target, prefix) {
 			return ""

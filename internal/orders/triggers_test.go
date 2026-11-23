@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -1278,5 +1279,125 @@ func TestCheckTriggerConditionExitAbove1IsProbeError(t *testing.T) {
 	}
 	if !strings.HasPrefix(result.Reason, ConditionProbeErrorMarker) {
 		t.Errorf("Reason = %q, want prefix %q (a broken probe must not read as a quiet not-met)", result.Reason, ConditionProbeErrorMarker)
+	}
+}
+
+// TestNextCronOccurrenceAfter pins the slot a reader judges a cron order
+// against (ga-6703d7): the first matching wall-clock minute strictly after the
+// last firing and no later than now, in the order's own zone.
+func TestNextCronOccurrenceAfter(t *testing.T) {
+	la, err := time.LoadLocation("America/Los_Angeles")
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := func(d, h, m int) time.Time { return time.Date(2026, 11, d, h, m, 0, 0, la) }
+	uneven := Order{Name: "tool-cache-reclaim", Trigger: "cron", Schedule: "50 1-5 * * *", TZ: "America/Los_Angeles"}
+	cases := []struct {
+		name       string
+		order      Order
+		after, now time.Time
+		want       time.Time
+		wantOK     bool
+	}{
+		{"between runs: next slot is tomorrow 01:50, not yet due", uneven, at(21, 5, 51), at(21, 21, 48), time.Time{}, false},
+		{"next slot reached", uneven, at(21, 5, 51), at(22, 1, 50), at(22, 1, 50), true},
+		{"fired on its slot: the next hourly slot", uneven, at(22, 1, 50), at(22, 3, 0), at(22, 2, 50), true},
+		{"a day missed: the first missed slot", uneven, at(20, 5, 51), at(21, 21, 48), at(21, 1, 50), true},
+		{
+			"seconds on the firing do not re-match its own minute",
+			Order{Trigger: "cron", Schedule: "*/30 * * * *", TZ: "UTC"},
+			time.Date(2026, 11, 21, 11, 0, 42, 0, time.UTC), time.Date(2026, 11, 21, 11, 29, 0, 0, time.UTC),
+			time.Time{},
+			false,
+		},
+	}
+	for _, tc := range cases {
+		got, ok, err := NextCronOccurrenceAfter(tc.order, tc.after, tc.now)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if ok != tc.wantOK || (ok && !got.Equal(tc.want)) {
+			t.Errorf("%s: got (%v, %v), want (%v, %v)", tc.name, got, ok, tc.want, tc.wantOK)
+		}
+	}
+	if _, _, err := NextCronOccurrenceAfter(Order{Trigger: "cron", Schedule: "61 * * * *"}, at(21, 0, 0), at(21, 1, 0)); err == nil {
+		t.Error("an unparseable schedule must return an error, not 'not due'")
+	}
+}
+
+// TestNextCronOccurrenceAfterFollowsCheckCronDST pins the helper to checkCron's
+// DST policy (both run scanCronCatchup): on fall-back the repeated wall-clock
+// minute is one slot, and on spring-forward a slot inside the skipped hour is
+// due at the first real minute after the jump.
+func TestNextCronOccurrenceAfterFollowsCheckCronDST(t *testing.T) {
+	ny, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Fall-back: 2026-11-01 01:59:59 EDT -> 01:00 EST. The order fired at the
+	// first 01:30 (EDT); the second 01:30 (EST) is the same wall-clock slot.
+	daily0130 := Order{Name: "fb", Trigger: "cron", Schedule: "30 1 * * *", TZ: "America/New_York"}
+	firstOneThirty := time.Date(2026, 11, 1, 5, 30, 0, 0, time.UTC) // 01:30 EDT
+	if got := firstOneThirty.In(ny); got.Hour() != 1 || got.Minute() != 30 {
+		t.Fatalf("fixture: %v is not 01:30 New York", got)
+	}
+	if slot, ok, err := NextCronOccurrenceAfter(daily0130, firstOneThirty, time.Date(2026, 11, 1, 13, 30, 0, 0, ny)); err != nil || ok {
+		t.Errorf("fall-back repeat counted as a new slot: got (%v, %v, %v), want not due", slot, ok, err)
+	}
+	// Spring-forward: 2027-03-14 02:00 EST -> 03:00 EDT, so 02:30 never exists.
+	daily0230 := Order{Name: "sf", Trigger: "cron", Schedule: "30 2 * * *", TZ: "America/New_York"}
+	slot, ok, err := NextCronOccurrenceAfter(daily0230, time.Date(2027, 3, 13, 2, 30, 0, 0, ny), time.Date(2027, 3, 14, 15, 0, 0, 0, ny))
+	want := time.Date(2027, 3, 14, 3, 0, 0, 0, ny)
+	if err != nil || !ok || !slot.Equal(want) {
+		t.Errorf("spring-forward slot = (%v, %v, %v), want (%v, true) as checkCron fires it", slot, ok, err, want)
+	}
+}
+
+// The first missed slot is found however old the last firing is, a leap-day
+// schedule reaches its next slot, an explicit tz wins over until's location,
+// and until at or before the firing is never due.
+func TestNextCronOccurrenceAfterBoundsAndZones(t *testing.T) {
+	utc := func(y int, m time.Month, d, h, mi int) time.Time { return time.Date(y, m, d, h, mi, 0, 0, time.UTC) }
+	annual := Order{Name: "yearly", Trigger: "cron", Schedule: "0 0 1 1 *", TZ: "UTC"}
+	if slot, ok, err := NextCronOccurrenceAfter(annual, utc(2020, 1, 1, 0, 0), utc(2026, 6, 1, 0, 0)); err != nil || !ok || !slot.Equal(utc(2021, 1, 1, 0, 0)) {
+		t.Errorf("annual dead since 2020: got (%v, %v, %v), want its first missed slot 2021-01-01", slot, ok, err)
+	}
+	if slot, ok, err := NextCronOccurrenceAfter(annual, utc(2025, 1, 1, 0, 0), utc(2026, 1, 3, 0, 0)); err != nil || !ok || !slot.Equal(utc(2026, 1, 1, 0, 0)) {
+		t.Errorf("annual just past a year: got (%v, %v, %v), want 2026-01-01", slot, ok, err)
+	}
+	leap := Order{Name: "leap", Trigger: "cron", Schedule: "0 0 29 2 *", TZ: "UTC"}
+	if slot, ok, err := NextCronOccurrenceAfter(leap, utc(2024, 2, 29, 0, 0), utc(2026, 6, 1, 0, 0)); err != nil || ok {
+		t.Errorf("leap-day order between leap years: got (%v, %v, %v), want not due", slot, ok, err)
+	}
+	if slot, ok, err := NextCronOccurrenceAfter(leap, utc(2024, 2, 29, 0, 0), utc(2028, 3, 1, 0, 0)); err != nil || !ok || !slot.Equal(utc(2028, 2, 29, 0, 0)) {
+		t.Errorf("leap-day order after the next leap day: got (%v, %v, %v), want 2028-02-29", slot, ok, err)
+	}
+	// tz America/Los_Angeles with times handed in UTC: 01:50 Los Angeles is 09:50Z in November.
+	la := Order{Name: "la", Trigger: "cron", Schedule: "50 1 * * *", TZ: "America/Los_Angeles"}
+	if slot, ok, err := NextCronOccurrenceAfter(la, utc(2026, 11, 21, 9, 51), utc(2026, 11, 22, 9, 55)); err != nil || !ok || !slot.Equal(utc(2026, 11, 22, 9, 50)) {
+		t.Errorf("tz override: got (%v, %v, %v), want 2026-11-22 09:50Z", slot, ok, err)
+	}
+	hourly := Order{Name: "h", Trigger: "cron", Schedule: "0 * * * *", TZ: "UTC"}
+	for _, until := range []time.Time{utc(2026, 1, 1, 10, 30), utc(2026, 1, 1, 9, 0)} {
+		if slot, ok, err := NextCronOccurrenceAfter(hourly, utc(2026, 1, 1, 10, 30), until); err != nil || ok {
+			t.Errorf("until %v at or before last: got (%v, %v, %v), want not due", until, slot, ok, err)
+		}
+	}
+}
+
+// A scan that reaches its bound before until without a slot is
+// ErrCronScanExhausted, never "not due": "0 0 1 1 1" (1 January AND a Monday)
+// fired on Monday 2024-01-01 next fires on Monday 2029-01-01, past the bound.
+func TestNextCronOccurrenceAfterExhaustedIsAnError(t *testing.T) {
+	order := Order{Name: "jan1-monday", Trigger: "cron", Schedule: "0 0 1 1 1", TZ: "UTC"}
+	last := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	if _, ok, err := NextCronOccurrenceAfter(order, last, last.Add(maxNextCronOccurrenceScan)); err != nil || ok {
+		t.Errorf("until exactly at the bound: got (%v, %v), want not due and no error", ok, err)
+	}
+	if _, ok, err := NextCronOccurrenceAfter(order, last, last.Add(maxNextCronOccurrenceScan+time.Minute)); !errors.Is(err, ErrCronScanExhausted) || ok {
+		t.Errorf("until a minute past the bound: got (%v, %v), want ErrCronScanExhausted", ok, err)
+	}
+	if _, _, err := NextCronOccurrenceAfter(order, last, time.Date(2032, 1, 2, 0, 0, 0, 0, time.UTC)); !errors.Is(err, ErrCronScanExhausted) {
+		t.Errorf("checked in 2032: err = %v, want ErrCronScanExhausted", err)
 	}
 }

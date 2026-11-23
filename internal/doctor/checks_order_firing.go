@@ -831,7 +831,7 @@ func (c *OrderFiringCurrentCheck) latestOrderFiredAtUsing(lastRun OrderFiringCur
 	if lastRun == nil {
 		return latest, nil
 	}
-	if !eventEvidenceSuffices(latest, expected, now) {
+	if !eventEvidenceSuffices(order, latest, expected, now) {
 		runAt, err := lastRun(order)
 		if err != nil {
 			return time.Time{}, err
@@ -847,8 +847,42 @@ func (c *OrderFiringCurrentCheck) latestOrderFiredAtUsing(lastRun OrderFiringCur
 // order current". Anything else needs the authoritative order-run lookup: the
 // event log can lag, and a stale event must not be reported as a real outage
 // without confirmation.
-func eventEvidenceSuffices(latest time.Time, expected time.Duration, now time.Time) bool {
-	return !latest.IsZero() && now.Sub(latest) < expected+expected/2
+//
+// It applies classifyOrderFiring's own measure (judgedFiringAge), so the event
+// log suffices exactly when it alone would judge the order current: a cron
+// order in the long gap of an uneven schedule needs no store read, and one the
+// events would call overdue is always confirmed against the store first.
+func eventEvidenceSuffices(order orders.Order, latest time.Time, expected time.Duration, now time.Time) bool {
+	return !latest.IsZero() && judgedFiringAge(order, latest, expected, now) < expected+expected/2
+}
+
+// judgedFiringAge is the age the staleness thresholds compare (overdue at
+// 1.5x expected, stale at 3x). For a cooldown order it is the age of the last
+// firing. For a cron order it is measured from the first slot after that
+// firing that the dispatcher would treat as due (orders.NextCronOccurrenceAfter:
+// the dispatcher's zone, catch-up scan, DST policy and lookback), plus one
+// interval, so the thresholds keep their meaning: overdue half an interval
+// past a missed slot, stale two intervals past it. A cron order with no slot
+// due yet is 0. For an evenly spaced schedule that fired on its slot the next
+// slot is lastFired+expected, so this equals the plain age; for an uneven one
+// ("50 1-5 * * *", whose expected is its 1 h minimum gap) the long gap between
+// runs no longer reads as stale (ga-6703d7). A schedule the helper cannot
+// evaluate, or whose bounded scan ran out before now without a slot
+// (orders.ErrCronScanExhausted), falls back to the plain age: never to
+// "current".
+func judgedFiringAge(order orders.Order, lastFired time.Time, expected time.Duration, now time.Time) time.Duration {
+	age := nonNegativeDuration(now.Sub(lastFired))
+	if order.Trigger != "cron" {
+		return age
+	}
+	due, ok, err := orders.NextCronOccurrenceAfter(order, lastFired, now)
+	if err != nil {
+		return age
+	}
+	if !ok {
+		return 0
+	}
+	return nonNegativeDuration(now.Sub(due)) + expected
 }
 
 // pendingLastRunOrders returns the monitored orders the event log cannot
@@ -873,7 +907,7 @@ func (c *OrderFiringCurrentCheck) pendingLastRunOrders(allOrders []orders.Order,
 		if err != nil {
 			continue
 		}
-		if eventEvidenceSuffices(latestOrderFiredAt(firedEvents, order.ScopedName()), expected, now) {
+		if eventEvidenceSuffices(order, latestOrderFiredAt(firedEvents, order.ScopedName()), expected, now) {
 			continue
 		}
 		pending = append(pending, order)
@@ -982,10 +1016,11 @@ func classifyOrderFiring(order orders.Order, now time.Time, expected time.Durati
 	}
 
 	age := nonNegativeDuration(now.Sub(lastFired))
+	judged := judgedFiringAge(order, lastFired, expected, now)
 	switch {
-	case age >= expected*3:
+	case judged >= expected*3:
 		return StatusError, SeverityBlocking, fmt.Sprintf("%s: last fired %s ago, expected every %s (CRITICAL: stale)", name, formatOrderFiringDuration(age), formatOrderFiringDuration(expected)), false
-	case age >= expected+expected/2:
+	case judged >= expected+expected/2:
 		return StatusWarning, SeverityBlocking, fmt.Sprintf("%s: last fired %s ago, expected every %s (overdue)", name, formatOrderFiringDuration(age), formatOrderFiringDuration(expected)), false
 	default:
 		return StatusOK, SeverityBlocking, fmt.Sprintf("%s: last fired %s ago, expected every %s", name, formatOrderFiringDuration(age), formatOrderFiringDuration(expected)), true

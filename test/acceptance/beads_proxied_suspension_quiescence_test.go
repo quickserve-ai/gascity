@@ -9,6 +9,7 @@
 package acceptance_test
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -89,6 +90,10 @@ const suspendDrainWait = 3 * time.Minute
 type scopeRecordingBD struct {
 	path    string
 	logPath string
+	// offset is the log's size at the last reset: calls before it are kept
+	// on disk, so a failure can show what ran just before its window opened.
+	offset  int64
+	resetAt time.Time
 }
 
 func newScopeRecordingBD(t *testing.T, realBD string) *scopeRecordingBD {
@@ -120,16 +125,25 @@ exec %s "$@"
 
 func shellQuoteArg(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 
-// reset forgets every call recorded so far.
+// reset starts a new window: callsUnder sees only calls recorded after it.
+// The earlier calls stay in the log for callsUnderBefore.
 func (r *scopeRecordingBD) reset(t *testing.T) {
 	t.Helper()
-	if err := os.Remove(r.logPath); err != nil && !os.IsNotExist(err) {
+	r.resetAt = time.Now()
+	info, err := os.Stat(r.logPath)
+	switch {
+	case os.IsNotExist(err):
+		r.offset = 0
+	case err != nil:
 		t.Fatal(err)
+	default:
+		r.offset = info.Size()
 	}
 }
 
-// callsUnder returns the recorded calls that targeted a scope under root.
-func (r *scopeRecordingBD) callsUnder(t *testing.T, root string) []string {
+// logLines returns the log's lines after the last reset (after=true) or
+// before it (after=false).
+func (r *scopeRecordingBD) logLines(t *testing.T, after bool) []string {
 	t.Helper()
 	data, err := os.ReadFile(r.logPath)
 	if os.IsNotExist(err) {
@@ -138,8 +152,36 @@ func (r *scopeRecordingBD) callsUnder(t *testing.T, root string) []string {
 	if err != nil {
 		t.Fatal(err)
 	}
+	cut := recordBoundary(data, r.offset)
+	if after {
+		data = data[cut:]
+	} else {
+		data = data[:cut]
+	}
+	return strings.Split(string(data), "\n")
+}
+
+// recordBoundary moves a reset offset forward to the end of the record it
+// falls inside. A record whose write straddled the reset started before the
+// window, so it belongs before it, as the old delete-at-reset dropped it whole;
+// cutting it in two would count its tail as a call inside the window.
+func recordBoundary(data []byte, offset int64) int64 {
+	if offset >= int64(len(data)) {
+		return int64(len(data))
+	}
+	if offset <= 0 || data[offset-1] == '\n' {
+		return max(offset, 0)
+	}
+	if i := bytes.IndexByte(data[offset:], '\n'); i >= 0 {
+		return offset + int64(i) + 1
+	}
+	return int64(len(data))
+}
+
+// underRoot keeps the lines whose target (not their callers) names root.
+func underRoot(lines []string, root string) []string {
 	var hits []string
-	for _, line := range strings.Split(string(data), "\n") {
+	for _, line := range lines {
 		// The callers only explain a call; the scope is what it targeted.
 		target, _, _ := strings.Cut(line, " callers=")
 		if line != "" && strings.Contains(target, root) {
@@ -147,6 +189,40 @@ func (r *scopeRecordingBD) callsUnder(t *testing.T, root string) []string {
 		}
 	}
 	return hits
+}
+
+// callsUnderBefore returns the calls under root recorded in the span before
+// the last reset. A call that started before the window and caused something
+// inside it (a proxy it started, a stop that followed) shows up here.
+func (r *scopeRecordingBD) callsUnderBefore(t *testing.T, root string, span time.Duration) []string {
+	t.Helper()
+	from := r.resetAt.Add(-span).Unix()
+	var hits []string
+	for _, line := range underRoot(r.logLines(t, false), root) {
+		var ts int64
+		if _, err := fmt.Sscanf(line, "ts=%d", &ts); err == nil && ts >= from {
+			hits = append(hits, line)
+		}
+	}
+	return hits
+}
+
+// preWindowNote renders callsUnderBefore for a failure message.
+func (r *scopeRecordingBD) preWindowNote(t *testing.T, root string) string {
+	t.Helper()
+	const span = 30 * time.Second
+	before := r.callsUnderBefore(t, root, span)
+	if len(before) == 0 {
+		return fmt.Sprintf("\nno call under %s in the %s before the window opened", root, span)
+	}
+	return fmt.Sprintf("\n%d call(s) under %s in the %s before the window opened:\n%s", len(before), root, span, strings.Join(before, "\n"))
+}
+
+// callsUnder returns the calls recorded since the last reset that targeted a
+// scope under root.
+func (r *scopeRecordingBD) callsUnder(t *testing.T, root string) []string {
+	t.Helper()
+	return underRoot(r.logLines(t, true), root)
 }
 
 // runEveryCityOrder runs each city-level order once with `gc order run`, all
@@ -274,10 +350,10 @@ func TestProxiedSuspensionIsQuiescenceSuspendedRig(t *testing.T) {
 		t.Logf("gc touched the running city %d time(s) in the %s window", n, window)
 	}
 	if calls := shim.callsUnder(t, rigDir); len(calls) > 0 {
-		t.Fatalf("gc touched the suspended rig %d time(s) in %s (orders run: %s):\n%s", len(calls), time.Since(start).Round(time.Second), strings.Join(ran, ", "), strings.Join(calls, "\n"))
+		t.Fatalf("gc touched the suspended rig %d time(s) in %s (orders run: %s):\n%s%s", len(calls), time.Since(start).Round(time.Second), strings.Join(ran, ", "), strings.Join(calls, "\n"), shim.preWindowNote(t, rigDir))
 	}
 	if started := doltProcessesUnder(t, rigDir); len(started) > 0 {
-		t.Fatalf("the suspended rig's pair came back:\n%s", strings.Join(started, "\n"))
+		t.Fatalf("the suspended rig's pair came back:\n%s%s", strings.Join(started, "\n"), shim.preWindowNote(t, rigDir))
 	}
 	if out, err := city.GC("rig", "resume", rigName); err != nil {
 		t.Fatalf("gc rig resume: %v\n%s", err, out)
@@ -309,10 +385,10 @@ func TestProxiedSuspensionIsQuiescenceSuspendedCity(t *testing.T) {
 	time.Sleep(window)
 	for _, root := range []string{cityRoot, rigDir} {
 		if calls := shim.callsUnder(t, root); len(calls) > 0 {
-			t.Errorf("gc touched %s %d time(s) in %s while the city was suspended:\n%s", root, len(calls), window, strings.Join(calls, "\n"))
+			t.Errorf("gc touched %s %d time(s) in %s while the city was suspended:\n%s%s", root, len(calls), window, strings.Join(calls, "\n"), shim.preWindowNote(t, root))
 		}
 		if started := doltProcessesUnder(t, root); len(started) > 0 {
-			t.Errorf("a pair under %s came back while the city was suspended:\n%s", root, strings.Join(started, "\n"))
+			t.Errorf("a pair under %s came back while the city was suspended:\n%s%s", root, strings.Join(started, "\n"), shim.preWindowNote(t, root))
 		}
 	}
 	if out, err := city.GC("resume"); err != nil {
@@ -320,5 +396,47 @@ func TestProxiedSuspensionIsQuiescenceSuspendedCity(t *testing.T) {
 	}
 	if out, err := city.GC("bd", "list", "--json"); err != nil {
 		t.Fatalf("gc bd list after resume: %v\n%s", err, out)
+	}
+}
+
+// TestScopeRecordingBDResetKeepsAStraddlingRecordBeforeTheWindow pins the reset
+// boundary: a record whose write was in flight at reset is not counted inside
+// the window, and a record written whole after reset is.
+func TestScopeRecordingBDResetKeepsAStraddlingRecordBeforeTheWindow(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "calls.log")
+	r := &scopeRecordingBD{logPath: logPath}
+	before := "ts=1 beads_dir=/scope/.beads argv=show callers= [x]\n"
+	head := "ts=2 beads_dir="
+	tail := "/scope/.beads argv=list callers= [/scope/y]\n"
+	after := "ts=3 beads_dir=/scope/.beads argv=dolt stop callers= [z]\n"
+	if err := os.WriteFile(logPath, []byte(before+head), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r.reset(t)
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(tail + after); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	got := r.callsUnder(t, "/scope")
+	if len(got) != 1 || !strings.HasPrefix(got[0], "ts=3 ") {
+		t.Fatalf("callsUnder after reset = %q, want only the ts=3 record", got)
+	}
+	if prior := underRoot(r.logLines(t, false), "/scope"); len(prior) != 2 {
+		t.Fatalf("records before the window = %q, want the ts=1 record and the straddling ts=2 record", prior)
+	}
+
+	empty := &scopeRecordingBD{logPath: filepath.Join(t.TempDir(), "none.log")}
+	empty.reset(t)
+	if err := os.WriteFile(empty.logPath, []byte(after), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := empty.callsUnder(t, "/scope"); len(got) != 1 {
+		t.Fatalf("callsUnder after a reset with no log = %q, want the one record", got)
 	}
 }
