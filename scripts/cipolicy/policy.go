@@ -365,7 +365,7 @@ const (
 	// (workflow env FLEET_BD_TAG, checked against its SHA256SUMS) instead of
 	// building upstream's BD_CURRENT_REF; two steps become one. Reviewed delta:
 	// one env key, one step's commands; no new job, trigger, permission or secret.
-	expectedNightlyExecutionHash = "96a3d3bcffab7436f8cc16936481c46f5cda2e9c48af92bd7ab2aab4439fb99e"
+	expectedNightlyExecutionHash = "416352f5ec515530665537a80c811995bb6761103c2fb39d766bd0043d407ac1"
 	// Setup action: reviewed delta (Go module fetch resilience) is setup-go
 	// `cache: false` and one step right after it,
 	// `uses: ./.github/actions/go-mod-download`.

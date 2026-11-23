@@ -439,11 +439,11 @@ exports_files(["bd"])
 http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
 
 http_file(
-    name = "bd_bin_v1_3_1_fleet_20261118_1",
+    name = "bd_bin_v1_3_1_fleet_20261120_1",
     downloaded_file_path = "bd",
     executable = True,
-    sha256 = "10c549c3e30770c4f270e148b986dc62ba47a512e6b802cf9eb3b2cfc77c3f17",
-    urls = ["https://github.com/quickserve-ai/beads/releases/download/v1.3.1-fleet.20261118.1/bd-v1.3.1-fleet.20261118.1-linux-amd64"],
+    sha256 = "22f4acc6a0a08bfed81fd431ab75c5c1f951cb81abb71058f6475de9dd6c4214",
+    urls = ["https://github.com/quickserve-ai/beads/releases/download/v1.3.1-fleet.20261120.1/bd-v1.3.1-fleet.20261120.1-linux-amd64"],
 )
 
 http_archive(
