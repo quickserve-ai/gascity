@@ -333,7 +333,7 @@ func (t *Tmux) noClientAttached(session string) error {
 // providers return runtime.ErrInteractionUnsupported.
 func (t *Tmux) ClearInput(ctx context.Context, session string, restoreWindow time.Duration) error {
 	if !acquireNudgeLock(session, t.cfg.NudgeLockTimeout) {
-		return fmt.Errorf("nudge lock timeout for session %q: previous nudge may be hung", session)
+		return fmt.Errorf("nudge lock timeout for session %q: previous nudge may be hung: %w", session, ErrNudgeLockBusy)
 	}
 	defer releaseNudgeLock(session)
 
