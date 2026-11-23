@@ -275,9 +275,6 @@ func checkCron(a Order, now time.Time, lastRunFn LastRunFunc) TriggerResult {
 		matched, err := CronScheduleMatchesAt(fields, t)
 		return err == nil && matched
 	}
-	sameWallMinute := func(x, y time.Time) bool {
-		return x.Format(wallMinuteLayout) == y.Format(wallMinuteLayout)
-	}
 
 	last, err := lastRunFn(a.ScopedName())
 	if err != nil {
@@ -289,7 +286,7 @@ func checkCron(a Order, now time.Time, lastRunFn LastRunFunc) TriggerResult {
 	// slot (wall-minute equality also covers the DST fall-back repeat, where
 	// two instants an hour apart share one wall-clock reading).
 	if matchesAt(now) {
-		if !last.IsZero() && sameWallMinute(last, now) {
+		if !last.IsZero() && sameCronWallMinute(last, now) {
 			return TriggerResult{Due: false, Reason: "cron: already run this minute", LastRun: last}
 		}
 		return TriggerResult{Due: true, Reason: "cron: schedule matched", LastRun: last}
@@ -321,6 +318,40 @@ func checkCron(a Order, now time.Time, lastRunFn LastRunFunc) TriggerResult {
 	if floor := now.Add(-lookback).Truncate(time.Minute); start.Before(floor) {
 		start = floor
 	}
+	if t, springForward, found := scanCronCatchup(matchesAt, last, start, now); found {
+		if springForward {
+			result := TriggerResult{Due: true, Reason: "cron: caught up occurrence skipped by DST spring-forward", LastRun: last}
+			result.Late = now.Sub(t) >= lateCronThreshold
+			return result
+		}
+		result := TriggerResult{Due: true, Reason: "cron: caught up missed occurrence", LastRun: last}
+		if behind := now.Sub(t); behind >= lateCronThreshold {
+			result.Late = true
+			result.Reason = fmt.Sprintf("cron: caught up missed occurrence (late: %s past the scheduled minute)", behind.Round(time.Minute))
+		}
+		return result
+	}
+
+	return TriggerResult{Due: false, Reason: "cron: schedule not matched", LastRun: last}
+}
+
+// sameCronWallMinute reports whether x and y occupy the same wall-clock
+// minute (wallMinuteLayout). Wall-minute equality also covers the DST
+// fall-back repeat, where two instants an hour apart share one reading and
+// count as a single cron slot.
+func sameCronWallMinute(x, y time.Time) bool {
+	return x.Format(wallMinuteLayout) == y.Format(wallMinuteLayout)
+}
+
+// scanCronCatchup is checkCron's catch-up scan: minute by minute over
+// [start, now] (both in the evaluation location), it returns the first
+// scheduled slot that is due because no firing covered it. A minute in the
+// same wall-clock slot as last (the fall-back repeat) is not a new slot. A
+// spring-forward gap whose skipped wall-clock readings match the schedule is
+// due at the first real minute after the jump (springForward=true). found is
+// false when no slot falls in the range. NextCronOccurrenceAfter runs the same
+// scan, so a reader judging an order sees the slots the dispatcher fires.
+func scanCronCatchup(matchesAt func(time.Time) bool, last, start, now time.Time) (slot time.Time, springForward, found bool) {
 	prev := start.Add(-time.Minute)
 	for t := start; !t.After(now); t = t.Add(time.Minute) {
 		// Spring-forward: one absolute minute stepped over a wall-clock
@@ -330,22 +361,65 @@ func checkCron(a Order, now time.Time, lastRunFn LastRunFunc) TriggerResult {
 		_, prevOff := prev.Zone()
 		_, tOff := t.Zone()
 		if tOff > prevOff && matchesInWallGap(matchesAt, prev, t) {
-			result := TriggerResult{Due: true, Reason: "cron: caught up occurrence skipped by DST spring-forward", LastRun: last}
-			result.Late = now.Sub(t) >= lateCronThreshold
-			return result
+			return t, true, true
 		}
-		if matchesAt(t) && !sameWallMinute(last, t) {
-			result := TriggerResult{Due: true, Reason: "cron: caught up missed occurrence", LastRun: last}
-			if behind := now.Sub(t); behind >= lateCronThreshold {
-				result.Late = true
-				result.Reason = fmt.Sprintf("cron: caught up missed occurrence (late: %s past the scheduled minute)", behind.Round(time.Minute))
-			}
-			return result
+		if matchesAt(t) && !sameCronWallMinute(last, t) {
+			return t, false, true
 		}
 		prev = t
 	}
+	return time.Time{}, false, false
+}
 
-	return TriggerResult{Due: false, Reason: "cron: schedule not matched", LastRun: last}
+// maxNextCronOccurrenceScan bounds NextCronOccurrenceAfter's scan forward from
+// the last firing: 1,465 days (four leap years and a day), which reaches the
+// next slot of an ordinary leap-day schedule. A schedule whose next slot lies
+// further out (a leap day across a non-leap century year, "0 0 1 1 1") makes
+// the scan run out before until; that is ErrCronScanExhausted, never "not due".
+const maxNextCronOccurrenceScan = (4*366 + 1) * 24 * time.Hour
+
+// ErrCronScanExhausted is NextCronOccurrenceAfter's answer when its bounded
+// scan ended before until without finding a slot: nothing is proven either
+// way, so a caller must not read it as "not due" (a doctor falls back to the
+// plain age of the last firing).
+var ErrCronScanExhausted = errors.New("cron: no slot within the scan bound after the last firing")
+
+// NextCronOccurrenceAfter returns the first slot after the firing at last that
+// the dispatcher would treat as due, judged at until: the same location
+// (resolveOrderLocation, with until standing in for now) and the same
+// catch-up scan (scanCronCatchup, so the DST fall-back repeat is one slot and
+// a slot in a spring-forward gap is due at the first real minute after the
+// jump). It scans forward from last, never back from until, so the slot it
+// names is the real first missed one however old last is. ok is false when no
+// slot has come due by until (including until at or before last). The scan
+// stops at the first slot or at until, so its cost is the gap to the next
+// slot, bounded by maxNextCronOccurrenceScan; a scan that reaches that bound
+// before until without a slot returns ErrCronScanExhausted.
+func NextCronOccurrenceAfter(a Order, last, until time.Time) (time.Time, bool, error) {
+	if err := ValidateCronSchedule(a.Schedule); err != nil {
+		return time.Time{}, false, err
+	}
+	loc, err := resolveOrderLocation(a, until)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	fields := strings.Fields(a.Schedule)
+	matchesAt := func(t time.Time) bool {
+		matched, err := CronScheduleMatchesAt(fields, t)
+		return err == nil && matched
+	}
+	now := until.In(loc)
+	last = last.In(loc)
+	exhausted := false
+	if end := last.Add(maxNextCronOccurrenceScan); now.After(end) {
+		now, exhausted = end, true
+	}
+	start := last.Truncate(time.Minute).Add(time.Minute)
+	slot, _, found := scanCronCatchup(matchesAt, last, start, now)
+	if !found && exhausted {
+		return time.Time{}, false, ErrCronScanExhausted
+	}
+	return slot, found, nil
 }
 
 // matchesInWallGap reports whether any wall-clock minute strictly between

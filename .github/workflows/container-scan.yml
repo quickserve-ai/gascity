@@ -144,6 +144,12 @@ jobs:
   image-vulnerabilities:
     name: Image vulnerabilities
     needs: runner-policy
+    # Upstream only. The quickserve-ai fork builds and ships none of the
+    # contrib/k8s images this job scans: every town runs gc as a native binary,
+    # and neither q-core product cluster runs a gc image (ga-cgyed9,
+    # 2026-11-22). Upstream scans and patches them; the weekly re-sync carries
+    # its fixes. Drop this line if the fork ever ships these images.
+    if: ${{ github.repository == 'gastownhall/gascity' }}
     runs-on: ${{ needs.runner-policy.outputs.runner_32vcpu }}
     timeout-minutes: 45
     permissions:

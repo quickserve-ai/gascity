@@ -110,11 +110,12 @@ func TestMergeOracleFieldCoverage(t *testing.T) {
 		// TestCachingStorePrimeSkipsAfterNewerReconcile.
 		"fullScanGen": true,
 		"backing":     true, "idPrefix": true, "mu": true, "reconciling": true,
-		"eventPrefixes": true, // event-ownership config, fixed at construction
-		"epoch":         true, // instance identity, fixed at construction
-		"reconcileGate": true, // reconcile-loop gate, fixed at construction
-		"now":           true, // the clock (WithClock), fixed at construction
-		"onChange":      true, "problemf": true, "problemLog": true,
+		"eventPrefixes":    true, // event-ownership config, fixed at construction
+		"epoch":            true, // instance identity, fixed at construction
+		"reconcileGate":    true, // reconcile-loop gate, fixed at construction
+		"reconcileTracker": true, // reconcile-step begin/end hook, fixed at construction
+		"now":              true, // the clock (WithClock), fixed at construction
+		"onChange":         true, "problemf": true, "problemLog": true,
 		"lastReconcileLogAt": true, "lastOverdueLogAt": true,
 		"primeMu": true, "primeRunning": true,
 		"primeCycle": true, "lastFullPrimeStartedAt": true, "primeRetryDelay": true,
