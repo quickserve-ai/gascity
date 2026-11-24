@@ -1,6 +1,7 @@
 package config
 
 import (
+	"os"
 	"os/exec"
 	"slices"
 	"strings"
@@ -157,11 +158,11 @@ func TestOpenWorkParkFirstRowScriptKeepsAPayloadJQCannotParseWhole(t *testing.T)
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
 			script := `r=` + shellquote.Quote(c.in) + `; ` + openWorkParkFirstRowScript() + `printf "%s" "$r"`
-			out, err := exec.Command("sh", "-c", script).Output()
-			if err != nil {
-				t.Fatalf("script failed: %v", err)
+			got, stderr, exit := runShellCommandCapture(t, script, []string{"PATH=" + os.Getenv("PATH")})
+			if exit != 0 {
+				t.Fatalf("script exit %d: %s", exit, stderr)
 			}
-			if got := string(out); got != c.want {
+			if got != c.want {
 				t.Fatalf("r = %q, want %q", got, c.want)
 			}
 		})
@@ -189,11 +190,11 @@ func TestHoldParkPoolDemandScriptStripsEveryOpenWorkPark(t *testing.T) {
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
 			script := `r=` + shellquote.Quote(c.in) + `; ` + holdParkPoolDemandScript() + `printf "%s" "$r"`
-			out, err := exec.Command("sh", "-c", script).Output()
-			if err != nil {
-				t.Fatalf("script failed: %v", err)
+			got, stderr, exit := runShellCommandCapture(t, script, []string{"PATH=" + os.Getenv("PATH")})
+			if exit != 0 {
+				t.Fatalf("script exit %d: %s", exit, stderr)
 			}
-			if got := string(out); got != c.want {
+			if got != c.want {
 				t.Fatalf("r = %q, want %q", got, c.want)
 			}
 		})

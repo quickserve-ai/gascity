@@ -114,8 +114,10 @@ func assignedOpenParkFreezeRulesAgree(t *testing.T) {
 		t.Fatalf("PoolDemandServeRulesForQuery().ExcludeLabels = %v, want freeze:deferred so the controller's demand count agrees with the query",
 			config.PoolDemandServeRulesForQuery().ExcludeLabels)
 	}
-	if got := filterReadyByRoute([]beads.Bead{{ID: "f", Status: "open", Type: "task", Labels: []string{beadmeta.FreezeDeferredLabel},
-		Metadata: map[string]string{beadmeta.RoutedToMetadataKey: assignedHoldAlias}}}, beadmeta.RoutedToMetadataKey, assignedHoldAlias); len(got) != 0 {
+	if got := filterReadyByRoute([]beads.Bead{{
+		ID: "f", Status: "open", Type: "task", Labels: []string{beadmeta.FreezeDeferredLabel},
+		Metadata: map[string]string{beadmeta.RoutedToMetadataKey: assignedHoldAlias},
+	}}, beadmeta.RoutedToMetadataKey, assignedHoldAlias); len(got) != 0 {
 		t.Fatalf("control dispatcher routed filter served a freeze:deferred bead: %v", got)
 	}
 }
@@ -161,12 +163,18 @@ func TestControlReadyMirrorsDropOpenWorkParks(t *testing.T) {
 		t.Fatalf("filterReadyByAssignee(limit 1) = %+v, want the first unparked row", one)
 	}
 	routed := []beads.Bead{
-		{ID: "routed-clock", Status: "open", Type: "task", Labels: []string{"hold:clock"},
-			Metadata: map[string]string{beadmeta.RoutedToMetadataKey: who}},
-		{ID: "routed-frozen-mixed-case", Status: "open", Type: "task", Labels: []string{"Freeze:Deferred"},
-			Metadata: map[string]string{beadmeta.RoutedToMetadataKey: who}},
-		{ID: "routed-plain", Status: "open", Type: "task",
-			Metadata: map[string]string{beadmeta.RoutedToMetadataKey: who}},
+		{
+			ID: "routed-clock", Status: "open", Type: "task", Labels: []string{"hold:clock"},
+			Metadata: map[string]string{beadmeta.RoutedToMetadataKey: who},
+		},
+		{
+			ID: "routed-frozen-mixed-case", Status: "open", Type: "task", Labels: []string{"Freeze:Deferred"},
+			Metadata: map[string]string{beadmeta.RoutedToMetadataKey: who},
+		},
+		{
+			ID: "routed-plain", Status: "open", Type: "task",
+			Metadata: map[string]string{beadmeta.RoutedToMetadataKey: who},
+		},
 	}
 	if r := filterReadyByRoute(routed, beadmeta.RoutedToMetadataKey, who); len(r) != 1 || r[0].ID != "routed-plain" {
 		t.Fatalf("filterReadyByRoute = %+v, want only routed-plain", r)
