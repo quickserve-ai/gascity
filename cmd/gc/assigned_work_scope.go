@@ -300,8 +300,20 @@ func filterAssignedWorkBeadsForPoolDemandAt(
 		if !assignedWorkIndexReachableFromAgentOnClaimRefs(cityPath, cfg, agentCfg, assignedWorkStoreRefs, i, claimRefs) {
 			continue
 		}
+		_, claimantLive := eligibleClaimants[strings.TrimSpace(wb.Assignee)]
+		// A dispatch-held OPEN assignment (beadmeta.DispatchHoldLabels, never the
+		// human label) whose claimant is gone is not wake demand: the seat this
+		// row would mint runs the default work query, which skips it ahead of its
+		// limit (assignedReadyTierCommand, #8010), so it reads past it and, with
+		// nothing else, drains, every tick (ga-v28pab). The same guards as the
+		// readiness veto below: a live claimant keeps its demand (ownership, never
+		// drained by this), an agent with its own WorkQuery is not judged by the
+		// default query, and an in_progress row keeps its own serve gate.
+		if !claimantLive && wb.Status == "open" && beadmeta.HasDispatchHold(wb.Labels) &&
+			strings.TrimSpace(agentCfg.WorkQuery) == "" {
+			continue
+		}
 		if i < len(assignedWorkStoreRefs) {
-			_, claimantLive := eligibleClaimants[strings.TrimSpace(wb.Assignee)]
 			if wakeReady.vetoesWakeCandidate(wb, agentCfg, claimantLive, assignedWorkStoreRefs[i]) {
 				withheld = append(withheld, poolWakeWithheldRow{storeRef: assignedWorkStoreRefs[i], bead: wb, template: template})
 				continue

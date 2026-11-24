@@ -70,11 +70,11 @@ const HumanLabel = "human"
 // session was re-woken every tick for assigned hold:external work its hook
 // drained past as no_work.
 //
-// Two demand paths do not consult it. Pool accounting
-// (filterAssignedWorkBeadsForPoolDemandAt) still counts a held OPEN assigned
-// row toward its template's desired seats, and held in_progress work still
-// keeps its owner's session in demand and awake, a claimed ownership fact
-// (ga-5736js). The route-scoped filters that mirror `bd ready --exclude-label`
+// Pool accounting (filterAssignedWorkBeadsForPoolDemandAt) drops a held OPEN
+// assigned row whose claimant is gone (ga-v28pab), but still counts one whose
+// claimant is live or whose agent runs its own WorkQuery; and held in_progress
+// work still keeps its owner's session in demand and awake, a claimed ownership
+// fact (ga-5736js). The route-scoped filters that mirror `bd ready --exclude-label`
 // (filterReadyByRoute, the work query's jq hold clause) compare the values
 // exactly rather than through this function.
 //
