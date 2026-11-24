@@ -167,3 +167,35 @@ func TestOpenWorkParkFirstRowScriptKeepsAPayloadJQCannotParseWhole(t *testing.T)
 		})
 	}
 }
+
+// The routed tier's jq strip applies the same open-work park rule as the hook
+// and the controller's demand predicate (ga-v28pab): a padded hold:* label and a
+// mixed-case freeze:deferred, which bd's exact --exclude-label lets through, are
+// dropped, and an unparseable payload is kept whole.
+func TestHoldParkPoolDemandScriptStripsEveryOpenWorkPark(t *testing.T) {
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq is required to run the generated script")
+	}
+	cases := map[string]struct{ in, want string }{
+		"parks stripped": {
+			in:   `[{"id":"c","labels":[" hold:clock"]},{"id":"f","labels":["Freeze:Deferred"]},{"id":"h","labels":["human"]},{"id":"a"}]`,
+			want: `[{"id":"h","labels":["human"]},{"id":"a"}]`,
+		},
+		"trailing garbage kept whole": {
+			in:   `[] trailing-garbage`,
+			want: `[] trailing-garbage`,
+		},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			script := `r=` + shellquote.Quote(c.in) + `; ` + holdParkPoolDemandScript() + `printf "%s" "$r"`
+			out, err := exec.Command("sh", "-c", script).Output()
+			if err != nil {
+				t.Fatalf("script failed: %v", err)
+			}
+			if got := string(out); got != c.want {
+				t.Fatalf("r = %q, want %q", got, c.want)
+			}
+		})
+	}
+}

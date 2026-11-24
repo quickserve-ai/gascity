@@ -186,31 +186,33 @@ func jqMeta(key string) string {
 	return `(.metadata["` + key + `"] // "")`
 }
 
-// holdParkExcludeSelectJQ drops beads carrying any hold:* label — parked
-// under the wait-class contract, so neither stranded nor dispatchable
-// (ga-uica16: two pool sessions consumed on a hold:cert-wait park). The
-// single definition of the rule lives in beadmeta (prefix rationale and the
-// serve/exist contract are documented there). It is the prefix complement of
-// PoolDemandServeRules' canonical --exclude-label pair: bd cannot prefix-match
-// a label, so the open wait-class set is stripped by jq after each unassigned
-// pool-demand read.
-const holdParkExcludeSelectJQ = beadmeta.HoldParkExcludeSelectJQ
+// holdParkExcludeSelectJQ drops unassigned routed rows that carry an
+// open-work park: any hold:* label (parked under the wait-class contract, so
+// neither stranded nor dispatchable; ga-uica16: two pool sessions consumed on a
+// hold:cert-wait park) or freeze:deferred in any case (ga-v28pab). It is
+// beadmeta.OpenWorkParkExcludeSelectJQ, the same rule the assigned-ready tier,
+// the hook (HasOpenWorkPark) and the controller's demand predicate apply, so a
+// routed row the hook would refuse never holds a place in a read the hook then
+// empties. It is the prefix and case-folded complement of PoolDemandServeRules'
+// exact --exclude-label set: bd cannot prefix-match or case-fold a label, so
+// the rest is stripped by jq after each unassigned pool-demand read.
+const holdParkExcludeSelectJQ = beadmeta.OpenWorkParkExcludeSelectJQ
 
 // holdParkFilterJQ wraps the exclusion select as a whole-array filter.
 func holdParkFilterJQ() string {
 	return `[.[] | ` + holdParkExcludeSelectJQ + `]`
 }
 
-// holdParkPoolDemandScript strips hold:*-parked rows from the pool-demand
-// candidates a ready read left in $r (ga-uica16), so a worker is never served a
-// row the count-form (poolDemandCountJQ) does not count. The strip runs after
-// the read's --limit window, so a window holding only parked rows reads as
-// empty and the tier falls through. A payload jq cannot parse is preserved for
+// holdParkPoolDemandScript strips open-work parks (holdParkExcludeSelectJQ) from
+// the pool-demand candidates a ready read left in $r (ga-uica16, ga-v28pab), so
+// a worker is never served a row the count-form (poolDemandCountJQ) does not
+// count. The strip runs after the read's --limit window, so a window holding
+// only parked rows reads as empty and the tier falls through. A payload jq does
+// not parse whole (jq exits non-zero, even after printing) is preserved for
 // the hook's fail-open handling, exactly as preferExecutablePoolDemandScript
 // preserves it, and the read's own failure clause has already run.
 func holdParkPoolDemandScript() string {
-	return `gc_unparked_pool_demand=$(printf "%s" "$r" | jq -c ` + shellquote.Quote(holdParkFilterJQ()) + ` 2>/dev/null); ` +
-		`[ -n "$gc_unparked_pool_demand" ] && r="$gc_unparked_pool_demand"; `
+	return `if gc_unparked_pool_demand=$(printf "%s" "$r" | jq -c ` + shellquote.Quote(holdParkFilterJQ()) + ` 2>/dev/null) && [ -n "$gc_unparked_pool_demand" ]; then r="$gc_unparked_pool_demand"; fi; `
 }
 
 // PoolDemandServeRules names, in Go, exactly what the generated Tier-3

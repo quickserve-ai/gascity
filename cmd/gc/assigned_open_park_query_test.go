@@ -72,23 +72,38 @@ func TestAssignedOpenParkOnlyFallsThroughToRoutedStep(t *testing.T) {
 // actionable routed bead behind it is; bd excludes freeze:deferred ahead of
 // the routed tier's limit, like the dispatch holds.
 func TestAssignedOpenParkUnassignedRoutedFreezeDeferredNotServed(t *testing.T) {
-	frozen := assignedHoldRoutedStep()
-	frozen.ID = "test-frozen-routed"
-	frozen.Labels = []string{beadmeta.FreezeDeferredLabel}
+	// "Freeze:Deferred" passes bd's exact --exclude-label, so it pins that the
+	// routed tier's jq strip folds case as the hook and the demand predicate do:
+	// a row the hook refuses must not hold a place in the routed read.
+	for _, label := range []string{beadmeta.FreezeDeferredLabel, "Freeze:Deferred"} {
+		frozen := assignedHoldRoutedStep()
+		frozen.ID = "test-frozen-routed"
+		frozen.Labels = []string{label}
+		assignedOpenParkRoutedFrozenCases(t, label, frozen)
+	}
+	assignedOpenParkFreezeRulesAgree(t)
+}
+
+func assignedOpenParkRoutedFrozenCases(t *testing.T, label string, frozen assignedHoldRow) {
+	t.Helper()
 	for _, federated := range []bool{false, true} {
-		t.Run("alone/federated="+strconv.FormatBool(federated), func(t *testing.T) {
+		t.Run(label+"/alone/federated="+strconv.FormatBool(federated), func(t *testing.T) {
 			out, _ := assignedHoldRunWorkQuery(t, assignedHoldTopology(federated), []assignedHoldRow{frozen})
 			res, claimed := assignedHoldClaim(t, out)
 			if res.Action == "work" || len(claimed) != 0 {
 				t.Fatalf("freeze:deferred routed bead served: action=%s bead=%q claimed=%v output %q", res.Action, res.BeadID, claimed, out)
 			}
 		})
-		t.Run("first/federated="+strconv.FormatBool(federated), func(t *testing.T) {
+		t.Run(label+"/first/federated="+strconv.FormatBool(federated), func(t *testing.T) {
 			out, _ := assignedHoldRunWorkQuery(t, assignedHoldTopology(federated), []assignedHoldRow{frozen, assignedHoldRoutedStep()})
 			res, claimed := assignedHoldClaim(t, out)
 			assertAssignedHoldRoutedStepClaimed(t, out, res, claimed)
 		})
 	}
+}
+
+func assignedOpenParkFreezeRulesAgree(t *testing.T) {
+	t.Helper()
 	var found bool
 	for _, l := range config.PoolDemandServeRulesForQuery().ExcludeLabels {
 		if l == beadmeta.FreezeDeferredLabel {
@@ -147,6 +162,8 @@ func TestControlReadyMirrorsDropOpenWorkParks(t *testing.T) {
 	}
 	routed := []beads.Bead{
 		{ID: "routed-clock", Status: "open", Type: "task", Labels: []string{"hold:clock"},
+			Metadata: map[string]string{beadmeta.RoutedToMetadataKey: who}},
+		{ID: "routed-frozen-mixed-case", Status: "open", Type: "task", Labels: []string{"Freeze:Deferred"},
 			Metadata: map[string]string{beadmeta.RoutedToMetadataKey: who}},
 		{ID: "routed-plain", Status: "open", Type: "task",
 			Metadata: map[string]string{beadmeta.RoutedToMetadataKey: who}},
