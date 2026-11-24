@@ -9,6 +9,7 @@ package main
 
 import (
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/beadmeta"
@@ -18,7 +19,10 @@ import (
 
 const assignedOpenParkActionableID = "test-actionable"
 
-var assignedOpenParkTownLabels = []string{"hold:human", "hold:human-decision", "hold:clock", beadmeta.FreezeDeferredLabel}
+// The padded and mixed-case spellings pin that the query's jq strip agrees
+// with the hook's Go filter (TrimSpace; freeze:deferred case-insensitive), so a
+// row the hook would reject is never the one the cut to one row keeps.
+var assignedOpenParkTownLabels = []string{"hold:human", "hold:human-decision", "hold:clock", beadmeta.FreezeDeferredLabel, "  hold:human ", "Freeze:Deferred"}
 
 func assignedOpenParkActionable(assignee string) assignedHoldRow {
 	return assignedHoldRow{ID: assignedOpenParkActionableID, Status: "open", Type: "task", Assignee: assignee}
@@ -114,5 +118,40 @@ func TestAssignedOpenParkInProgressCertWaitStillServed(t *testing.T) {
 					res.Action, res.Reason, res.BeadID, out)
 			}
 		})
+	}
+}
+
+// The control dispatcher's Go mirrors agree with the generated tiers: its
+// assigned mirror drops an OPEN park but keeps bd's human label and a claimed
+// park; its routed mirror drops any hold:* park as the shell routed tier's jq
+// strip does (ga-v28pab).
+func TestControlReadyMirrorsDropOpenWorkParks(t *testing.T) {
+	const who = "rig/control-dispatcher"
+	ready := []beads.Bead{
+		{ID: "frozen", Status: "open", Type: "task", Assignee: who, Labels: []string{beadmeta.FreezeDeferredLabel}},
+		{ID: "clock", Status: "open", Type: "task", Assignee: who, Labels: []string{"hold:clock"}},
+		{ID: "human", Status: "open", Type: "task", Assignee: who, Labels: []string{beadmeta.HumanLabel}},
+		{ID: "claimed-park", Status: "in_progress", Type: "task", Assignee: who, Labels: []string{"hold:cert-wait"}},
+		{ID: "plain", Status: "open", Type: "task", Assignee: who},
+	}
+	var got []string
+	for _, b := range filterReadyByAssignee(ready, who, 0) {
+		got = append(got, b.ID)
+	}
+	if want := "human,claimed-park,plain"; strings.Join(got, ",") != want {
+		t.Fatalf("filterReadyByAssignee kept %v, want %s", got, want)
+	}
+	// The cut to N runs after the drop: a parked head does not use up the limit.
+	if one := filterReadyByAssignee(ready, who, 1); len(one) != 1 || one[0].ID != "human" {
+		t.Fatalf("filterReadyByAssignee(limit 1) = %+v, want the first unparked row", one)
+	}
+	routed := []beads.Bead{
+		{ID: "routed-clock", Status: "open", Type: "task", Labels: []string{"hold:clock"},
+			Metadata: map[string]string{beadmeta.RoutedToMetadataKey: who}},
+		{ID: "routed-plain", Status: "open", Type: "task",
+			Metadata: map[string]string{beadmeta.RoutedToMetadataKey: who}},
+	}
+	if r := filterReadyByRoute(routed, beadmeta.RoutedToMetadataKey, who); len(r) != 1 || r[0].ID != "routed-plain" {
+		t.Fatalf("filterReadyByRoute = %+v, want only routed-plain", r)
 	}
 }

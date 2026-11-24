@@ -865,12 +865,12 @@ func assignedReadyTierCommand(shellVar string, topo QueryTopology) string {
 // read is unbounded (one identity's own ready rows) and the cut to one row runs
 // here, after the park strip: a parked head never hides an actionable
 // assignment behind it, and a read holding only parked rows reads as [] and
-// falls through to the tiers below (ga-v28pab). A payload jq cannot parse is
-// kept for the hook's fail-open handling, as holdParkPoolDemandScript keeps it.
+// falls through to the tiers below (ga-v28pab). A payload jq does not parse
+// whole (jq exits non-zero, even after printing a partial result) is kept for
+// the hook's fail-open handling, as holdParkPoolDemandScript keeps it.
 func openWorkParkFirstRowScript() string {
 	filter := `[.[] | ` + beadmeta.OpenWorkParkExcludeSelectJQ + `] | .[:1]`
-	return `gc_unparked_assigned=$(printf "%s" "$r" | jq -c ` + shellquote.Quote(filter) + ` 2>/dev/null); ` +
-		`[ -n "$gc_unparked_assigned" ] && r="$gc_unparked_assigned"; `
+	return `if gc_unparked_assigned=$(printf "%s" "$r" | jq -c ` + shellquote.Quote(filter) + ` 2>/dev/null) && [ -n "$gc_unparked_assigned" ]; then r="$gc_unparked_assigned"; fi; `
 }
 
 func standardAssignedReadyWorkQueryScript(topo QueryTopology) string {

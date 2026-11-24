@@ -1,11 +1,13 @@
 package config
 
 import (
+	"os/exec"
 	"slices"
 	"strings"
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/beadmeta"
+	"github.com/gastownhall/gascity/internal/shellquote"
 )
 
 // This file expresses the ga-x9kptu / ga-5736js acceptance criteria at the
@@ -128,5 +130,40 @@ func TestAssigneeScopedProbesStayHumanTransparent(t *testing.T) {
 		if strings.Contains(got, `"human"`) {
 			t.Errorf("%s() = %q, assignee-scoped tier must stay human-transparent", name, got)
 		}
+	}
+}
+
+// openWorkParkFirstRowScript replaces $r only when jq parsed the whole payload:
+// jq can print a result and still fail on what follows it, and a partial result
+// must not stand in for the payload the hook's fail-open handling reads.
+func TestOpenWorkParkFirstRowScriptKeepsAPayloadJQCannotParseWhole(t *testing.T) {
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq is required to run the generated script")
+	}
+	cases := map[string]struct{ in, want string }{
+		"parsed, parked head stripped": {
+			in:   `[{"id":"p","labels":["  hold:human "]},{"id":"a","labels":[]}]`,
+			want: `[{"id":"a","labels":[]}]`,
+		},
+		"parsed, mixed-case freeze stripped": {
+			in:   `[{"id":"f","labels":["Freeze:Deferred"]}]`,
+			want: `[]`,
+		},
+		"trailing garbage kept whole": {
+			in:   `[] trailing-garbage`,
+			want: `[] trailing-garbage`,
+		},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			script := `r=` + shellquote.Quote(c.in) + `; ` + openWorkParkFirstRowScript() + `printf "%s" "$r"`
+			out, err := exec.Command("sh", "-c", script).Output()
+			if err != nil {
+				t.Fatalf("script failed: %v", err)
+			}
+			if got := string(out); got != c.want {
+				t.Fatalf("r = %q, want %q", got, c.want)
+			}
+		})
 	}
 }

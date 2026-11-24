@@ -47,7 +47,7 @@ func TestHasDispatchHold(t *testing.T) {
 
 // TestHasOpenWorkPark pins the unclaimed-work park rule (ga-v28pab): the two
 // canonical dispatch holds (case-folded), any "hold:" label and
-// "freeze:deferred" (trimmed, exact, as the route query's jq compares them).
+// "freeze:deferred" (trimmed, case-insensitive, as the controller's demand predicate and the query's jq compare it).
 // Hold-ish labels without the "hold:" prefix are ordinary work.
 func TestHasOpenWorkPark(t *testing.T) {
 	cases := []struct {
@@ -68,7 +68,7 @@ func TestHasOpenWorkPark(t *testing.T) {
 		{"canonical hold case-folded", []string{" Hold:External"}, true},
 		{"town hold is case-exact like the route query", []string{"Hold:Human"}, false},
 		{"freeze deferred trimmed", []string{" freeze:deferred "}, true},
-		{"freeze deferred is case-exact", []string{"Freeze:Deferred"}, false},
+		{"freeze deferred is case-insensitive", []string{"Freeze:Deferred"}, true},
 	}
 	for _, tc := range cases {
 		if got := HasOpenWorkPark(tc.labels); got != tc.want {

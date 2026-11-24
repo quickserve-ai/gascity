@@ -105,7 +105,7 @@ const FreezeDeferredLabel = "freeze:deferred"
 // dispatch hold (HasDispatchHold, trimmed and case-insensitive), any hold:*
 // label (HasHoldLabel, the single definition in hold.go, the same rule the
 // route-scoped work query's jq clause applies), or "freeze:deferred" (trimmed,
-// exact). It answers the same "is this WORK for whoever asks?" question as
+// case-insensitive, as the controller's demand predicate compares it). It answers the same "is this WORK for whoever asks?" question as
 // HasDispatchHold, for unclaimed rows only: the hook's serve filter (for
 // candidates not yet in_progress or hooked), the controller's open-work wake
 // gate (assignedOpenWorkHeld), the drain-ack claimability classifier and
@@ -117,7 +117,7 @@ func HasOpenWorkPark(labels []string) bool {
 		return true
 	}
 	for _, label := range labels {
-		if strings.TrimSpace(label) == FreezeDeferredLabel {
+		if strings.EqualFold(strings.TrimSpace(label), FreezeDeferredLabel) {
 			return true
 		}
 	}
@@ -135,8 +135,11 @@ func OpenWorkParkExactLabels() []string {
 
 // OpenWorkParkExcludeSelectJQ is HasOpenWorkPark for shell/jq consumers of bd
 // --json rows: it keeps only rows with no "hold:*" label (the canonical dispatch
-// holds start with it too) and no "freeze:deferred" label. One leading or
-// trailing space is trimmed (jq 1.6 has no trim); the match is case-sensitive, like
-// HoldParkExcludeSelectJQ, and the hook's Go-side filter (isHeldHookCandidate)
-// still catches a mixed-case canonical hold.
-const OpenWorkParkExcludeSelectJQ = `select(([(.labels // [])[] | ltrimstr(" ") | rtrimstr(" ") | select(startswith("` + HoldLabelPrefix + `") or . == "` + FreezeDeferredLabel + `")] | length) == 0)`
+// holds start with it too) and no "freeze:deferred" label. Each label is
+// trimmed of surrounding whitespace first, as strings.TrimSpace does in
+// HasOpenWorkPark; freeze:deferred compares case-insensitively, as
+// HasOpenWorkPark and the controller's demand predicate do; the hold: prefix is
+// case-sensitive, like HasHoldLabel and HoldParkExcludeSelectJQ, and the hook's
+// Go-side filter (isHeldHookCandidate) still catches a mixed-case canonical
+// hold. Needs jq's regex support (sub), which every supported jq build has.
+const OpenWorkParkExcludeSelectJQ = `select(([(.labels // [])[] | sub("^\\s+"; "") | sub("\\s+$"; "") | select(startswith("` + HoldLabelPrefix + `") or (ascii_downcase == "` + FreezeDeferredLabel + `"))] | length) == 0)`
