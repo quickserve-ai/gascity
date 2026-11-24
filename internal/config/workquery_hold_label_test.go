@@ -49,16 +49,17 @@ func TestLegacyEphemeralPoolDemandShellRouteScopedExcludesDispatchHoldLabels(t *
 }
 
 // The bd-1.0.4 assigned-ready wisp probe serves its first row and exits the
-// work query, so its jq selection drops every dispatch hold (#8010); the
-// behavior is pinned in workquery_assigned_ready_hold_test.go.
+// work query, so its jq selection drops every open-work park, the dispatch
+// holds included (#8010, ga-v28pab); the behavior is pinned in
+// workquery_assigned_ready_hold_test.go.
 func TestEphemeralAssignedReadyProbeScriptExcludesDispatchHoldLabels(t *testing.T) {
 	got := ephemeralAssignedReadyProbeScript("cand", QueryTopology{})
-	if !strings.Contains(got, ".labels") {
-		t.Errorf("ephemeralAssignedReadyProbeScript() = %q, missing a .labels reference", got)
+	if !strings.Contains(got, beadmeta.OpenWorkParkExcludeSelectJQ) {
+		t.Errorf("ephemeralAssignedReadyProbeScript() = %q, missing the open-work park selector %q", got, beadmeta.OpenWorkParkExcludeSelectJQ)
 	}
 	for _, label := range beadmeta.DispatchHoldLabels {
-		if !strings.Contains(got, `"`+label+`"`) {
-			t.Errorf("ephemeralAssignedReadyProbeScript() = %q, missing hold label %q", got, label)
+		if !strings.HasPrefix(label, beadmeta.HoldLabelPrefix) {
+			t.Errorf("dispatch hold %q does not start with %q, so the open-work park selector would not drop it", label, beadmeta.HoldLabelPrefix)
 		}
 	}
 }

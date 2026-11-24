@@ -123,3 +123,20 @@ func HasOpenWorkPark(labels []string) bool {
 	}
 	return false
 }
+
+// OpenWorkParkExactLabels are the open-work park labels a bd reader can
+// exclude by exact match (--exclude-label, or NOT label= in a bd query): the
+// canonical dispatch holds plus FreezeDeferredLabel. The rest of the
+// HasOpenWorkPark rule, any other "hold:*" label, is a prefix bd cannot match,
+// so queries strip it with OpenWorkParkExcludeSelectJQ after the read.
+func OpenWorkParkExactLabels() []string {
+	return append(append([]string(nil), DispatchHoldLabels...), FreezeDeferredLabel)
+}
+
+// OpenWorkParkExcludeSelectJQ is HasOpenWorkPark for shell/jq consumers of bd
+// --json rows: it keeps only rows with no "hold:*" label (the canonical dispatch
+// holds start with it too) and no "freeze:deferred" label. One leading or
+// trailing space is trimmed (jq 1.6 has no trim); the match is case-sensitive, like
+// HoldParkExcludeSelectJQ, and the hook's Go-side filter (isHeldHookCandidate)
+// still catches a mixed-case canonical hold.
+const OpenWorkParkExcludeSelectJQ = `select(([(.labels // [])[] | ltrimstr(" ") | rtrimstr(" ") | select(startswith("` + HoldLabelPrefix + `") or . == "` + FreezeDeferredLabel + `")] | length) == 0)`

@@ -395,6 +395,9 @@ func renormalizeFederatedCommand(federated string) string {
 	}
 	federated = strings.ReplaceAll(federated, gcReadyCommand, bdReadyCommand)
 	federated = strings.ReplaceAll(federated, `--json --limit=1) || exit $?`, `--json --limit=1 2>/dev/null)`)
+	// The assigned-ready read is unbounded (--limit=0): its cut to one row runs
+	// after the open-park strip (openWorkParkFirstRowScript, ga-v28pab).
+	federated = strings.ReplaceAll(federated, `--json --limit=0) || exit $?`, `--json --limit=0 2>/dev/null)`)
 	// Suffix-matched so one pair covers both the routed tier (no explicit
 	// --sort; the reader's canonical priority order decides) and the
 	// migration fallback (which keeps --sort oldest for its retirement window).

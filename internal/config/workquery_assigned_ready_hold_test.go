@@ -13,10 +13,11 @@ import (
 
 // Coverage for #8010: the assigned-ready tier serves its first row and exits
 // the work query, so a dispatch-held OPEN assignment it returns starves every
-// tier below it. Its ready read excludes beadmeta.DispatchHoldLabels (never the
-// human label) before its --limit=1, and its bd-1.0.4 wisp probe drops the same
-// labels before its `.[:1]` cut, so a held row is neither served nor able to
-// shadow an unheld assignment. These tests EXECUTE the generated query against a
+// tier below it. Its ready read drops every open-work park (the dispatch holds,
+// any hold:* label and freeze:deferred, never the human label) before its cut to
+// one row, and its bd-1.0.4 wisp probe drops the same before its `.[:1]` cut, so
+// a parked row is neither served nor able to shadow an actionable assignment
+// (ga-v28pab widened the set from the two canonical holds). These tests EXECUTE the generated query against a
 // fake reader that honors the filter flags, so they pin observable behavior.
 
 // fakeFilteringReader stands in for both `bd` and `gc`. `ready` and `list`
@@ -233,7 +234,7 @@ func TestAssignedReadyHeldOnlyFallsThroughToRoutedTier(t *testing.T) {
 						routedOpenRow(),
 					})
 					assertServed(t, got, "routed")
-					if !strings.Contains(log, "--assignee="+identity+" --exclude-label hold:mayor --exclude-label hold:external --json --limit=1") {
+					if !strings.Contains(log, "--assignee="+identity+" --exclude-label hold:mayor --exclude-label hold:external --exclude-label freeze:deferred --json --limit=0") {
 						t.Errorf("assigned-ready read for %s does not exclude the dispatch holds before its limit; reads:\n%s", identity, log)
 					}
 				})
@@ -304,20 +305,36 @@ func TestAssignedReadyServesUnheldAssignmentBehindHeldHead(t *testing.T) {
 	}
 }
 
-// TestAssignedReadyStaysHumanTransparent: bd's human label is not a dispatch
-// hold, nor is a non-canonical hold:human label, so a task assigned to the seat
-// that carries one is still served ahead of routed work on every reader shape.
+// TestAssignedReadyStaysHumanTransparent: bd's human label is not an
+// open-work park, so a task assigned to the seat that carries it is still
+// served ahead of routed work on every reader shape.
 func TestAssignedReadyStaysHumanTransparent(t *testing.T) {
 	for topoName, topo := range assignedHoldTopologies() {
-		for _, label := range []string{beadmeta.HumanLabel, "hold:human"} {
+		t.Run(topoName, func(t *testing.T) {
+			got, _ := runFilteredQuery(t, assignedHoldPoolAgent().EffectiveWorkQueryFor(topo), assignedHoldSeatEnv(), []fakeReaderRow{
+				assignedOpenRow("labeled", assignedHoldTestAlias, beadmeta.HumanLabel),
+				routedOpenRow(),
+			})
+			if len(got) != 1 || got[0].ID != "labeled" {
+				t.Fatalf("query served %+v, want the human-labeled assignment ahead of the routed step", got)
+			}
+		})
+	}
+}
+
+// TestAssignedReadyParkedOnTownLabelFallsThrough: a task assigned to the seat
+// and parked on a town label (a non-canonical hold:* or freeze:deferred) is an
+// open-work park, so the routed step is served on every reader shape
+// (ga-v28pab).
+func TestAssignedReadyParkedOnTownLabelFallsThrough(t *testing.T) {
+	for topoName, topo := range assignedHoldTopologies() {
+		for _, label := range []string{"hold:human", "hold:clock", beadmeta.FreezeDeferredLabel} {
 			t.Run(topoName+"/"+label, func(t *testing.T) {
 				got, _ := runFilteredQuery(t, assignedHoldPoolAgent().EffectiveWorkQueryFor(topo), assignedHoldSeatEnv(), []fakeReaderRow{
-					assignedOpenRow("labeled", assignedHoldTestAlias, label),
+					assignedOpenRow("parked", assignedHoldTestAlias, label),
 					routedOpenRow(),
 				})
-				if len(got) != 1 || got[0].ID != "labeled" {
-					t.Fatalf("query served %+v, want the %s-labeled assignment ahead of the routed step", got, label)
-				}
+				assertServed(t, got, "routed")
 			})
 		}
 	}
@@ -404,19 +421,36 @@ func TestLegacyControlAssignedReadyServesUnheldWispBehindHeldHead(t *testing.T) 
 	}
 }
 
-// TestAssignedReadyWispStaysHumanTransparent: the wisp probe drops the dispatch
-// holds and nothing else, so a wisp assigned to the seat that carries bd's
-// human label, or a non-canonical hold:human label, is still served ahead of
-// routed work.
+// TestAssignedReadyWispStaysHumanTransparent: the wisp probe drops open-work
+// parks (any hold:* label, freeze:deferred) and nothing else, so a wisp
+// assigned to the seat that carries bd's native human label is still served
+// ahead of routed work.
 func TestAssignedReadyWispStaysHumanTransparent(t *testing.T) {
 	for topoName, topo := range bd104WispTopologies() {
-		for _, label := range []string{beadmeta.HumanLabel, "hold:human"} {
+		t.Run(topoName, func(t *testing.T) {
+			got, _ := runFilteredQueryWithWisps(t, assignedHoldPoolAgent().EffectiveWorkQueryFor(topo), assignedHoldSeatEnv(),
+				[]fakeReaderRow{routedOpenRow()},
+				[]fakeReaderRow{assignedOpenWisp("labeled", assignedHoldTestAlias, 0, beadmeta.HumanLabel)})
+			if len(got) != 1 || got[0].ID != "labeled" {
+				t.Fatalf("query served %+v, want the human-labeled wisp ahead of the routed step", got)
+			}
+		})
+	}
+}
+
+// TestAssignedReadyWispParkedOnTownLabelFallsThrough: a wisp assigned to the
+// seat and parked on a town label (a non-canonical hold:* or freeze:deferred)
+// is an open-work park, so the probe skips it and the routed step is served
+// (ga-v28pab; before it, the probe dropped only the two canonical holds).
+func TestAssignedReadyWispParkedOnTownLabelFallsThrough(t *testing.T) {
+	for topoName, topo := range bd104WispTopologies() {
+		for _, label := range []string{"hold:human", "hold:clock", beadmeta.FreezeDeferredLabel} {
 			t.Run(topoName+"/"+label, func(t *testing.T) {
 				got, _ := runFilteredQueryWithWisps(t, assignedHoldPoolAgent().EffectiveWorkQueryFor(topo), assignedHoldSeatEnv(),
 					[]fakeReaderRow{routedOpenRow()},
-					[]fakeReaderRow{assignedOpenWisp("labeled", assignedHoldTestAlias, 0, label)})
-				if len(got) != 1 || got[0].ID != "labeled" {
-					t.Fatalf("query served %+v, want the %s-labeled wisp ahead of the routed step", got, label)
+					[]fakeReaderRow{assignedOpenWisp("parked", assignedHoldTestAlias, 0, label)})
+				if len(got) != 1 || got[0].ID == "parked" {
+					t.Fatalf("query served %+v, want the %s-parked wisp skipped for the routed step", got, label)
 				}
 			})
 		}
