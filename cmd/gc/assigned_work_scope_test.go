@@ -1123,3 +1123,27 @@ func TestFilterAssignedWorkBeadsForPoolDemandDropsDispatchHeldOpenAssignment(t *
 		t.Fatalf("kept %v, want %v (dispatch-held OPEN assignments dropped; human and in_progress kept)", ids, want)
 	}
 }
+
+// The same held OPEN row keeps its demand when its claimant is live (ownership:
+// this filter never drains a working seat) and when its agent runs its own
+// WorkQuery (the default query's exclusion does not describe it).
+func TestFilterAssignedWorkBeadsForPoolDemandKeepsHeldOpenForLiveClaimantOrCustomQuery(t *testing.T) {
+	route := map[string]string{"gc.routed_to": "worker"}
+	held := []string{beadmeta.HoldExternalLabel}
+
+	cfg := &config.City{Agents: []config.Agent{{Name: "worker"}}}
+	sessions := []beads.Bead{{
+		ID: "session-1", Status: "open", Type: sessionBeadType,
+		Metadata: map[string]string{"template": "worker", "session_name": "worker-session"},
+	}}
+	live := []beads.Bead{{ID: "held-live", Status: "open", Assignee: "session-1", Labels: held, Metadata: route}}
+	if got := filterAssignedWorkBeadsForPoolDemand(cfg, "", nil, sessionInfosFromBeads(sessions), live, []string{""}, nil); len(got) != 1 {
+		t.Fatalf("live claimant: kept %#v, want the held row kept", got)
+	}
+
+	custom := &config.City{Agents: []config.Agent{{Name: "worker", WorkQuery: "printf '[]'"}}}
+	orphan := []beads.Bead{{ID: "held-custom", Status: "open", Assignee: "worker-dead", Labels: held, Metadata: route}}
+	if got := filterAssignedWorkBeadsForPoolDemand(custom, "", nil, nil, orphan, []string{""}, nil); len(got) != 1 {
+		t.Fatalf("custom WorkQuery: kept %#v, want the held row kept", got)
+	}
+}

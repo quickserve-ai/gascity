@@ -834,16 +834,16 @@ func inProgressBlockedByEnrichmentScriptWithServeAction(federated bool, checkHol
 // held head from hiding an unheld assignment for the same identity. The wisp
 // probe behind it (ephemeralAssignedReadyProbeScript) filters the same way.
 //
-// The CONTROLLER mirrors this predicate, with the exception below, before it counts such a row as capacity
+// The CONTROLLER mirrors this predicate before it counts such a row as capacity
 // demand — cmd/gc poolWakeReadiness, the assigned-arm counterpart to
 // PoolDemandServeRules below. It answers from the Ready() snapshot the demand
 // phase already holds, and deliberately declines to answer for the cases where
 // this command is not what will run: a template carrying its own WorkQuery
 // (which replaces this tier verbatim, see effectiveQuery), and a bead type or
 // label Ready() structurally excludes but ephemeralAssignedReadyProbeScript
-// still serves. EXCEPTION, not yet mirrored: the controller does not drop a
-// dispatch-held assigned row (ga-v28pab step 2), so a seat can be woken for one;
-// that seat now reads past it to the routed tier instead of reading nothing.
+// still serves. The dispatch-hold exclusion is mirrored there too, for an OPEN
+// row whose claimant is gone (filterAssignedWorkBeadsForPoolDemandAt,
+// ga-v28pab): a row with a live claimant keeps its demand by ownership.
 //
 // Change the flags here and that mirror needs the same change, or the pool goes
 // back to spawning seats for rows their own hooks are forbidden to claim.
