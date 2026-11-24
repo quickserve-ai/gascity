@@ -269,6 +269,15 @@ func filterAssignedWorkBeadsForPoolDemandAt(
 		if beads.IsDeferred(wb, now) {
 			continue
 		}
+		// A dispatch-held OPEN assignment (beadmeta.DispatchHoldLabels, never the
+		// human label) is not wake demand: the assignee's own work query skips it
+		// ahead of its limit (assignedReadyTierCommand, #8010), so a seat woken
+		// for it reads past it and, with nothing else, drains. Counting it here
+		// wakes that seat every tick for work it may not claim (ga-v28pab). An
+		// in_progress row keeps its own serve gate and is left to it.
+		if wb.Status == "open" && beadmeta.HasDispatchHold(wb.Labels) {
+			continue
+		}
 		template := routedToOrLegacyWorkflowTarget(wb)
 		if template == "" {
 			if sessionBeadID := assigneeToSessionBeadID[strings.TrimSpace(wb.Assignee)]; sessionBeadID != "" {
