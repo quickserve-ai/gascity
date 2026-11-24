@@ -31,10 +31,11 @@ import (
 
 const holdTestIdentity = "gastown__polecat-az-wisp-ak1hw"
 
-// heldWorkQueryRow renders one work-query row carrying the given hold label.
-func heldWorkQueryRow(id, status, assignee, label string) string {
+// heldWorkQueryRow renders one work-query row, assigned to holdTestIdentity,
+// carrying the given hold label.
+func heldWorkQueryRow(id, status, label string) string {
 	return `{"id":"` + id + `","status":"` + status + `","issue_type":"task","assignee":"` +
-		assignee + `","labels":["` + label + `","mysql-cutover"]}`
+		holdTestIdentity + `","labels":["` + label + `","mysql-cutover"]}`
 }
 
 func holdTestClaimOptions() hookClaimOptions {
@@ -54,7 +55,7 @@ func TestHookClaimDoesNotServeHeldExistingAssignment(t *testing.T) {
 		t.Run(label, func(t *testing.T) {
 			const heldID = "gas-4cu"
 			runner := func(string, string) (string, error) {
-				return `[` + heldWorkQueryRow(heldID, "in_progress", holdTestIdentity, label) + `]`, nil
+				return `[` + heldWorkQueryRow(heldID, "in_progress", label) + `]`, nil
 			}
 			ops := hookClaimOps{
 				Runner: runner,
@@ -92,7 +93,7 @@ func TestHookClaimSkipsHeldAssignmentAndClaimsReadyWork(t *testing.T) {
 	)
 	runner := func(string, string) (string, error) {
 		return `[
-			` + heldWorkQueryRow(heldID, "in_progress", holdTestIdentity, beadmeta.HoldExternalLabel) + `,
+			` + heldWorkQueryRow(heldID, "in_progress", beadmeta.HoldExternalLabel) + `,
 			{"id":"` + readyID + `","status":"open","issue_type":"task","assignee":"","metadata":{"gc.routed_to":"` + holdTestIdentity + `"}}
 		]`, nil
 	}
@@ -129,7 +130,7 @@ func TestHookClaimSkipsHeldAssignmentAndClaimsReadyWork(t *testing.T) {
 func TestHookClaimDoesNotPromoteHeldReadyAssignment(t *testing.T) {
 	const heldID = "gas-held-open"
 	runner := func(string, string) (string, error) {
-		return `[` + heldWorkQueryRow(heldID, "open", holdTestIdentity, beadmeta.HoldMayorLabel) + `]`, nil
+		return `[` + heldWorkQueryRow(heldID, "open", beadmeta.HoldMayorLabel) + `]`, nil
 	}
 	ops := hookClaimOps{
 		Runner: runner,
@@ -239,7 +240,7 @@ func TestHookClaimDoesNotPromoteTownParkedReadyAssignment(t *testing.T) {
 	for _, label := range []string{"hold:human-decision", "hold:human", "freeze:deferred"} {
 		t.Run(label, func(t *testing.T) {
 			runner := func(string, string) (string, error) {
-				return `[` + heldWorkQueryRow("ga-parked", "open", holdTestIdentity, label) + `]`, nil
+				return `[` + heldWorkQueryRow("ga-parked", "open", label) + `]`, nil
 			}
 			ops := hookClaimOps{
 				Runner: runner,
