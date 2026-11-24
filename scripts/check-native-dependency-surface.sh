@@ -41,7 +41,16 @@ esac
 # github.com/quickserve-ai/beads to go.sum, and the go.sum count below takes it
 # as a second module although `go list -m all` still lists 737. Drop back to
 # upstream's value when the replace goes.
-max_modules="${GC_NATIVE_DEP_MAX_MODULES:-738}"
+#
+# Re-baselined 2026-11-24 to 749 for the otel v1.47.0 security bump
+# (GO-2026-6974, ga-ch8xto). The fixed otlp exporters require
+# grpc-gateway/v2 v2.30.0, whose go.mod declares the go-openapi stack.
+# Measured: go.sum distinct modules + 1 went 738 -> 749, and `go list -m all`
+# went 737 -> 760. Of the 23 new modules only go-openapi/swag's submodules
+# (the same library, split upstream) link into cmd/gc (`go list -deps`); the
+# rest (analysis, errors, loads, runtime, spec, strfmt, validate, ...) are
+# graph-only. Drop back to 738 if the exporters stop requiring them.
+max_modules="${GC_NATIVE_DEP_MAX_MODULES:-749}"
 # max_binary_bytes re-baselined 2026-08-29 (ga-iuznq2). The build below now
 # adds -trimpath and CGO_ENABLED=0, which removes cross-host path-embedding
 # and native C-object (dolthub/gozstd, ICU) variance that previously made
