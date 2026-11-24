@@ -175,13 +175,20 @@ func controlReadyRoutes(parsed parsedControlReadyQuery) []string {
 	return routes
 }
 
-// filterReadyByAssignee mirrors `bd ready --assignee=$cand --exclude-type=epic --limit=N`.
-// ready is expected to already be in canonical ready order
-// (SortBeadsReadyOrder), matching bd's own default (no --sort) ready order.
+// filterReadyByAssignee mirrors the assigned-ready tier: `bd ready
+// --assignee=$cand --exclude-type=epic` with every open-work park dropped
+// before the cut to N (config's assignedReadyTierCommand: the exact park
+// labels in bd, any other hold:* in jq; ga-v28pab, #8010). bd's native human
+// label stays transparent here, as it does in that tier. ready is expected to
+// already be in canonical ready order (SortBeadsReadyOrder), matching bd's own
+// default (no --sort) ready order.
 func filterReadyByAssignee(ready []beads.Bead, assignee string, limit int) []beads.Bead {
 	var out []beads.Bead
 	for _, b := range ready {
 		if b.Assignee != assignee || b.Type == controlReadyExcludeType {
+			continue
+		}
+		if b.Status == "open" && beadmeta.HasOpenWorkPark(b.Labels) {
 			continue
 		}
 		out = append(out, b)
@@ -194,11 +201,15 @@ func filterReadyByAssignee(ready []beads.Bead, assignee string, limit int) []bea
 
 // filterReadyByRoute mirrors `bd ready --metadata-field $metadataKey=$route --unassigned --exclude-type=epic --exclude-label <label>... --sort oldest --limit=N`,
 // where the excluded labels are config.PoolDemandServeRulesForQuery().ExcludeLabels:
-// the dispatch holds and bd's native human label.
+// the dispatch holds, freeze:deferred (ga-v28pab) and bd's native human label.
+// It also drops any open-work park (beadmeta.HasOpenWorkPark: any hold:* label,
+// freeze:deferred in any case), the jq strip the shell routed tier runs after
+// its read (holdParkPoolDemandScript), so a routed park such as hold:clock is
+// not run here either (ga-v28pab).
 // This is a route-scoped, unassigned tier (Tier 3 pool-demand/control-dispatcher
-// routing), so beads parked for a hold or a person must be excluded (ga-5736js):
-// filterReadyByAssignee (Tier 1/2, assignee-scoped) stays transparent to both
-// by design and must not gain this filter.
+// routing), so beads parked for a hold or a person must be excluded (ga-5736js).
+// filterReadyByAssignee drops open-work parks but stays transparent to bd's
+// human label, as the assigned-ready tier does.
 func filterReadyByRoute(ready []beads.Bead, metadataKey, route string) []beads.Bead {
 	excludedLabels := config.PoolDemandServeRulesForQuery().ExcludeLabels
 	var matched []beads.Bead
@@ -207,6 +218,9 @@ func filterReadyByRoute(ready []beads.Bead, metadataKey, route string) []beads.B
 			continue
 		}
 		if b.Metadata[metadataKey] != route {
+			continue
+		}
+		if beadmeta.HasOpenWorkPark(b.Labels) {
 			continue
 		}
 		excluded := false

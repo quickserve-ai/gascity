@@ -92,3 +92,54 @@ func HasDispatchHold(labels []string) bool {
 	}
 	return false
 }
+
+// FreezeDeferredLabel marks work deferred by a fork freeze. A town parks
+// unclaimed work under it or under any hold:* label ("hold:human",
+// "hold:clock", "hold:human-decision", ...), and none of those values is a
+// canonical dispatch hold, so before HasOpenWorkPark a named seat's
+// `gc hook --claim` served the parked bead back as work and flipped it to
+// in_progress (ga-v28pab).
+const FreezeDeferredLabel = "freeze:deferred"
+
+// HasOpenWorkPark reports whether labels park an UNCLAIMED bead: a canonical
+// dispatch hold (HasDispatchHold, trimmed and case-insensitive), any hold:*
+// label (HasHoldLabel, the single definition in hold.go, the same rule the
+// route-scoped work query's jq clause applies), or "freeze:deferred" (trimmed,
+// case-insensitive, as the controller's demand predicate compares it). It answers the same "is this WORK for whoever asks?" question as
+// HasDispatchHold, for unclaimed rows only: the hook's serve filter (for
+// candidates not yet in_progress or hooked), the controller's open-work wake
+// gate (assignedOpenWorkHeld), the drain-ack claimability classifier and
+// continuation-group pre-assignment. A claimed bead stays on HasDispatchHold
+// alone, so a seat's own in_progress park (a hold:cert-wait park is
+// in_progress by town doctrine) is still served to it.
+func HasOpenWorkPark(labels []string) bool {
+	if HasDispatchHold(labels) || HasHoldLabel(labels) {
+		return true
+	}
+	for _, label := range labels {
+		if strings.EqualFold(strings.TrimSpace(label), FreezeDeferredLabel) {
+			return true
+		}
+	}
+	return false
+}
+
+// OpenWorkParkExactLabels are the open-work park labels a bd reader can
+// exclude by exact match (--exclude-label, or NOT label= in a bd query): the
+// canonical dispatch holds plus FreezeDeferredLabel. The rest of the
+// HasOpenWorkPark rule, any other "hold:*" label, is a prefix bd cannot match,
+// so queries strip it with OpenWorkParkExcludeSelectJQ after the read.
+func OpenWorkParkExactLabels() []string {
+	return append(append([]string(nil), DispatchHoldLabels...), FreezeDeferredLabel)
+}
+
+// OpenWorkParkExcludeSelectJQ is HasOpenWorkPark for shell/jq consumers of bd
+// --json rows: it keeps only rows with no "hold:*" label (the canonical dispatch
+// holds start with it too) and no "freeze:deferred" label. Each label is
+// trimmed of surrounding whitespace first, as strings.TrimSpace does in
+// HasOpenWorkPark; freeze:deferred compares case-insensitively, as
+// HasOpenWorkPark and the controller's demand predicate do; the hold: prefix is
+// case-sensitive, like HasHoldLabel and HoldParkExcludeSelectJQ, and the hook's
+// Go-side filter (isHeldHookCandidate) still catches a mixed-case canonical
+// hold. Needs jq's regex support (sub), which every supported jq build has.
+const OpenWorkParkExcludeSelectJQ = `select(([(.labels // [])[] | sub("^\\s+"; "") | sub("\\s+$"; "") | select(startswith("` + HoldLabelPrefix + `") or (ascii_downcase == "` + FreezeDeferredLabel + `"))] | length) == 0)`

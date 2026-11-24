@@ -31,10 +31,11 @@ import (
 
 const holdTestIdentity = "gastown__polecat-az-wisp-ak1hw"
 
-// heldWorkQueryRow renders one work-query row carrying the given hold label.
-func heldWorkQueryRow(id, status, assignee, label string) string {
+// heldWorkQueryRow renders one work-query row, assigned to holdTestIdentity,
+// carrying the given hold label.
+func heldWorkQueryRow(id, status, label string) string {
 	return `{"id":"` + id + `","status":"` + status + `","issue_type":"task","assignee":"` +
-		assignee + `","labels":["` + label + `","mysql-cutover"]}`
+		holdTestIdentity + `","labels":["` + label + `","mysql-cutover"]}`
 }
 
 func holdTestClaimOptions() hookClaimOptions {
@@ -54,7 +55,7 @@ func TestHookClaimDoesNotServeHeldExistingAssignment(t *testing.T) {
 		t.Run(label, func(t *testing.T) {
 			const heldID = "gas-4cu"
 			runner := func(string, string) (string, error) {
-				return `[` + heldWorkQueryRow(heldID, "in_progress", holdTestIdentity, label) + `]`, nil
+				return `[` + heldWorkQueryRow(heldID, "in_progress", label) + `]`, nil
 			}
 			ops := hookClaimOps{
 				Runner: runner,
@@ -92,7 +93,7 @@ func TestHookClaimSkipsHeldAssignmentAndClaimsReadyWork(t *testing.T) {
 	)
 	runner := func(string, string) (string, error) {
 		return `[
-			` + heldWorkQueryRow(heldID, "in_progress", holdTestIdentity, beadmeta.HoldExternalLabel) + `,
+			` + heldWorkQueryRow(heldID, "in_progress", beadmeta.HoldExternalLabel) + `,
 			{"id":"` + readyID + `","status":"open","issue_type":"task","assignee":"","metadata":{"gc.routed_to":"` + holdTestIdentity + `"}}
 		]`, nil
 	}
@@ -129,7 +130,7 @@ func TestHookClaimSkipsHeldAssignmentAndClaimsReadyWork(t *testing.T) {
 func TestHookClaimDoesNotPromoteHeldReadyAssignment(t *testing.T) {
 	const heldID = "gas-held-open"
 	runner := func(string, string) (string, error) {
-		return `[` + heldWorkQueryRow(heldID, "open", holdTestIdentity, beadmeta.HoldMayorLabel) + `]`, nil
+		return `[` + heldWorkQueryRow(heldID, "open", beadmeta.HoldMayorLabel) + `]`, nil
 	}
 	ops := hookClaimOps{
 		Runner: runner,
@@ -194,5 +195,69 @@ func TestFilterUnreadyHookCandidatesKeepsNonHoldLabels(t *testing.T) {
 	if len(rows) != 1 || rows[0]["id"] != "wk-1" {
 		t.Fatalf("non-canonical hold-ish labels were filtered; only %v are holds. got %s",
 			beadmeta.DispatchHoldLabels, got)
+	}
+}
+
+// TestFilterUnreadyHookCandidatesDropsUnclaimedTownParks is the ga-v28pab
+// regression: an UNCLAIMED bead parked under a town hold label (hold:human,
+// hold:human-decision, hold:clock) or freeze:deferred is not work, so the hook
+// must not serve it and a session-start `gc hook --claim` must not flip it to
+// in_progress. A CLAIMED bead under the same labels is still the seat's own
+// work: a hold:cert-wait park is in_progress by town doctrine and must stay
+// served. A canonical hold still drops a claimed bead (gas-kg6).
+func TestFilterUnreadyHookCandidatesDropsUnclaimedTownParks(t *testing.T) {
+	in := `[
+		{"id":"open-human","status":"open","labels":["hold:human"]},
+		{"id":"open-decision","status":"open","labels":["hold:human-decision","platform"]},
+		{"id":"open-freeze","status":"open","labels":["freeze:deferred","hold:clock"]},
+		{"id":"open-freeze-only","status":"open","labels":[" freeze:deferred "]},
+		{"id":"ip-cert-wait","status":"in_progress","labels":["hold:cert-wait"]},
+		{"id":"hooked-human","status":"hooked","labels":["hold:human"]},
+		{"id":"ip-mayor","status":"in_progress","labels":["hold:mayor"]},
+		{"id":"open-plain","status":"open","labels":["freeze:a","holding-pattern"]}
+	]`
+	got := filterUnreadyHookCandidates(in, time.Now())
+
+	var rows []map[string]any
+	if err := json.Unmarshal([]byte(got), &rows); err != nil {
+		t.Fatalf("filtered output is not a JSON array: %v (output %q)", err, got)
+	}
+	want := []string{"ip-cert-wait", "hooked-human", "open-plain"}
+	if len(rows) != len(want) {
+		t.Fatalf("filterUnreadyHookCandidates kept %d rows, want %d %v: %s", len(rows), len(want), want, got)
+	}
+	for i, id := range want {
+		if rows[i]["id"] != id {
+			t.Fatalf("row %d id = %v, want %q: %s", i, rows[i]["id"], id, got)
+		}
+	}
+}
+
+// TestHookClaimDoesNotPromoteTownParkedReadyAssignment is the mayor's observed
+// sequence on ga-v28pab: an OPEN bead assigned to the seat and parked
+// hold:human-decision must not be promoted to in_progress by the claim.
+func TestHookClaimDoesNotPromoteTownParkedReadyAssignment(t *testing.T) {
+	for _, label := range []string{"hold:human-decision", "hold:human", "freeze:deferred"} {
+		t.Run(label, func(t *testing.T) {
+			runner := func(string, string) (string, error) {
+				return `[` + heldWorkQueryRow("ga-parked", "open", label) + `]`, nil
+			}
+			ops := hookClaimOps{
+				Runner: runner,
+				Claim: func(_ context.Context, _ string, _ []string, id, _ string) (beads.Bead, bool, error) {
+					t.Fatalf("store.Claim promoted %s-parked bead %q to in_progress", label, id)
+					return beads.Bead{}, false, nil
+				},
+			}
+			var stdout, stderr bytes.Buffer
+			doHookClaim("bd ready --json", "/tmp/work", holdTestClaimOptions(), ops, &stdout, &stderr)
+			var result hookClaimJSONResult
+			if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+				t.Fatalf("stdout is not JSON: %v\nraw: %s", err, stdout.String())
+			}
+			if result.Action == "work" {
+				t.Fatalf("REGRESSION ga-v28pab: %s-parked open assignment %q served as action=work (reason=%q)", label, result.BeadID, result.Reason)
+			}
+		})
 	}
 }

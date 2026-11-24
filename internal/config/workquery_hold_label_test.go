@@ -1,11 +1,14 @@
 package config
 
 import (
+	"os"
+	"os/exec"
 	"slices"
 	"strings"
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/beadmeta"
+	"github.com/gastownhall/gascity/internal/shellquote"
 )
 
 // This file expresses the ga-x9kptu / ga-5736js acceptance criteria at the
@@ -49,16 +52,17 @@ func TestLegacyEphemeralPoolDemandShellRouteScopedExcludesDispatchHoldLabels(t *
 }
 
 // The bd-1.0.4 assigned-ready wisp probe serves its first row and exits the
-// work query, so its jq selection drops every dispatch hold (#8010); the
-// behavior is pinned in workquery_assigned_ready_hold_test.go.
+// work query, so its jq selection drops every open-work park, the dispatch
+// holds included (#8010, ga-v28pab); the behavior is pinned in
+// workquery_assigned_ready_hold_test.go.
 func TestEphemeralAssignedReadyProbeScriptExcludesDispatchHoldLabels(t *testing.T) {
 	got := ephemeralAssignedReadyProbeScript("cand", QueryTopology{})
-	if !strings.Contains(got, ".labels") {
-		t.Errorf("ephemeralAssignedReadyProbeScript() = %q, missing a .labels reference", got)
+	if !strings.Contains(got, beadmeta.OpenWorkParkExcludeSelectJQ) {
+		t.Errorf("ephemeralAssignedReadyProbeScript() = %q, missing the open-work park selector %q", got, beadmeta.OpenWorkParkExcludeSelectJQ)
 	}
 	for _, label := range beadmeta.DispatchHoldLabels {
-		if !strings.Contains(got, `"`+label+`"`) {
-			t.Errorf("ephemeralAssignedReadyProbeScript() = %q, missing hold label %q", got, label)
+		if !strings.HasPrefix(label, beadmeta.HoldLabelPrefix) {
+			t.Errorf("dispatch hold %q does not start with %q, so the open-work park selector would not drop it", label, beadmeta.HoldLabelPrefix)
 		}
 	}
 }
@@ -127,5 +131,72 @@ func TestAssigneeScopedProbesStayHumanTransparent(t *testing.T) {
 		if strings.Contains(got, `"human"`) {
 			t.Errorf("%s() = %q, assignee-scoped tier must stay human-transparent", name, got)
 		}
+	}
+}
+
+// openWorkParkFirstRowScript replaces $r only when jq parsed the whole payload:
+// jq can print a result and still fail on what follows it, and a partial result
+// must not stand in for the payload the hook's fail-open handling reads.
+func TestOpenWorkParkFirstRowScriptKeepsAPayloadJQCannotParseWhole(t *testing.T) {
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq is required to run the generated script")
+	}
+	cases := map[string]struct{ in, want string }{
+		"parsed, parked head stripped": {
+			in:   `[{"id":"p","labels":["  hold:human "]},{"id":"a","labels":[]}]`,
+			want: `[{"id":"a","labels":[]}]`,
+		},
+		"parsed, mixed-case freeze stripped": {
+			in:   `[{"id":"f","labels":["Freeze:Deferred"]}]`,
+			want: `[]`,
+		},
+		"trailing garbage kept whole": {
+			in:   `[] trailing-garbage`,
+			want: `[] trailing-garbage`,
+		},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			script := `r=` + shellquote.Quote(c.in) + `; ` + openWorkParkFirstRowScript() + `printf "%s" "$r"`
+			got, stderr, exit := runShellCommandCapture(t, script, []string{"PATH=" + os.Getenv("PATH")})
+			if exit != 0 {
+				t.Fatalf("script exit %d: %s", exit, stderr)
+			}
+			if got != c.want {
+				t.Fatalf("r = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+// The routed tier's jq strip applies the same open-work park rule as the hook
+// and the controller's demand predicate (ga-v28pab): a padded hold:* label and a
+// mixed-case freeze:deferred, which bd's exact --exclude-label lets through, are
+// dropped, and an unparseable payload is kept whole.
+func TestHoldParkPoolDemandScriptStripsEveryOpenWorkPark(t *testing.T) {
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq is required to run the generated script")
+	}
+	cases := map[string]struct{ in, want string }{
+		"parks stripped": {
+			in:   `[{"id":"c","labels":[" hold:clock"]},{"id":"f","labels":["Freeze:Deferred"]},{"id":"h","labels":["human"]},{"id":"a"}]`,
+			want: `[{"id":"h","labels":["human"]},{"id":"a"}]`,
+		},
+		"trailing garbage kept whole": {
+			in:   `[] trailing-garbage`,
+			want: `[] trailing-garbage`,
+		},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			script := `r=` + shellquote.Quote(c.in) + `; ` + holdParkPoolDemandScript() + `printf "%s" "$r"`
+			got, stderr, exit := runShellCommandCapture(t, script, []string{"PATH=" + os.Getenv("PATH")})
+			if exit != 0 {
+				t.Fatalf("script exit %d: %s", exit, stderr)
+			}
+			if got != c.want {
+				t.Fatalf("r = %q, want %q", got, c.want)
+			}
+		})
 	}
 }

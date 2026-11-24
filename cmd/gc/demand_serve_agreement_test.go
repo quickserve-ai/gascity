@@ -605,7 +605,8 @@ func TestGoPredicateAndGeneratedQueryAgreeRowByRow(t *testing.T) {
 // Go side applies in controllerDemandRouteCandidates: run_target is consulted
 // only when there is no canonical route, and only for a root the fallback may
 // still speak for (workflowRunTargetFallbackEligible, #5900) — and drops any
-// row parked under a hold:* label (ga-uica16). Mirroring those jq clauses
+// open-work park: a hold:* label (ga-uica16) or freeze:deferred in any case
+// (beadmeta.HasOpenWorkPark, ga-v28pab). Mirroring those jq clauses
 // here is the single restatement in this conformance, and
 // assertLegacyTierFilterUnchanged is what keeps it honest.
 func legacyWorkflowTierServes(bead beads.Bead, opts readyOpts, metaWant []metadataFieldFilter) bool {
@@ -615,7 +616,7 @@ func legacyWorkflowTierServes(bead beads.Bead, opts readyOpts, metaWant []metada
 	if strings.TrimSpace(bead.Metadata[beadmeta.WorkflowExpandedMetadataKey]) == "true" {
 		return false
 	}
-	if beadmeta.HasHoldLabel(bead.Labels) {
+	if beadmeta.HasOpenWorkPark(bead.Labels) {
 		return false
 	}
 	return strings.TrimSpace(bead.Metadata[beadmeta.RoutedToMetadataKey]) == ""
@@ -654,7 +655,7 @@ func assertLegacyTierFilterUnchanged(t *testing.T, query string) {
 	// poolDemandFirstRowFunctionScript, brackets and limit slice included. The
 	// query is compared with the sh -c single-quote escaping undone, so the pin
 	// holds the jq PROGRAM rather than the quoting of the shell wrapper around it.
-	const wantFilter = `jq '[.[] | select(((.metadata["gc.routed_to"] // "") == "") and ((.metadata["gc.workflow_expanded"] // "") != "true")) | select(([.labels[]? | select(startswith("hold:"))] | length) == 0)] | .[:1]'`
+	const wantFilter = `jq '[.[] | select(((.metadata["gc.routed_to"] // "") == "") and ((.metadata["gc.workflow_expanded"] // "") != "true")) | select(([(.labels // [])[] | sub("^\\s+"; "") | sub("\\s+$"; "") | select(startswith("hold:") or (ascii_downcase == "freeze:deferred"))] | length) == 0)] | .[:1]'`
 	if !strings.Contains(unescapeShellSingleQuotes(query), wantFilter) {
 		t.Fatalf("the legacy workflow tier's post-filter is no longer exactly\n  %s\nso the Go mirror in legacyWorkflowTierServes is unpinned. Re-derive the mirror against the new filter, then update this pin.\nGenerated query:\n%s", wantFilter, query)
 	}

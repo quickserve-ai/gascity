@@ -186,31 +186,33 @@ func jqMeta(key string) string {
 	return `(.metadata["` + key + `"] // "")`
 }
 
-// holdParkExcludeSelectJQ drops beads carrying any hold:* label — parked
-// under the wait-class contract, so neither stranded nor dispatchable
-// (ga-uica16: two pool sessions consumed on a hold:cert-wait park). The
-// single definition of the rule lives in beadmeta (prefix rationale and the
-// serve/exist contract are documented there). It is the prefix complement of
-// PoolDemandServeRules' canonical --exclude-label pair: bd cannot prefix-match
-// a label, so the open wait-class set is stripped by jq after each unassigned
-// pool-demand read.
-const holdParkExcludeSelectJQ = beadmeta.HoldParkExcludeSelectJQ
+// holdParkExcludeSelectJQ drops unassigned routed rows that carry an
+// open-work park: any hold:* label (parked under the wait-class contract, so
+// neither stranded nor dispatchable; ga-uica16: two pool sessions consumed on a
+// hold:cert-wait park) or freeze:deferred in any case (ga-v28pab). It is
+// beadmeta.OpenWorkParkExcludeSelectJQ, the same rule the assigned-ready tier,
+// the hook (HasOpenWorkPark) and the controller's demand predicate apply, so a
+// routed row the hook would refuse never holds a place in a read the hook then
+// empties. It is the prefix and case-folded complement of PoolDemandServeRules'
+// exact --exclude-label set: bd cannot prefix-match or case-fold a label, so
+// the rest is stripped by jq after each unassigned pool-demand read.
+const holdParkExcludeSelectJQ = beadmeta.OpenWorkParkExcludeSelectJQ
 
 // holdParkFilterJQ wraps the exclusion select as a whole-array filter.
 func holdParkFilterJQ() string {
 	return `[.[] | ` + holdParkExcludeSelectJQ + `]`
 }
 
-// holdParkPoolDemandScript strips hold:*-parked rows from the pool-demand
-// candidates a ready read left in $r (ga-uica16), so a worker is never served a
-// row the count-form (poolDemandCountJQ) does not count. The strip runs after
-// the read's --limit window, so a window holding only parked rows reads as
-// empty and the tier falls through. A payload jq cannot parse is preserved for
+// holdParkPoolDemandScript strips open-work parks (holdParkExcludeSelectJQ) from
+// the pool-demand candidates a ready read left in $r (ga-uica16, ga-v28pab), so
+// a worker is never served a row the count-form (poolDemandCountJQ) does not
+// count. The strip runs after the read's --limit window, so a window holding
+// only parked rows reads as empty and the tier falls through. A payload jq does
+// not parse whole (jq exits non-zero, even after printing) is preserved for
 // the hook's fail-open handling, exactly as preferExecutablePoolDemandScript
 // preserves it, and the read's own failure clause has already run.
 func holdParkPoolDemandScript() string {
-	return `gc_unparked_pool_demand=$(printf "%s" "$r" | jq -c ` + shellquote.Quote(holdParkFilterJQ()) + ` 2>/dev/null); ` +
-		`[ -n "$gc_unparked_pool_demand" ] && r="$gc_unparked_pool_demand"; `
+	return `if gc_unparked_pool_demand=$(printf "%s" "$r" | jq -c ` + shellquote.Quote(holdParkFilterJQ()) + ` 2>/dev/null) && [ -n "$gc_unparked_pool_demand" ]; then r="$gc_unparked_pool_demand"; fi; `
 }
 
 // PoolDemandServeRules names, in Go, exactly what the generated Tier-3
@@ -233,8 +235,8 @@ type PoolDemandServeRules struct {
 	// ExcludeTypes mirrors --exclude-type: issue types the tier never serves.
 	ExcludeTypes []string
 	// ExcludeLabels mirrors the repeated --exclude-label flags: the dispatch
-	// holds, and bd's native human label, that a worker is deliberately
-	// forbidden to claim through.
+	// holds, freeze:deferred (ga-v28pab) and bd's native human label, that a
+	// worker is deliberately forbidden to claim through.
 	ExcludeLabels []string
 }
 
@@ -245,7 +247,7 @@ func PoolDemandServeRulesForQuery() PoolDemandServeRules {
 	return PoolDemandServeRules{
 		RequireUnassigned: true,
 		ExcludeTypes:      []string{"epic"},
-		ExcludeLabels:     append(append([]string(nil), beadmeta.DispatchHoldLabels...), beadmeta.HumanLabel),
+		ExcludeLabels:     append(beadmeta.OpenWorkParkExactLabels(), beadmeta.HumanLabel),
 	}
 }
 
@@ -827,12 +829,15 @@ func inProgressBlockedByEnrichmentScriptWithServeAction(federated bool, checkHol
 // pre-assigned tier, and the tier a graph step assigned to this worker arrives
 // on. It is one of the four ready reads the federation swap covers.
 //
-// The read excludes beadmeta.DispatchHoldLabels (never the human label) before
-// its --limit=1. Its callers serve the first row and exit the query, so a held
-// row it returned would be stripped by the hook's held-candidate filter and
-// starve every tier below (#8010); filtering ahead of the limit also keeps a
-// held head from hiding an unheld assignment for the same identity. The wisp
-// probe behind it (ephemeralAssignedReadyProbeScript) filters the same way.
+// The read drops every open-work park (beadmeta.HasOpenWorkPark: the dispatch
+// holds, any hold:* label, freeze:deferred; never bd's human label) before it
+// cuts to one row: the exact labels by --exclude-label in bd, the hold:* prefix
+// by openWorkParkFirstRowScript. Its callers serve the first row and exit the
+// query, so a parked row it returned would be stripped by the hook's
+// held-candidate filter and starve every tier below (#8010); filtering ahead of
+// the cut also keeps a parked head from hiding an actionable assignment for the
+// same identity (ga-v28pab). The wisp probe behind it
+// (ephemeralAssignedReadyProbeScript) filters the same way.
 //
 // The CONTROLLER mirrors this predicate before it counts such a row as capacity
 // demand — cmd/gc poolWakeReadiness, the assigned-arm counterpart to
@@ -850,9 +855,24 @@ func inProgressBlockedByEnrichmentScriptWithServeAction(federated bool, checkHol
 func assignedReadyTierCommand(shellVar string, topo QueryTopology) string {
 	fed := topo.FederatedReady
 	return `r=$(` + readyReaderCommand(fed) + bdReadyIncludeEphemeralArg(topo.includeEphemeralReady()) +
-		` --assignee="$` + shellVar + `"` + excludeLabelArgs(beadmeta.DispatchHoldLabels) +
-		` --json --limit=1` + readyReaderStderrSink(fed) + `)` +
-		readyReaderFailurePropagation(fed) + `; `
+		` --assignee="$` + shellVar + `"` + excludeLabelArgs(beadmeta.OpenWorkParkExactLabels()) +
+		` --json --limit=0` + readyReaderStderrSink(fed) + `)` +
+		readyReaderFailurePropagation(fed) + `; ` +
+		openWorkParkFirstRowScript()
+}
+
+// openWorkParkFirstRowScript keeps the first row of the assigned-ready read in
+// $r that no open-work park label covers (beadmeta.OpenWorkParkExcludeSelectJQ:
+// any hold:* label or freeze:deferred). bd cannot prefix-match a label, so the
+// read is unbounded (one identity's own ready rows) and the cut to one row runs
+// here, after the park strip: a parked head never hides an actionable
+// assignment behind it, and a read holding only parked rows reads as [] and
+// falls through to the tiers below (ga-v28pab). A payload jq does not parse
+// whole (jq exits non-zero, even after printing a partial result) is kept for
+// the hook's fail-open handling, as holdParkPoolDemandScript keeps it.
+func openWorkParkFirstRowScript() string {
+	filter := `[.[] | ` + beadmeta.OpenWorkParkExcludeSelectJQ + `] | .[:1]`
+	return `if gc_unparked_assigned=$(printf "%s" "$r" | jq -c ` + shellquote.Quote(filter) + ` 2>/dev/null) && [ -n "$gc_unparked_assigned" ]; then r="$gc_unparked_assigned"; fi; `
 }
 
 func standardAssignedReadyWorkQueryScript(topo QueryTopology) string {
@@ -967,13 +987,25 @@ func ephemeralAssignedInProgressProbeScript(shellVar string, topo QueryTopology)
 // ordered by creation and holds up to 20 rows, so the jq filters that follow
 // still see past a blocked first row. The dispatch holds
 // (beadmeta.DispatchHoldLabels, never the human label) are excluded INSIDE the
-// query, ahead of that 20-row window: both callers drop held rows anyway, and
+// query, ahead of that 20-row window (the open-tier caller widens the set, see
+// bdQueryEphemeralAssignedStatusQuietShellExcluding): both callers drop held rows anyway, and
 // filtering only after the window let 20 older held rows hide an unheld
 // assignment behind them (#8010 carry review). The identity is quoted inside the
 // query language because aliases contain '/'.
 func bdQueryEphemeralAssignedStatusQuietShell(status, shellVar string) string {
+	return bdQueryEphemeralAssignedStatusQuietShellExcluding(status, shellVar, beadmeta.DispatchHoldLabels)
+}
+
+// bdQueryEphemeralAssignedStatusQuietShellExcluding is
+// bdQueryEphemeralAssignedStatusQuietShell with the in-query exclusion set
+// chosen by the caller. The open-tier wisp probe passes
+// beadmeta.OpenWorkParkExactLabels (adding freeze:deferred, ga-v28pab); a
+// hold:* label other than the canonical two is a prefix the query language
+// cannot match, so such a wisp still takes a place in the 20-row window and is
+// dropped by the probe's jq selector after it.
+func bdQueryEphemeralAssignedStatusQuietShellExcluding(status, shellVar string, excluded []string) string {
 	return `bd query --json "ephemeral=true AND status=` + status + ` AND assignee=\"$` + shellVar + `\"` +
-		bdQueryExcludeLabelClauses(beadmeta.DispatchHoldLabels) + `" --sort created --limit=20 2>/dev/null`
+		bdQueryExcludeLabelClauses(excluded) + `" --sort created --limit=20 2>/dev/null`
 }
 
 // bdQueryExcludeLabelClauses renders one ` AND NOT label=\"<l>\"` clause per
@@ -1012,9 +1044,10 @@ func ephemeralAssignedInProgressProbeScriptDeferringGraphAnchor(shellVar string,
 // single-store city.
 //
 // It is the wisp half of the assigned-ready tier: like assignedReadyTierCommand
-// ahead of it, it serves its first row and exits the query. So it drops
-// beadmeta.DispatchHoldLabels (never the human label) inside its jq selection,
-// before the `.[:1]` cut. A held wisp it served would be stripped by the hook's
+// ahead of it, it serves its first row and exits the query. So it drops every
+// open-work park (beadmeta.OpenWorkParkExcludeSelectJQ: hold:* and
+// freeze:deferred, never the human label) inside its jq selection, before the
+// `.[:1]` cut (ga-v28pab). A held wisp it served would be stripped by the hook's
 // held-candidate filter and starve every tier below it (#8010), and filtering
 // ahead of the cut keeps a held wisp from hiding an unheld one assigned to the
 // same identity.
@@ -1023,7 +1056,7 @@ func ephemeralAssignedInProgressProbeScriptDeferringGraphAnchor(shellVar string,
 // a dependency_count > 0 candidate enriched via a real bd show --json call,
 // so a step whose dependencies have since all closed is still reachable —
 // see ephemeralReadyDependencyCandidateFilterJQ. Both filters take the
-// dispatch-hold exclusion in their selector (never the human label), so a held
+// open-work park exclusion in their selector (never the human label), so a held
 // candidate cannot be the one the `.[:1]` cut keeps (#8010; this replaces the
 // earlier hold-transparent rule of #4952 for this tier).
 //
@@ -1037,14 +1070,14 @@ func ephemeralAssignedInProgressProbeScriptDeferringGraphAnchor(shellVar string,
 // through the same fast and slow filters: `bd query status=open` is not a
 // readiness query, since dependency-blocked issues keep status "open".
 func ephemeralAssignedReadyProbeScript(shellVar string, topo QueryTopology) string {
-	selector := `select((.assignee // "") == $id)` + excludeHoldLabelsJQClause()
+	selector := `select((.assignee // "") == $id) | ` + beadmeta.OpenWorkParkExcludeSelectJQ
 	fastFilter := legacyEphemeralReadyFilterJQ(selector, 1, false)
 	slowFilter := ephemeralReadyDependencyCandidateFilterJQ(selector, 1, false)
 	candidatesVar := "open_ephemeral"
 	read := ephemeralStatusSnapshotShell(candidatesVar, "open")
 	if topo.includeEphemeralReady() {
 		candidatesVar = "assigned_open_ephemeral"
-		read = candidatesVar + `=$(` + bdQueryEphemeralAssignedStatusQuietShell("open", shellVar) + `); `
+		read = candidatesVar + `=$(` + bdQueryEphemeralAssignedStatusQuietShellExcluding("open", shellVar, beadmeta.OpenWorkParkExactLabels()) + `); `
 	}
 	return read +
 		`r=$(printf "%s" "$` + candidatesVar + `" | jq --arg id "$` + shellVar + `" ` + shellquote.Quote(fastFilter) + ` 2>/dev/null); ` +
