@@ -882,7 +882,10 @@ func (t *Tmux) classifyPaneLines(session, target string, lines []string, checkDr
 	draft := checkDraft && t.sessionClientCount(session) != 0 && t.paneIsClaudeFamily(target)
 	prefix := t.resolveIdlePromptPrefix(session)
 	reason := classifyHumanPrompt(lines, prefix, draft)
-	if reason == NudgeDeferReasonHumanDraft && t.composerHoldsOnlyDimText(target, prefix) {
+	// A faint placeholder is an empty composer whether or not the box was
+	// found: composer_not_found gets the same attribute re-read human_draft
+	// does, so a no-box placeholder still delivers as it did before ga-bz7eo5.
+	if (reason == NudgeDeferReasonHumanDraft || reason == NudgeDeferReasonComposerNotFound) && t.composerHoldsOnlyDimText(target, prefix) {
 		reason = ""
 	}
 	return reason
