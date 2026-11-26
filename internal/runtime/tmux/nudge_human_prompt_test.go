@@ -437,6 +437,10 @@ func TestSnapshotIdleHumanPrompts(t *testing.T) {
 		{name: "idle composer", screen: idleComposerFixture, wantIdle: true},
 		{name: "quoted dialog", screen: quotedDialogAboveComposerFixture, wantIdle: true},
 		{name: "other provider placeholder", screen: humanDraftFixture, provider: "codex", wantIdle: true},
+		// ga-bz7eo5: an attached pane with no composer box and a prompt echo in
+		// scrollback is not a person's draft, so the lifecycle paths do not
+		// hold the seat on it (krieger was held 49 h this way).
+		{name: "attached, no box, prompt echo does not hold", screen: strings.Replace(noBoxScrollbackFixture, "\n✻ Thinking…", "", 1), attached: true, wantIdle: true},
 		{
 			name: "faint placeholder", attached: true, wantIdle: true,
 			screen: strings.Replace(idleComposerFixture, "❯\n", "❯ Try a question\n", 1),
@@ -867,6 +871,31 @@ func TestNudgeSessionTreatsFaintPlaceholderAsAnEmptyComposer(t *testing.T) {
 			t.Fatalf("NudgeSession typed with the attribute read failing: %q", keys)
 		}
 		assertDeferred(t, err, NudgeDeferReasonHumanDraft)
+	})
+	// ga-bz7eo5 review: with no box drawn, a faint placeholder is still an
+	// empty composer and delivers; a failed attribute read still defers.
+	noBox := func(s string) string {
+		return strings.ReplaceAll(strings.ReplaceAll(s, rule+"\n", ""), "\x1b[38;5;244m"+rule+"\n", "")
+	}
+	t.Run("no box, placeholder only: delivers", func(t *testing.T) {
+		fe := &panePromptExecutor{screen: noBox(placeholderComposerFixture), styled: noBox(placeholderComposerStyledFixture), attached: true}
+		fe.onEnter = func(int) string { return busyFixture }
+		tm, session := newGuardTestTmux(fe)
+		if err := tm.NudgeSession(session, guardTestNudge); errors.Is(err, ErrNudgeDeferredHumanPrompt) {
+			t.Fatalf("NudgeSession() deferred on a faint placeholder with no box: %v", err)
+		}
+		if len(fe.keyCalls()) == 0 {
+			t.Fatal("NudgeSession sent no keys into an empty no-box composer showing a placeholder")
+		}
+	})
+	t.Run("no box, attribute read fails: defers as composer_not_found", func(t *testing.T) {
+		fe := &panePromptExecutor{screen: noBox(placeholderComposerFixture), styledErr: errors.New("capture-pane: transient"), attached: true}
+		tm, session := newGuardTestTmux(fe)
+		err := tm.NudgeSession(session, guardTestNudge)
+		if keys := fe.keyCalls(); len(keys) != 0 {
+			t.Fatalf("NudgeSession typed with no box and the attribute read failing: %q", keys)
+		}
+		assertDeferred(t, err, NudgeDeferReasonComposerNotFound)
 	})
 }
 
