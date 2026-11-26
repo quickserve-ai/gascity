@@ -54,8 +54,16 @@ const (
 	// NudgeDeferReasonHumanDraft: the composer holds text on an ATTACHED
 	// session, so a person may be mid-message. Before the first Enter
 	// (stage before_submit) it means the composer holds text that is not
-	// the nudge just typed: a person replaced it (ga-da5vmz).
+	// the nudge just typed: a person replaced it (ga-da5vmz). It is written
+	// only where that text was read inside Claude's composer box.
 	NudgeDeferReasonHumanDraft = "human_draft"
+	// NudgeDeferReasonComposerNotFound: an ATTACHED claude pane shows no
+	// composer box, only a prompt-looking line somewhere in the capture
+	// (often a scrollback echo of a past prompt). The guard cannot tell
+	// whose that text is, so it defers under this name instead of calling
+	// it a person's draft (ga-bz7eo5: krieger held 49 h as "human_draft"
+	// with no input box on screen).
+	NudgeDeferReasonComposerNotFound = "composer_not_found"
 	// NudgeDeferReasonCaptureFailed: the pane could not be read, so a prompt
 	// could not be ruled out. The guard fails closed.
 	NudgeDeferReasonCaptureFailed = "capture_failed"
@@ -226,15 +234,32 @@ func classifyHumanPrompt(lines []string, promptPrefix string, checkDraft bool) s
 	if checkDraft && composerHoldsHumanDraft(lines, promptPrefix) {
 		return NudgeDeferReasonHumanDraft
 	}
+	if checkDraft && composerNotFoundOverText(lines, promptPrefix) {
+		return NudgeDeferReasonComposerNotFound
+	}
 	return ""
 }
 
 // composerHoldsHumanDraft reports whether the live composer holds text that is
 // not gc's own (isGCNudgeDraft): the draft half of classifyHumanPrompt, which
-// applies it only where the caller says a draft can be a person's.
+// applies it only where the caller says a draft can be a person's. Only text
+// read inside the composer box counts (ga-bz7eo5): without a box, the last
+// prompt-looking line is as likely a scrollback echo as a draft, and calling
+// it a person's text held a seat deaf for two days.
 func composerHoldsHumanDraft(lines []string, promptPrefix string) bool {
-	found, text := composerDraft(lines, promptPrefix)
-	return found && text != "" && !isGCNudgeDraft(text)
+	text, boxed := composerBoxText(lines, promptPrefix)
+	return boxed && text != "" && !isGCNudgeDraft(text)
+}
+
+// composerNotFoundOverText reports the case composerHoldsHumanDraft no longer
+// calls a draft: no composer box was found, but a prompt-looking line with
+// text that is not gc's own is in the capture. Nobody can say whose it is.
+func composerNotFoundOverText(lines []string, promptPrefix string) bool {
+	if _, boxed := composerBoxText(lines, promptPrefix); boxed {
+		return false
+	}
+	idx, text := lastComposerLine(lines, promptPrefix)
+	return idx >= 0 && text != "" && !isGCNudgeDraft(text)
 }
 
 // composerDraft returns the text in the live composer and whether a composer
@@ -779,6 +804,9 @@ func (t *Tmux) humanPromptGuardOwning(session, target, stage string, checkDraft 
 	reason := t.classifyPaneLines(session, target, lines, checkDraft)
 	if reason == "" && owner != nil && t.draftIsNotOurs(session, target, lines, owner) {
 		reason = NudgeDeferReasonHumanDraft
+		if _, boxed := composerBoxText(lines, t.resolveIdlePromptPrefix(session)); !boxed {
+			reason = NudgeDeferReasonComposerNotFound
+		}
 	}
 	if reason != "" {
 		return &NudgeDeferredError{Session: session, Reason: reason, Stage: stage}
@@ -854,7 +882,10 @@ func (t *Tmux) classifyPaneLines(session, target string, lines []string, checkDr
 	draft := checkDraft && t.sessionClientCount(session) != 0 && t.paneIsClaudeFamily(target)
 	prefix := t.resolveIdlePromptPrefix(session)
 	reason := classifyHumanPrompt(lines, prefix, draft)
-	if reason == NudgeDeferReasonHumanDraft && t.composerHoldsOnlyDimText(target, prefix) {
+	// A faint placeholder is an empty composer whether or not the box was
+	// found: composer_not_found gets the same attribute re-read human_draft
+	// does, so a no-box placeholder still delivers as it did before ga-bz7eo5.
+	if (reason == NudgeDeferReasonHumanDraft || reason == NudgeDeferReasonComposerNotFound) && t.composerHoldsOnlyDimText(target, prefix) {
 		reason = ""
 	}
 	return reason

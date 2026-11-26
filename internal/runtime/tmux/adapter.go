@@ -2548,6 +2548,8 @@ func startupDeferralWarning(err error) string {
 		return "typed but not submitted: a prompt for a person appeared before Enter (Enter was withheld)"
 	case reason == NudgeDeferReasonCaptureFailed:
 		return "not delivered: the pane could not be read, so a prompt for a person could not be ruled out (nothing was typed)"
+	case reason == NudgeDeferReasonComposerNotFound:
+		return "not delivered: no input box was found in the pane, so whose text it shows is unknown (nothing was typed)"
 	default:
 		return "not delivered: the pane holds a prompt for a person (nothing was typed)"
 	}
