@@ -134,6 +134,16 @@ const humanDraftFixture = `⏺ Done. The tests pass.
   cherub@mac /repo (main)
   -- INSERT -- ⏵⏵ bypass permissions on (shift+tab to cycle)`
 
+// noBoxScrollbackFixture is a pane captured from a scratch tmux (ga-bz7eo5
+// reproduction): Claude scrollback holding an echo of a past prompt, and no
+// composer box anywhere. Before the fix the guard called the echo a person's
+// draft (human_draft) and held the seat until a person pressed a key.
+const noBoxScrollbackFixture = `❯ Run 'gc prime', check your hook and inbox, then execute what's assigned
+⏺ Done. Two beads re-dated; mailed the mayor.
+⏺ Bash(gc bd list --assignee krieger)
+  ⎿  3 open
+✻ Thinking…`
+
 // busyFixture is the pane after a submitted turn started.
 const busyFixture = `❯ <system-reminder> nudge
 ✽ Garnishing… (10s · ↓ 853 tokens)
@@ -661,6 +671,13 @@ func TestClassifyHumanPrompt(t *testing.T) {
 		{name: "attached boxed empty composer", screen: feedbackSurveySessionFixture, attached: true, want: ""},
 		{name: "generic numbered selection", screen: "Pick one\n❯ 1. Red\n  2. Blue\n", want: NudgeDeferReasonSelectionPrompt},
 		{name: "a numbered list with no cursor is prose", screen: "Plan:\n1. Red\n2. Blue\n❯ \n", want: ""},
+		// ga-bz7eo5: no composer box, only a scrollback echo of a past prompt.
+		// It is not a person's draft; the guard says it could not find the box.
+		{name: "attached, no box, prompt echo in scrollback", screen: noBoxScrollbackFixture, attached: true, want: NudgeDeferReasonComposerNotFound},
+		{name: "detached, no box, prompt echo in scrollback", screen: noBoxScrollbackFixture, want: ""},
+		{name: "attached, no box, only gc's own reminder echoed", screen: "❯ <system-reminder> earlier nudge </system-reminder>\n⏺ Done.", attached: true, want: ""},
+		{name: "attached, no box, no prompt line at all", screen: "⏺ Done.\n✻ Thinking…", attached: true, want: ""},
+		{name: "attached, box, draft below an echoed prompt is still a human draft", screen: "❯ an old prompt\n" + composerFixture("❯ I do"), attached: true, want: NudgeDeferReasonHumanDraft},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -880,6 +897,43 @@ func TestNudgeSessionDefersOnEveryShapeOfHumanDraft(t *testing.T) {
 				t.Fatalf("NudgeSession typed into a human draft: %q", keys)
 			}
 			assertDeferred(t, err, NudgeDeferReasonHumanDraft)
+		})
+	}
+}
+
+// TestNudgeSessionNamesAMissingComposerBox (ga-bz7eo5): on an attached claude
+// pane with no composer box, the nudge types nothing and defers as
+// composer_not_found, never as a person's draft.
+func TestNudgeSessionNamesAMissingComposerBox(t *testing.T) {
+	fe := &panePromptExecutor{screen: noBoxScrollbackFixture, attached: true}
+	tm, session := newGuardTestTmux(fe)
+	err := tm.NudgeSession(session, guardTestNudge)
+	if keys := fe.keyCalls(); len(keys) != 0 {
+		t.Fatalf("NudgeSession typed into a pane with no composer box: %q", keys)
+	}
+	assertDeferred(t, err, NudgeDeferReasonComposerNotFound)
+}
+
+// TestComposerHoldsHumanDraftOnlyInsideTheBox: the evidence rule. A draft is
+// text read inside the composer box; the no-box fallback line is not one.
+func TestComposerHoldsHumanDraftOnlyInsideTheBox(t *testing.T) {
+	for _, tt := range []struct {
+		name, screen        string
+		draft, notFoundText bool
+	}{
+		{name: "boxed draft", screen: humanDraftFixture, draft: true},
+		{name: "boxed empty", screen: idleComposerFixture},
+		{name: "no box, echoed prompt", screen: noBoxScrollbackFixture, notFoundText: true},
+		{name: "no box, nothing prompt-like", screen: "⏺ Done."},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			lines := strings.Split(tt.screen, "\n")
+			if got := composerHoldsHumanDraft(lines, DefaultReadyPromptPrefix); got != tt.draft {
+				t.Fatalf("composerHoldsHumanDraft() = %v, want %v", got, tt.draft)
+			}
+			if got := composerNotFoundOverText(lines, DefaultReadyPromptPrefix); got != tt.notFoundText {
+				t.Fatalf("composerNotFoundOverText() = %v, want %v", got, tt.notFoundText)
+			}
 		})
 	}
 }
